@@ -23,21 +23,35 @@ export type LinFrame = LinFrame(vars: [string])
  *  consumed on EVERY exit path, including early `return` — unlike regular
  *  linear params whose end-of-function check covers only the fall-through
  *  path.
+ *  `consumed` is the set of linear names already consumed on the current
+ *  execution path. Used by the `Variable` walker to detect double-use
+ *  (LinearReuse): when a name is in `consumed` but not in `vars`, it was
+ *  a linear binding that has already been consumed once.
  */
-export type LinState = LinState(vars: [string], frame_stack: [LinFrame], must_consume: [string])
+export type LinState = LinState(vars: [string], frame_stack: [LinFrame], must_consume: [string], consumed: [string])
 
 export let lin_empty = fn () -> LinState do
-  return LinState(vars: [], frame_stack: [], must_consume: [])
+  return LinState(vars: [], frame_stack: [], must_consume: [], consumed: [])
 end
 
 export let lin_add = fn (st: LinState, name: string) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
-  return LinState(vars: name :: vs, frame_stack: fs, must_consume: mc)
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co) = st
+  // Remove from consumed when a new binding shadows a previously consumed name.
+  return LinState(vars: name :: vs, frame_stack: fs, must_consume: mc, consumed: remove_one(xs: co, target: name))
+end
+
+/** Clear `name` from the consumed set without adding it to vars. Used when a
+ *  NEW non-linear binding shadows a previously consumed linear name, so the
+ *  old consumed entry does not falsely trigger LinearReuse in the new scope.
+ */
+export let lin_clear_consumed = fn (st: LinState, name: string) -> LinState do
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co) = st
+  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: remove_one(xs: co, target: name))
 end
 
 export let lin_remove = fn (st: LinState, name: string) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
-  return LinState(vars: remove_one(xs: vs, target: name), frame_stack: fs, must_consume: mc)
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co) = st
+  return LinState(vars: remove_one(xs: vs, target: name), frame_stack: fs, must_consume: mc, consumed: name :: co)
 end
 
 let remove_one = fn (xs: [string], target: string) -> [string] do
@@ -50,8 +64,14 @@ let remove_one = fn (xs: [string], target: string) -> [string] do
 end
 
 export let lin_member = fn (st: LinState, name: string) -> bool do
-  let LinState(vars: vs, frame_stack: _, must_consume: _) = st
+  let LinState(vars: vs, frame_stack: _, must_consume: _, consumed: _) = st
   return str_member(xs: vs, target: name)
+end
+
+/** True when `name` was a linear binding already consumed on this path. */
+export let lin_consumed_member = fn (st: LinState, name: string) -> bool do
+  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: co) = st
+  return str_member(xs: co, target: name)
 end
 
 export let str_member = fn (xs: [string], target: string) -> bool do
@@ -86,20 +106,20 @@ let all_in = fn (needles: [string], haystack: [string]) -> bool do
 end
 
 export let lin_push_frame = fn (st: LinState) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
-  return LinState(vars: vs, frame_stack: LinFrame(vars: copy(xs: vs)) :: fs, must_consume: mc)
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co) = st
+  return LinState(vars: vs, frame_stack: LinFrame(vars: copy(xs: vs)) :: fs, must_consume: mc, consumed: co)
 end
 
 export let lin_pop_frame = fn (st: LinState) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc) = st
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co) = st
   match fs do
     | [] -> return st
-    | _ :: rest -> return LinState(vars: vs, frame_stack: rest, must_consume: mc)
+    | _ :: rest -> return LinState(vars: vs, frame_stack: rest, must_consume: mc, consumed: co)
   end
 end
 
 export let lin_top_frame = fn (st: LinState) -> Option<[string]> do
-  let LinState(vars: _, frame_stack: fs, must_consume: _) = st
+  let LinState(vars: _, frame_stack: fs, must_consume: _, consumed: _) = st
   match fs do
     | [] -> return None
     | LinFrame(vars: top) :: _ -> return Some(val: top)
@@ -130,15 +150,15 @@ let join_inner = fn (xs: [string]) -> string do
 end
 
 export let lin_set_vars = fn (st: LinState, vs: [string]) -> LinState do
-  let LinState(vars: _, frame_stack: fs, must_consume: mc) = st
-  return LinState(vars: vs, frame_stack: fs, must_consume: mc)
+  let LinState(vars: _, frame_stack: fs, must_consume: mc, consumed: co) = st
+  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co)
 end
 
 /** Return the set of names that must be consumed on every exit path
  *  (currently seeded only by with-@k cont_binder arms).
  */
 export let lin_get_must_consume = fn (st: LinState) -> [string] do
-  let LinState(vars: _, frame_stack: _, must_consume: mc) = st
+  let LinState(vars: _, frame_stack: _, must_consume: mc, consumed: _) = st
   return mc
 end
 
@@ -153,8 +173,23 @@ export let find_live_must_consume = fn (mc: [string], live: [string]) -> Option<
 end
 
 export let lin_state_vars = fn (st: LinState) -> [string] do
-  let LinState(vars: vs, frame_stack: _, must_consume: _) = st
+  let LinState(vars: vs, frame_stack: _, must_consume: _, consumed: _) = st
   return vs
+end
+
+export let lin_state_consumed = fn (st: LinState) -> [string] do
+  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: co) = st
+  return co
+end
+
+/** Restore both `vars` and `consumed` to saved values. Used by the try-catch
+ *  handler to reset the catch arm's starting state to the pre-try snapshot,
+ *  preventing try-body consumed bindings from polluting reuse detection in
+ *  the catch arm.
+ */
+export let lin_restore_state = fn (st: LinState, vs: [string], co: [string]) -> LinState do
+  let LinState(vars: _, frame_stack: fs, must_consume: mc, consumed: _) = st
+  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co)
 end
 
 export let filter_not_in = fn (

@@ -23,7 +23,7 @@ import {
 } from "src/ir/hir/types.nx"
 import {
   TypeError,
-  LinearUnused, LinearMismatch, LinearLeakAcrossThrowableCall
+  LinearUnused, LinearReuse, LinearMismatch, LinearLeakAcrossThrowableCall
 } from "src/typecheck/errors.nx"
 import { Option, Some, None } from "std:option"
 import {
@@ -34,10 +34,10 @@ import {
 } from "src/typecheck/linearity/sig_map.nx"
 import {
   LinState,
-  lin_empty, lin_add, lin_remove, lin_member, str_member,
+  lin_empty, lin_add, lin_remove, lin_member, lin_consumed_member, lin_clear_consumed, str_member,
   vars_equal, lin_push_frame, lin_pop_frame, lin_top_frame,
   join_simple, lin_set_vars, lin_get_must_consume, find_live_must_consume,
-  lin_state_vars, filter_not_in
+  lin_state_vars, lin_state_consumed, lin_restore_state, filter_not_in
 } from "src/typecheck/linearity/state.nx"
 import {
   lin_field_is_linear, lin_variant_is_known, lin_any_record_has_linear_field,
@@ -68,13 +68,13 @@ import {
  *  user wrote `let x = …` without a sigil.
  */
 let let_binds_linear = fn (
-  sigil: Sigil, ann: Option<TypeExpr>, value: HirExpr, sigs: [SigEntry], tdefs: [RecordDef]
+  sigil: Sigil, ann: Option<TypeExpr>, value: HirExpr, sigs: [SigEntry], tdefs: [RecordDef], enum_defs: [EnumDef]
 ) -> bool do
   match sigil do
     | SigilLinear | SigilLazy -> return true
     | _ ->
       match ann do
-        | Some(val: t) -> if is_linear_binding_type(t, tdefs) then return true end
+        | Some(val: t) -> if is_linear_binding_type(t, tdefs, enum_defs) then return true end
         | None -> ()
       end
       let HirExpr(node: vnode, span: _) = value
@@ -82,9 +82,10 @@ let let_binds_linear = fn (
         | Call(func: f, args: _) ->
           match sig_lookup(sigs, name: f) do
             | Some(val: SigEntry(name: _, param_types: _, ret_type: rt, throw_row: _)) ->
-              return is_linear_binding_type(t: rt, tdefs)
+              return is_linear_binding_type(t: rt, tdefs, enum_defs)
             | None -> return false
           end
+        | Array(_) -> return true
         | _ -> return false
       end
   end
@@ -164,7 +165,7 @@ let check_function_with_kont = fn (func: HirFunction, kont: Option<string>, sigs
       | EagerBody(stmts) ->
         // Seed live set with linear params; push frame snapshot so the
         // body's throwable-call check excludes them (call-site contract).
-        let initial_vars = collect_linear_params(params: ps, tdefs, acc: [])
+        let initial_vars = collect_linear_params(params: ps, tdefs, enum_defs, acc: [])
         // When a cont_binder k is present it must be consumed on every exit
         // path (including early `return`). Two cases:
         //   (a) synthesized handler binding arms: synthesize_handler has
@@ -181,7 +182,7 @@ let check_function_with_kont = fn (func: HirFunction, kont: Option<string>, sigs
             else k :: initial_vars
             end
         end
-        let st0 = LinState(vars: all_vars, frame_stack: [], must_consume: kont_vars)
+        let st0 = LinState(vars: all_vars, frame_stack: [], must_consume: kont_vars, consumed: [])
         let st1 = lin_push_frame(st: st0)
         let st2 = check_stmts(stmts, st: st1, sigs, tdefs, enum_defs)
         // Function-end consumption check: any linear param or local left
@@ -201,21 +202,21 @@ end
  *  where `fn (%x: T)` (sigil-only) was previously dropped by HIR
  * conversion.
  */
-let param_binds_linear = fn (sig: Sigil, t: TypeExpr, tdefs: [RecordDef]) -> bool do
+let param_binds_linear = fn (sig: Sigil, t: TypeExpr, tdefs: [RecordDef], enum_defs: [EnumDef]) -> bool do
   match sig do
     | SigilLinear | SigilLazy -> return true
-    | _ -> return is_linear_binding_type(t, tdefs)
+    | _ -> return is_linear_binding_type(t, tdefs, enum_defs)
   end
 end
 
-let collect_linear_params = fn (params: [HirParam], tdefs: [RecordDef], acc: [string]) -> [string] do
+let collect_linear_params = fn (params: [HirParam], tdefs: [RecordDef], enum_defs: [EnumDef], acc: [string]) -> [string] do
   match params do
     | [] -> return acc
     | HirParam(label: _, name: n, sigil: s, typ: t) :: rest ->
-      if param_binds_linear(sig: s, t, tdefs) then
-        return collect_linear_params(params: rest, tdefs, acc: n :: acc)
+      if param_binds_linear(sig: s, t, tdefs, enum_defs) then
+        return collect_linear_params(params: rest, tdefs, enum_defs, acc: n :: acc)
       end
-      return collect_linear_params(params: rest, tdefs, acc)
+      return collect_linear_params(params: rest, tdefs, enum_defs, acc)
   end
 end
 
@@ -310,14 +311,17 @@ let check_stmt = fn (
       // Walk RHS first so any linear use inside it is consumed before the
       // new binding is added.
       let st1 = check_expr(expr: v, st, sigs, tdefs, enum_defs, at_stmt_level: false)
-      let binds_lin = let_binds_linear(sigil: sig, ann, value: v, sigs, tdefs)
+      let binds_lin = let_binds_linear(sigil: sig, ann, value: v, sigs, tdefs, enum_defs)
       if n == "_" then
         // reject `let _ = e` when e is non-auto-droppable linear.
         if binds_lin && call_ret_non_droppable(value: v, sigs) then throw LinearUnused(name: "_", span) end
         return st1
       end
       if binds_lin then return lin_add(st: st1, name: n) end
-      return st1
+      // Even for non-linear bindings, clear `n` from consumed so a previously
+      // consumed linear with the same name doesn't falsely fire LinearReuse
+      // in the new binding's scope (shadowing).
+      return lin_clear_consumed(st: st1, name: n)
     | Expr(expr: e) ->
       // Top-of-Stmt expression: a root Call here triggers the throwable-
       // call leak check. Nested calls inside larger
@@ -343,14 +347,15 @@ let check_stmt = fn (
       // is the catch arm's responsibility on throw. Throwable-call check
       // inside the body excludes those vars from "leaked".
       let pre_try_vars = lin_state_vars(st)
+      let pre_try_consumed = lin_state_consumed(st)
       let st_try = lin_push_frame(st)
       let st_after_try = check_stmts(stmts: b, st: st_try, sigs, tdefs, enum_defs)
       let st_after_try2 = lin_pop_frame(st: st_after_try)
       // Catch arm starts from pre-try snapshot (Strategy A),
-      // not from the post-success state. The catch arm must finish with
-      // the same linear-var set as the post-success state (per-arm
-      // consistency — "Linear mismatch across catch arms").
-      let st_catch_in = lin_set_vars(st: st_after_try2, vs: pre_try_vars)
+      // not from the post-success state. Restore both vars and consumed so
+      // that bindings consumed in the try body do not falsely appear in the
+      // consumed set when the catch arm re-uses those bindings.
+      let st_catch_in = lin_restore_state(st: st_after_try2, vs: pre_try_vars, co: pre_try_consumed)
       let st_catch_out = check_stmts(stmts: cb, st: st_catch_in, sigs, tdefs, enum_defs)
       let post_catch_vars = lin_state_vars(st: st_catch_out)
       let post_try_vars = lin_state_vars(st: st_after_try2)
@@ -384,6 +389,7 @@ let check_expr_kind = fn (
     | Literal(_) -> return st
     | Variable(name: n, sigil: _) ->
       if lin_member(st, name: n) then return lin_remove(st, name: n) end
+      if lin_consumed_member(st, name: n) then throw LinearReuse(name: n, span) end
       return st
     | Borrow(name: _, sigil: _) ->
       return st
@@ -409,11 +415,13 @@ let check_expr_kind = fn (
     | Array(elems: es) ->
       return check_exprs(exprs: es, st, sigs, tdefs, enum_defs)
     | Index(target: t, index: i) ->
-      // Move-out rejection: indexing a linear-element array would move the
-      // element out. Implementing this requires per-Index typing; left to
-      // a future linearity follow-up. The structural walk still recurses.
-      let st1 = check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
-      return check_expr(expr: i, st: st1, sigs, tdefs, enum_defs, at_stmt_level: false)
+      // Array indexing is a borrow-like operation: the array stays live after
+      // a[i] read or a[i] <- v write. Do NOT consume the array target here.
+      // Move-out of linear-element arrays (a[i] consuming elem) requires
+      // per-Index typing; left to a future linearity follow-up.
+      // Only recurse into the index expression (may itself use linears).
+      let _ = t
+      return check_expr(expr: i, st, sigs, tdefs, enum_defs, at_stmt_level: false)
     | FieldAccess(target: t, field: _) ->
       return check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
     | If(cond: c, then_branch: tb, else_branch: eb) ->
@@ -497,7 +505,7 @@ let check_expr_kind = fn (
       // Lambda body is its own frame; outer linears captured by the lambda
       // are tracked via `src/typecheck/capture.nx`. Walk the body in a
       // fresh state seeded only with the lambda's own linear params.
-      let lparams = collect_linear_params(params: ps, tdefs, acc: [])
+      let lparams = collect_linear_params(params: ps, tdefs, enum_defs, acc: [])
       let lst0 = lin_set_vars(st: lin_empty(), vs: lparams)
       let lst1 = lin_push_frame(st: lst0)
       let lst2 = check_stmts(stmts: b, st: lst1, sigs, tdefs, enum_defs)

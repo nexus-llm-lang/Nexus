@@ -83,21 +83,52 @@ let lin_record_field_type_by_name = fn (fields: [NamedType], fname: string) -> O
   end
 end
 
+/** True when the named field `fname` of the RECORD type named `variant` is
+ *  declared with a linear type. Returns false when the type is not found in
+ *  `tdefs` or the field is not linear. Used by bind_pattern_fields_for_variant
+ *  to avoid the fallback_linear over-approximation for record constructors.
+ */
+export let lin_record_type_field_is_linear = fn (
+  tdefs: [RecordDef], variant: string, fname: string, enum_defs: [EnumDef]
+) -> bool do
+  match tdefs do
+    | [] -> return false
+    | RecordDef(name: n, is_public: _, type_params: _, fields: fs) :: rest ->
+      if n == variant then
+        match lin_record_field_type_by_name(fields: fs, fname) do
+          | Some(val: ft) -> return is_linear_binding_type(ft, tdefs, enum_defs)
+          | None -> return false
+        end
+      end
+      return lin_record_type_field_is_linear(tdefs: rest, variant, fname, enum_defs)
+  end
+end
+
+/** True when the record type `variant` is declared in tdefs. */
+export let lin_record_type_is_known = fn (tdefs: [RecordDef], variant: string) -> bool do
+  match tdefs do
+    | [] -> return false
+    | RecordDef(name: n, is_public: _, type_params: _, fields: _) :: rest ->
+      if n == variant then return true end
+      return lin_record_type_is_known(tdefs: rest, variant)
+  end
+end
+
 /** Scan all RecordDefs for a record that has a field named `fname` with a
  *  linear type. Conservative: any match wins. Used for PRec patterns where
  *  the scrutinee type is not tracked through the pattern AST.
  */
 export let lin_any_record_has_linear_field = fn (
-  tdefs: [RecordDef], fname: string
+  tdefs: [RecordDef], fname: string, enum_defs: [EnumDef]
 ) -> bool do
   match tdefs do
     | [] -> return false
     | RecordDef(name: _, is_public: _, type_params: _, fields: fs) :: rest ->
       match lin_record_field_type_by_name(fields: fs, fname) do
-        | Some(val: ft) -> if is_linear_binding_type(ft, tdefs) then return true end
+        | Some(val: ft) -> if is_linear_binding_type(ft, tdefs, enum_defs) then return true end
         | None -> ()
       end
-      return lin_any_record_has_linear_field(tdefs: rest, fname)
+      return lin_any_record_has_linear_field(tdefs: rest, fname, enum_defs)
   end
 end
 
@@ -106,15 +137,15 @@ end
  *  not found, when the field is not found, or when the field type is not linear.
  */
 export let lin_field_is_linear = fn (
-  defs: [EnumDef], variant: string, fname: string, tdefs: [RecordDef]
+  defs: [EnumDef], variant: string, fname: string, tdefs: [RecordDef], enum_defs: [EnumDef]
 ) -> bool do
   match defs do
     | [] -> return false
     | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
       if lin_variant_has_name(vs: vs, variant) then
-        return lin_named_field_linear_in_variant(vs: vs, variant, fname, tdefs)
+        return lin_named_field_linear_in_variant(vs: vs, variant, fname, tdefs, enum_defs)
       end
-      return lin_field_is_linear(defs: rest, variant, fname, tdefs)
+      return lin_field_is_linear(defs: rest, variant, fname, tdefs, enum_defs)
   end
 end
 
@@ -134,30 +165,30 @@ end
  *  linear declared type. Returns false when variant not found or field not linear.
  */
 let lin_named_field_linear_in_variant = fn (
-  vs: [VariantDef], variant: string, fname: string, tdefs: [RecordDef]
+  vs: [VariantDef], variant: string, fname: string, tdefs: [RecordDef], enum_defs: [EnumDef]
 ) -> bool do
   match vs do
     | [] -> return false
     | VariantDef(name: n, fields: fs) :: rest ->
       if n == variant then
-        return lin_check_named_field_linear(fields: fs, fname, tdefs)
+        return lin_check_named_field_linear(fields: fs, fname, tdefs, enum_defs)
       end
-      return lin_named_field_linear_in_variant(vs: rest, variant, fname, tdefs)
+      return lin_named_field_linear_in_variant(vs: rest, variant, fname, tdefs, enum_defs)
   end
 end
 
 let lin_check_named_field_linear = fn (
-  fields: [VariantField], fname: string, tdefs: [RecordDef]
+  fields: [VariantField], fname: string, tdefs: [RecordDef], enum_defs: [EnumDef]
 ) -> bool do
   match fields do
     | [] -> return false
     | VariantField(name: vfname, typ: t) :: rest ->
       match vfname do
         | Some(val: n) ->
-          if n == fname then return is_linear_binding_type(t, tdefs) end
-          return lin_check_named_field_linear(fields: rest, fname, tdefs)
+          if n == fname then return is_linear_binding_type(t, tdefs, enum_defs) end
+          return lin_check_named_field_linear(fields: rest, fname, tdefs, enum_defs)
         | None ->
-          return lin_check_named_field_linear(fields: rest, fname, tdefs)
+          return lin_check_named_field_linear(fields: rest, fname, tdefs, enum_defs)
       end
   end
 end
@@ -173,5 +204,22 @@ export let lin_variant_is_known = fn (defs: [EnumDef], variant: string) -> bool 
     | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
       if lin_variant_has_name(vs: vs, variant) then return true end
       return lin_variant_is_known(defs: rest, variant)
+  end
+end
+
+/** True when `variant` matches an EnumDef TYPE NAME (not a variant/constructor
+ *  name). Used for opaque-type patterns where variants are stripped during
+ *  import (D-Type-Sum-Opaque): the constructor name equals the type name, but
+ *  after stripping, lin_variant_is_known returns false. Matching the enum type
+ *  name lets bind_pattern_fields_for_variant treat the fields as non-linear
+ *  (since the struct carries only primitive fields) rather than falling back to
+ *  scrutinee_linear, which would incorrectly track primitive i64 fields as linear.
+ */
+export let lin_enum_type_name_is_known = fn (defs: [EnumDef], variant: string) -> bool do
+  match defs do
+    | [] -> return false
+    | EnumDef(name: n, is_public: _, is_opaque: _, type_params: _, variants: _) :: rest ->
+      if n == variant then return true end
+      return lin_enum_type_name_is_known(defs: rest, variant)
   end
 end
