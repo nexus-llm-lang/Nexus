@@ -1,0 +1,172 @@
+// Tests that needs_cabi_realloc activates for wasi-namespaced externals with
+// string params, and that the type section emits the cabi_realloc signature
+// (i32 i32 i32 i32) -> i32 when has_cabi_realloc is true.
+
+import * as test_assert from "std:test/assert"
+import { TypeExpr, TyUnit, TyRow, TyString } from "src/common/ast.nx"
+import {
+  LirExternal, LirParam, LirProgram,
+  LirFunction, LirAtomUnit
+} from "src/ir/lir/types.nx"
+import { None } from "std:option"
+import * as bb from "std:bytebuffer"
+import { ByteBuffer } from "std:bytebuffer"
+import { is_foreign_component_module, needs_cabi_realloc } from "src/backend/wasm/collect.nx"
+import { build_type_section_dedup, DedupedTypes } from "src/backend/wasm/section/type_section.nx"
+import { Span } from "src/common/token.nx"
+
+let dummy_span = fn () -> Span do
+  return Span(offset: 0, line: 1, col: 1)
+end
+
+let empty_throw_row = fn () -> TypeExpr do
+  return TyRow(types: [], rest: None)
+end
+
+let mk_string_ext = fn (name: string, wasm_module: string) -> LirExternal do
+  let p = LirParam(label: "s", name: "s", typ: TyString)
+  return LirExternal(
+    name, wasm_module, wasm_name: name,
+    params: [p], ret_type: TyUnit, throw_row: empty_throw_row()
+  )
+end
+
+let mk_unit_fn = fn (name: string) -> LirFunction do
+  return LirFunction(
+    name, params: [], ret_type: TyUnit, body: [], ret: LirAtomUnit, span: dummy_span()
+  )
+end
+
+let read_all = fn (buf: &ByteBuffer) -> [i64] do
+  return read_all_go(buf, idx: 0, len: bb.length(buf), acc: [])
+end
+
+let read_all_go = fn (buf: &ByteBuffer, idx: i64, len: i64, acc: [i64]) -> [i64] do
+  if idx >= len then return rev_i64(xs: acc, out: []) end
+  let b = bb.get_byte(buf, idx)
+  return read_all_go(buf, idx: idx + 1, len, acc: b :: acc)
+end
+
+let rev_i64 = fn (xs: [i64], out: [i64]) -> [i64] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_i64(xs: rest, out: x :: out)
+  end
+end
+
+let nth = fn (xs: [i64], idx: i64) -> i64 do
+  match xs do
+    | [] -> return -1
+    | x :: rest ->
+      if idx <= 0 then return x
+      else return nth(xs: rest, idx: idx - 1)
+      end
+  end
+end
+
+// Find the cabi_realloc type signature in the type section bytes.
+// The signature is (i32 i32 i32 i32) -> i32:
+//   0x60 (func form) + 0x04 (4 params) + 4x 0x7f (i32) + 0x01 (1 return) + 0x7f (i32)
+let contains_cabi_sig = fn (bytes: [i64]) -> bool do
+  return search_cabi_go(bytes, idx: 0, total: list_len(xs: bytes))
+end
+
+let list_len = fn (xs: [i64]) -> i64 do
+  match xs do
+    | [] -> 0
+    | _ :: rest -> 1 + list_len(xs: rest)
+  end
+end
+
+let search_cabi_go = fn (bytes: [i64], idx: i64, total: i64) -> bool do
+  if idx + 9 > total then return false end
+  // Check for: 0x60 04 7f 7f 7f 7f 01 7f
+  // (but skip count byte at idx=0 — the section starts with a count ULEB)
+  if nth(xs: bytes, idx) == 96 then
+    if nth(xs: bytes, idx: idx + 1) == 4 then
+      if nth(xs: bytes, idx: idx + 2) == 127 then
+        if nth(xs: bytes, idx: idx + 3) == 127 then
+          if nth(xs: bytes, idx: idx + 4) == 127 then
+            if nth(xs: bytes, idx: idx + 5) == 127 then
+              if nth(xs: bytes, idx: idx + 6) == 1 then
+                if nth(xs: bytes, idx: idx + 7) == 127 then
+                  return true
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  return search_cabi_go(bytes, idx: idx + 1, total)
+end
+
+let run_type_section_with_cabi = fn (ext: LirExternal, has_cabi: bool) -> [i64] do
+  let main_fn = mk_unit_fn(name: "main")
+  let prog = LirProgram(functions: [main_fn], externals: [ext])
+  let DedupedTypes(
+    section: %ts,
+    count: _,
+    ext_type_idxs: _,
+    func_type_idxs: _,
+    wasi_run_type_idx: _,
+    exn_tag_type_idx: _,
+    ss_tag_type_idx: _,
+    alloc_type_idx: _,
+    alloc_mark_type_idx: _,
+    alloc_reset_type_idx: _,
+    cabi_type_idx,
+    closure_type_idxs: _,
+    ss_cont_type_idx: _,
+    ss_dispatch_block_type_idx: _
+  ) = build_type_section_dedup(
+    program: prog,
+    has_eh: false, has_ss: false, has_alloc: false,
+    has_cabi_realloc: has_cabi, closure_arities: [],
+    p3_component: false
+  )
+  let _ = cabi_type_idx
+  let bytes = read_all(buf: &ts)
+  bb.free(buf: %ts)
+  return bytes
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ── part 1: needs_cabi_realloc activates for wasi string params ──
+
+  let wasi_string_ext = mk_string_ext(
+    name: "blocking-write-and-flush",
+    wasm_module: "wasi:io/streams@0.2.1"
+  )
+  test_assert.assert_true(
+    cond: needs_cabi_realloc(exts: [wasi_string_ext]),
+    label: "wasi: external with string param triggers needs_cabi_realloc")
+
+  let nexus_string_ext = mk_string_ext(
+    name: "print",
+    wasm_module: "nexus:std/io"
+  )
+  test_assert.assert_true(
+    cond: !needs_cabi_realloc(exts: [nexus_string_ext]),
+    label: "nexus:std/ external with string param does not trigger needs_cabi_realloc")
+
+  // ── part 2: type section includes cabi_realloc sig when has_cabi_realloc is true ──
+
+  let bytes_with_cabi = run_type_section_with_cabi(ext: wasi_string_ext, has_cabi: true)
+  test_assert.assert_true(
+    cond: contains_cabi_sig(bytes: bytes_with_cabi),
+    label: "type section contains cabi_realloc signature (i32 i32 i32 i32)->i32 when has_cabi_realloc=true")
+
+  let bytes_no_cabi = run_type_section_with_cabi(ext: wasi_string_ext, has_cabi: false)
+  test_assert.assert_true(
+    cond: !contains_cabi_sig(bytes: bytes_no_cabi),
+    label: "type section does not contain cabi_realloc signature when has_cabi_realloc=false")
+
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end

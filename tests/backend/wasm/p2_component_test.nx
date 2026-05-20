@@ -1,0 +1,206 @@
+// Tests for the WASI preview2 component wrapper binary emitters.
+//
+// Verifies that build_p2_component and its sub-functions emit the correct
+// binary encoding according to the WebAssembly component model binary format.
+//
+// Preview2 component structure:
+//   component header (magic + cm_version)
+//   core module 0 (inline)
+//   core instance section: instantiate(module=0, args=[])
+//   alias section: core func "run_export" from inst 0; core memory "memory" from inst 0
+//   type section: result<none,none>; func()->type(0)
+//   canon section: lift(core_func=0, opts=[memory(0)], type=1)
+//   instance section: FromExports({run=func(0)})
+//   export section: wasi_iface = instance(0)
+
+import * as test_assert from "std:test/assert"
+import * as bb from "std:bytebuffer"
+import { ByteBuffer } from "std:bytebuffer"
+import { build_p2_component } from "src/backend/wasm/section/component_model.nx"
+import * as wdefs from "src/backend/wasm/defs.nx"
+
+let read_all = fn (buf: &ByteBuffer) -> [i64] do
+  return read_all_go(buf, idx: 0, len: bb.length(buf), acc: [])
+end
+
+let read_all_go = fn (buf: &ByteBuffer, idx: i64, len: i64, acc: [i64]) -> [i64] do
+  if idx >= len then return rev_i64(xs: acc, out: []) end
+  let b = bb.get_byte(buf, idx)
+  return read_all_go(buf, idx: idx + 1, len, acc: b :: acc)
+end
+
+let rev_i64 = fn (xs: [i64], out: [i64]) -> [i64] do
+  match xs do
+    | [] -> return out
+    | x :: rest -> return rev_i64(xs: rest, out: x :: out)
+  end
+end
+
+let nth = fn (xs: [i64], idx: i64) -> i64 do
+  match xs do
+    | [] -> return -1
+    | x :: rest ->
+      if idx <= 0 then return x
+      else return nth(xs: rest, idx: idx - 1)
+      end
+  end
+end
+
+let list_length = fn (xs: [i64]) -> i64 do
+  match xs do
+    | [] -> 0
+    | _ :: rest -> 1 + list_length(xs: rest)
+  end
+end
+
+// Minimal core wasm: module with (func (result i32) (i32.const 0) end) + memory export.
+// Binary: magic(4) + version(4) + type_sec(5) + func_sec(3) + memory_sec(4)
+//         + export_sec(size) + code_sec(size)
+//
+// We embed a tiny but valid core wasm that exports:
+//   "wasi:cli/run@0.2.0#run" as func returning i32
+//   "memory" as memory
+//
+// Pre-computed bytes matching:
+// (module
+//   (type (func (result i32)))
+//   (func (type 0) i32.const 0)
+//   (memory 1)
+//   (export "memory" (memory 0))
+//   (export "wasi:cli/run@0.2.0#run" (func 0))
+// )
+let minimal_core_wasm = fn () -> %ByteBuffer do
+  let %buf = bb.empty()
+  // magic + version
+  let %buf = bb.push_bytes(buf: %buf, bytes: [0, 97, 115, 109, 1, 0, 0, 0])
+  // type section: id=1, len=5, count=1, func () -> i32
+  let %buf = bb.push_bytes(buf: %buf, bytes: [1, 5, 1, 96, 0, 1, 127])
+  // func section: id=3, len=2, count=1, type_idx=0
+  let %buf = bb.push_bytes(buf: %buf, bytes: [3, 2, 1, 0])
+  // memory section: id=5, len=3, count=1, flags=0 min=1
+  let %buf = bb.push_bytes(buf: %buf, bytes: [5, 3, 1, 0, 1])
+  // export section: id=7, count=2
+  //   "memory" (6 bytes) mem_kind=2 idx=0
+  //   "wasi:cli/run@0.2.0#run" (22 bytes) func_kind=0 idx=0
+  let %buf = bb.push_bytes(buf: %buf, bytes: [7, 36, 2])
+  let %buf = bb.push_bytes(buf: %buf, bytes: [6, 109, 101, 109, 111, 114, 121, 2, 0])
+  // 22-byte export name for "wasi:cli/run@0.2.0#run"
+  let %buf = bb.push_bytes(buf: %buf, bytes: [22, 119, 97, 115, 105, 58, 99, 108, 105, 47])
+  let %buf = bb.push_bytes(buf: %buf, bytes: [114, 117, 110, 64, 48, 46, 50, 46, 48, 35])
+  let %buf = bb.push_bytes(buf: %buf, bytes: [114, 117, 110, 0, 0])
+  // code section: id=10, len=6, count=1, func_len=4, 0 locals, i32.const 0, end
+  return bb.push_bytes(buf: %buf, bytes: [10, 6, 1, 4, 0, 65, 0, 11])
+end
+
+// Find a subsequence in bytes starting at idx.
+let find_subseq = fn (haystack: [i64], needle: [i64]) -> bool do
+  return find_subseq_go(haystack, needle, offset: 0, total: list_length(xs: haystack))
+end
+
+let find_subseq_go = fn (haystack: [i64], needle: [i64], offset: i64, total: i64) -> bool do
+  let nlen = list_length(xs: needle)
+  if offset + nlen > total then return false end
+  if matches_at(haystack, needle, offset) then return true end
+  return find_subseq_go(haystack, needle, offset: offset + 1, total)
+end
+
+let matches_at = fn (haystack: [i64], needle: [i64], offset: i64) -> bool do
+  return matches_at_go(haystack, needle, h_idx: offset, n_idx: 0, nlen: list_length(xs: needle))
+end
+
+let matches_at_go = fn (haystack: [i64], needle: [i64], h_idx: i64, n_idx: i64, nlen: i64) -> bool do
+  if n_idx >= nlen then return true end
+  if nth(xs: haystack, idx: h_idx) != nth(xs: needle, idx: n_idx) then return false end
+  return matches_at_go(haystack, needle, h_idx: h_idx + 1, n_idx: n_idx + 1, nlen)
+end
+
+let body = fn () -> unit throws { Exn } do
+  // Build the preview2 component wrapping the minimal core wasm.
+  let %core = minimal_core_wasm()
+  let %component = build_p2_component(
+    core_wasm: %core,
+    wasi_iface: "wasi:cli/run@0.2.0",
+    run_func_export: "wasi:cli/run@0.2.0#run"
+  )
+  let bytes = read_all(buf: &component)
+  bb.free(buf: %component)
+
+  // ── Check 1: component magic + version ──
+  // Magic: 0x00 0x61 0x73 0x6d
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 0), expected: 0, label: "magic[0]")
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 1), expected: 97, label: "magic[1]")
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 2), expected: 115, label: "magic[2]")
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 3), expected: 109, label: "magic[3]")
+  // Component version: 0x0d 0x00 0x01 0x00
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 4), expected: 13, label: "version[0]=0x0d")
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 5), expected: 0, label: "version[1]=0x00")
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 6), expected: 1, label: "version[2]=0x01")
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 7), expected: 0, label: "version[3]=0x00")
+
+  // ── Check 2: core module section starts at byte 8 ──
+  // cm_sec_core_module = 1
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 8), expected: 1,
+    label: "byte 8 is core module section id (0x01)")
+
+  // ── Check 3: core module embedded — starts with wasm magic ──
+  // core module section: id(1) + len(uleb) + core_bytes
+  // The core wasm magic is 0x00 0x61 0x73 0x6d, so starting at byte 10 (after id+1bytelen):
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 10), expected: 0, label: "core[0] = wasm magic 0x00")
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 11), expected: 97, label: "core[1] = wasm magic 0x61")
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 12), expected: 115, label: "core[2] = wasm magic 0x73")
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 13), expected: 109, label: "core[3] = wasm magic 0x6d")
+
+  // ── Check 4: core instance section present (id=0x02) ──
+  // After the core module bytes comes the core instance section (id=2).
+  // We can find it by searching for the instantiate pattern: 02 04 01 00 00 00
+  // (section_id=2, len=4, count=1, kind=Instantiate(0), module_idx=0, arg_count=0)
+  test_assert.assert_true(
+    cond: find_subseq(haystack: bytes, needle: [2, 4, 1, 0, 0, 0]),
+    label: "component contains core instance section (02 04 01 00 00 00)")
+
+  // ── Check 5: alias section present (id=0x06) with func+memory aliases ──
+  // Alias for core memory "memory": 00 02 01 00 06 memory
+  // 06=len("memory"), then bytes for "memory" = 109 101 109 111 114 121
+  test_assert.assert_true(
+    cond: find_subseq(haystack: bytes, needle: [0, 2, 1, 0, 6, 109, 101, 109, 111, 114, 121]),
+    label: "alias section contains memory alias entry (00 02 01 00 06 'memory')")
+
+  // ── Check 6: component type section (id=0x07) contains result<none,none> ──
+  // result<none,none> encoding: 0x6a 0x00 0x00 (106 0 0)
+  test_assert.assert_true(
+    cond: find_subseq(haystack: bytes, needle: [106, 0, 0]),
+    label: "type section contains result<none,none> (6a 00 00)")
+
+  // ── Check 7: type section contains func()->type(0) ──
+  // func type encoding: 0x40 0x00 0x00 0x00 (64 0 0 0)
+  test_assert.assert_true(
+    cond: find_subseq(haystack: bytes, needle: [64, 0, 0, 0]),
+    label: "type section contains func()->result (40 00 00 00)")
+
+  // ── Check 8: canon lift present (0x00 0x00 discriminant) ──
+  // Lift entry: 00 00 00 01 03 00 01 (lift, core_func=0, 1 opt, memory=0, type=1)
+  test_assert.assert_true(
+    cond: find_subseq(haystack: bytes, needle: [0, 0, 0, 1, 3, 0, 1]),
+    label: "canon section contains lift entry (00 00 00 01 03 00 01)")
+
+  // ── Check 9: instance section (id=0x05) present with "run" export ──
+  // FromExports instance with "run": bytes for "run" = 114 117 110
+  test_assert.assert_true(
+    cond: find_subseq(haystack: bytes, needle: [114, 117, 110]),
+    label: "instance section contains 'run' export name")
+
+  // ── Check 10: component export section (id=0x0b=11) contains interface name ──
+  // "wasi:cli/run@0.2.0" = 18 bytes
+  // The name bytes: 119 97 115 105 58 99 108 105 47 114 117 110 64 48 46 50 46 48
+  test_assert.assert_true(
+    cond: find_subseq(haystack: bytes, needle: [119, 97, 115, 105, 58, 99, 108, 105, 47,
+                                                114, 117, 110, 64, 48, 46, 50, 46, 48]),
+    label: "export section contains 'wasi:cli/run@0.2.0' name")
+
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end

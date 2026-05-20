@@ -438,6 +438,199 @@ let build_cm_wasi_run_export = fn () -> %ByteBuffer do
   return %s
 end
 
+// ─── WASI preview2 component wrapper ──────────────────────────────────────────
+//
+// Preview2 components wrap a core wasm module by:
+//   1. Embedding the core module inline.
+//   2. Instantiating it (no imports required — the run func is exported, not imported).
+//   3. Aliasing the core run func and memory out of the instantiated core instance.
+//   4. Declaring component types: result<none,none> + func()->result<none,none>.
+//   5. Canon-lifting the run func with the memory option.
+//   6. Exposing it as a component instance exporting "run".
+//   7. Exporting that instance as "wasi:cli/run@0.2.0".
+//
+// The resulting component runs under: wasmtime run <file.wasm>
+// Validated with: wasm-tools validate --features component-model <file.wasm>
+//
+// Binary encoding constants (derived from wasm-component-model binary spec):
+//   core instance export alias: 0x00 <core_sort> 0x01 <instance_idx> <name>
+//     core_sort = 0x00 (func) | 0x02 (memory)
+//   component type: result<none,none> = 0x6a 0x00 0x00
+//   component functype: 0x40 <params> 0x00 <single_result_typeref>
+//   canon lift: 0x00 0x00 <core_func_idx> <opt_count> [opts] <type_idx>
+//   instance FromExports: 0x01 <count> [0x00 <name> <sort> <idx>]*
+//   component export entry: <count> 0x00 <name> <sort> <idx> 0x00
+
+/** Build a core alias entry for a function export from a core instance.
+ *  Encoding: 0x00(CoreInstanceExport) 0x00(Func) 0x01(ExportAlias) instance_idx name
+ */
+let p2_alias_core_func_entry = fn (instance_idx: i64, name: string) -> %ByteBuffer do
+  let %out = bb.empty()
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 0, 1])
+  let %out = bb.push_uleb128(buf: %out, val: instance_idx)
+  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: name))
+  return bb.push_string(buf: %out, s: name)
+end
+
+/** Build a core alias entry for a memory export from a core instance.
+ *  Encoding: 0x00(CoreInstanceExport) 0x02(Memory) 0x01(ExportAlias) instance_idx name
+ */
+let p2_alias_core_memory_entry = fn (instance_idx: i64, name: string) -> %ByteBuffer do
+  let %out = bb.empty()
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 2, 1])
+  let %out = bb.push_uleb128(buf: %out, val: instance_idx)
+  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: name))
+  return bb.push_string(buf: %out, s: name)
+end
+
+/** Build the alias section aliasing a core func and core memory from core instance 0.
+ *  run_func_export is the wasm export name of the run entry point (e.g. "wasi:cli/run@0.2.0#run").
+ */
+let build_p2_alias_section = fn (run_func_export: string) -> %ByteBuffer do
+  let %fn_entry = p2_alias_core_func_entry(instance_idx: 0, name: run_func_export)
+  let %mem_entry = p2_alias_core_memory_entry(instance_idx: 0, name: "memory")
+  let %out = bb.empty()
+  let %out = bb.push_uleb128(buf: %out, val: 2)
+  let %out = bb.push_buf(buf: %out, src: &fn_entry)
+  bb.free(buf: %fn_entry)
+  let %out = bb.push_buf(buf: %out, src: &mem_entry)
+  bb.free(buf: %mem_entry)
+  return %out
+end
+
+/** Build the component type section for the WASI run interface:
+ *  type 0 = result<none,none>       (0x6a 0x00 0x00)
+ *  type 1 = func() -> type(0)       (0x40 0x00 0x00 0x00)
+ *
+ *  0x6a = component defined-type: result
+ *  0x40 = component functype
+ *  param-count=0 then result-discriminant=0x00 (single unnamed result) + type_idx=0
+ */
+let build_p2_type_section = fn () -> %ByteBuffer do
+  let %out = bb.empty()
+  let %out = bb.push_uleb128(buf: %out, val: 2)
+  let %out = bb.push_bytes(buf: %out, bytes: [106, 0, 0])
+  let %out = bb.push_bytes(buf: %out, bytes: [64, 0, 0, 0])
+  return %out
+end
+
+/** Build the canonical function section lifting one core func as a component func.
+ *  core_func_idx: the aliased core function index
+ *  mem_idx: the aliased core memory index
+ *  type_idx: the component type index for the lifted function
+ *
+ *  Encoding: count=1, [0x00 0x00] core_func_idx opt_count [0x03 mem_idx] type_idx
+ *  The two leading 0x00 bytes are the canon lift discriminant in the component model binary.
+ */
+let build_p2_canon_lift_section = fn (core_func_idx: i64, mem_idx: i64, type_idx: i64) -> %ByteBuffer do
+  let %out = bb.empty()
+  let %out = bb.push_uleb128(buf: %out, val: 1)
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 0])
+  let %out = bb.push_uleb128(buf: %out, val: core_func_idx)
+  let %out = bb.push_uleb128(buf: %out, val: 1)
+  let %out = bb.push_bytes(buf: %out, bytes: [3])
+  let %out = bb.push_uleb128(buf: %out, val: mem_idx)
+  return bb.push_uleb128(buf: %out, val: type_idx)
+end
+
+/** Build the component instance section exporting a single func as "run".
+ *  lift_func_idx is the component-level func index (the canon-lifted run function).
+ *
+ *  Encoding: count=1, kind=FromExports(0x01), export_count=1,
+ *  [0x00 name(3,"run") sort=func(0x01) idx]
+ *  The 0x00 before name is the externname URL-option byte (absent = 0x00).
+ */
+let build_p2_instance_section = fn (lift_func_idx: i64) -> %ByteBuffer do
+  let %out = bb.empty()
+  let %out = bb.push_uleb128(buf: %out, val: 1)
+  let %out = bb.push_bytes(buf: %out, bytes: [1, 1, 0, 3])
+  let %out = bb.push_string(buf: %out, s: "run")
+  let %out = bb.push_byte(buf: %out, byte: 1)
+  return bb.push_uleb128(buf: %out, val: lift_func_idx)
+end
+
+/** Build the component export section exporting a WASI interface instance.
+ *  wasi_iface is the interface name (e.g. "wasi:cli/run@0.2.0").
+ *  instance_idx is the component instance index to export.
+ *
+ *  Encoding: count=1, [0x00 name sort=Instance(0x05) idx 0x00]
+ *  Trailing 0x00 is the component export's optional type annotation (absent).
+ */
+let build_p2_export_section = fn (wasi_iface: string, instance_idx: i64) -> %ByteBuffer do
+  let %out = bb.empty()
+  let %out = bb.push_uleb128(buf: %out, val: 1)
+  let %out = bb.push_bytes(buf: %out, bytes: [0])
+  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: wasi_iface))
+  let %out = bb.push_string(buf: %out, s: wasi_iface)
+  let %out = bb.push_byte(buf: %out, byte: 5)
+  let %out = bb.push_uleb128(buf: %out, val: instance_idx)
+  return bb.push_byte(buf: %out, byte: 0)
+end
+
+/** Build a minimal WASI preview2 component wrapping `core_wasm`.
+ *  The core module must export:
+ *    - run_func_export (e.g. "wasi:cli/run@0.2.0#run") returning i32
+ *    - "memory"
+ *  The resulting binary is a valid WebAssembly component runnable with:
+ *    wasmtime run <file>
+ *  and valid under:
+ *    wasm-tools validate --features component-model <file>
+ *
+ *  wasi_iface is the component export name (e.g. "wasi:cli/run@0.2.0").
+ *  run_func_export is the core wasm export name (e.g. "wasi:cli/run@0.2.0#run").
+ */
+export let build_p2_component = fn (core_wasm: %ByteBuffer, wasi_iface: string, run_func_export: string) -> %ByteBuffer do
+  let %out = bb.empty()
+  // Component magic + version
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 97, 115, 109])
+  let %out = bb.push_bytes(buf: %out, bytes: [wdefs.cm_version_byte0, wdefs.cm_version_byte1,
+                                              wdefs.cm_version_byte2, wdefs.cm_version_byte3])
+  // Core module 0: inline the nexus-generated core wasm
+  let %out = bb.push_uleb128(%out, val: wdefs.cm_sec_core_module)
+  let %out = bb.push_uleb128(%out, val: bb.length(buf: &core_wasm))
+  let %out = bb.push_buf(%out, src: &core_wasm)
+  bb.free(buf: %core_wasm)
+
+  // Core instance 0: instantiate module 0 with no args
+  let %inst_body = bb.empty()
+  let %inst_body = bb.push_uleb128(%inst_body, val: 1)
+  let %inst_body = bb.push_bytes(buf: %inst_body, bytes: [0, 0, 0])
+  let %inst_sec = cm_wrap_section(section_id: wdefs.cm_sec_core_instance, content: %inst_body)
+  let %out = bb.push_buf(%out, src: &inst_sec)
+  bb.free(buf: %inst_sec)
+
+  // Alias section: core func (run) and core memory from instance 0
+  let %alias_sec = cm_wrap_section(section_id: wdefs.cm_sec_alias,
+                                    content: build_p2_alias_section(run_func_export))
+  let %out = bb.push_buf(%out, src: &alias_sec)
+  bb.free(buf: %alias_sec)
+
+  // Component type section: result<none,none> and func()->result
+  let %type_sec = cm_wrap_section(section_id: wdefs.cm_sec_type, content: build_p2_type_section())
+  let %out = bb.push_buf(%out, src: &type_sec)
+  bb.free(buf: %type_sec)
+
+  // Canon section: lift core func 0 with memory(0) to component func 0, type 1
+  let %canon_sec = cm_wrap_section(section_id: wdefs.cm_sec_canon,
+                                    content: build_p2_canon_lift_section(core_func_idx: 0, mem_idx: 0, type_idx: 1))
+  let %out = bb.push_buf(%out, src: &canon_sec)
+  bb.free(buf: %canon_sec)
+
+  // Component instance section: {run = func 0}
+  let %inst2_sec = cm_wrap_section(section_id: wdefs.cm_sec_instance,
+                                    content: build_p2_instance_section(lift_func_idx: 0))
+  let %out = bb.push_buf(%out, src: &inst2_sec)
+  bb.free(buf: %inst2_sec)
+
+  // Component export section: wasi_iface = instance 0
+  let %export_sec = cm_wrap_section(section_id: wdefs.cm_sec_export,
+                                     content: build_p2_export_section(wasi_iface, instance_idx: 0))
+  let %out = bb.push_buf(%out, src: &export_sec)
+  bb.free(buf: %export_sec)
+
+  return %out
+end
+
 /** Write the full component-model wrapper for `core_wasm` to `fd` without
  *  allocating a large intermediate buffer.  Frees `core_wasm`.
  */
