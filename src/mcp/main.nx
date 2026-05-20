@@ -50,6 +50,7 @@ import {
   method_not_found, invalid_request, invalid_params, internal_error,
   classify, read_ndjson_message_pipelined, write_ndjson_message
 } from "std:jsonrpc"
+import * as arena from "std:runtime/arena"
 import { Pair } from "std:tuple"
 import {
   DiagEntry, DiagRange, SeverityError
@@ -428,24 +429,43 @@ let is_exit_notification = fn (msg: IncomingMessage) -> bool do
   end
 end
 
+// Arena discipline (nexus-9os3): the MCP loop has no persistent server state
+// between iterations; the only value that must survive each reset is
+// `next_leftover` (the unparsed stdin tail).  We take the mark AFTER
+// `read_ndjson_message_pipelined` returns so that `next_leftover` is below the
+// mark, dispatch+write the response, then reset to reclaim all per-request
+// pipeline allocations (parse tree, HIR, typecheck state, reply JSON) in O(1).
 let run_mcp_loop = fn (remaining: i64, leftover: string) -> unit require { Console, Fs } throws { JsonRpcError } do
   if remaining == 0 then return () end
   try
     let Pair(left: msg_opt, right: next_leftover) = read_ndjson_message_pipelined(leftover)
+    // Mark taken after `next_leftover` is allocated so it is below the reset
+    // point and survives the reclaim at the end of this iteration.
+    arena.save_request_mark()
     match msg_opt do
-      | None -> return ()
+      | None ->
+        arena.reset_to_request_mark()
+        return ()
       | Some(val: value) ->
         let classified = classify(value)
-        if is_exit_notification(msg: classified) then return () end
+        if is_exit_notification(msg: classified) then
+          arena.reset_to_request_mark()
+          return ()
+        end
         let reply = dispatch_message(msg: classified)
         match reply do
           | Some(val: r) -> write_ndjson_message(value: r)
           | None -> ()
         end
+        // Reclaim per-request pipeline scratch: message JSON, classified msg,
+        // tool-call dispatch result, reply JSON.  `next_leftover` (below mark)
+        // is unaffected.
+        arena.reset_to_request_mark()
         let next_remaining = if remaining < 0 then -1 else remaining - 1 end
         return run_mcp_loop(remaining: next_remaining, leftover: next_leftover)
     end
   catch err ->
+    arena.reset_to_request_mark()
     match err do
       | JsonRpcFrameError(msg) ->
         Console.eprintln(val: "[mcp] frame error: " ++ msg)

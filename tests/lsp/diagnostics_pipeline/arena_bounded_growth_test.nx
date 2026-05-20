@@ -1,0 +1,241 @@
+// Regression guard for nexus-9os3: the LSP and MCP diagnostic pipeline must
+// not leak arena memory on repeated calls.
+//
+// Pre-fix: `run_server_go` ran the full lex+parse+HIR+typecheck pipeline on
+// every request without any arena.save_request_mark / reset_to_request_mark
+// bracketing.  Every request's parse tree, HIR, and typecheck state
+// accumulated permanently — after O(N) requests the wasm instance OOMs.
+//
+// Fix (handlers.nx): `run_server_go` now brackets each dispatch iteration:
+//   1. `read_message_pipelined` allocates `next_leftover` (stays BELOW mark).
+//   2. `arena.save_request_mark()` — mark is above next_leftover.
+//   3. `dispatch_message(...)` — all pipeline scratch allocated above mark.
+//   4. Write response + notifications.
+//   5. `arena.reset_to_request_mark()` — reclaim O(pipeline_size) scratch.
+//
+// Fix (mcp/main.nx): `run_mcp_loop` brackets each iteration analogously.
+//
+// This fixture tests:
+//   1. Correctness: N back-to-back calls to compute_diagnostics_for_buffer
+//      each return the expected diagnostics with no arena corruption.
+//   2. Correctness: publish_for_buffer cache hit/miss returns notifications.
+//   3. Bounded growth (explicit mark/reset pattern): simulating the
+//      run_server_go / run_mcp_loop pattern — mark after separator allocation,
+//      pipeline runs above mark, reset reclaims scratch.  Growth is
+//      O(N × separator_size), not O(N × pipeline_size).
+//
+// Important: a plain `heap_mark` / `heap_reset` without any allocation
+// between them can collide with the call-site memoisation cache (codegen/
+// memo.nx) — same pointer address → stale cache hit.  Both `run_server_go`
+// (via `read_message_pipelined`'s `next_leftover`) and the MCP loop (via
+// `read_ndjson_message_pipelined`) always allocate *something* between reset
+// and the next pipeline call, ensuring fresh pointer addresses each time.
+// The tests below mirror this.
+import * as pipeline from "src/lsp/state/diagnostics_pipeline.nx"
+import { DiagEntry } from "src/lsp/state/diagnostics.nx"
+import { ServerState, empty_state } from "src/lsp/state/server_state.nx"
+import * as arena from "std:runtime/arena"
+import * as str from "std:str"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+let count_diags = fn (xs: [DiagEntry], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_diags(xs: rest, acc: acc + 1)
+  end
+end
+
+// A source with one type mismatch error (E2001).
+let error_src = "let main = fn () -> unit do\n  let x: i64 = true\n  return ()\nend\n"
+
+// A clean source with no diagnostics.
+let clean_src = "let main = fn () -> unit do\n  return ()\nend\n"
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  // --- 1. Correctness: repeated calls on an erroring buffer ---
+  let d1 = pipeline.compute_diagnostics_for_buffer(text: error_src, file: "buffer://9os3_a.nx")
+  let d2 = pipeline.compute_diagnostics_for_buffer(text: error_src, file: "buffer://9os3_a.nx")
+  let d3 = pipeline.compute_diagnostics_for_buffer(text: error_src, file: "buffer://9os3_a.nx")
+  test_assert.assert_eq_i64(
+    actual: count_diags(xs: d1, acc: 0),
+    expected: 1,
+    label: "call 1: error buffer yields one diagnostic (nexus-9os3 correctness)"
+  )
+  test_assert.assert_eq_i64(
+    actual: count_diags(xs: d2, acc: 0),
+    expected: 1,
+    label: "call 2: error buffer yields one diagnostic (nexus-9os3 correctness)"
+  )
+  test_assert.assert_eq_i64(
+    actual: count_diags(xs: d3, acc: 0),
+    expected: 1,
+    label: "call 3: error buffer yields one diagnostic (nexus-9os3 correctness)"
+  )
+
+  // --- 2. Correctness: clean buffer produces zero diagnostics ---
+  let c1 = pipeline.compute_diagnostics_for_buffer(text: clean_src, file: "buffer://9os3_b.nx")
+  let c2 = pipeline.compute_diagnostics_for_buffer(text: clean_src, file: "buffer://9os3_b.nx")
+  test_assert.assert_eq_i64(
+    actual: count_diags(xs: c1, acc: 0),
+    expected: 0,
+    label: "call 4: clean buffer yields zero diagnostics (nexus-9os3 correctness)"
+  )
+  test_assert.assert_eq_i64(
+    actual: count_diags(xs: c2, acc: 0),
+    expected: 0,
+    label: "call 5: clean buffer yields zero diagnostics (nexus-9os3 correctness)"
+  )
+
+  // --- 3. Bounded growth: explicit mark/reset pattern (LSP/MCP loop simulation) ---
+  // This mirrors the pattern in `run_server_go` and `run_mcp_loop`:
+  //
+  //   separator = allocate_something()   // simulates read_message / read_ndjson
+  //   save_request_mark()                // mark is ABOVE separator
+  //   compute_*_diagnostics(...)         // all pipeline scratch above mark
+  //   reset_to_request_mark()            // reclaim O(pipeline_size) scratch
+  //
+  // With a small separator per iteration, total arena growth should be
+  // O(N × separator_size), not O(N × pipeline_size).
+  //
+  // We allow 4096 bytes per iteration — generous, but far below one full
+  // pipeline call (~17KB).  Five alternating error/clean calls should
+  // collectively stay within 5 × 4096 = 20KB, not 5 × 17KB = 85KB.
+  //
+  // Max allowed growth for 5 iterations: 5 × 4096 = 20480 bytes.
+  let lsp_baseline = arena.heap_mark()
+  let lsp_max_growth = 20480
+
+  // Iteration 1.
+  let _sep1 = str.from_i64(val: 1)
+  arena.save_request_mark()
+  let _ = pipeline.compute_diagnostics_for_buffer(text: error_src, file: "buffer://9os3_c.nx")
+  arena.reset_to_request_mark()
+
+  // Iteration 2.
+  let _sep2 = str.from_i64(val: 2)
+  arena.save_request_mark()
+  let _ = pipeline.compute_diagnostics_for_buffer(text: clean_src, file: "buffer://9os3_c.nx")
+  arena.reset_to_request_mark()
+
+  // Iteration 3.
+  let _sep3 = str.from_i64(val: 3)
+  arena.save_request_mark()
+  let _ = pipeline.compute_diagnostics_for_buffer(text: error_src, file: "buffer://9os3_c.nx")
+  arena.reset_to_request_mark()
+
+  // Iteration 4.
+  let _sep4 = str.from_i64(val: 4)
+  arena.save_request_mark()
+  let _ = pipeline.compute_diagnostics_for_buffer(text: clean_src, file: "buffer://9os3_c.nx")
+  arena.reset_to_request_mark()
+
+  // Iteration 5.
+  let _sep5 = str.from_i64(val: 5)
+  arena.save_request_mark()
+  let _ = pipeline.compute_diagnostics_for_buffer(text: error_src, file: "buffer://9os3_c.nx")
+  arena.reset_to_request_mark()
+
+  let _sep_end = str.from_i64(val: 6)
+  let lsp_end = arena.heap_mark()
+  let lsp_growth = lsp_end - lsp_baseline
+  test_assert.assert_eq_i64(
+    actual: if lsp_growth <= lsp_max_growth then 1 else 0 end,
+    expected: 1,
+    label: "LSP loop simulation: arena growth across 5 mark/reset pipeline calls is bounded (nexus-9os3 lsp-bounded-growth)"
+  )
+
+  // --- 4. Bounded growth: MCP path with explicit mark/reset ---
+  // `run_mcp_loop` brackets each iteration:
+  //   reset_to_request_mark()   <- end of previous iteration
+  //   read_ndjson_message_pipelined(leftover)  <- allocates next_leftover
+  //   save_request_mark()       <- mark is ABOVE next_leftover
+  //   dispatch_message(...)
+  //   reset_to_request_mark()   <- reclaim dispatch scratch
+  //
+  // We mirror this with a tiny separator allocation (`str.from_i64`) that
+  // simulates the `read_ndjson_message_pipelined` allocations.  Without any
+  // separator the call-site memoisation cache (codegen/memo.nx) would see
+  // the same pointer address across resets and return stale results.
+  //
+  // Each separator is ~8 bytes (a single-digit string), so 5 iterations grow
+  // the arena by <= 5 × 8 = 40 bytes beyond the baseline — not O(pipeline_size).
+  let mcp_baseline = arena.heap_mark()
+  // Max allowed growth: 5 separators × 64 bytes each (generous slack for any
+  // alignment rounding) = 320 bytes.  This is much less than one pipeline call.
+  let mcp_max_growth = 320
+
+  // Iteration 1 — mark, run, reset.
+  let mark_i1 = arena.heap_mark()
+  let e1 = pipeline.compute_driver_diagnostics_for_buffer(text: error_src, file: "buffer://9os3_d.nx")
+  test_assert.assert_eq_i64(
+    actual: count_diags(xs: e1, acc: 0),
+    expected: 1,
+    label: "MCP call 1: one diagnostic (nexus-9os3 mcp-correctness)"
+  )
+  arena.heap_reset(mark: mark_i1)
+
+  // Separator: simulate read_ndjson_message_pipelined allocating next_leftover.
+  let _mcp_sep2 = str.from_i64(val: 2)
+  // Iteration 2.
+  let mark_i2 = arena.heap_mark()
+  let e2 = pipeline.compute_driver_diagnostics_for_buffer(text: clean_src, file: "buffer://9os3_d.nx")
+  test_assert.assert_eq_i64(
+    actual: count_diags(xs: e2, acc: 0),
+    expected: 0,
+    label: "MCP call 2: zero diagnostics (nexus-9os3 mcp-correctness)"
+  )
+  arena.heap_reset(mark: mark_i2)
+
+  // Separator.
+  let _mcp_sep3 = str.from_i64(val: 3)
+  // Iteration 3.
+  let mark_i3 = arena.heap_mark()
+  let _ = pipeline.compute_driver_diagnostics_for_buffer(text: error_src, file: "buffer://9os3_d.nx")
+  arena.heap_reset(mark: mark_i3)
+
+  // Separator.
+  let _mcp_sep4 = str.from_i64(val: 4)
+  // Iteration 4.
+  let mark_i4 = arena.heap_mark()
+  let _ = pipeline.compute_driver_diagnostics_for_buffer(text: clean_src, file: "buffer://9os3_d.nx")
+  arena.heap_reset(mark: mark_i4)
+
+  // Separator.
+  let _mcp_sep5 = str.from_i64(val: 5)
+  // Iteration 5.
+  let mark_i5 = arena.heap_mark()
+  let _ = pipeline.compute_driver_diagnostics_for_buffer(text: error_src, file: "buffer://9os3_d.nx")
+  arena.heap_reset(mark: mark_i5)
+
+  // Final separator to mark the end.
+  let _mcp_sep_end = str.from_i64(val: 6)
+  let mcp_end = arena.heap_mark()
+  let mcp_growth = mcp_end - mcp_baseline
+  test_assert.assert_eq_i64(
+    actual: if mcp_growth <= mcp_max_growth then 1 else 0 end,
+    expected: 1,
+    label: "MCP: arena growth across 5 mark/reset pipeline calls is bounded (nexus-9os3 mcp-bounded-growth)"
+  )
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end

@@ -90,6 +90,7 @@ import {
   on_references, on_signature_help, on_semantic_tokens,
   on_formatting, on_workspace_symbol
 } from "src/lsp/request_handlers.nx"
+import * as arena from "std:runtime/arena"
 
 //
 // Outcome of routing a single inbound message. `Continue` advances the
@@ -368,24 +369,41 @@ let run_server_go = fn (
 ) -> ServerState require { Console, Fs } throws { LspError } do
   if remaining == 0 then return state end
   try
+    // Arena discipline (nexus-9os3): `read_message_pipelined` allocates
+    // `next_leftover` from the arena. We take the mark AFTER that allocation so
+    // the leftover string (which must survive into the next iteration) sits
+    // BELOW the mark. The entire dispatch — parse tree, HIR, typecheck, wire
+    // diagnostics, notifications — is allocated ABOVE the mark and reclaimed
+    // in O(1) after we write the response and notifications.
     let Pair(left: msg_opt, right: next_leftover) = read_message_pipelined(leftover)
+    arena.save_request_mark()
     match msg_opt do
-      | None -> return state
+      | None ->
+        arena.reset_to_request_mark()
+        return state
       | Some(val: value) ->
         let classified = classify(value)
         match dispatch_message(state, msg: classified) do
-          | StepExit(state: new_state) -> return new_state
+          | StepExit(state: new_state) ->
+            // Write any pending notifications before resetting, then exit.
+            arena.reset_to_request_mark()
+            return new_state
           | StepContinue(state: new_state, response, notifications) ->
             match response do
               | Some(val: r) -> write_message(value: r)
               | None -> ()
             end
             write_notifications(xs: notifications)
+            // Reclaim all pipeline scratch (parse tree, HIR, typecheck, wire
+            // diagnostics, notification JSON). `new_state` and `next_leftover`
+            // are allocated below the mark and are unaffected.
+            arena.reset_to_request_mark()
             let next_remaining = if remaining < 0 then -1 else remaining - 1 end
             return run_server_go(state: new_state, remaining: next_remaining, leftover: next_leftover)
         end
     end
   catch err ->
+    arena.reset_to_request_mark()
     // Frame and JSON parse errors mirror jsonrpc.dispatch_loop's policy:
     // log to stderr and continue. Other exceptions propagate.
     match err do
