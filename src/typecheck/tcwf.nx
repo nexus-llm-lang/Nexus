@@ -28,14 +28,14 @@
  */
 
 import { Span } from "src/common/token.nx"
-import { TypeExpr, TyRef, TyArrow, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyUserDefined, NamedType, EnumDef, VariantDef } from "src/common/ast.nx"
+import { TypeExpr, TyRef, TyArrow, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyUserDefined, NamedType, EnumDef, VariantDef, RecordDef } from "src/common/ast.nx"
 import { HirCap, HirCapMethod, ExceptionGroupEntry, HirProgram, HirFunction, HirHandlerArm, HirHandlerBindingEntry, HirHandlerBinding, HirParam } from "src/ir/hir/types.nx"
 import { TypeError, UnknownCapability, UnknownThrowVariant, RefEscapes, RefInnerLinear } from "src/typecheck/errors.nx"
 import { VariantIndex, VariantInfo }, * as vidx from "src/common/variant_index.nx"
 import { Option, Some, None } from "std:option"
 import * as str from "std:str"
 import * as list from "std:list"
-import { is_linear } from "src/ir/shared/type_pred.nx"
+import { is_linear_binding_type } from "src/ir/shared/type_pred.nx"
 import { suggest_names } from "src/common/levenshtein.nx"
 
 // The seven WASI-grant capabilities. Kept here (rather than imported from
@@ -298,28 +298,28 @@ end
 // through enforce_no_escapes_ref (gravity rule) — only wfRef needed here.
 
 /** Enforce wfRef on a single parameter type: if it is `~σ` (TyRef) and
- *  σ is linear (TyLinear), throw `RefInnerLinear`.
+ *  σ is structurally linear (spec `linear(σ)` predicate), throw `RefInnerLinear`.
  *  `param` is the parameter label used for the diagnostic.
  */
-let enforce_wf_ref_one = fn (typ: TypeExpr, param: string, span: Span) -> unit throws { TypeError } do
+let enforce_wf_ref_one = fn (typ: TypeExpr, param: string, span: Span, tdefs: [RecordDef]) -> unit throws { TypeError } do
   match typ do
     | TyRef(inner: i) ->
-      if is_linear(typ: i) then throw RefInnerLinear(param, span) end
+      if is_linear_binding_type(t: i, tdefs) then throw RefInnerLinear(param, span) end
       return ()
     | _ -> return ()
   end
 end
 
 /** Enforce wfRef over a list of named parameter types. Each parameter whose
- *  declared type is `~σ` is checked: if σ is linear the function throws
- *  `RefInnerLinear` naming the offending parameter label.
+ *  declared type is `~σ` is checked: if σ is structurally linear the function
+ *  throws `RefInnerLinear` naming the offending parameter label.
  */
-export let enforce_wf_ref_params = fn (params: [NamedType], span: Span) -> unit throws { TypeError } do
+export let enforce_wf_ref_params = fn (params: [NamedType], span: Span, tdefs: [RecordDef]) -> unit throws { TypeError } do
   match params do
     | [] -> return ()
     | NamedType(name: n, typ: t) :: rest ->
-      enforce_wf_ref_one(typ: t, param: n, span)
-      return enforce_wf_ref_params(params: rest, span)
+      enforce_wf_ref_one(typ: t, param: n, span, tdefs)
+      return enforce_wf_ref_params(params: rest, span, tdefs)
   end
 end
 
@@ -352,7 +352,7 @@ end
 
 let walk_funcs = fn (
   funcs: [HirFunction], caps: [HirCap],
-  vidx_: VariantIndex, groups: [ExceptionGroupEntry]
+  vidx_: VariantIndex, groups: [ExceptionGroupEntry], tdefs: [RecordDef]
 ) -> unit throws { TypeError } do
   match funcs do
     | [] -> return ()
@@ -364,26 +364,26 @@ let walk_funcs = fn (
       enforce_no_escapes_ref(typ: ret, context: "return type of '" ++ fn_name ++ "'", span: sp)
       // wfRef on parameter types: pre-DCE so even unused functions with ref(%T) params are rejected.
       let fn_param_nts = hir_params_to_named_types_tcwf(params: fn_params)
-      enforce_wf_ref_params(params: fn_param_nts, span: sp)
-      return walk_funcs(funcs: rest, caps, vidx_, groups)
+      enforce_wf_ref_params(params: fn_param_nts, span: sp, tdefs)
+      return walk_funcs(funcs: rest, caps, vidx_, groups, tdefs)
   end
 end
 
 let walk_handler_bindings = fn (
   hbs: [HirHandlerBindingEntry], caps: [HirCap],
-  vidx_: VariantIndex, groups: [ExceptionGroupEntry]
+  vidx_: VariantIndex, groups: [ExceptionGroupEntry], tdefs: [RecordDef]
 ) -> unit throws { TypeError } do
   match hbs do
     | [] -> return ()
     | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(cap_name: _, requires: _, arms)) :: rest ->
-      walk_handler_arms(arms, caps, vidx_, groups)
-      return walk_handler_bindings(hbs: rest, caps, vidx_, groups)
+      walk_handler_arms(arms, caps, vidx_, groups, tdefs)
+      return walk_handler_bindings(hbs: rest, caps, vidx_, groups, tdefs)
   end
 end
 
 let walk_handler_arms = fn (
   arms: [HirHandlerArm], caps: [HirCap],
-  vidx_: VariantIndex, groups: [ExceptionGroupEntry]
+  vidx_: VariantIndex, groups: [ExceptionGroupEntry], tdefs: [RecordDef]
 ) -> unit throws { TypeError } do
   match arms do
     | [] -> return ()
@@ -392,8 +392,8 @@ let walk_handler_arms = fn (
       wf_throw(row: tw, vidx_, groups, span: sp)
       // wfRef on handler arm parameter types.
       let arm_param_nts = hir_params_to_named_types_tcwf(params: arm_ps)
-      enforce_wf_ref_params(params: arm_param_nts, span: sp)
-      return walk_handler_arms(arms: rest, caps, vidx_, groups)
+      enforce_wf_ref_params(params: arm_param_nts, span: sp, tdefs)
+      return walk_handler_arms(arms: rest, caps, vidx_, groups, tdefs)
   end
 end
 
@@ -423,18 +423,18 @@ let walk_cap_methods = fn (
 end
 
 let walk_caps_wf_ref = fn (
-  caps: [HirCap], vidx_: VariantIndex, groups: [ExceptionGroupEntry]
+  caps: [HirCap], vidx_: VariantIndex, groups: [ExceptionGroupEntry], tdefs: [RecordDef]
 ) -> unit throws { TypeError } do
   match caps do
     | [] -> return ()
     | HirCap(name: _, methods) :: rest ->
-      walk_cap_methods_wf_ref(methods, vidx_, groups)
-      return walk_caps_wf_ref(caps: rest, vidx_, groups)
+      walk_cap_methods_wf_ref(methods, vidx_, groups, tdefs)
+      return walk_caps_wf_ref(caps: rest, vidx_, groups, tdefs)
   end
 end
 
 let walk_cap_methods_wf_ref = fn (
-  methods: [HirCapMethod], vidx_: VariantIndex, groups: [ExceptionGroupEntry]
+  methods: [HirCapMethod], vidx_: VariantIndex, groups: [ExceptionGroupEntry], tdefs: [RecordDef]
 ) -> unit throws { TypeError } do
   match methods do
     | [] -> return ()
@@ -443,8 +443,8 @@ let walk_cap_methods_wf_ref = fn (
       enforce_no_escapes_ref(typ: mret, context: "return type of cap method '" ++ mname ++ "'", span: sp)
       // wfRef on D-Cap method parameter types (spec §wfRef table, D-Cap).
       let method_param_nts = hir_params_to_named_types_tcwf(params: mparams)
-      enforce_wf_ref_params(params: method_param_nts, span: sp)
-      return walk_cap_methods_wf_ref(methods: rest, vidx_, groups)
+      enforce_wf_ref_params(params: method_param_nts, span: sp, tdefs)
+      return walk_cap_methods_wf_ref(methods: rest, vidx_, groups, tdefs)
   end
 end
 
@@ -453,11 +453,11 @@ end
  *  Covers D-Cap method signatures: ∀j∈J. wfCap(α_j) ∧ wfThrow(β_j).
  */
 export let check_program_wf_rows = fn (prog: HirProgram) -> unit throws { TypeError } do
-  let HirProgram(caps, functions: funcs, externals: _, handler_bindings: hbs, enum_defs: edefs, exception_groups: egs, value_binding_names: _, type_defs: _, visible_enum_names: _) = prog
+  let HirProgram(caps, functions: funcs, externals: _, handler_bindings: hbs, enum_defs: edefs, exception_groups: egs, value_binding_names: _, type_defs: tdefs, visible_enum_names: _) = prog
   let vi = variant_index_of(enum_defs: edefs)
   walk_caps(caps, all_caps: caps, vidx_: vi, groups: egs)
   // Gravity rule (¬escapesRef) + wfRef on D-Cap method signatures.
-  walk_caps_wf_ref(caps, vidx_: vi, groups: egs)
-  walk_funcs(funcs, caps, vidx_: vi, groups: egs)
-  return walk_handler_bindings(hbs, caps, vidx_: vi, groups: egs)
+  walk_caps_wf_ref(caps, vidx_: vi, groups: egs, tdefs)
+  walk_funcs(funcs, caps, vidx_: vi, groups: egs, tdefs)
+  return walk_handler_bindings(hbs, caps, vidx_: vi, groups: egs, tdefs)
 end
