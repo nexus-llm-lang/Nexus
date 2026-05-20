@@ -20,11 +20,12 @@
 
 import { Span } from "src/common/token.nx"
 import {
-  TypeExpr, TyRow, TyVar, TyHandler, TyLazy,
+  TypeExpr, TyRow, TyHandler, TyLazy,
   TyUnit, TyUserDefined
 } from "src/common/ast.nx"
 import {
   HirExpr, HirExprKind, HirStmt, HirStmtKind, HirMatchCase,
+  HirPatternKind, PVar, PCtor, PWild,
   ExceptionGroupEntry
 } from "src/ir/hir/types.nx"
 import {
@@ -419,5 +420,122 @@ export let check_each_callee_member_admitted = fn (
           end
         | _ -> return check_each_callee_member_admitted(callee_types: rest, caller_types, groups, func)
       end
+  end
+end
+
+// ---------------------------------------------------------------------------
+// T-TryCatch body-row helpers (used by infer_try_impl in stmt_eval.nx)
+// ---------------------------------------------------------------------------
+
+/** True when the catch is a catch-all (handles every exception):
+ *  - Single wildcard param: `catch _ -> ...` compiles to catch_param = "_".
+ *  - Multi-arm match whose last arm is PWild or PVar (wildcard).
+ */
+export let catch_is_catch_all = fn (catch_param: string, catch_body: [HirStmt]) -> bool do
+  if catch_param == "_" then return true end
+  // Multi-arm path: catch_body = [Expr(Match(target: __exn, cases: [...]))]
+  return match_body_has_wildcard_arm(catch_body)
+end
+
+let match_body_has_wildcard_arm = fn (stmts: [HirStmt]) -> bool do
+  match stmts do
+    | HirStmt(node: Expr(expr: HirExpr(node: Match(target: _, cases: cs), span: _)), span: _) :: [] ->
+      return cases_have_wildcard(cs)
+    | _ -> return false
+  end
+end
+
+let cases_have_wildcard = fn (cases: [HirMatchCase]) -> bool do
+  match cases do
+    | [] -> return false
+    | HirMatchCase(pattern: p, body: _) :: rest ->
+      match p do
+        | PWild -> return true
+        | PVar(name: _, sigil: _) -> return true
+        | _ -> return cases_have_wildcard(cases: rest)
+      end
+  end
+end
+
+/** Collect the `TypeExpr` entries for the exception variants that the catch
+ *  body explicitly handles via PCtor patterns.  Used to augment the try body's
+ *  effective throws-row (so throw sites for those variants are admitted).
+ *
+ *  For a single-variable catch (`catch e -> ...`) the caller should already
+ *  have checked `catch_is_catch_all` and used an open row; this function only
+ *  fires on the selective-catch path.  Returns `[]` for anything that is not
+ *  a PCtor arm — wildcard / PVar arms are handled by `catch_is_catch_all`.
+ */
+export let collect_caught_types = fn (catch_param: string, catch_body: [HirStmt]) -> [TypeExpr] do
+  let _ = catch_param
+  return collect_caught_types_from_stmts(catch_body)
+end
+
+let collect_caught_types_from_stmts = fn (stmts: [HirStmt]) -> [TypeExpr] do
+  match stmts do
+    | HirStmt(node: Expr(expr: HirExpr(node: Match(target: _, cases: cs), span: _)), span: _) :: [] ->
+      return collect_caught_types_from_cases(cs, acc: [])
+    | _ -> return []
+  end
+end
+
+let collect_caught_types_from_cases = fn (cases: [HirMatchCase], acc: [TypeExpr]) -> [TypeExpr] do
+  match cases do
+    | [] -> return acc
+    | HirMatchCase(pattern: p, body: _) :: rest ->
+      match p do
+        | PCtor(variant: v, fields: _, sigil: _) ->
+          return collect_caught_types_from_cases(
+            cases: rest,
+            acc: TyUserDefined(name: v, args: []) :: acc
+          )
+        | _ -> return collect_caught_types_from_cases(cases: rest, acc)
+      end
+  end
+end
+
+/** Build the effective throws-row that the try body is checked under.
+ *
+ *  For a catch-all: return an open row (admits everything).
+ *  For a selective catch: return the outer declared row augmented with the
+ *  caught variant types.  The augmentation allows throw sites for caught
+ *  variants to pass through `check_raise_admitted` even when the outer row
+ *  is closed empty (`throws {}`).
+ *
+ *  After the body type-checks under this augmented row, the residual
+ *  (what escapes the try/catch) is exactly what was admitted by `outer_row`
+ *  alone — because the extra caught variants are all handled by the catch arms.
+ */
+export let build_try_body_row = fn (
+  outer_row: TypeExpr, caught_types: [TypeExpr]
+) -> TypeExpr do
+  match outer_row do
+    | TyRow(types: outer_types, rest: r) ->
+      return TyRow(types: append_types(caught_types, outer_types), rest: r)
+    | _ ->
+      // Non-row outer (e.g. unsolved TyVar): preserve as-is; throw-checking
+      // will be conservative (admits anything from a non-row).
+      return outer_row
+  end
+end
+
+let append_types = fn (prefix: [TypeExpr], suffix: [TypeExpr]) -> [TypeExpr] do
+  return append_types_go(prefix, suffix, acc: [])
+end
+
+let append_types_go = fn (prefix: [TypeExpr], suffix: [TypeExpr], acc: [TypeExpr]) -> [TypeExpr] do
+  match prefix do
+    | [] ->
+      // Append suffix items (they are already in the right order).
+      return append_suffix(suffix, acc)
+    | t :: rest ->
+      return append_types_go(prefix: rest, suffix, acc: t :: acc)
+  end
+end
+
+let append_suffix = fn (suffix: [TypeExpr], acc: [TypeExpr]) -> [TypeExpr] do
+  match suffix do
+    | [] -> return list.reverse(xs: acc)
+    | t :: rest -> return append_suffix(suffix: rest, acc: t :: acc)
   end
 end

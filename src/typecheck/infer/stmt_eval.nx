@@ -21,7 +21,7 @@
 import { Span } from "src/common/token.nx"
 import {
   TypeExpr, TyUnit, TyI64, TyLinear, TyLazy, TyRef, TyBorrow, TyArray,
-  TyArrow,
+  TyArrow, TyRow,
   Sigil, SigilMutable, SigilLinear, SigilLazy
 } from "src/common/ast.nx"
 import {
@@ -46,7 +46,8 @@ import {
   default_numeric_literals
 } from "src/typecheck/infer/statements.nx"
 import {
-  check_handlers_bound, check_inject_uniqueness, check_inject_require_subset
+  check_handlers_bound, check_inject_uniqueness, check_inject_require_subset,
+  catch_is_catch_all, collect_caught_types, build_try_body_row
 } from "src/typecheck/infer/control_flow.nx"
 import {
   extend_require_row
@@ -388,10 +389,39 @@ export let infer_try_impl = fn (
   state: CheckState, body: [HirStmt], catch_param: string, catch_body: [HirStmt], ret_type: TypeExpr, span: Span,
   infer_stmts_fn: (state: CheckState, stmts: [HirStmt], ret_type: TypeExpr) -> InferExprResult throws { TypeError }
 ) -> InferExprResult throws { TypeError } do
-  let _ = span
-  match infer_stmts_fn(state, stmts: body, ret_type) do
+  // T-TryCatch residual narrowing (spec type-system-formal.md §T-TryCatch):
+  //
+  // The try body is type-checked under an *augmented* throws-row that extends
+  // the enclosing declared row with the exception variants handled by the catch
+  // arms.  This allows throw sites for caught variants to be admitted even when
+  // the outer row is `throws {}`.
+  //
+  //   catch-all arm  → body row = open (admits everything; residual = {})
+  //   selective arms → body row = outer_row ∪ {CaughtVariant₁, CaughtVariant₂, …}
+  //
+  // Any throws in the body that are NOT in the augmented row are still rejected
+  // at the throw site (they would escape the try/catch AND violate the outer
+  // declared row).
+  //
+  // The enclosing declared outer_row stays unchanged for the catch body and for
+  // all call-site checks outside the try block.
+  let outer_row = tctypes.state_throw_row(state)
+  let is_catch_all = catch_is_catch_all(catch_param, catch_body)
+  let body_throw_row = if is_catch_all then
+    // Catch-all: the body may throw anything — all exceptions are handled.
+    TyRow(types: [], rest: Some(val: outer_row))
+  else
+    // Selective: augment the outer row with the caught variant types so that
+    // throw sites for those variants are admitted.
+    let caught_types = collect_caught_types(catch_param, catch_body)
+    build_try_body_row(outer_row, caught_types)
+  end
+  let body_state = tctypes.state_with_throw_row(state, throw_row: body_throw_row)
+  match infer_stmts_fn(state: body_state, stmts: body, ret_type) do
     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: "try body: " ++ m, span: espan)
     | InferExprOk(state: st1, subst: s1, typ: _) ->
+      // Restore the outer throw_row in st1 before typing the catch body.
+      let st1r = tctypes.state_with_throw_row(state: st1, throw_row: outer_row)
       // T-TryCatch: derive the catch parameter's type from the active
       // throws-row, projecting whatever the body could throw. Every Nexus
       // exception is a variant of the built-in `Exn` enum, so when the row
@@ -401,14 +431,19 @@ export let infer_try_impl = fn (
       // coding the string literal "Exn". The desugared `match catch_param`
       // (built by hir.nx for multi-arm catch) then drives per-arm dispatch
       // through bind_constructor_pattern unchanged.
-      let row = subst.subst_apply(subst: s1, typ: tctypes.state_throw_row(state: st1))
-      let param_ty = catch_param_type_from_row(row)
+      //
+      // When the outer row is closed-empty (throws {}) but the body is allowed
+      // to throw (because a catch-all handles it), the catch param still needs
+      // Exn type so the catch body can pattern-match.  Use the body_throw_row
+      // (which was augmented or opened) for the param type projection.
+      let row_for_param = subst.subst_apply(subst: s1, typ: body_throw_row)
+      let param_ty = catch_param_type_from_row(row_for_param)
       let catch_env = tctypes.env_insert(
-        env: tctypes.state_env(state: st1),
+        env: tctypes.state_env(state: st1r),
         name: catch_param,
         scheme: tctypes.mono(typ: param_ty)
       )
-      let st2 = tctypes.state_with_env(state: st1, env: catch_env)
+      let st2 = tctypes.state_with_env(state: st1r, env: catch_env)
       // Mark that we are inside a catch body so `infer_match` suppresses the
       // hasCatchAll premise: selective catch (`| E1 -> ... | E2 -> ...`) is
       // valid without a wildcard arm — unmatched exceptions propagate via
