@@ -1,0 +1,451 @@
+/**
+ * mir/utils: Non-SCC helpers for HIR → MIR lowering.
+ *
+ * Owns:
+ * - MirCtx accessor helpers (ctx_cont_binders, ctx_value_binding_names, etc.)
+ * - NamePair scope manipulation (lookup, insert_or_replace, insert_if_absent,
+ *   remove_key, activate_handlers)
+ * - Handler-name mapping builders (build_handler_cap_names, build_global_cap_handlers)
+ * - External lowering (lower_externals)
+ * - Kont/inject-resume helpers (any_handler_has_kont, collect_with_kont_arm_fns,
+ *   collect_with_kont_arm_tags)
+ * - Alias call-target resolution (find_alias_src, resolve_alias_call_target)
+ * - arm_cont_binder lookup, append_name_pairs
+ * - Integer-to-string helpers (i64_to_str, digit_to_char)
+ * - MIR list combinators (append_mir_funcs, concat_mir_stmts, rev_mir_stmts, etc.)
+ * - Pattern lowering (lower_pattern and its recursive sub-helpers)
+ *
+ * Does not own:
+ * - Any function that calls lower_stmts / lower_expr (those stay in mir.nx
+ *   as part of the mutual-recursion SCC)
+ */
+import { MirError, MirHandlerNotInMapping } from "src/ir/mir/errors.nx"
+import { Option, Some, None } from "std:option"
+import * as naming from "src/common/naming.nx"
+import * as str from "std:str"
+import * as list from "std:list"
+import { HirFunction, HirHandlerArm, HirPatternKind, HirPatternField, HirRecordPatField, HirExternal, HirHandlerBinding, HirHandlerBindingEntry, HirStmt, HirStmtKind, HirExpr, HirExprKind, EagerBody, LazyBody }, * as hir from "src/ir/hir/types.nx"
+import { MirParam, MirExternal, MirFunction, MirStmt, MirPattern, MirPatternField, MirRecordPatField, NamePair, MirCtx, MirExprResult, MirStmtsResult } from "src/ir/mir/types.nx"
+import { lower_hir_params } from "src/ir/mir/func_lower.nx"
+
+// ─── MirCtx accessors ────────────────────────────────────────────────────────
+
+export let ctx_cont_binders = fn (ctx: MirCtx) -> [string] do
+  match ctx do | MirCtx(scope: _, cap_layouts: _, handler_cap_names: _, all_funcs: _, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: _, cont_binders: cb, _) -> return cb end
+end
+
+export let ctx_value_binding_names = fn (ctx: MirCtx) -> [string] do
+  let MirCtx(scope: _, cap_layouts: _, handler_cap_names: _, all_funcs: _, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: _, cont_binders: _, value_binding_names: vbns) = ctx
+  return vbns
+end
+
+export let list_has = fn (name: string, names: [string]) -> bool do
+  match names do
+    | [] -> return false
+    | h :: rest ->
+      if h == name then return true end
+      return list_has(name, names: rest)
+  end
+end
+
+// ─── NamePair scope helpers ───────────────────────────────────────────────────
+
+export let lookup = fn (key: string, pairs: [NamePair]) -> Option<string> do
+  match pairs do
+    | [] -> return None
+    | NamePair(key: k, value: v) :: rest ->
+      if k == key then return Some(val: v)
+      else return lookup(key, pairs: rest)
+      end
+  end
+end
+
+export let insert_or_replace = fn (key: string, value: string, pairs: [NamePair]) -> [NamePair] throws { MirError } do
+  return NamePair(key, value) :: remove_key(key, pairs)
+end
+
+/** Insert (key, value) only if `key` is not already present — user bindings
+ *  take precedence over compiler-intrinsic defaults.
+ */
+export let insert_if_absent = fn (key: string, value: string, pairs: [NamePair]) -> [NamePair] throws { MirError } do
+  match lookup(key, pairs) do
+    | Some(_) -> return pairs
+    | None -> return NamePair(key, value) :: pairs
+  end
+end
+
+let remove_key = fn (key: string, pairs: [NamePair]) -> [NamePair] throws { MirError } do
+  return remove_key_go(key, pairs, acc: [])
+end
+
+let remove_key_go = fn (key: string, pairs: [NamePair], acc: [NamePair]) -> [NamePair] throws { MirError } do
+  match pairs do
+    | [] -> return list.reverse(xs: acc)
+    | NamePair(key: k, value: val) :: rest ->
+      if k == key then return remove_key_go(key, pairs: rest, acc)
+      else return remove_key_go(key, pairs: rest, acc: NamePair(key: k, value: val) :: acc)
+      end
+  end
+end
+
+export let activate_handlers = fn (handler_names: [string], handler_cap_names: [NamePair], scope: [NamePair]) -> [NamePair] throws { MirError } do
+  match handler_names do
+    | [] -> return scope
+    | hname :: rest ->
+      let cap_opt = lookup(key: hname, pairs: handler_cap_names)
+      let new_scope = match cap_opt do
+        | Some(val: cname) -> insert_or_replace(key: cname, value: hname, pairs: scope)
+        | None -> throw MirHandlerNotInMapping(handler_name: hname)
+      end
+      return activate_handlers(handler_names: rest, handler_cap_names, scope: new_scope)
+  end
+end
+
+export let append_name_pairs = fn (a: [NamePair], b: [NamePair]) -> [NamePair] throws { MirError } do
+  match a do
+    | [] -> return b
+    | h :: t -> return h :: append_name_pairs(a: t, b)
+  end
+end
+
+// ─── Handler-name mapping builders ───────────────────────────────────────────
+
+/** Build handler_binding_name → cap_name mapping. */
+export let build_handler_cap_names = fn (bindings: [HirHandlerBindingEntry]) -> [NamePair] throws { MirError } do
+  return build_handler_cap_names_go(bindings, acc: [])
+end
+
+let build_handler_cap_names_go = fn (bindings: [HirHandlerBindingEntry], acc: [NamePair]) -> [NamePair] throws { MirError } do
+  match bindings do
+    | [] -> return list.reverse(xs: acc)
+    | HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(cap_name: pname, requires: _, arms: _)) :: rest ->
+      return build_handler_cap_names_go(bindings: rest, acc: NamePair(key: bname, value: pname) :: acc)
+  end
+end
+
+/** Build global cap_name → handler_binding_name mapping (last handler wins). */
+export let build_global_cap_handlers = fn (handler_cap_names: [NamePair]) -> [NamePair] throws { MirError } do
+  return build_global_go(pairs: handler_cap_names, accum: [])
+end
+
+let build_global_go = fn (pairs: [NamePair], accum: [NamePair]) -> [NamePair] throws { MirError } do
+  match pairs do
+    | [] -> return accum
+    | NamePair(key: binding_name, value: cap_name) :: rest ->
+      let new_accum = insert_or_replace(key: cap_name, value: binding_name, pairs: accum)
+      return build_global_go(pairs: rest, accum: new_accum)
+  end
+end
+
+// ─── External lowering ────────────────────────────────────────────────────────
+
+export let lower_externals = fn (exts: [HirExternal]) -> [MirExternal] throws { MirError } do
+  return lower_externals_go(exts, acc: [])
+end
+
+let lower_externals_go = fn (exts: [HirExternal], acc: [MirExternal]) -> [MirExternal] throws { MirError } do
+  match exts do
+    | [] -> return list.reverse(xs: acc)
+    | HirExternal(name: n, wasm_module: wm, wasm_name: wn, type_params: _, params: ps, ret_type: rt, throw_row: tr) :: rest ->
+      let mir_params = lower_hir_params(params: ps)
+      return lower_externals_go(exts: rest, acc: MirExternal(name: n, wasm_module: wm, wasm_name: wn,
+                       params: mir_params, ret_type: rt, throw_row: tr) :: acc)
+  end
+end
+
+// ─── Kont / inject-resume helpers ─────────────────────────────────────────────
+
+export let any_handler_has_kont = fn (handler_names: [string], bindings: [HirHandlerBindingEntry]) -> bool throws { MirError } do
+  match handler_names do
+    | [] -> return false
+    | h :: rest ->
+      if handler_has_any_kont(handler_name: h, bindings) then return true end
+      return any_handler_has_kont(handler_names: rest, bindings)
+  end
+end
+
+let handler_has_any_kont = fn (handler_name: string, bindings: [HirHandlerBindingEntry]) -> bool throws { MirError } do
+  match bindings do
+    | [] -> return false
+    | HirHandlerBindingEntry(name: bn, binding: HirHandlerBinding(cap_name: _, requires: _, arms)) :: rest ->
+      if bn == handler_name then return arms_have_any_kont(arms) end
+      return handler_has_any_kont(handler_name, bindings: rest)
+  end
+end
+
+let arms_have_any_kont = fn (arms: [HirHandlerArm]) -> bool throws { MirError } do
+  match arms do
+    | [] -> return false
+    | HirHandlerArm(arm: _, cont_binder: Some(_)) :: _ -> return true
+    | _ :: rest -> return arms_have_any_kont(arms: rest)
+  end
+end
+
+export let collect_with_kont_arm_fns = fn (handler_names: [string], bindings: [HirHandlerBindingEntry]) -> [string] throws { MirError } do
+  return collect_with_kont_arm_fns_go(handler_names, bindings, acc: [])
+end
+
+let collect_with_kont_arm_fns_go = fn (handler_names: [string], bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] throws { MirError } do
+  match handler_names do
+    | [] -> return acc
+    | h :: rest ->
+      let new_acc = arm_fns_for_handler(handler_name: h, bindings, acc)
+      return collect_with_kont_arm_fns_go(handler_names: rest, bindings, acc: new_acc)
+  end
+end
+
+let arm_fns_for_handler = fn (handler_name: string, bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] throws { MirError } do
+  match bindings do
+    | [] -> return acc
+    | HirHandlerBindingEntry(name: bn, binding: HirHandlerBinding(cap_name: _, requires: _, arms)) :: rest ->
+      if bn == handler_name then return arm_fns_collect(arms, acc) end
+      return arm_fns_for_handler(handler_name, bindings: rest, acc)
+  end
+end
+
+let arm_fns_collect = fn (arms: [HirHandlerArm], acc: [string]) -> [string] throws { MirError } do
+  match arms do
+    | [] -> return acc
+    | HirHandlerArm(arm: HirFunction(name: fname, type_params: _, params: _, ret_type: _, _), cont_binder: Some(_)) :: rest ->
+      return arm_fns_collect(arms: rest, acc: fname :: acc)
+    | _ :: rest -> return arm_fns_collect(arms: rest, acc)
+  end
+end
+
+/** Parallel collector to `collect_with_kont_arm_fns`: returns the per-arm
+ *  suspend-tag name (`<cap>::<method>`), in lockstep order with the arm-fn
+ *  list, so the InjectResume codegen can wire each `on tag → label` clause
+ *  directly to its matching arm without a runtime dispatch table.
+ */
+export let collect_with_kont_arm_tags = fn (handler_names: [string], bindings: [HirHandlerBindingEntry]) -> [string] throws { MirError } do
+  return collect_with_kont_arm_tags_go(handler_names, bindings, acc: [])
+end
+
+let collect_with_kont_arm_tags_go = fn (handler_names: [string], bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] throws { MirError } do
+  match handler_names do
+    | [] -> return acc
+    | h :: rest ->
+      let new_acc = arm_tags_for_handler(handler_name: h, bindings, acc)
+      return collect_with_kont_arm_tags_go(handler_names: rest, bindings, acc: new_acc)
+  end
+end
+
+let arm_tags_for_handler = fn (handler_name: string, bindings: [HirHandlerBindingEntry], acc: [string]) -> [string] throws { MirError } do
+  match bindings do
+    | [] -> return acc
+    | HirHandlerBindingEntry(name: bn, binding: HirHandlerBinding(cap_name: pn, requires: _, arms)) :: rest ->
+      if bn == handler_name then return arm_tags_collect(cap_name: pn, binding_name: bn, arms, acc) end
+      return arm_tags_for_handler(handler_name, bindings: rest, acc)
+  end
+end
+
+let arm_tags_collect = fn (cap_name: string, binding_name: string, arms: [HirHandlerArm], acc: [string]) -> [string] throws { MirError } do
+  match arms do
+    | [] -> return acc
+    | HirHandlerArm(arm: HirFunction(name: fname, type_params: _, params: _, ret_type: _, _), cont_binder: Some(_)) :: rest ->
+      let method_name = strip_handler_arm_prefix(fname, binding_name)
+      let tag = cap_name ++ "::" ++ method_name
+      return arm_tags_collect(cap_name, binding_name, arms: rest, acc: tag :: acc)
+    | _ :: rest -> return arm_tags_collect(cap_name, binding_name, arms: rest, acc)
+  end
+end
+
+/** Recover the source-level method name from a synthesised handler arm
+ *  function name. `synthesize_handler_arms` (hir.nx) names arms via
+ *  `naming.handler_func_name(handler_name, method_name)`, which produces
+ *  `__handler_<binding_name>_<method>` — strip exactly
+ *  `naming.handler_prefix_len(binding_name)` characters from the front.
+ */
+let strip_handler_arm_prefix = fn (fname: string, binding_name: string) -> string throws { MirError } do
+  let prefix_len = naming.handler_prefix_len(handler_name: binding_name)
+  return str.substring(s: fname, start: prefix_len, len: str.length(s: fname) - prefix_len)
+end
+
+// ─── Alias call-target resolution ─────────────────────────────────────────────
+
+/** find_alias_src: walk `functions` looking for an alias-pattern function
+ *  named `f` (zero params, zero type-params, body = [return Variable(src)]).
+ *  Returns `src` on match, or `f` if not an alias.
+ */
+export let find_alias_src = fn (f: string, functions: [HirFunction]) -> string do
+  match functions do
+    | [] -> return f
+    | func :: rest ->
+      let HirFunction(name: n, type_params: tps, params: ps, body: b, ret_type: _, throw_row: _, span: _, file: _, requires: _) = func
+      let is_zero_tps = match tps do | [] -> true | _ -> false end
+      let is_zero_ps = match ps do | [] -> true | _ -> false end
+      if !is_zero_tps || !is_zero_ps || n != f then
+        return find_alias_src(f, functions: rest)
+      end
+      match b do
+        | EagerBody(stmts: stmts) ->
+          match stmts do
+            | [HirStmt(node: Return(expr: HirExpr(node: Variable(name: src, sigil: _), span: _)), span: _)] ->
+              return src
+            | _ -> return find_alias_src(f, functions: rest)
+          end
+        | _ -> return find_alias_src(f, functions: rest)
+      end
+  end
+end
+
+/** resolve_alias_call_target: if `f` is a value-binding-name (top-level alias)
+ *  and its HirFunction body is a single-Variable return, redirect to the real
+ *  callee. Otherwise return `f` unchanged.
+ */
+export let resolve_alias_call_target = fn (f: string, ctx: MirCtx) -> string do
+  if !list_has(name: f, names: ctx_value_binding_names(ctx)) then return f end
+  let MirCtx(scope: _, cap_layouts: _, handler_cap_names: _, all_funcs: funcs, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: _, cont_binders: _, _) = ctx
+  return find_alias_src(f, functions: funcs)
+end
+
+// ─── arm_cont_binder lookup ───────────────────────────────────────────────────
+
+/** Find the arm matching `method_name` inside the handler binding named
+ *  `handler_name`, and return its cont_binder (Some(k) for `with @k`,
+ *  None for plain arms / unknown binding).
+ */
+export let arm_cont_binder = fn (handler_name: string, method_name: string, bindings: [HirHandlerBindingEntry]) -> Option<string> do
+  match bindings do
+    | [] -> return None
+    | HirHandlerBindingEntry(name: bn, binding: HirHandlerBinding(cap_name: _, requires: _, arms)) :: rest ->
+      if bn == handler_name then
+        let synth_name = naming.handler_func_name(handler_name, method_name)
+        return arm_cont_binder_in_arms(synth_name, arms)
+      end
+      return arm_cont_binder(handler_name, method_name, bindings: rest)
+  end
+end
+
+let arm_cont_binder_in_arms = fn (synth_name: string, arms: [HirHandlerArm]) -> Option<string> do
+  match arms do
+    | [] -> return None
+    | HirHandlerArm(arm: HirFunction(name: fname, type_params: _, params: _, ret_type: _, _), cont_binder: kb) :: rest ->
+      if fname == synth_name then return kb end
+      return arm_cont_binder_in_arms(synth_name, arms: rest)
+  end
+end
+
+// ─── Integer-to-string helpers ────────────────────────────────────────────────
+
+export let i64_to_str = fn (n: i64) -> string throws { MirError } do
+  if n == 0 then return "0"
+  end
+  if n < 0 then return "-" ++ i64_to_str_pos(n: -n, acc: "")
+  end
+  return i64_to_str_pos(n, acc: "")
+end
+
+let i64_to_str_pos = fn (n: i64, acc: string) -> string throws { MirError } do
+  if n == 0 then return acc
+  end
+  let digit = n % 10
+  let ch = digit_to_char(d: digit)
+  let next_n = n / 10
+  return i64_to_str_pos(n: next_n, acc: ch ++ acc)
+end
+
+let digit_to_char = fn (d: i64) -> string throws { MirError } do
+  if d == 0 then return "0" end
+  if d == 1 then return "1" end
+  if d == 2 then return "2" end
+  if d == 3 then return "3" end
+  if d == 4 then return "4" end
+  if d == 5 then return "5" end
+  if d == 6 then return "6" end
+  if d == 7 then return "7" end
+  if d == 8 then return "8" end
+  return "9"
+end
+
+// ─── MIR list combinators ─────────────────────────────────────────────────────
+
+export let append_mir_funcs = fn (a: [MirFunction], b: [MirFunction]) -> [MirFunction] throws { MirError } do
+  match a do
+    | [] -> return b
+    | x :: rest -> return x :: append_mir_funcs(a: rest, b)
+  end
+end
+
+export let concat_mir_funcs = fn (a: [MirFunction], b: [MirFunction]) -> [MirFunction] throws { MirError } do
+  return concat_mir_funcs_go(xs: a, ys: b, acc: [])
+end
+
+let concat_mir_funcs_go = fn (xs: [MirFunction], ys: [MirFunction], acc: [MirFunction]) -> [MirFunction] throws { MirError } do
+  match xs do
+    | [] -> return rev_mir_funcs(lst: acc, out: ys)
+    | x :: rest -> return concat_mir_funcs_go(xs: rest, ys, acc: x :: acc)
+  end
+end
+
+export let concat_mir_stmts = fn (a: [MirStmt], b: [MirStmt]) -> [MirStmt] throws { MirError } do
+  return concat_mir_stmts_go(xs: a, ys: b, acc: [])
+end
+
+let concat_mir_stmts_go = fn (xs: [MirStmt], ys: [MirStmt], acc: [MirStmt]) -> [MirStmt] throws { MirError } do
+  match xs do
+    | [] -> return rev_mir_stmts(lst: acc, out: ys)
+    | x :: rest -> return concat_mir_stmts_go(xs: rest, ys, acc: x :: acc)
+  end
+end
+
+export let rev_mir_funcs = fn (lst: [MirFunction], out: [MirFunction]) -> [MirFunction] throws { MirError } do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_mir_funcs(lst: rest, out: x :: out)
+  end
+end
+
+export let rev_mir_stmts = fn (lst: [MirStmt], out: [MirStmt]) -> [MirStmt] throws { MirError } do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_mir_stmts(lst: rest, out: x :: out)
+  end
+end
+
+// ─── Pattern lowering ─────────────────────────────────────────────────────────
+
+export let lower_pattern = fn (pat: HirPatternKind) -> MirPattern throws { MirError } do
+  match pat do
+    | hir.PLit(lit: l) -> return MirPatLiteral(lit: l)
+    | hir.PVar(name: n, sigil: s) -> return MirPatVariable(name: n, sigil: s)
+    | hir.PCtor(variant: v, fields: fs, sigil: _) ->
+      return MirPatConstructor(name: v, fields: lower_pattern_fields(fs))
+    | hir.PRec(fields: fs, is_partial: p) ->
+      return MirPatRecord(fields: lower_record_pat_fields(fs), is_partial: p)
+    | hir.PWild -> return MirPatWildcard
+    | hir.POr(alts) ->
+      return MirPatOr(alts: lower_or_alts(alts, acc: []))
+  end
+end
+
+let lower_or_alts = fn (alts: [HirPatternKind], acc: [MirPattern]) -> [MirPattern] throws { MirError } do
+  match alts do
+    | [] -> return list.reverse(xs: acc)
+    | a :: rest -> return lower_or_alts(alts: rest, acc: lower_pattern(pat: a) :: acc)
+  end
+end
+
+let lower_pattern_fields = fn (fs: [HirPatternField]) -> [MirPatternField] throws { MirError } do
+  return lower_pattern_fields_go(fs, acc: [])
+end
+
+let lower_pattern_fields_go = fn (fs: [HirPatternField], acc: [MirPatternField]) -> [MirPatternField] throws { MirError } do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | HirPatternField(name: n, pattern: p) :: rest ->
+      return lower_pattern_fields_go(fs: rest, acc: MirPatternField(name: n, pattern: lower_pattern(pat: p)) :: acc)
+  end
+end
+
+let lower_record_pat_fields = fn (fs: [HirRecordPatField]) -> [MirRecordPatField] throws { MirError } do
+  return lower_record_pat_fields_go(fs, acc: [])
+end
+
+let lower_record_pat_fields_go = fn (fs: [HirRecordPatField], acc: [MirRecordPatField]) -> [MirRecordPatField] throws { MirError } do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | HirRecordPatField(name: n, pattern: p) :: rest ->
+      return lower_record_pat_fields_go(fs: rest, acc: MirRecordPatField(name: n, pattern: lower_pattern(pat: p)) :: acc)
+  end
+end
