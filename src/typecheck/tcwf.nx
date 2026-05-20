@@ -28,7 +28,7 @@
  */
 
 import { Span } from "src/common/token.nx"
-import { TypeExpr, TyRef, TyArrow, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyUserDefined, NamedType, EnumDef, VariantDef, RecordDef } from "src/common/ast.nx"
+import { TypeExpr, TyRef, TyArrow, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyUserDefined, NamedType, EnumDef, VariantDef, VariantField, RecordDef } from "src/common/ast.nx"
 import { HirCap, HirCapMethod, ExceptionGroupEntry, HirProgram, HirFunction, HirHandlerArm, HirHandlerBindingEntry, HirHandlerBinding, HirParam } from "src/ir/hir/types.nx"
 import { TypeError, UnknownCapability, UnknownThrowVariant, RefEscapes, RefInnerLinear } from "src/typecheck/errors.nx"
 import { VariantIndex, VariantInfo }, * as vidx from "src/common/variant_index.nx"
@@ -448,6 +448,100 @@ let walk_cap_methods_wf_ref = fn (
   end
 end
 
+// D-Type-Sum / D-Type-Sum-Opaque wfRef + escapesRef enforcement
+// (spec §wfRef table row "Field types of a sum-type variant" and
+//  §escapesRef table row "Field types of a sum-type variant").
+// EnumDef/RecordDef carry no span; Span(0,0,0) used as in D-External.
+
+let variant_field_context = fn (field_name: Option<string>, idx: i64, variant_name: string, enum_name: string) -> string do
+  match field_name do
+    | Some(val: n) -> return "field '" ++ n ++ "' of variant '" ++ variant_name ++ "' in type '" ++ enum_name ++ "'"
+    | None -> return "field #" ++ str.from_i64(val: idx) ++ " of variant '" ++ variant_name ++ "' in type '" ++ enum_name ++ "'"
+  end
+end
+
+let walk_variant_fields = fn (
+  fields: [VariantField], idx: i64, variant_name: string, enum_name: string,
+  tdefs: [RecordDef], enum_defs: [EnumDef]
+) -> unit throws { TypeError } do
+  match fields do
+    | [] -> return ()
+    | VariantField(name: mname, typ: t) :: rest ->
+      let ctx = variant_field_context(field_name: mname, idx, variant_name, enum_name)
+      // wfRef: if t = ref(σ) and linear(σ), reject.
+      match t do
+        | TyRef(inner: i) ->
+          if is_linear_binding_type(t: i, tdefs, enum_defs) then
+            throw RefInnerLinear(param: ctx, span: Span(offset: 0, line: 0, col: 0))
+          end
+        | _ -> ()
+      end
+      // escapesRef: reject ref(σ) at any structurally reachable position.
+      enforce_no_escapes_ref(typ: t, context: ctx, span: Span(offset: 0, line: 0, col: 0))
+      return walk_variant_fields(fields: rest, idx: idx + 1, variant_name, enum_name, tdefs, enum_defs)
+  end
+end
+
+let walk_variants = fn (
+  variants: [VariantDef], enum_name: string,
+  tdefs: [RecordDef], enum_defs: [EnumDef]
+) -> unit throws { TypeError } do
+  match variants do
+    | [] -> return ()
+    | VariantDef(name: vname, fields: fs) :: rest ->
+      walk_variant_fields(fields: fs, idx: 0, variant_name: vname, enum_name, tdefs, enum_defs)
+      return walk_variants(variants: rest, enum_name, tdefs, enum_defs)
+  end
+end
+
+let walk_enum_defs = fn (
+  defs: [EnumDef], tdefs: [RecordDef], enum_defs: [EnumDef]
+) -> unit throws { TypeError } do
+  match defs do
+    | [] -> return ()
+    | EnumDef(name: ename, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      walk_variants(variants: vs, enum_name: ename, tdefs, enum_defs)
+      return walk_enum_defs(defs: rest, tdefs, enum_defs)
+  end
+end
+
+// D-Type-Record wfRef + escapesRef enforcement
+// (spec §wfRef table row "Field types of a record type declaration" and
+//  §escapesRef table row "Field types of a record type declaration").
+
+let walk_record_fields = fn (
+  fields: [NamedType], type_name: string,
+  tdefs: [RecordDef], enum_defs: [EnumDef]
+) -> unit throws { TypeError } do
+  match fields do
+    | [] -> return ()
+    | NamedType(name: fname, typ: t) :: rest ->
+      let ctx = "field '" ++ fname ++ "' of record type '" ++ type_name ++ "'"
+      // wfRef: if t = ref(σ) and linear(σ), reject.
+      match t do
+        | TyRef(inner: i) ->
+          if is_linear_binding_type(t: i, tdefs, enum_defs) then
+            throw RefInnerLinear(param: ctx, span: Span(offset: 0, line: 0, col: 0))
+          end
+        | _ -> ()
+      end
+      // escapesRef: reject ref(σ) at any structurally reachable position.
+      enforce_no_escapes_ref(typ: t, context: ctx, span: Span(offset: 0, line: 0, col: 0))
+      return walk_record_fields(fields: rest, type_name, tdefs, enum_defs)
+  end
+end
+
+let walk_type_defs = fn (
+  defs: [RecordDef], tdefs: [RecordDef], enum_defs: [EnumDef]
+) -> unit throws { TypeError } do
+  match defs do
+    | [] -> return ()
+    | RecordDef(name: rname, is_public: _, type_params: _, fields: fs) :: rest ->
+      walk_record_fields(fields: fs, type_name: rname, tdefs, enum_defs)
+      return walk_type_defs(defs: rest, tdefs, enum_defs)
+  end
+end
+
 /** Run wfCap and wfThrow over every introduction site in the program.
  *  Pre-DCE so unused functions with typo'd rows are still rejected.
  *  Covers D-Cap method signatures: ∀j∈J. wfCap(α_j) ∧ wfThrow(β_j).
@@ -459,5 +553,9 @@ export let check_program_wf_rows = fn (prog: HirProgram) -> unit throws { TypeEr
   // Gravity rule (¬escapesRef) + wfRef on D-Cap method signatures.
   walk_caps_wf_ref(caps, vidx_: vi, groups: egs, tdefs)
   walk_funcs(funcs, caps, vidx_: vi, groups: egs, tdefs)
-  return walk_handler_bindings(hbs, caps, vidx_: vi, groups: egs, tdefs)
+  walk_handler_bindings(hbs, caps, vidx_: vi, groups: egs, tdefs)
+  // D-Type-Sum / D-Type-Sum-Opaque: wfRef + escapesRef on variant fields.
+  walk_enum_defs(defs: edefs, tdefs, enum_defs: edefs)
+  // D-Type-Record: wfRef + escapesRef on record fields.
+  return walk_type_defs(defs: tdefs, tdefs, enum_defs: edefs)
 end
