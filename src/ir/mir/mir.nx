@@ -461,6 +461,44 @@ let desugar_for = fn (var: string, start_expr: HirExpr, end_expr: HirExpr, body:
   end
 end
 
+// ─── Alias call-target resolution (nexus-blcd) ─────────────────────────────
+
+/** find_alias_src: walk `functions` looking for an alias-pattern function
+ *  named `f` (zero params, zero type-params, body = [return Variable(src)]).
+ *  Returns `src` on match, or `f` if not an alias.
+ */
+let find_alias_src = fn (f: string, functions: [HirFunction]) -> string do
+  match functions do
+    | [] -> return f
+    | func :: rest ->
+      let HirFunction(name: n, type_params: tps, params: ps, body: b, ret_type: _, throw_row: _, span: _, file: _, requires: _) = func
+      let is_zero_tps = match tps do | [] -> true | _ -> false end
+      let is_zero_ps = match ps do | [] -> true | _ -> false end
+      if !is_zero_tps || !is_zero_ps || n != f then
+        return find_alias_src(f, functions: rest)
+      end
+      match b do
+        | EagerBody(stmts: stmts) ->
+          match stmts do
+            | [HirStmt(node: Return(expr: HirExpr(node: Variable(name: src, sigil: _), span: _)), span: _)] ->
+              return src
+            | _ -> return find_alias_src(f, functions: rest)
+          end
+        | _ -> return find_alias_src(f, functions: rest)
+      end
+  end
+end
+
+/** resolve_alias_call_target: if `f` is a value-binding-name (top-level alias)
+ *  and its HirFunction body is a single-Variable return, redirect to the real
+ *  callee. Otherwise return `f` unchanged.
+ */
+let resolve_alias_call_target = fn (f: string, ctx: MirCtx) -> string do
+  if !list_has(name: f, names: ctx_value_binding_names(ctx)) then return f end
+  let MirCtx(scope: _, cap_layouts: _, handler_cap_names: _, all_funcs: funcs, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: _, cont_binders: _, _) = ctx
+  return find_alias_src(f, functions: funcs)
+end
+
 let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExprResult throws { MirError } do
   let HirExpr(node, span: _) = expr
   match node do
@@ -495,19 +533,23 @@ let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExprResult throws { MirEr
       end
     | Borrow(name: n, sigil: _) -> return MirExprResult(ctx, expr: MirBorrow(name: n))
     | Call(func: f, args) ->
+      // nexus-blcd: resolve top-level alias before cap-call detection and
+      // ret-type lookup. `let g = inc` lowers `g` as a 0-param stub; redirect
+      // to the real callee so args and ret_type come from `inc`, not the stub.
+      let f_resolved = resolve_alias_call_target(f, ctx)
       let MirCtx(scope: _, cap_layouts: pl, handler_cap_names: _, all_funcs: _, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: _, cont_binders: _, _) = ctx
-      match detect_cap_call(func: f, cap_layouts: pl) do
+      match detect_cap_call(func: f_resolved, cap_layouts: pl) do
         | CapCallFound(cap_name: pname, method_name: mname) ->
           return lower_cap_call(cap_name: pname, method_name: mname, args, ctx)
         | CapCallNotFound ->
           match lower_call_args(args, ctx) do | MirCallArgsResult(ctx: ctx1, args: mir_args) ->
-            match lookup_known_ret_type(name: f, ctx: ctx1) do
+            match lookup_known_ret_type(name: f_resolved, ctx: ctx1) do
               | Some(val: ret_type) ->
-                return MirExprResult(ctx: ctx1, expr: MirCall(func: f, args: mir_args, ret_type))
+                return MirExprResult(ctx: ctx1, expr: MirCall(func: f_resolved, args: mir_args, ret_type))
               | None ->
-                // f is a local / parameter holding a closure. LIR recovers
-                // the real return type from semantic_vars.
-                return MirExprResult(ctx: ctx1, expr: MirCallClosure(closure: MirVariable(name: f), args: mir_args, ret_type: TyI64))
+                // f_resolved is a local / parameter holding a closure. LIR
+                // recovers the real return type from semantic_vars.
+                return MirExprResult(ctx: ctx1, expr: MirCallClosure(closure: MirVariable(name: f_resolved), args: mir_args, ret_type: TyI64))
             end
           end
       end
