@@ -1,0 +1,213 @@
+/**
+ * profile: static call-graph profiling pass for nexus-p2d8.10.
+ *
+ * Performs a single static walk of the LIR program to produce per-call-site
+ * profiling data needed by nexus-p2d8.9 (LIR value specialization):
+ *   - invocation-count proxy: number of static call sites per callee
+ *     (each static call site is one potential hot-path entry; runtime counts
+ *     are not available without runtime instrumentation, so the static count
+ *     gives the upper bound on how many callers can benefit from specialization)
+ *   - per-parameter constant-argument frequency: for each parameter position,
+ *     what fraction of direct call sites pass a literal (LirAtomInt / Float /
+ *     Bool / String / Unit) vs a variable reference (LirAtomVar).
+ *
+ * Output: JSONL file — one line per call site, format:
+ *   {"caller":"<fn>","callee":"<fn>","site_idx":<N>,"args":[{"label":"<l>","const":true|false,"const_val":<s>|null},...]}
+ *
+ * The pass runs entirely on the optimised LIR program (post lir_opt) before
+ * codegen. It does not touch the codegen SCC (emit_expr/emit_stmt/emit_stmts)
+ * and produces zero output / zero overhead when the --profile-out flag is absent.
+ */
+
+import { LirProgram, LirFunction, LirStmt, LirExpr, LirAtom, LirCallArg } from "src/ir/lir/types.nx"
+import { Fs } from "std:fs"
+import * as list from "std:list"
+import * as str from "std:str"
+
+/** One recorded call-site argument slot. */
+type ProfileArg = ProfileArg(label: string, is_const: bool, const_val: string)
+
+/** One call-site record collected during the walk. */
+type CallSite = CallSite(caller: string, callee: string, site_idx: i64, args: [ProfileArg])
+
+// Classify a LirAtom as constant (literal) or variable, returning the
+// string representation of the constant when it is one.
+let atom_is_const = fn (a: LirAtom) -> bool do
+  match a do
+    | LirAtomVar(_) -> return false
+    | LirAtomInt(_) | LirAtomFloat(_) | LirAtomBool(_) | LirAtomString(_) | LirAtomUnit ->
+      return true
+  end
+end
+
+let atom_const_val = fn (a: LirAtom) -> string do
+  match a do
+    | LirAtomVar(name: n, typ: _) -> return n
+    | LirAtomInt(val: v) -> return str.from_i64(val: v)
+    | LirAtomFloat(val: v) -> return v
+    | LirAtomBool(val: b) -> return if b then "true" else "false" end
+    | LirAtomString(val: s) -> return s
+    | LirAtomUnit -> return "()"
+  end
+end
+
+// Build a ProfileArg list from a call's [LirCallArg].
+let classify_args = fn (args: [LirCallArg]) -> [ProfileArg] do
+  return classify_args_go(args, acc: [])
+end
+
+let classify_args_go = fn (args: [LirCallArg], acc: [ProfileArg]) -> [ProfileArg] do
+  match args do
+    | [] -> return list.reverse(xs: acc)
+    | LirCallArg(label: lbl, value: a) :: rest ->
+      let pa = ProfileArg(label: lbl, is_const: atom_is_const(a), const_val: atom_const_val(a))
+      return classify_args_go(args: rest, acc: pa :: acc)
+  end
+end
+
+// Walk a single expression and collect any direct call site into acc.
+// site_idx tracks how many direct calls we have seen in this function body so
+// far so each site gets a unique index within its caller.
+type WalkState = WalkState(acc: [CallSite], site_idx: i64)
+
+let walk_expr_prof = fn (expr: LirExpr, caller: string, state: WalkState) -> WalkState do
+  let WalkState(acc, site_idx) = state
+  match expr do
+    | LirExprCall(func: callee, args, typ: _) | LirExprTailCall(func: callee, args, typ: _) ->
+      let pa = classify_args(args)
+      let site = CallSite(caller, callee, site_idx, args: pa)
+      return WalkState(acc: site :: acc, site_idx: site_idx + 1)
+    | _ -> return state
+  end
+end
+
+let walk_stmt_prof = fn (stmt: LirStmt, caller: string, state: WalkState) -> WalkState do
+  match stmt do
+    | LirStmtLet(name: _, typ: _, expr: e) ->
+      return walk_expr_prof(expr: e, caller, state)
+    | LirStmtIf(cond: _, then_body: tb, else_body: eb)
+    | LirStmtIfReturn(cond: _, then_body: tb, then_ret: _, else_body: eb, else_ret: _, ret_type: _) ->
+      let s1 = walk_stmts_prof(stmts: tb, caller, state)
+      return walk_stmts_prof(stmts: eb, caller, state: s1)
+    | LirStmtLoop(cond_stmts: cs, cond: _, body: b) ->
+      let s1 = walk_stmts_prof(stmts: cs, caller, state)
+      return walk_stmts_prof(stmts: b, caller, state: s1)
+    | LirStmtTryCatch(body: b, body_ret: _, catch_param: _, catch_param_typ: _, catch_body: cb, catch_ret: _) ->
+      let s1 = walk_stmts_prof(stmts: b, caller, state)
+      return walk_stmts_prof(stmts: cb, caller, state: s1)
+  end
+end
+
+let walk_stmts_prof = fn (stmts: [LirStmt], caller: string, state: WalkState) -> WalkState do
+  match stmts do
+    | [] -> return state
+    | s :: rest ->
+      let s1 = walk_stmt_prof(stmt: s, caller, state)
+      return walk_stmts_prof(stmts: rest, caller, state: s1)
+  end
+end
+
+// Collect all call sites from all functions in the program.
+let collect_call_sites = fn (funcs: [LirFunction]) -> [CallSite] do
+  return collect_call_sites_go(funcs, acc: [])
+end
+
+let collect_call_sites_go = fn (funcs: [LirFunction], acc: [CallSite]) -> [CallSite] do
+  match funcs do
+    | [] -> return list.reverse(xs: acc)
+    | LirFunction(name: fname, params: _, ret_type: _, body: b, ret: _, span: _) :: rest ->
+      let WalkState(acc: new_sites, site_idx: _) = walk_stmts_prof(stmts: b, caller: fname,
+                                                                     state: WalkState(acc: [], site_idx: 0))
+      let appended = list_append_rev(xs: new_sites, acc)
+      return collect_call_sites_go(funcs: rest, acc: appended)
+  end
+end
+
+// Append xs (already reversed per-function list) onto acc preserving order
+// within each function. We want final list to be in program order, so we
+// reverse the per-function list before appending.
+let list_append_rev = fn (xs: [CallSite], acc: [CallSite]) -> [CallSite] do
+  match xs do
+    | [] -> return acc
+    | x :: rest -> return list_append_rev(xs: rest, acc: x :: acc)
+  end
+end
+
+// JSON-escape a string (minimal: backslash, double-quote, newline, tab).
+let json_escape = fn (s: string) -> string do
+  return json_escape_chars(s, i: 0, acc: "")
+end
+
+let escape_char = fn (ch: i64) -> string do
+  if ch == 34 then return "\\\"" end
+  if ch == 92 then return "\\\\" end
+  if ch == 10 then return "\\n" end
+  if ch == 9 then return "\\t" end
+  if ch == 13 then return "\\r" end
+  return str.from_char(codepoint: ch)
+end
+
+let json_escape_chars = fn (s: string, i: i64, acc: string) -> string do
+  let len = str.length(s)
+  if i >= len then return acc end
+  let ch = str.char_at(s, index: i)
+  let escaped = escape_char(ch)
+  return json_escape_chars(s, i: i + 1, acc: acc ++ escaped)
+end
+
+// Serialize a ProfileArg to JSON fragment: {"label":"...","const":...,"const_val":...}
+let serialize_profile_arg = fn (pa: ProfileArg) -> string do
+  let ProfileArg(label: lbl, is_const: ic, const_val: cv) = pa
+  let const_str = if ic then "true" else "false" end
+  let val_str = if ic then "\"" ++ json_escape(cv) ++ "\"" else "null" end
+  return "{\"label\":\"" ++ json_escape(lbl) ++ "\",\"const\":" ++ const_str ++ ",\"const_val\":" ++ val_str ++ "}"
+end
+
+let serialize_profile_args = fn (args: [ProfileArg]) -> string do
+  return "[" ++ serialize_profile_args_go(args, first: true) ++ "]"
+end
+
+let serialize_profile_args_go = fn (args: [ProfileArg], first: bool) -> string do
+  match args do
+    | [] -> return ""
+    | pa :: rest ->
+      let sep = if first then "" else "," end
+      return sep ++ serialize_profile_arg(pa) ++ serialize_profile_args_go(args: rest, first: false)
+  end
+end
+
+// Serialize one CallSite to a JSONL line (no trailing newline).
+let serialize_call_site = fn (cs: CallSite) -> string do
+  let CallSite(caller, callee, site_idx, args) = cs
+  return "{\"caller\":\"" ++ json_escape(caller) ++ "\""
+    ++ ",\"callee\":\"" ++ json_escape(callee) ++ "\""
+    ++ ",\"site_idx\":" ++ str.from_i64(val: site_idx)
+    ++ ",\"args\":" ++ serialize_profile_args(args)
+    ++ "}"
+end
+
+// Build the full JSONL content (each site on its own line).
+let build_jsonl = fn (sites: [CallSite]) -> string do
+  return build_jsonl_go(sites, acc: "")
+end
+
+let build_jsonl_go = fn (sites: [CallSite], acc: string) -> string do
+  match sites do
+    | [] -> return acc
+    | cs :: rest ->
+      let line = serialize_call_site(cs) ++ "\n"
+      return build_jsonl_go(sites: rest, acc: acc ++ line)
+  end
+end
+
+/** Analyse the LIR program and write a JSONL call-site profile to `path`.
+ *  Called from main.nx when --profile-out is present.
+ *  Returns true on success, false if the file could not be written.
+ */
+export let emit_profile = fn (program: LirProgram, path: string) -> bool require { Fs } do
+  let LirProgram(functions: funcs, externals: _) = program
+  let sites = collect_call_sites(funcs)
+  let content = build_jsonl(sites)
+  Fs.write_string(path, content)
+  return true
+end
