@@ -291,8 +291,11 @@ SIZE=$(echo "$ENTRY" | awk '{ print $1 }')
 OFFSET=$(echo "$ENTRY" | awk '{ print $2 }')
 
 TMP=$(mktemp) || exit 1
-# Extract: skip OFFSET bytes from the head of $0, then take SIZE bytes.
-tail -c +$((OFFSET + 1)) "$0" | head -c "$SIZE" > "$TMP"
+# Extract the payload bytes [OFFSET, OFFSET+SIZE) of $0. Read the first
+# OFFSET+SIZE bytes and keep the last SIZE: `tail` consumes all of `head`'s
+# output, so neither side closes the pipe early (a `tail … | head -c SIZE`
+# would SIGPIPE `tail`, printing a spurious "Broken pipe" on every run).
+head -c "$((OFFSET + SIZE))" "$0" | tail -c "$SIZE" > "$TMP"
 
 # Compose the wasmtime feature flag set. Both payloads are self-contained
 # core WASM with preview1 imports satisfied by --dir mounts.
