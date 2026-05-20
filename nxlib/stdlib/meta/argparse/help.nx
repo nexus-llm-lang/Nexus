@@ -1,0 +1,447 @@
+/**
+ * argparse/help: Usage and help-text rendering.
+ *
+ * Defines Example, ExitCode, SubcommandCategory, SubcommandSpec types
+ * and the render_usage / render_subcommand_help / render_subcommand_overview
+ * functions. Imports ArgKind and ArgSpec from spec.
+ */
+
+import { ArgKind, ArgSpec } from "std:meta/argparse/spec"
+import { Option, Some, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+
+// ─── Usage rendering ──────────────────────────────────────────────────────
+//
+// Deterministic usage text built from the spec list. Format:
+//
+//   <summary>
+//
+//   Subcommands:
+//     <name>  <help>
+//
+//   Options:
+//     <short>, <long> [<VALUE>]  <help>
+//     <name>                     <help>          (positional)
+//
+
+/** Render the usage text from `summary` (the top line) plus the spec
+ *  list. Subcommand / option / positional sections are emitted only when
+ *  any spec of that kind exists. Output ends without a trailing newline
+ *  to match the existing `print_usage` contract. */
+export let render_usage = fn (summary: string, specs: [ArgSpec]) -> string do
+  let subs = filter_kind(specs, target: kind_subcommand_tag(), acc: [])
+  let opts = filter_opts_and_flags(specs, acc: [])
+  let poss = filter_kind(specs, target: kind_positional_tag(), acc: [])
+  let sub_block = if list.length(xs: subs) > 0 then
+      "\n\nSubcommands:\n" ++ render_lines(specs: subs, render_one: render_sub_line, acc: "")
+    else "" end
+  let pos_block = if list.length(xs: poss) > 0 then
+      "\n\nPositional:\n" ++ render_lines(specs: poss, render_one: render_pos_line, acc: "")
+    else "" end
+  let opt_block = if list.length(xs: opts) > 0 then
+      "\n\nOptions:\n" ++ render_lines(specs: opts, render_one: render_opt_line, acc: "")
+    else "" end
+  return summary ++ sub_block ++ pos_block ++ opt_block
+end
+
+// Phantom tag fns: keep filter logic local without exposing the variant
+// names externally. Returning an `i64` keeps the comparison cheap.
+let kind_subcommand_tag = fn () -> i64 do return 3 end
+let kind_positional_tag = fn () -> i64 do return 2 end
+
+let kind_tag = fn (k: ArgKind) -> i64 do
+  match k do
+    | Flag -> return 0
+    | OptValue -> return 1
+    | Positional -> return 2
+    | Subcommand -> return 3
+  end
+end
+
+let filter_kind = fn (specs: [ArgSpec], target: i64, acc: [ArgSpec]) -> [ArgSpec] do
+  match specs do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest ->
+      match s do | ArgSpec(name: _, kind, short: _, long: _, takes_value: _, required: _, help: _) ->
+        if kind_tag(k: kind) == target then
+          return filter_kind(specs: rest, target, acc: s :: acc)
+        end
+        return filter_kind(specs: rest, target, acc)
+      end
+  end
+end
+
+let filter_opts_and_flags = fn (specs: [ArgSpec], acc: [ArgSpec]) -> [ArgSpec] do
+  match specs do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest ->
+      match s do | ArgSpec(name: _, kind, short: _, long: _, takes_value: _, required: _, help: _) ->
+        let t = kind_tag(k: kind)
+        if t == 0 || t == 1 then
+          return filter_opts_and_flags(specs: rest, acc: s :: acc)
+        end
+        return filter_opts_and_flags(specs: rest, acc)
+      end
+  end
+end
+
+let render_lines = fn (specs: [ArgSpec], render_one: (s: ArgSpec) -> string, acc: string) -> string do
+  match specs do
+    | [] -> return acc
+    | s :: rest ->
+      let line = render_one(s)
+      let next = if str.length(s: acc) == 0 then "  " ++ line else acc ++ "\n  " ++ line end
+      return render_lines(specs: rest, render_one, acc: next)
+  end
+end
+
+let render_sub_line = fn (s: ArgSpec) -> string do
+  match s do | ArgSpec(name, kind: _, short: _, long: _, takes_value: _, required: _, help) ->
+    if str.length(s: help) == 0 then return name end
+    return pad_label(label: name, width: 16) ++ help
+  end
+end
+
+let render_pos_line = fn (s: ArgSpec) -> string do
+  match s do | ArgSpec(name, kind: _, short: _, long: _, takes_value: _, required, help) ->
+    let lbl = if required then "<" ++ name ++ ">" else "[" ++ name ++ "]" end
+    if str.length(s: help) == 0 then return lbl end
+    return pad_label(label: lbl, width: 24) ++ help
+  end
+end
+
+let render_opt_line = fn (s: ArgSpec) -> string do
+  match s do | ArgSpec(name: _, kind, short, long, takes_value, required: _, help) ->
+    let s_part = match short do
+      | Some(val: v) -> v
+      | None -> ""
+    end
+    let l_part = match long do
+      | Some(val: v) -> v
+      | None -> ""
+    end
+    let has_short = str.length(s: s_part) > 0
+    let has_long = str.length(s: l_part) > 0
+    let bare_one = if has_short then s_part else l_part end
+    let bare = if has_short && has_long then s_part ++ ", " ++ l_part else bare_one end
+    let opt_value_part = if takes_value then " VALUE" else "" end
+    let value_part = match kind do
+      | OptValue -> opt_value_part
+      | _ -> ""
+    end
+    let lbl = bare ++ value_part
+    if str.length(s: help) == 0 then return lbl end
+    return pad_label(label: lbl, width: 36) ++ help
+  end
+end
+
+let pad_label = fn (label: string, width: i64) -> string do
+  let n = str.length(s: label)
+  if n >= width then return label ++ "  " end
+  return label ++ str.repeat(s: " ", n: width - n)
+end
+
+// ─── Per-subcommand rich help ──────────────────────────
+//
+// A structured help block per subcommand. Driver builds a list of these
+// and looks one up by name when handling `nexus <sub> --help` or
+// `nexus help <sub>`. Render produces the SYNOPSIS / DESCRIPTION /
+// FLAGS / EXAMPLES / SEE ALSO / EXIT CODES sections; sections with no
+// content are elided so a minimal sub still renders cleanly.
+
+/** One worked-example block. `command` is the literal command line the
+ *  user types (rendered prefixed with two spaces); `comment` is the
+ *  one-line explanation rendered on the next line as `      # ...`. Pass
+ *  `""` to omit the comment. */
+export type Example = Example(command: string, comment: string)
+
+/** One exit-code row. `code` is the numeric exit value; `meaning` is the
+ *  short human-readable description rendered to the right. */
+export type ExitCode = ExitCode(code: i64, meaning: string)
+
+/** Functional taxonomy a subcommand belongs to. Used by
+ *  `render_subcommand_overview` to group the top-level `nexus help` listing
+ *  so an LLM (or human) immediately sees which layer each subcommand
+ * serves. Issue.
+ *
+ *  Variants:
+ *    - CategoryBuild     compile / run / typecheck / repl / test / fmt
+ *    - CategoryContext   ast / hir / types / caps / explain / context / grep
+ *    - CategorySafety    safety-oriented inspection / diffing
+ *    - CategoryTooling   mcp / lsp / help (host integration)
+ *
+ *  Declaring this as a closed variant (rather than a free-form string)
+ *  forces every `subspec(...)` call site to pick a category — no default.
+ */
+export type SubcommandCategory =
+    CategoryBuild
+  | CategoryContext
+  | CategorySafety
+  | CategoryTooling
+
+/** Human-readable header for a category group. */
+export let category_label = fn (c: SubcommandCategory) -> string do
+  match c do
+    | CategoryBuild -> return "Build & Run"
+    | CategoryContext -> return "Context & Introspection"
+    | CategorySafety -> return "Safety & Diffing"
+    | CategoryTooling -> return "Tooling & Integration"
+  end
+end
+
+let category_tag = fn (c: SubcommandCategory) -> i64 do
+  match c do
+    | CategoryBuild -> return 0
+    | CategoryContext -> return 1
+    | CategorySafety -> return 2
+    | CategoryTooling -> return 3
+  end
+end
+
+/** Per-subcommand help bundle. `flags` is reused with `render_usage`-
+ *  style auto-derivation. `synopsis` is the one-liner shown under
+ *  SYNOPSIS (do not include a leading "nexus" prefix — the renderer adds
+ *  it). `description` is free-form prose for the DESCRIPTION block (use
+ *  `\n` to break paragraphs). `examples` / `see_also` / `exit_codes` can
+ * be empty lists when not applicable. `category` places
+ *  the subcommand in the top-level grouped overview.
+ */
+export type SubcommandSpec = SubcommandSpec(
+  name: string,
+  synopsis: string,
+  description: string,
+  flags: [ArgSpec],
+  examples: [Example],
+  see_also: [string],
+  exit_codes: [ExitCode],
+  category: SubcommandCategory
+)
+
+/** Convenience builder so call sites stay declarative. */
+export let subspec = fn (
+  name: string,
+  synopsis: string,
+  description: string,
+  flags: [ArgSpec],
+  examples: [Example],
+  see_also: [string],
+  exit_codes: [ExitCode],
+  category: SubcommandCategory
+) -> SubcommandSpec do
+  return SubcommandSpec(name, synopsis, description, flags, examples, see_also, exit_codes, category)
+end
+
+/** Build an Example row. Pass `""` for `comment` when no annotation is
+ *  needed. */
+export let example = fn (command: string, comment: string) -> Example do
+  return Example(command: command, comment: comment)
+end
+
+/** Build an ExitCode row. */
+export let exit_code = fn (code: i64, meaning: string) -> ExitCode do
+  return ExitCode(code: code, meaning: meaning)
+end
+
+/** Render the full multi-section help block for one subcommand. Format:
+ *
+ *    SYNOPSIS
+ *      nexus <name> <synopsis>
+ *
+ *    DESCRIPTION
+ *      <description>
+ *
+ *    FLAGS
+ *      ...auto-derived table from `flags`...
+ *
+ *    EXAMPLES
+ *      <command>
+ *        # <comment>
+ *
+ *    SEE ALSO
+ *      nexus <other>, nexus <other2>
+ *
+ *    EXIT CODES
+ *      <code>  <meaning>
+ *
+ *  Empty sections are elided. No trailing newline (matches print_usage). */
+export let render_subcommand_help = fn (prog: string, spec: SubcommandSpec) -> string do
+  match spec do | SubcommandSpec(name: n, synopsis, description, flags, examples, see_also, exit_codes, category: _) ->
+    let syn_section = render_synopsis_section(prog, name: n, synopsis)
+    let desc_section = render_description_section(description)
+    let flags_section = render_flags_section(flags)
+    let ex_section = render_examples_section(examples)
+    let see_section = render_see_also_section(prog, see_also)
+    let exit_section = render_exit_codes_section(exit_codes)
+    return syn_section ++ desc_section ++ flags_section ++ ex_section ++ see_section ++ exit_section
+  end
+end
+
+let render_synopsis_section = fn (prog: string, name: string, synopsis: string) -> string do
+  let body = if str.length(s: synopsis) == 0 then
+      "  " ++ prog ++ " " ++ name
+    else
+      "  " ++ prog ++ " " ++ name ++ " " ++ synopsis
+    end
+  return "SYNOPSIS\n" ++ body
+end
+
+let render_description_section = fn (description: string) -> string do
+  if str.length(s: description) == 0 then return "" end
+  let indented = indent_lines(text: description, prefix: "  ")
+  return "\n\nDESCRIPTION\n" ++ indented
+end
+
+let render_flags_section = fn (flags: [ArgSpec]) -> string do
+  if list.length(xs: flags) == 0 then return "" end
+  let body = render_lines(specs: flags, render_one: render_opt_line, acc: "")
+  return "\n\nFLAGS\n" ++ body
+end
+
+let render_examples_section = fn (examples: [Example]) -> string do
+  if list.length(xs: examples) == 0 then return "" end
+  let body = render_examples_lines(examples, acc: "")
+  return "\n\nEXAMPLES\n" ++ body
+end
+
+let render_examples_lines = fn (examples: [Example], acc: string) -> string do
+  match examples do
+    | [] -> return acc
+    | Example(command: cmd, comment: cmt) :: rest ->
+      let cmd_line = "  " ++ cmd
+      let entry = if str.length(s: cmt) == 0 then cmd_line
+        else cmd_line ++ "\n    # " ++ cmt end
+      let next = if str.length(s: acc) == 0 then entry else acc ++ "\n" ++ entry end
+      return render_examples_lines(examples: rest, acc: next)
+  end
+end
+
+let render_see_also_section = fn (prog: string, see_also: [string]) -> string do
+  if list.length(xs: see_also) == 0 then return "" end
+  let body = render_see_also_lines(prog, names: see_also, acc: "")
+  return "\n\nSEE ALSO\n  " ++ body
+end
+
+let render_see_also_lines = fn (prog: string, names: [string], acc: string) -> string do
+  match names do
+    | [] -> return acc
+    | n :: rest ->
+      let entry = prog ++ " " ++ n
+      let next = if str.length(s: acc) == 0 then entry else acc ++ ", " ++ entry end
+      return render_see_also_lines(prog, names: rest, acc: next)
+  end
+end
+
+let render_exit_codes_section = fn (exit_codes: [ExitCode]) -> string do
+  if list.length(xs: exit_codes) == 0 then return "" end
+  let body = render_exit_codes_lines(codes: exit_codes, acc: "")
+  return "\n\nEXIT CODES\n" ++ body
+end
+
+let render_exit_codes_lines = fn (codes: [ExitCode], acc: string) -> string do
+  match codes do
+    | [] -> return acc
+    | ExitCode(code: c, meaning: m) :: rest ->
+      let label = pad_label(label: str.from_i64(val: c), width: 6)
+      let entry = "  " ++ label ++ m
+      let next = if str.length(s: acc) == 0 then entry else acc ++ "\n" ++ entry end
+      return render_exit_codes_lines(codes: rest, acc: next)
+  end
+end
+
+// Render a multi-line string with `prefix` prepended to every line. We
+// hand-roll a fold so we do not depend on str.split (the stdlib has it,
+// but keeping this module dependency-light makes future hoisting easy).
+let indent_lines = fn (text: string, prefix: string) -> string do
+  let parts = split_on_newline(s: text, acc: [], cur: "")
+  return join_with_prefix(parts, prefix, acc: "")
+end
+
+let split_on_newline = fn (s: string, acc: [string], cur: string) -> [string] do
+  let n = str.length(s)
+  if n == 0 then
+    return list.reverse(xs: cur :: acc)
+  end
+  let head = str.substring(s, start: 0, len: 1)
+  let tail = str.substring(s, start: 1, len: n - 1)
+  if head == "\n" then
+    return split_on_newline(s: tail, acc: cur :: acc, cur: "")
+  end
+  return split_on_newline(s: tail, acc, cur: cur ++ head)
+end
+
+let join_with_prefix = fn (parts: [string], prefix: string, acc: string) -> string do
+  match parts do
+    | [] -> return acc
+    | p :: rest ->
+      let line = prefix ++ p
+      let next = if str.length(s: acc) == 0 then line else acc ++ "\n" ++ line end
+      return join_with_prefix(parts: rest, prefix, acc: next)
+  end
+end
+
+// ─── Top-level grouped overview ─────────────────────────
+//
+// `render_subcommand_overview` is the new top-level `nexus help` renderer.
+// Instead of one flat alphabetical-ish list it emits one labelled group
+// per `SubcommandCategory`, in declaration order, then the truly-global
+// options (the qpuz filtered set). Empty groups are elided so a future
+// category without members stays invisible.
+
+let filter_subs_by_category = fn (subs: [SubcommandSpec], target: i64, acc: [SubcommandSpec]) -> [SubcommandSpec] do
+  match subs do
+    | [] -> return list.reverse(xs: acc)
+    | s :: rest ->
+      match s do | SubcommandSpec(name: _, synopsis: _, description: _, flags: _, examples: _, see_also: _, exit_codes: _, category) ->
+        if category_tag(c: category) == target then
+          return filter_subs_by_category(subs: rest, target, acc: s :: acc)
+        end
+        return filter_subs_by_category(subs: rest, target, acc)
+      end
+  end
+end
+
+let render_overview_sub_line = fn (s: SubcommandSpec) -> string do
+  match s do | SubcommandSpec(name, synopsis, description: _, flags: _, examples: _, see_also: _, exit_codes: _, category: _) ->
+    if str.length(s: synopsis) == 0 then return pad_label(label: name, width: 16) end
+    return pad_label(label: name, width: 16) ++ synopsis
+  end
+end
+
+let render_overview_sub_lines = fn (subs: [SubcommandSpec], acc: string) -> string do
+  match subs do
+    | [] -> return acc
+    | s :: rest ->
+      let line = render_overview_sub_line(s)
+      let next = if str.length(s: acc) == 0 then "  " ++ line else acc ++ "\n  " ++ line end
+      return render_overview_sub_lines(subs: rest, acc: next)
+  end
+end
+
+let render_category_group = fn (subs: [SubcommandSpec], c: SubcommandCategory) -> string do
+  let members = filter_subs_by_category(subs, target: category_tag(c), acc: [])
+  if list.length(xs: members) == 0 then return "" end
+  return "\n\n" ++ category_label(c) ++ ":\n" ++ render_overview_sub_lines(subs: members, acc: "")
+end
+
+/** Render the top-level `nexus help` overview with subcommands grouped by
+ *  `SubcommandCategory`. `summary` is the first line (e.g. "Usage: nexus
+ *  <subcommand> [options] <args>"); `subs` is the full spec table (any
+ *  order — groups are rendered in category declaration order, then by
+ *  list position within a group); `globals` is the truly-global flag
+ *  ArgSpec list (qpuz: per-sub flags must not leak in here). Empty
+ *  category groups are elided; the "Options:" block is elided when
+ *  `globals` is empty. No trailing newline — matches render_usage.
+ * Issue. */
+export let render_subcommand_overview = fn (summary: string, subs: [SubcommandSpec], globals: [ArgSpec]) -> string do
+  let g_build = render_category_group(subs, c: CategoryBuild)
+  let g_ctx = render_category_group(subs, c: CategoryContext)
+  let g_safety = render_category_group(subs, c: CategorySafety)
+  let g_tool = render_category_group(subs, c: CategoryTooling)
+  let groups = g_build ++ g_ctx ++ g_safety ++ g_tool
+  let opts = filter_opts_and_flags(specs: globals, acc: [])
+  let opt_block = if list.length(xs: opts) > 0 then
+      "\n\nOptions:\n" ++ render_lines(specs: opts, render_one: render_opt_line, acc: "")
+    else "" end
+  return summary ++ groups ++ opt_block
+end

@@ -27,702 +27,95 @@
  * peels the program-name token plus a single keyword. Order-sensitive
  * routing (repl short-circuits before --output parsing) stays in the
  * driver — argparse only provides the primitive.
- */
-
-import { Option, Some, None } from "std:option"
-import * as str from "std:str"
-import * as list from "std:list"
-
-// ─── Argument kind ─────────────────────────────────────────────────────────
-
-/** What sort of CLI token this spec describes.
  *
- * - `Flag`        : boolean presence, no value (e.g. `--verbose`).
- * - `OptValue`    : key/value pair: `--out PATH` or `--out=PATH`.
- * - `Positional`  : bare token consumed in declaration order.
- * - `Subcommand`  : a keyword that selects a routing arm.
+ * Implementation is split into sub-modules:
+ *   argparse/spec.nx   — ArgKind, ArgSpec types + builder helpers
+ *   argparse/parse.nx  — parse / parse_permissive / get_* / detect_subcommand
+ *   argparse/help.nx   — render_usage / render_subcommand_help / render_subcommand_overview
  */
-export type ArgKind = Flag | OptValue | Positional | Subcommand
 
-/** Declarative spec for one CLI entry. `name` is the canonical lookup key
- *  (use it with `get_flag` / `get_opt`). `short` / `long` are the actual
- *  CLI spellings; either can be `None`. `takes_value` is meaningful for
- *  OptValue (set automatically by `opt`). `required` is consulted by
- *  `parse` to add a diagnostic when a positional / required opt is
- *  missing. `help` is the one-line description for `render_usage`. */
-export type ArgSpec = ArgSpec(
-  name: string,
-  kind: ArgKind,
-  short: Option<string>,
-  long: Option<string>,
-  takes_value: bool,
-  required: bool,
-  help: string
-)
+import * as specmod from "std:meta/argparse/spec"
+import * as parsemod from "std:meta/argparse/parse"
+import * as helpmod from "std:meta/argparse/help"
 
-// ─── Builders ──────────────────────────────────────────────────────────────
+// ─── Spec builders (delegates to spec) ─────────────────────────────────────
 
-/** Build a boolean `--flag` entry. Pass `""` for short/long that doesn't
- *  exist; the helpers accept the empty string as None. */
 export let spec_flag = fn (name: string, short: string, long: string, help: string) -> ArgSpec do
-  return ArgSpec(name, kind: Flag,
-    short: opt_str(s: short),
-    long: opt_str(s: long),
-    takes_value: false, required: false, help)
+  return specmod.spec_flag(name, short, long, help)
 end
 
-/** Build a `--opt VALUE` / `--opt=VALUE` entry. `required` triggers a
- *  diagnostic at parse time when the option is absent. */
 export let spec_opt = fn (name: string, short: string, long: string, required: bool, help: string) -> ArgSpec do
-  return ArgSpec(name, kind: OptValue,
-    short: opt_str(s: short),
-    long: opt_str(s: long),
-    takes_value: true, required, help)
+  return specmod.spec_opt(name, short, long, required, help)
 end
 
-/** Build a positional entry. Positional specs are matched in declaration
- *  order; surplus positionals collect under the last positional. */
 export let spec_positional = fn (name: string, required: bool, help: string) -> ArgSpec do
-  return ArgSpec(name, kind: Positional,
-    short: None, long: None,
-    takes_value: false, required, help)
+  return specmod.spec_positional(name, required, help)
 end
 
-/** Build a subcommand-token entry. Used only for `render_usage`; routing
- *  is the caller's responsibility (see `detect_subcommand`). */
 export let spec_subcommand = fn (name: string, help: string) -> ArgSpec do
-  return ArgSpec(name, kind: Subcommand,
-    short: None, long: None,
-    takes_value: false, required: false, help)
+  return specmod.spec_subcommand(name, help)
 end
 
-let opt_str = fn (s: string) -> Option<string> do
-  if str.length(s) == 0 then return None end
-  return Some(val: s)
-end
+// ─── Core parse (delegates to parsemod) ────────────────────────────────────
 
-// ─── Parsed result ─────────────────────────────────────────────────────────
-
-/** Runtime value carried by a successfully-matched ArgSpec. */
-export type ArgValue =
-    VFlag(present: bool)
-  | VOpt(value: Option<string>)
-  | VPositional(values: [string])
-
-/** Per-spec parsed value, keyed by ArgSpec.name. */
-export type ParsedArg = ParsedArg(name: string, value: ArgValue)
-
-export type DiagSeverity = SevError | SevWarning
-
-/** Parse-time diagnostic — argparse does not throw; callers decide how to
- *  surface these (typically by raising InvalidUsage). */
-export type Diagnostic = Diagnostic(severity: DiagSeverity, message: string)
-
-/** Full parse output: keyed value list, raw positionals (for callers that
- *  prefer the list to spec lookups), a `remaining` tail (tokens following
- *  `--`, for `run`-style forwarders), and the diagnostic list. */
-export type ParseResult = ParseResult(
-  values: [ParsedArg],
-  positionals: [string],
-  remaining: [string],
-  diags: [Diagnostic]
-)
-
-// ─── Spec lookup ───────────────────────────────────────────────────────────
-
-let opt_eq = fn (a: Option<string>, b: string) -> bool do
-  match a do
-    | None -> return false
-    | Some(val: v) -> return v == b
-  end
-end
-
-// Match a CLI token against a spec's short / long spellings (Flag,
-// OptValue). Returns true on exact equality.
-let spec_matches_token = fn (spec: ArgSpec, tok: string) -> bool do
-  match spec do | ArgSpec(name: _, kind, short, long, takes_value: _, required: _, help: _) ->
-    match kind do
-      | Flag -> return opt_eq(a: short, b: tok) || opt_eq(a: long, b: tok)
-      | OptValue -> return opt_eq(a: short, b: tok) || opt_eq(a: long, b: tok)
-      | _ -> return false
-    end
-  end
-end
-
-let find_matching_spec = fn (specs: [ArgSpec], tok: string) -> Option<ArgSpec> do
-  match specs do
-    | [] -> return None
-    | s :: rest ->
-      if spec_matches_token(spec: s, tok) then return Some(val: s) end
-      return find_matching_spec(specs: rest, tok)
-  end
-end
-
-// Find an OptValue spec whose long form matches `--name=...` (i.e. the
-// key before `=`). Returns the spec and the inline value when found.
-let find_opt_for_eq = fn (specs: [ArgSpec], key: string) -> Option<ArgSpec> do
-  match specs do
-    | [] -> return None
-    | s :: rest ->
-      match s do | ArgSpec(name: _, kind, short: _, long, takes_value: _, required: _, help: _) ->
-        match kind do
-          | OptValue ->
-            if opt_eq(a: long, b: key) then return Some(val: s) end
-            return find_opt_for_eq(specs: rest, key)
-          | _ -> return find_opt_for_eq(specs: rest, key)
-        end
-      end
-  end
-end
-
-let collect_positional_specs = fn (specs: [ArgSpec], acc: [ArgSpec]) -> [ArgSpec] do
-  match specs do
-    | [] -> return list.reverse(xs: acc)
-    | s :: rest ->
-      match s do | ArgSpec(name: _, kind, short: _, long: _, takes_value: _, required: _, help: _) ->
-        match kind do
-          | Positional -> return collect_positional_specs(specs: rest, acc: s :: acc)
-          | _ -> return collect_positional_specs(specs: rest, acc)
-        end
-      end
-  end
-end
-
-// ─── Value upsert ─────────────────────────────────────────────────────────
-//
-// `parse` builds the `values` list as it walks. Multiple appearances of
-// the same flag/opt overwrite; positionals accumulate.
-
-let upsert_go = fn (values: [ParsedArg], name: string, new_value: ArgValue, acc: [ParsedArg], replaced: bool) -> [ParsedArg] do
-  match values do
-    | [] ->
-      if replaced then return list.reverse(xs: acc) end
-      return list.reverse(xs: ParsedArg(name, value: new_value) :: acc)
-    | ParsedArg(name: n, value: v) :: rest ->
-      if n == name then
-        let merged = merge_values(old: v, new: new_value)
-        return upsert_go(values: rest, name, new_value: merged, acc: ParsedArg(name: n, value: merged) :: acc, replaced: true)
-      end
-      return upsert_go(values: rest, name, new_value, acc: ParsedArg(name: n, value: v) :: acc, replaced)
-  end
-end
-
-let merge_values = fn (old: ArgValue, new: ArgValue) -> ArgValue do
-  match old do
-    | VFlag(_) -> return new
-    | VOpt(_) -> return new
-    | VPositional(values: olds) ->
-      match new do
-        | VPositional(values: news) -> return VPositional(values: list.concat(xs: olds, ys: news))
-        | _ -> return new
-      end
-  end
-end
-
-let upsert = fn (values: [ParsedArg], name: string, new_value: ArgValue) -> [ParsedArg] do
-  return upsert_go(values, name, new_value, acc: [], replaced: false)
-end
-
-// ─── Core parser ──────────────────────────────────────────────────────────
-
-/** Walk `args` once against `specs` and return the ParseResult. Pure: any
- *  parse problem becomes a Diagnostic, never a throw. Unknown flags
- *  (tokens starting with `-` that no spec recognises) produce an error
- *  diagnostic AND are dropped from `positionals` so subsequent matching
- *  isn't poisoned. Tokens after `--` accumulate into `remaining`. */
 export let parse = fn (args: [string], specs: [ArgSpec]) -> ParseResult do
-  let pos_specs = collect_positional_specs(specs, acc: [])
-  return walk(args, specs, pos_specs, values: [], positionals_rev: [], remaining_rev: [], diags_rev: [], pos_idx: 0, after_ddash: false, allow_unknown: false)
+  return parsemod.parse(args, specs)
 end
 
-/** Like `parse`, but unknown flags are forwarded into `positionals`
- *  verbatim instead of generating an error diagnostic. Used by the
- *  driver's global-flag pass, which recognises only the cross-cutting
- *  flags (`--verbose`, `-o`, `--format`, ...) and lets every other
- *  `-flag` fall through to the per-subcommand parser (fmt's `--check`,
- *  test's `--junit`, etc.). */
 export let parse_permissive = fn (args: [string], specs: [ArgSpec]) -> ParseResult do
-  let pos_specs = collect_positional_specs(specs, acc: [])
-  return walk(args, specs, pos_specs, values: [], positionals_rev: [], remaining_rev: [], diags_rev: [], pos_idx: 0, after_ddash: false, allow_unknown: true)
+  return parsemod.parse_permissive(args, specs)
 end
 
-let walk = fn (
-  args: [string],
-  specs: [ArgSpec],
-  pos_specs: [ArgSpec],
-  values: [ParsedArg],
-  positionals_rev: [string],
-  remaining_rev: [string],
-  diags_rev: [Diagnostic],
-  pos_idx: i64,
-  after_ddash: bool,
-  allow_unknown: bool
-) -> ParseResult do
-  match args do
-    | [] ->
-      let final_diags = check_required(specs, values, diags_rev)
-      return ParseResult(
-        values,
-        positionals: list.reverse(xs: positionals_rev),
-        remaining: list.reverse(xs: remaining_rev),
-        diags: list.reverse(xs: final_diags)
-      )
-    | tok :: rest ->
-      if after_ddash then
-        return walk(args: rest, specs, pos_specs, values, positionals_rev,
-          remaining_rev: tok :: remaining_rev, diags_rev, pos_idx, after_ddash: true, allow_unknown)
-      end
-      if tok == "--" then
-        return walk(args: rest, specs, pos_specs, values, positionals_rev, remaining_rev, diags_rev, pos_idx, after_ddash: true, allow_unknown)
-      end
-      // `--key=value` form
-      if str.starts_with(s: tok, prefix: "--") && str.index_of(s: tok, sub: "=") > 0 then
-        let eq_idx = str.index_of(s: tok, sub: "=")
-        let key = str.substring(s: tok, start: 0, len: eq_idx)
-        let value = str.substring(s: tok, start: eq_idx + 1, len: str.length(s: tok) - eq_idx - 1)
-        match find_opt_for_eq(specs, key) do
-          | Some(val: s) ->
-            match s do | ArgSpec(name, kind: _, short: _, long: _, takes_value: _, required: _, help: _) ->
-              let values2 = upsert(values, name, new_value: VOpt(value: Some(val: value)))
-              return walk(args: rest, specs, pos_specs, values: values2, positionals_rev, remaining_rev, diags_rev, pos_idx, after_ddash: false, allow_unknown)
-            end
-          | None ->
-            // Unknown attached-form `--key=value` — forward the whole token
-            // into positionals under permissive mode; error under strict.
-            if allow_unknown then
-              return walk(args: rest, specs, pos_specs, values, positionals_rev: tok :: positionals_rev, remaining_rev, diags_rev, pos_idx, after_ddash: false, allow_unknown)
-            end
-            let d = Diagnostic(severity: SevError, message: "unknown flag: " ++ key)
-            return walk(args: rest, specs, pos_specs, values, positionals_rev, remaining_rev, diags_rev: d :: diags_rev, pos_idx, after_ddash: false, allow_unknown)
-        end
-      end
-      // Flag / OptValue (two-token form) lookup
-      match find_matching_spec(specs, tok) do
-        | Some(val: s) ->
-          match s do | ArgSpec(name, kind, short: _, long: _, takes_value, required: _, help: _) ->
-            match kind do
-              | Flag ->
-                let values2 = upsert(values, name, new_value: VFlag(present: true))
-                return walk(args: rest, specs, pos_specs, values: values2, positionals_rev, remaining_rev, diags_rev, pos_idx, after_ddash: false, allow_unknown)
-              | OptValue ->
-                match rest do
-                  | [] ->
-                    let d = Diagnostic(severity: SevError, message: tok ++ " requires a value")
-                    return walk(args: rest, specs, pos_specs, values, positionals_rev, remaining_rev, diags_rev: d :: diags_rev, pos_idx, after_ddash: false, allow_unknown)
-                  | v :: rest2 ->
-                    let values2 = upsert(values, name, new_value: VOpt(value: Some(val: v)))
-                    return walk(args: rest2, specs, pos_specs, values: values2, positionals_rev, remaining_rev, diags_rev, pos_idx, after_ddash: false, allow_unknown)
-                end
-              | _ ->
-                // Subcommand / Positional should not appear as flag matches
-                return walk(args: rest, specs, pos_specs, values, positionals_rev: tok :: positionals_rev, remaining_rev, diags_rev, pos_idx, after_ddash: false, allow_unknown)
-            end
-          end
-        | None ->
-          // Unknown flag (starts with `-` but isn't bare `-`) →
-          // diagnostic under strict mode, pass-through under permissive.
-          if str.starts_with(s: tok, prefix: "-") && str.length(s: tok) > 1 && tok != "--" then
-            if allow_unknown then
-              return walk(args: rest, specs, pos_specs, values, positionals_rev: tok :: positionals_rev, remaining_rev, diags_rev, pos_idx, after_ddash: false, allow_unknown)
-            end
-            let d = Diagnostic(severity: SevError, message: "unknown flag: " ++ tok)
-            return walk(args: rest, specs, pos_specs, values, positionals_rev, remaining_rev, diags_rev: d :: diags_rev, pos_idx, after_ddash: false, allow_unknown)
-          end
-          // Positional: append to the appropriate positional spec's value
-          let new_idx = absorb_positional(pos_specs, pos_idx)
-          let values2 = upsert_positional(values, pos_specs, pos_idx, tok)
-          return walk(args: rest, specs, pos_specs, values: values2, positionals_rev: tok :: positionals_rev, remaining_rev, diags_rev, pos_idx: new_idx, after_ddash: false, allow_unknown)
-      end
-  end
-end
+// ─── Lookup helpers (delegates to parsemod) ────────────────────────────────
 
-// Bump the positional-spec cursor unless we're already on the last spec
-// (in which case extra positionals fold into it).
-let absorb_positional = fn (pos_specs: [ArgSpec], pos_idx: i64) -> i64 do
-  let n = list.length(xs: pos_specs)
-  if n == 0 then return 0 end
-  if pos_idx + 1 < n then return pos_idx + 1 end
-  return pos_idx
-end
-
-let nth_spec = fn (pos_specs: [ArgSpec], idx: i64) -> Option<ArgSpec> do
-  match pos_specs do
-    | [] -> return None
-    | s :: rest ->
-      if idx == 0 then return Some(val: s) end
-      return nth_spec(pos_specs: rest, idx: idx - 1)
-  end
-end
-
-let upsert_positional = fn (values: [ParsedArg], pos_specs: [ArgSpec], pos_idx: i64, tok: string) -> [ParsedArg] do
-  match nth_spec(pos_specs, idx: pos_idx) do
-    | None -> return values
-    | Some(val: s) ->
-      match s do | ArgSpec(name, kind: _, short: _, long: _, takes_value: _, required: _, help: _) ->
-        return upsert(values, name, new_value: VPositional(values: [tok]))
-      end
-  end
-end
-
-// Append a "required option missing" diagnostic for every spec that
-// declared `required: true` but produced no value during the walk.
-let check_required = fn (specs: [ArgSpec], values: [ParsedArg], diags_rev: [Diagnostic]) -> [Diagnostic] do
-  match specs do
-    | [] -> return diags_rev
-    | s :: rest ->
-      match s do | ArgSpec(name, kind, short: _, long, takes_value: _, required, help: _) ->
-        if !required then return check_required(specs: rest, values, diags_rev) end
-        if value_present(values, name) then
-          return check_required(specs: rest, values, diags_rev)
-        end
-        let lbl = match long do
-          | Some(val: l) -> l
-          | None -> name
-        end
-        let _ = kind
-        let d = Diagnostic(severity: SevError, message: "missing required argument: " ++ lbl)
-        return check_required(specs: rest, values, diags_rev: d :: diags_rev)
-      end
-  end
-end
-
-let value_present = fn (values: [ParsedArg], name: string) -> bool do
-  match values do
-    | [] -> return false
-    | ParsedArg(name: n, value: _) :: rest ->
-      if n == name then return true end
-      return value_present(values: rest, name)
-  end
-end
-
-// ─── Lookup helpers ───────────────────────────────────────────────────────
-
-let lookup = fn (values: [ParsedArg], name: string) -> Option<ArgValue> do
-  match values do
-    | [] -> return None
-    | ParsedArg(name: n, value) :: rest ->
-      if n == name then return Some(val: value) end
-      return lookup(values: rest, name)
-  end
-end
-
-/** Read a Flag spec's presence by canonical name. Returns false when the
- *  spec was never matched. */
 export let get_flag = fn (result: ParseResult, name: string) -> bool do
-  match result do | ParseResult(values, positionals: _, remaining: _, diags: _) ->
-    match lookup(values, name) do
-      | None -> return false
-      | Some(val: VFlag(present)) -> return present
-      | _ -> return false
-    end
-  end
+  return parsemod.get_flag(result, name)
 end
 
-/** Read an OptValue spec's value by canonical name. Returns None when
- *  unset; callers usually pattern-match on the result. */
 export let get_opt = fn (result: ParseResult, name: string) -> Option<string> do
-  match result do | ParseResult(values, positionals: _, remaining: _, diags: _) ->
-    match lookup(values, name) do
-      | None -> return None
-      | Some(val: VOpt(value)) -> return value
-      | _ -> return None
-    end
-  end
+  return parsemod.get_opt(result, name)
 end
 
-/** Read every value matched against a Positional spec. Returns [] when
- *  the positional never matched. */
 export let get_positional = fn (result: ParseResult, name: string) -> [string] do
-  match result do | ParseResult(values, positionals: _, remaining: _, diags: _) ->
-    match lookup(values, name) do
-      | None -> return []
-      | Some(val: VPositional(values: vs)) -> return vs
-      | _ -> return []
-    end
-  end
+  return parsemod.get_positional(result, name)
 end
 
-/** The raw positional list in argv order. Useful when the caller does not
- *  want to declare individual positional specs. */
 export let get_positionals_all = fn (result: ParseResult) -> [string] do
-  match result do | ParseResult(values: _, positionals, remaining: _, diags: _) -> return positionals end
+  return parsemod.get_positionals_all(result)
 end
 
-/** Tokens following `--`. Empty when no `--` separator was present. Drives
- *  `run`-style forwarders. */
 export let get_remaining = fn (result: ParseResult) -> [string] do
-  match result do | ParseResult(values: _, positionals: _, remaining, diags: _) -> return remaining end
+  return parsemod.get_remaining(result)
 end
 
-/** The diagnostic list — empty on success. Callers typically throw
- *  InvalidUsage on the first error. */
 export let get_diags = fn (result: ParseResult) -> [Diagnostic] do
-  match result do | ParseResult(values: _, positionals: _, remaining: _, diags) -> return diags end
+  return parsemod.get_diags(result)
 end
 
-/** True when no error-severity diagnostics were emitted. */
 export let is_ok = fn (result: ParseResult) -> bool do
-  match result do | ParseResult(values: _, positionals: _, remaining: _, diags) ->
-    return !has_error(diags)
-  end
+  return parsemod.is_ok(result)
 end
 
-let has_error = fn (diags: [Diagnostic]) -> bool do
-  match diags do
-    | [] -> return false
-    | Diagnostic(severity: SevError, message: _) :: _ -> return true
-    | _ :: rest -> return has_error(diags: rest)
-  end
-end
-
-/** Return the first error message, or "" when none. Cheap convenience for
- *  callers that wrap parse failures in InvalidUsage. */
 export let first_error = fn (result: ParseResult) -> string do
-  match result do | ParseResult(values: _, positionals: _, remaining: _, diags) ->
-    return first_error_in(diags)
-  end
+  return parsemod.first_error(result)
 end
 
-let first_error_in = fn (diags: [Diagnostic]) -> string do
-  match diags do
-    | [] -> return ""
-    | Diagnostic(severity: SevError, message) :: _ -> return message
-    | _ :: rest -> return first_error_in(diags: rest)
-  end
-end
+// ─── Subcommand detection (delegates to parsemod) ──────────────────────────
 
-// ─── Subcommand detection ─────────────────────────────────────────────────
-
-/** Result of `detect_subcommand`: did we strip the keyword, and what's
- *  left? When `present` is true, `remaining` is `prog :: rest_after_kw`. */
-export type SubcommandHit = SubcommandHit(present: bool, remaining: [string])
-
-/** Peel a single subcommand keyword sitting immediately after the program
- *  name. Returns `present: true` and the argv with `kw` removed when the
- *  argv looks like `[prog, kw, ...]`; otherwise leaves argv untouched.
- *
- *  This generalises every strip_X_subcommand in src/tools: the pattern
- *  is always "match prog :: kw :: rest -> if kw == X then ...". */
 export let detect_subcommand = fn (args: [string], kw: string) -> SubcommandHit do
-  match args do
-    | [] -> return SubcommandHit(present: false, remaining: [])
-    | _ :: [] -> return SubcommandHit(present: false, remaining: args)
-    | prog :: second :: rest2 ->
-      if second == kw then
-        return SubcommandHit(present: true, remaining: prog :: rest2)
-      end
-      return SubcommandHit(present: false, remaining: args)
-  end
+  return parsemod.detect_subcommand(args, kw)
 end
 
-// ─── Usage rendering ──────────────────────────────────────────────────────
-//
-// Deterministic usage text built from the spec list. Format:
-//
-//   <summary>
-//
-//   Subcommands:
-//     <name>  <help>
-//
-//   Options:
-//     <short>, <long> [<VALUE>]  <help>
-//     <name>                     <help>          (positional)
-//
+// ─── Usage rendering (delegates to help) ───────────────────────────────────
 
-/** Render the usage text from `summary` (the top line) plus the spec
- *  list. Subcommand / option / positional sections are emitted only when
- *  any spec of that kind exists. Output ends without a trailing newline
- *  to match the existing `print_usage` contract. */
 export let render_usage = fn (summary: string, specs: [ArgSpec]) -> string do
-  let subs = filter_kind(specs, target: kind_subcommand_tag(), acc: [])
-  let opts = filter_opts_and_flags(specs, acc: [])
-  let poss = filter_kind(specs, target: kind_positional_tag(), acc: [])
-  let sub_block = if !list.is_empty(xs: subs) then
-      "\n\nSubcommands:\n" ++ render_lines(specs: subs, render_one: render_sub_line, acc: "")
-    else "" end
-  let pos_block = if !list.is_empty(xs: poss) then
-      "\n\nPositional:\n" ++ render_lines(specs: poss, render_one: render_pos_line, acc: "")
-    else "" end
-  let opt_block = if !list.is_empty(xs: opts) then
-      "\n\nOptions:\n" ++ render_lines(specs: opts, render_one: render_opt_line, acc: "")
-    else "" end
-  return summary ++ sub_block ++ pos_block ++ opt_block
+  return helpmod.render_usage(summary, specs)
 end
 
-// Phantom tag fns: keep filter logic local without exposing the variant
-// names externally. Returning an `i64` keeps the comparison cheap.
-let kind_subcommand_tag = fn () -> i64 do return 3 end
-let kind_positional_tag = fn () -> i64 do return 2 end
-
-let kind_tag = fn (k: ArgKind) -> i64 do
-  match k do
-    | Flag -> return 0
-    | OptValue -> return 1
-    | Positional -> return 2
-    | Subcommand -> return 3
-  end
-end
-
-let filter_kind = fn (specs: [ArgSpec], target: i64, acc: [ArgSpec]) -> [ArgSpec] do
-  match specs do
-    | [] -> return list.reverse(xs: acc)
-    | s :: rest ->
-      match s do | ArgSpec(name: _, kind, short: _, long: _, takes_value: _, required: _, help: _) ->
-        if kind_tag(k: kind) == target then
-          return filter_kind(specs: rest, target, acc: s :: acc)
-        end
-        return filter_kind(specs: rest, target, acc)
-      end
-  end
-end
-
-let filter_opts_and_flags = fn (specs: [ArgSpec], acc: [ArgSpec]) -> [ArgSpec] do
-  match specs do
-    | [] -> return list.reverse(xs: acc)
-    | s :: rest ->
-      match s do | ArgSpec(name: _, kind, short: _, long: _, takes_value: _, required: _, help: _) ->
-        let t = kind_tag(k: kind)
-        if t == 0 || t == 1 then
-          return filter_opts_and_flags(specs: rest, acc: s :: acc)
-        end
-        return filter_opts_and_flags(specs: rest, acc)
-      end
-  end
-end
-
-let render_lines = fn (specs: [ArgSpec], render_one: (s: ArgSpec) -> string, acc: string) -> string do
-  match specs do
-    | [] -> return acc
-    | s :: rest ->
-      let line = render_one(s)
-      let next = if str.length(s: acc) == 0 then "  " ++ line else acc ++ "\n  " ++ line end
-      return render_lines(specs: rest, render_one, acc: next)
-  end
-end
-
-let render_sub_line = fn (s: ArgSpec) -> string do
-  match s do | ArgSpec(name, kind: _, short: _, long: _, takes_value: _, required: _, help) ->
-    if str.length(s: help) == 0 then return name end
-    return pad_label(label: name, width: 16) ++ help
-  end
-end
-
-let render_pos_line = fn (s: ArgSpec) -> string do
-  match s do | ArgSpec(name, kind: _, short: _, long: _, takes_value: _, required, help) ->
-    let lbl = if required then "<" ++ name ++ ">" else "[" ++ name ++ "]" end
-    if str.length(s: help) == 0 then return lbl end
-    return pad_label(label: lbl, width: 24) ++ help
-  end
-end
-
-let render_opt_line = fn (s: ArgSpec) -> string do
-  match s do | ArgSpec(name: _, kind, short, long, takes_value, required: _, help) ->
-    let s_part = match short do
-      | Some(val: v) -> v
-      | None -> ""
-    end
-    let l_part = match long do
-      | Some(val: v) -> v
-      | None -> ""
-    end
-    let has_short = str.length(s: s_part) > 0
-    let has_long = str.length(s: l_part) > 0
-    let bare_one = if has_short then s_part else l_part end
-    let bare = if has_short && has_long then s_part ++ ", " ++ l_part else bare_one end
-    let opt_value_part = if takes_value then " VALUE" else "" end
-    let value_part = match kind do
-      | OptValue -> opt_value_part
-      | _ -> ""
-    end
-    let lbl = bare ++ value_part
-    if str.length(s: help) == 0 then return lbl end
-    return pad_label(label: lbl, width: 36) ++ help
-  end
-end
-
-let pad_label = fn (label: string, width: i64) -> string do
-  let n = str.length(s: label)
-  if n >= width then return label ++ "  " end
-  return label ++ str.repeat(s: " ", n: width - n)
-end
-
-// ─── Per-subcommand rich help ──────────────────────────
-//
-// A structured help block per subcommand. Driver builds a list of these
-// and looks one up by name when handling `nexus <sub> --help` or
-// `nexus help <sub>`. Render produces the SYNOPSIS / DESCRIPTION /
-// FLAGS / EXAMPLES / SEE ALSO / EXIT CODES sections; sections with no
-// content are elided so a minimal sub still renders cleanly.
-
-/** One worked-example block. `command` is the literal command line the
- *  user types (rendered prefixed with two spaces); `comment` is the
- *  one-line explanation rendered on the next line as `      # ...`. Pass
- *  `""` to omit the comment. */
-export type Example = Example(command: string, comment: string)
-
-/** One exit-code row. `code` is the numeric exit value; `meaning` is the
- *  short human-readable description rendered to the right. */
-export type ExitCode = ExitCode(code: i64, meaning: string)
-
-/** Functional taxonomy a subcommand belongs to. Used by
- *  `render_subcommand_overview` to group the top-level `nexus help` listing
- *  so an LLM (or human) immediately sees which layer each subcommand
- * serves. Issue.
- *
- *  Variants:
- *    - CategoryBuild     compile / run / typecheck / repl / test / fmt
- *    - CategoryContext   ast / hir / types / caps / explain / context / grep
- *    - CategorySafety    safety-oriented inspection / diffing
- *    - CategoryTooling   mcp / lsp / help (host integration)
- *
- *  Declaring this as a closed variant (rather than a free-form string)
- *  forces every `subspec(...)` call site to pick a category — no default.
- */
-export type SubcommandCategory =
-    CategoryBuild
-  | CategoryContext
-  | CategorySafety
-  | CategoryTooling
-
-/** Human-readable header for a category group. */
 export let category_label = fn (c: SubcommandCategory) -> string do
-  match c do
-    | CategoryBuild -> return "Build & Run"
-    | CategoryContext -> return "Context & Introspection"
-    | CategorySafety -> return "Safety & Diffing"
-    | CategoryTooling -> return "Tooling & Integration"
-  end
+  return helpmod.category_label(c)
 end
 
-let category_tag = fn (c: SubcommandCategory) -> i64 do
-  match c do
-    | CategoryBuild -> return 0
-    | CategoryContext -> return 1
-    | CategorySafety -> return 2
-    | CategoryTooling -> return 3
-  end
-end
-
-/** Per-subcommand help bundle. `flags` is reused with `render_usage`-
- *  style auto-derivation. `synopsis` is the one-liner shown under
- *  SYNOPSIS (do not include a leading "nexus" prefix — the renderer adds
- *  it). `description` is free-form prose for the DESCRIPTION block (use
- *  `\n` to break paragraphs). `examples` / `see_also` / `exit_codes` can
- * be empty lists when not applicable. `category` places
- *  the subcommand in the top-level grouped overview.
- */
-export type SubcommandSpec = SubcommandSpec(
-  name: string,
-  synopsis: string,
-  description: string,
-  flags: [ArgSpec],
-  examples: [Example],
-  see_also: [string],
-  exit_codes: [ExitCode],
-  category: SubcommandCategory
-)
-
-/** Convenience builder so call sites stay declarative. */
 export let subspec = fn (
   name: string,
   synopsis: string,
@@ -733,219 +126,21 @@ export let subspec = fn (
   exit_codes: [ExitCode],
   category: SubcommandCategory
 ) -> SubcommandSpec do
-  return SubcommandSpec(name, synopsis, description, flags, examples, see_also, exit_codes, category)
+  return helpmod.subspec(name, synopsis, description, flags, examples, see_also, exit_codes, category)
 end
 
-/** Build an Example row. Pass `""` for `comment` when no annotation is
- *  needed. */
 export let example = fn (command: string, comment: string) -> Example do
-  return Example(command: command, comment: comment)
+  return helpmod.example(command, comment)
 end
 
-/** Build an ExitCode row. */
 export let exit_code = fn (code: i64, meaning: string) -> ExitCode do
-  return ExitCode(code: code, meaning: meaning)
+  return helpmod.exit_code(code, meaning)
 end
 
-/** Render the full multi-section help block for one subcommand. Format:
- *
- *    SYNOPSIS
- *      nexus <name> <synopsis>
- *
- *    DESCRIPTION
- *      <description>
- *
- *    FLAGS
- *      ...auto-derived table from `flags`...
- *
- *    EXAMPLES
- *      <command>
- *        # <comment>
- *
- *    SEE ALSO
- *      nexus <other>, nexus <other2>
- *
- *    EXIT CODES
- *      <code>  <meaning>
- *
- *  Empty sections are elided. No trailing newline (matches print_usage). */
 export let render_subcommand_help = fn (prog: string, spec: SubcommandSpec) -> string do
-  match spec do | SubcommandSpec(name: n, synopsis, description, flags, examples, see_also, exit_codes, category: _) ->
-    let syn_section = render_synopsis_section(prog, name: n, synopsis)
-    let desc_section = render_description_section(description)
-    let flags_section = render_flags_section(flags)
-    let ex_section = render_examples_section(examples)
-    let see_section = render_see_also_section(prog, see_also)
-    let exit_section = render_exit_codes_section(exit_codes)
-    return syn_section ++ desc_section ++ flags_section ++ ex_section ++ see_section ++ exit_section
-  end
+  return helpmod.render_subcommand_help(prog, spec)
 end
 
-let render_synopsis_section = fn (prog: string, name: string, synopsis: string) -> string do
-  let body = if str.length(s: synopsis) == 0 then
-      "  " ++ prog ++ " " ++ name
-    else
-      "  " ++ prog ++ " " ++ name ++ " " ++ synopsis
-    end
-  return "SYNOPSIS\n" ++ body
-end
-
-let render_description_section = fn (description: string) -> string do
-  if str.length(s: description) == 0 then return "" end
-  let indented = indent_lines(text: description, prefix: "  ")
-  return "\n\nDESCRIPTION\n" ++ indented
-end
-
-let render_flags_section = fn (flags: [ArgSpec]) -> string do
-  if list.is_empty(xs: flags) then return "" end
-  let body = render_lines(specs: flags, render_one: render_opt_line, acc: "")
-  return "\n\nFLAGS\n" ++ body
-end
-
-let render_examples_section = fn (examples: [Example]) -> string do
-  if list.is_empty(xs: examples) then return "" end
-  let body = render_examples_lines(examples, acc: "")
-  return "\n\nEXAMPLES\n" ++ body
-end
-
-let render_examples_lines = fn (examples: [Example], acc: string) -> string do
-  match examples do
-    | [] -> return acc
-    | Example(command: cmd, comment: cmt) :: rest ->
-      let cmd_line = "  " ++ cmd
-      let entry = if str.length(s: cmt) == 0 then cmd_line
-        else cmd_line ++ "\n    # " ++ cmt end
-      let next = if str.length(s: acc) == 0 then entry else acc ++ "\n" ++ entry end
-      return render_examples_lines(examples: rest, acc: next)
-  end
-end
-
-let render_see_also_section = fn (prog: string, see_also: [string]) -> string do
-  if list.is_empty(xs: see_also) then return "" end
-  let body = render_see_also_lines(prog, names: see_also, acc: "")
-  return "\n\nSEE ALSO\n  " ++ body
-end
-
-let render_see_also_lines = fn (prog: string, names: [string], acc: string) -> string do
-  match names do
-    | [] -> return acc
-    | n :: rest ->
-      let entry = prog ++ " " ++ n
-      let next = if str.length(s: acc) == 0 then entry else acc ++ ", " ++ entry end
-      return render_see_also_lines(prog, names: rest, acc: next)
-  end
-end
-
-let render_exit_codes_section = fn (exit_codes: [ExitCode]) -> string do
-  if list.is_empty(xs: exit_codes) then return "" end
-  let body = render_exit_codes_lines(codes: exit_codes, acc: "")
-  return "\n\nEXIT CODES\n" ++ body
-end
-
-let render_exit_codes_lines = fn (codes: [ExitCode], acc: string) -> string do
-  match codes do
-    | [] -> return acc
-    | ExitCode(code: c, meaning: m) :: rest ->
-      let label = pad_label(label: str.from_i64(val: c), width: 6)
-      let entry = "  " ++ label ++ m
-      let next = if str.length(s: acc) == 0 then entry else acc ++ "\n" ++ entry end
-      return render_exit_codes_lines(codes: rest, acc: next)
-  end
-end
-
-// Render a multi-line string with `prefix` prepended to every line. We
-// hand-roll a fold so we do not depend on str.split (the stdlib has it,
-// but keeping this module dependency-light makes future hoisting easy).
-let indent_lines = fn (text: string, prefix: string) -> string do
-  let parts = split_on_newline(s: text, acc: [], cur: "")
-  return join_with_prefix(parts, prefix, acc: "")
-end
-
-let split_on_newline = fn (s: string, acc: [string], cur: string) -> [string] do
-  let n = str.length(s)
-  if n == 0 then
-    return list.reverse(xs: cur :: acc)
-  end
-  let head = str.substring(s, start: 0, len: 1)
-  let tail = str.substring(s, start: 1, len: n - 1)
-  if head == "\n" then
-    return split_on_newline(s: tail, acc: cur :: acc, cur: "")
-  end
-  return split_on_newline(s: tail, acc, cur: cur ++ head)
-end
-
-let join_with_prefix = fn (parts: [string], prefix: string, acc: string) -> string do
-  match parts do
-    | [] -> return acc
-    | p :: rest ->
-      let line = prefix ++ p
-      let next = if str.length(s: acc) == 0 then line else acc ++ "\n" ++ line end
-      return join_with_prefix(parts: rest, prefix, acc: next)
-  end
-end
-
-// ─── Top-level grouped overview ─────────────────────────
-//
-// `render_subcommand_overview` is the new top-level `nexus help` renderer.
-// Instead of one flat alphabetical-ish list it emits one labelled group
-// per `SubcommandCategory`, in declaration order, then the truly-global
-// options (the qpuz filtered set). Empty groups are elided so a future
-// category without members stays invisible.
-
-let filter_subs_by_category = fn (subs: [SubcommandSpec], target: i64, acc: [SubcommandSpec]) -> [SubcommandSpec] do
-  match subs do
-    | [] -> return list.reverse(xs: acc)
-    | s :: rest ->
-      match s do | SubcommandSpec(name: _, synopsis: _, description: _, flags: _, examples: _, see_also: _, exit_codes: _, category) ->
-        if category_tag(c: category) == target then
-          return filter_subs_by_category(subs: rest, target, acc: s :: acc)
-        end
-        return filter_subs_by_category(subs: rest, target, acc)
-      end
-  end
-end
-
-let render_overview_sub_line = fn (s: SubcommandSpec) -> string do
-  match s do | SubcommandSpec(name, synopsis, description: _, flags: _, examples: _, see_also: _, exit_codes: _, category: _) ->
-    if str.length(s: synopsis) == 0 then return pad_label(label: name, width: 16) end
-    return pad_label(label: name, width: 16) ++ synopsis
-  end
-end
-
-let render_overview_sub_lines = fn (subs: [SubcommandSpec], acc: string) -> string do
-  match subs do
-    | [] -> return acc
-    | s :: rest ->
-      let line = render_overview_sub_line(s)
-      let next = if str.length(s: acc) == 0 then "  " ++ line else acc ++ "\n  " ++ line end
-      return render_overview_sub_lines(subs: rest, acc: next)
-  end
-end
-
-let render_category_group = fn (subs: [SubcommandSpec], c: SubcommandCategory) -> string do
-  let members = filter_subs_by_category(subs, target: category_tag(c), acc: [])
-  if list.is_empty(xs: members) then return "" end
-  return "\n\n" ++ category_label(c) ++ ":\n" ++ render_overview_sub_lines(subs: members, acc: "")
-end
-
-/** Render the top-level `nexus help` overview with subcommands grouped by
- *  `SubcommandCategory`. `summary` is the first line (e.g. "Usage: nexus
- *  <subcommand> [options] <args>"); `subs` is the full spec table (any
- *  order — groups are rendered in category declaration order, then by
- *  list position within a group); `globals` is the truly-global flag
- *  ArgSpec list (qpuz: per-sub flags must not leak in here). Empty
- *  category groups are elided; the "Options:" block is elided when
- *  `globals` is empty. No trailing newline — matches render_usage.
- * Issue. */
 export let render_subcommand_overview = fn (summary: string, subs: [SubcommandSpec], globals: [ArgSpec]) -> string do
-  let g_build = render_category_group(subs, c: CategoryBuild)
-  let g_ctx = render_category_group(subs, c: CategoryContext)
-  let g_safety = render_category_group(subs, c: CategorySafety)
-  let g_tool = render_category_group(subs, c: CategoryTooling)
-  let groups = g_build ++ g_ctx ++ g_safety ++ g_tool
-  let opts = filter_opts_and_flags(specs: globals, acc: [])
-  let opt_block = if !list.is_empty(xs: opts) then
-      "\n\nOptions:\n" ++ render_lines(specs: opts, render_one: render_opt_line, acc: "")
-    else "" end
-  return summary ++ groups ++ opt_block
+  return helpmod.render_subcommand_overview(summary, subs, globals)
 end
