@@ -9,9 +9,10 @@
  * - Phase 2 -- arm sort: PCtor arms are sorted by variant name (lexicographic)
  *   so the LIR decision-tree builder receives them in a stable, compressor-
  *   friendly order.  Wildcard/variable arms are preserved last.
- * - Phase 3 -- redundancy elimination: after the first PWild (or PVar without
- *   binder use) arm, any subsequent arms are provably unreachable and are
- *   stripped.
+ * Phase 3 (silent stripping of arms after the first wildcard) is intentionally
+ * absent: the typecheck exhaustiveness pass (check_redundancy) is the
+ * authoritative reporter for unreachable arms.  Stripping here would prevent
+ * E2001 from ever firing for `_ | specific` patterns (nexus-os2d).
  *
  * Phase 4 (list-pattern head peeling) is skipped -- too complex / separate
  * concern.
@@ -499,11 +500,35 @@ let concat_cases_go = fn (a: [HirMatchCase], b: [HirMatchCase], acc: [HirMatchCa
   end
 end
 
+// Returns true iff some wildcard (PWild/PVar) arm precedes a non-wildcard arm
+// in the original list.  Used by Phase 2 to skip reordering when that would
+// hide the redundancy that the typecheck exhaustiveness pass is supposed to
+// catch and report (nexus-os2d).
+let has_wildcard_before_specific = fn (cases: [HirMatchCase]) -> bool do
+  return has_wbs_go(cases: cases, seen_wildcard: false)
+end
+
+let has_wbs_go = fn (cases: [HirMatchCase], seen_wildcard: bool) -> bool do
+  match cases do
+    | [] -> return false
+    | HirMatchCase(pattern: pat, body: _) :: rest ->
+      match pat_is_wildcard(pat) do
+        | true -> return has_wbs_go(cases: rest, seen_wildcard: true)
+        | false ->
+          if seen_wildcard then return true end
+          return has_wbs_go(cases: rest, seen_wildcard: false)
+      end
+  end
+end
+
 // Phase 2 entry point: enum-defs-aware arm sort.
 // If all PCtor-specific arms belong to the same enum, sort by declaration order.
 // Otherwise fall back to no-sort (preserve original order) to avoid cross-enum
 // reordering (e.g. list Cons vs custom-type ctors).
+// Skipped entirely when a wildcard precedes a specific arm: reordering in that
+// case would hide a redundant-arm error that the typecheck must report.
 let phase2_cases = fn (cases: [HirMatchCase], enum_defs: [EnumDef]) -> [HirMatchCase] do
+  if has_wildcard_before_specific(cases: cases) then return cases end
   let PartitionResult(specific: sp, wildcard: wc) = partition_cases(cases: cases, sp_acc: [], wc_acc: [])
   let same_enum = all_pctors_same_enum(cases: sp, defs: enum_defs)
   let sorted = match same_enum do
@@ -513,36 +538,18 @@ let phase2_cases = fn (cases: [HirMatchCase], enum_defs: [EnumDef]) -> [HirMatch
   return concat_cases(a: sorted, b: wc)
 end
 
-// Phase 3: redundancy elimination.
-// Once we encounter a PWild or PVar arm (catchall), all subsequent arms
-// are dead. Strip them. The wildcard arm itself is kept.
-
-let phase3_cases = fn (cases: [HirMatchCase]) -> [HirMatchCase] do
-  return phase3_go(cases: cases, acc: [])
-end
-
-let phase3_go = fn (cases: [HirMatchCase], acc: [HirMatchCase]) -> [HirMatchCase] do
-  match cases do
-    | [] -> return rev_cases(xs: acc, out: [])
-    | HirMatchCase(pattern: pat, body: b) :: rest ->
-      if pat_is_wildcard(pat) then
-        return rev_cases(xs: HirMatchCase(pattern: pat, body: b) :: acc, out: [])
-      else
-        return phase3_go(cases: rest, acc: HirMatchCase(pattern: pat, body: b) :: acc)
-      end
-  end
-end
-
 // Full canonicalization of a single match case list.
 // enum_defs is threaded through to enable Phase 2 enum-aware arm sort.
+// Phase 3 (strip arms after first wildcard) is intentionally absent: the
+// typecheck exhaustiveness pass (check_redundancy in exhaustive/decision.nx)
+// is the authoritative detector for unreachable arms.  Silent stripping here
+// would prevent that diagnostic from ever firing (nexus-os2d).
 
 let canonicalize_cases = fn (cases: [HirMatchCase], enum_defs: [EnumDef]) -> [HirMatchCase] do
-  // Phase 3: strip dead arms after first wildcard.
-  let after_p3 = phase3_cases(cases: cases)
   // Phase 2: sort PCtor arms by enum declaration order when all arms belong to
   // the same enum.  Falls back to no-sort when arms span multiple enums or
   // include list Cons (which is not a user-defined enum variant).
-  let after_p2 = phase2_cases(cases: after_p3, enum_defs: enum_defs)
+  let after_p2 = phase2_cases(cases: cases, enum_defs: enum_defs)
   // Phase 1: fuse arms with identical simple bodies into a single POr arm.
   let after_p1 = phase1_cases(cases: after_p2)
   return after_p1
