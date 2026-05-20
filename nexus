@@ -894,6 +894,10 @@ if [ "$TEST_MODE" = "1" ]; then
     idx="$1"; f="$2"
     wasm="$RESULTS_DIR/test_$idx.wasm"
     elog="$RESULTS_DIR/err_$idx.log"
+    # Fresh per-fixture scratch, mapped to the guest as /tmp in the run
+    # phases below. Fixtures may write under /tmp without depending on the
+    # host having a real /tmp (a nix dev-shell puts TMPDIR elsewhere).
+    scratch="$RESULTS_DIR/scratch_$idx"; mkdir -p "$scratch"
 
     # Classify by file path. Anything under a `negative/` directory uses
     # the inverted-semantics path; the header parse below picks between
@@ -1085,7 +1089,7 @@ if [ "$TEST_MODE" = "1" ]; then
         exit 0
       fi
       t1=$(date +%s%N 2>/dev/null || date +%s000000000)
-      if wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+      if wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$scratch::/tmp" \
           ${NEXUS_WASMTIME_ARGS:-} \
           "$wasm" \
           >"$elog" 2>&1; then
@@ -1145,7 +1149,7 @@ if [ "$TEST_MODE" = "1" ]; then
       fi
       t1=$(date +%s%N 2>/dev/null || date +%s000000000)
       if ! wasmtime run -W component-model=y,component-model-async=y,exceptions=y \
-          -S p3=y --dir=. ${NEXUS_WASMTIME_ARGS:-} \
+          -S p3=y --dir=. --dir="$scratch::/tmp" ${NEXUS_WASMTIME_ARGS:-} \
           "$wasm" \
           >/dev/null 2>"$elog"; then
         t2=$(date +%s%N 2>/dev/null || date +%s000000000)
@@ -1182,7 +1186,7 @@ if [ "$TEST_MODE" = "1" ]; then
       exit 0
     fi
     t1=$(date +%s%N 2>/dev/null || date +%s000000000)
-    if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+    if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$scratch::/tmp" \
         ${NEXUS_WASMTIME_ARGS:-} \
         "$wasm" \
         >/dev/null 2>"$elog"; then
