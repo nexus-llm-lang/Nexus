@@ -12,10 +12,16 @@ import {
   HirPatternKind, HirPatternField, HirRecordPatField
 } from "src/ir/hir/types.nx"
 import {
+  TypeExpr, TyRow, TyUnit, TyVar
+} from "src/common/ast.nx"
+import {
   LinState,
   lin_member, lin_remove,
   str_member
 } from "src/typecheck/linearity/state.nx"
+import {
+  SigEntry, sig_lookup
+} from "src/typecheck/linearity/sig_map.nx"
 
 // ─── Lambda-capture consumption ──────────────────────────────────────────────
 
@@ -203,5 +209,90 @@ let cap_pattern_record_binders = fn (
     | [] -> return acc
     | HirRecordPatField(name: _, pattern: p) :: rest ->
       return cap_pattern_record_binders(fields: rest, acc: cap_pattern_binders(pat: p, acc))
+  end
+end
+
+// ─── Throw-point detection + pre-throw consumption scan ──────────────────────
+
+/** True when `eff_row` is a non-empty throws row (i.e., the call may throw).
+ *  A bare type variable / Unit row is treated as non-throwable: the caller
+ *  has not committed to a concrete throws set yet, so the per-call check
+ *  at the binder site of an as-yet-unresolved arrow does not fire.
+ */
+export let row_is_throwable = fn (eff_row: TypeExpr) -> bool do
+  match eff_row do
+    | TyRow(types: ts, rest: _) ->
+      match ts do
+        | [] -> return false
+        | _ :: _ -> return true
+      end
+    | TyUnit | TyVar(_) | _ -> return false
+  end
+end
+
+/** True when the direct value expression `en` is a throwable call or raise.
+ *  Nested complex expressions (If, Match) are conservatively treated as
+ *  potential throw points so that the pre-scan stops early rather than
+ *  accidentally including post-throw consumptions in the pre-throw set.
+ */
+let throw_expr_has_throw_point = fn (en: HirExprKind, sigs: [SigEntry]) -> bool do
+  match en do
+    // Treat ALL function calls as potential throw points. This is conservative:
+    // it may stop the pre-throw scan too early (when the call is actually pure),
+    // which only means we fail to detect some pre-throw consumptions. The result
+    // is that catch_vars keeps those outer linears available, which is safe (not
+    // a false positive — the catch arm may legitimately need them). The
+    // alternative of checking sig_lookup + row_is_throwable can silently miss
+    // throwable calls when their throw_row is TyVar or the sig-map doesn't
+    // include imported functions, causing false positives (E2008).
+    | Call(_, _) -> return true
+    | Raise(_) -> return true
+    // Nested constructs may contain throwable calls — stop conservatively.
+    | If(_) -> return true
+    | Match(_) -> return true
+    | _ -> return false
+  end
+end
+
+/** True when the statement directly contains a throwable call or raise at
+ *  the top level of its value expression (for Let/Return) or directly
+ *  (for Expr). Does not recurse into nested stmts/exprs beyond the first
+ *  call-site level.
+ */
+let throw_stmt_has_throw_point = fn (nd: HirStmtKind, sigs: [SigEntry]) -> bool do
+  match nd do
+    | Expr(expr: HirExpr(node: en, span: _)) -> return throw_expr_has_throw_point(en, sigs)
+    | Let(name: _, sigil: _, typ: _, value: HirExpr(node: en, span: _)) ->
+      return throw_expr_has_throw_point(en, sigs)
+    | Return(expr: HirExpr(node: en, span: _)) -> return throw_expr_has_throw_point(en, sigs)
+    | _ -> return false
+  end
+end
+
+/** Lightweight scan of try-body stmts to find outer linears consumed before
+ *  the first throw point. Reuses cap_scan_expr for correct Variable matching.
+ *  Unlike check_stmts (which does full linearity checking), this scan does
+ *  NOT call check_stmt — it only tracks Variable references that consume outer
+ *  linears. Stops at the first throwable call or raise (inclusive). This
+ *  avoids mutual-recursion with walk.nx's SCC.
+ */
+export let scan_stmts_until_throw = fn (
+  stmts: [HirStmt], outer_vars: [string], consumed: [string], sigs: [SigEntry]
+) -> [string] do
+  match stmts do
+    | [] -> return consumed
+    | HirStmt(node: nd, span: _) :: rest ->
+      // Scan this statement's expression(s) for outer-linear consumption.
+      let consumed1 = match nd do
+        | Expr(expr: e) -> cap_scan_expr(expr: e, outer: outer_vars, bound: [], acc: consumed)
+        | Let(name: _, sigil: _, typ: _, value: v) ->
+          cap_scan_expr(expr: v, outer: outer_vars, bound: [], acc: consumed)
+        | Return(expr: e) -> cap_scan_expr(expr: e, outer: outer_vars, bound: [], acc: consumed)
+        | _ -> consumed
+      end
+      if throw_stmt_has_throw_point(nd, sigs) then
+        return consumed1
+      end
+      return scan_stmts_until_throw(stmts: rest, outer_vars, consumed: consumed1, sigs)
   end
 end

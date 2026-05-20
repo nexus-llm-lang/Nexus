@@ -11,7 +11,7 @@
 
 import { Span } from "src/common/token.nx"
 import {
-  TypeExpr, TyLinear, TyRow, TyUnit, TyVar,
+  TypeExpr, TyLinear,
   RecordDef, EnumDef, VariantField,
   Sigil, SigilLinear, SigilLazy
 } from "src/common/ast.nx"
@@ -37,14 +37,16 @@ import {
   lin_empty, lin_add, lin_remove, lin_member, lin_consumed_member, lin_clear_consumed, str_member,
   vars_equal, lin_push_frame, lin_pop_frame, lin_top_frame,
   join_simple, lin_set_vars, lin_get_must_consume, find_live_must_consume,
-  lin_state_vars, lin_state_consumed, lin_restore_state, filter_not_in
+  lin_state_vars, lin_state_consumed, lin_restore_state, filter_not_in,
+  append_consumed
 } from "src/typecheck/linearity/state.nx"
 import {
   lin_field_is_linear, lin_variant_is_known, lin_any_record_has_linear_field,
   lin_variant_field_type_at, lin_ctor_enum_is_linear
 } from "src/typecheck/linearity/predicates.nx"
 import {
-  collect_param_names, consume_all, collect_captured_linears
+  collect_param_names, consume_all, collect_captured_linears,
+  row_is_throwable, scan_stmts_until_throw
 } from "src/typecheck/linearity/capture.nx"
 import {
   is_linear_scrutinee, bind_pattern_linear,
@@ -57,7 +59,7 @@ import {
   all_cases_diverge_depth, last_stmt
 } from "src/typecheck/linearity/diverge.nx"
 
-// ─── Sig-map-aware linearity classification ──────────────────────────────────
+// ─── Sig-map-aware linearity classification ─────────────────────────────────
 
 /** Determine whether the value-RHS of a `let x = expr` would yield a linear
  *  binding. Classification, in priority order:
@@ -95,24 +97,6 @@ let let_binds_linear = fn (
         | Array(_) -> return true
         | _ -> return false
       end
-  end
-end
-
-// ─── Throwability classification ────────────────────────────────────────────
-
-/** True when `eff_row` is a non-empty throws row (i.e., the call may throw).
- *  A bare type variable / Unit row is treated as non-throwable: the caller
- *  has not committed to a concrete throws set yet, so the per-call check
- *  at the binder site of an as-yet-unresolved arrow does not fire.
- */
-let row_is_throwable = fn (eff_row: TypeExpr) -> bool do
-  match eff_row do
-    | TyRow(types: ts, rest: _) ->
-      match ts do
-        | [] -> return false
-        | _ :: _ -> return true
-      end
-    | TyUnit | TyVar(_) | _ -> return false
   end
 end
 
@@ -357,13 +341,26 @@ let check_stmt = fn (
       let pre_try_vars = lin_state_vars(st)
       let pre_try_consumed = lin_state_consumed(st)
       let st_try = lin_push_frame(st)
+      // Pre-scan: lightweight walk up to the first throwable call or raise to
+      // find outer linears consumed BEFORE any possible throw. Uses a
+      // scan-only pass (no full linearity check) to avoid calling check_stmt
+      // from within the SCC at this step.
+      // Consumptions after the first throw point are on the success
+      // continuation only and remain available in catch arms.
+      // scan_stmts_until_throw returns the subset of pre_try_vars consumed
+      // before the first throw. No filter needed (scan only tracks pre_try_vars).
+      let outer_consumed_before_throw = scan_stmts_until_throw(
+        stmts: b, outer_vars: pre_try_vars, consumed: [], sigs
+      )
+      // Full try body check (the pre-scan covers only up to the throw point;
+      // this walk checks the remainder and enforces all linearity rules).
       let st_after_try = check_stmts(stmts: b, st: st_try, sigs, tdefs, enum_defs)
       let st_after_try2 = lin_pop_frame(st: st_after_try)
-      // Catch arm starts from pre-try snapshot (Strategy A),
-      // not from the post-success state. Restore both vars and consumed so
-      // that bindings consumed in the try body do not falsely appear in the
-      // consumed set when the catch arm re-uses those bindings.
-      let st_catch_in = lin_restore_state(st: st_after_try2, vs: pre_try_vars, co: pre_try_consumed)
+      // Build catch arm entry state: pre-try vars minus those consumed before
+      // the first throw, consumed set extended with those consumed before throw.
+      let catch_vars = filter_not_in(xs: pre_try_vars, exclude: outer_consumed_before_throw, acc: [])
+      let catch_consumed = append_consumed(xs: pre_try_consumed, ys: outer_consumed_before_throw)
+      let st_catch_in = lin_restore_state(st: st_after_try2, vs: catch_vars, co: catch_consumed)
       let st_catch_out = check_stmts(stmts: cb, st: st_catch_in, sigs, tdefs, enum_defs)
       let post_catch_vars = lin_state_vars(st: st_catch_out)
       let post_try_vars = lin_state_vars(st: st_after_try2)
