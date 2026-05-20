@@ -549,84 +549,264 @@ let build_p2_instance_section = fn (lift_func_idx: i64) -> %ByteBuffer do
   return bb.push_uleb128(buf: %out, val: lift_func_idx)
 end
 
-/** Build the component export section exporting a WASI interface instance.
- *  wasi_iface is the interface name (e.g. "wasi:cli/run@0.2.0").
- *  instance_idx is the component instance index to export.
- *
- *  Encoding: count=1, [0x00 name sort=Instance(0x05) idx 0x00]
- *  Trailing 0x00 is the component export's optional type annotation (absent).
+/** Build the p2 core-instance section that creates 4 instances:
+ *  inst 1: Instantiate(module=0=stub, 0 args)
+ *  inst 2: FromExports { "get-stdout"=func_0, "write"=func_1 }
+ *  inst 3: Instantiate(module=1=adapter, args: {"env"=inst_0, "p2"=inst_2})
+ *  inst 4: Instantiate(module=2=nexus, args: {"env"=inst_0, "wasi_snapshot_preview1"=inst_3})
  */
-let build_p2_export_section = fn (wasi_iface: string, instance_idx: i64) -> %ByteBuffer do
+let build_p2_core_instance_section = fn () -> %ByteBuffer do
   let %out = bb.empty()
-  let %out = bb.push_uleb128(buf: %out, val: 1)
-  let %out = bb.push_bytes(buf: %out, bytes: [0])
-  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: wasi_iface))
-  let %out = bb.push_string(buf: %out, s: wasi_iface)
-  let %out = bb.push_byte(buf: %out, byte: 5)
-  let %out = bb.push_uleb128(buf: %out, val: instance_idx)
-  return bb.push_byte(buf: %out, byte: 0)
+  let %out = bb.push_uleb128(buf: %out, val: 4)
+  // Entry 0: Instantiate(module=0, args=[])
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 0, 0])
+  // Entry 1: FromExports count=2
+  let %out = bb.push_bytes(buf: %out, bytes: [1, 2])
+  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: "get-stdout"))
+  let %out = bb.push_string(buf: %out, s: "get-stdout")
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 0])
+  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: "write"))
+  let %out = bb.push_string(buf: %out, s: "write")
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 1])
+  // Entry 2: Instantiate(module=1=adapter, args=2: {env=inst0, p2=inst2})
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 1, 2])
+  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: "env"))
+  let %out = bb.push_string(buf: %out, s: "env")
+  let %out = bb.push_bytes(buf: %out, bytes: [18, 0])
+  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: "p2"))
+  let %out = bb.push_string(buf: %out, s: "p2")
+  let %out = bb.push_bytes(buf: %out, bytes: [18, 2])
+  // Entry 3: Instantiate(module=2=nexus, args=2: {env=inst0, wasi_snapshot_preview1=inst3})
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 2, 2])
+  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: "env"))
+  let %out = bb.push_string(buf: %out, s: "env")
+  let %out = bb.push_bytes(buf: %out, bytes: [18, 0])
+  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: "wasi_snapshot_preview1"))
+  let %out = bb.push_string(buf: %out, s: "wasi_snapshot_preview1")
+  return bb.push_bytes(buf: %out, bytes: [18, 3])
 end
 
 /** Build a minimal WASI preview2 component wrapping `core_wasm`.
- *  The core module must export:
- *    - run_func_export (e.g. "wasi:cli/run@0.2.0#run") returning i32
- *    - "memory"
- *  The resulting binary is a valid WebAssembly component runnable with:
- *    wasmtime run <file>
- *  and valid under:
- *    wasm-tools validate --features component-model <file>
  *
- *  wasi_iface is the component export name (e.g. "wasi:cli/run@0.2.0").
- *  run_func_export is the core wasm export name (e.g. "wasi:cli/run@0.2.0#run").
+ *  The component structure:
+ *    Secs 0-8: Component-level type/import/alias sections for WASI interfaces
+ *              (wasi:io/error, wasi:io/streams, wasi:cli/stdout) — fixed bytes.
+ *    Sec  9: Core module 0 = stub (just exports memory).
+ *    Sec 10: Core module 1 = adapter (implements wasi_snapshot_preview1 via p2).
+ *    Sec 11: Core module 2 = nexus core_wasm (dynamic).
+ *    Sec 12: Instantiate stub → core instance 0.
+ *    Sec 13: Canon lower get-stdout → core func 0.
+ *    Sec 14: Alias core memory from instance 0 → core memory 0.
+ *    Sec 15: Canon lower write with memory 0 → core func 1.
+ *    Sec 16: Four core instances (1-4): stub dup, from-exports, adapter, nexus.
+ *    Sec 17: Alias run func from nexus (instance 4) → core func 2.
+ *    Sec 18: Component types: result<_,_> + func()->result.
+ *    Sec 19: Canon lift core func 2 → component func 2 (the run function).
+ *    Sec 20: Component instance {run: func 2}.
+ *    Sec 21: Component export wasi_iface = component instance 3.
+ *
+ *  The nexus core module must:
+ *    - Import "wasi_snapshot_preview1" functions (fd_write, proc_exit, etc.)
+ *    - Import "env" "memory" (not define its own memory — MemoryImported("env"))
+ *    - Export run_func_export returning i32
+ *
+ *  Validated with: wasm-tools validate --features component-model
+ *  Runnable with:  wasmtime run -W component-model=y,exceptions=y
  */
 export let build_p2_component = fn (core_wasm: %ByteBuffer, wasi_iface: string, run_func_export: string) -> %ByteBuffer do
   let %out = bb.empty()
-  // Component magic + version
+
+  // Component magic + version (8 bytes)
   let %out = bb.push_bytes(buf: %out, bytes: [0, 97, 115, 109])
   let %out = bb.push_bytes(buf: %out, bytes: [wdefs.cm_version_byte0, wdefs.cm_version_byte1,
                                               wdefs.cm_version_byte2, wdefs.cm_version_byte3])
-  // Core module 0: inline the nexus-generated core wasm
-  let %out = bb.push_uleb128(%out, val: wdefs.cm_sec_core_module)
-  let %out = bb.push_uleb128(%out, val: bb.length(buf: &core_wasm))
-  let %out = bb.push_buf(%out, src: &core_wasm)
-  bb.free(buf: %core_wasm)
 
-  // Core instance 0: instantiate module 0 with no args
-  let %inst_body = bb.empty()
-  let %inst_body = bb.push_uleb128(%inst_body, val: 1)
-  let %inst_body = bb.push_bytes(buf: %inst_body, bytes: [0, 0, 0])
-  let %inst_sec = cm_wrap_section(section_id: wdefs.cm_sec_core_instance, content: %inst_body)
-  let %out = bb.push_buf(%out, src: &inst_sec)
-  bb.free(buf: %inst_sec)
+  // Secs 0-8: WASI interface type+import+alias sections (fixed bytes extracted from
+  // wasm-tools-generated component with wasi:io/error, wasi:io/streams, wasi:cli/stdout).
+  // Sec 0: type — wasi:io/error instance type (error resource)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 66, 1, 4, 0, 5, 101, 114, 114, 111, 114, 3, 1]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 1: import wasi:io/error@0.2.0
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_import, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 0, 19, 119, 97, 115, 105, 58, 105, 111, 47, 101, 114, 114, 111, 114, 64, 48, 46, 50, 46, 48, 5, 0]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 2: alias error resource type from import 0
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 3, 0, 0, 5, 101, 114, 114, 111, 114]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 3: type — wasi:io/streams instance type (stream-error, output-stream, write method)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 66, 12, 2, 3, 2, 1, 1, 4, 0, 5, 101, 114, 114, 111, 114, 3, 0, 0, 1, 105, 1, 1, 105, 0,
+    1, 113, 2, 21, 108, 97, 115, 116, 45, 111, 112, 101, 114, 97, 116, 105, 111, 110, 45, 102, 97,
+    105, 108, 101, 100, 1, 3, 0, 6, 99, 108, 111, 115, 101, 100, 0, 0, 4, 0, 12, 115, 116, 114,
+    101, 97, 109, 45, 101, 114, 114, 111, 114, 3, 0, 4, 4, 0, 13, 111, 117, 116, 112, 117, 116,
+    45, 115, 116, 114, 101, 97, 109, 3, 1, 1, 104, 6, 1, 112, 125, 1, 106, 0, 1, 5, 1, 64, 2,
+    4, 115, 101, 108, 102, 7, 8, 99, 111, 110, 116, 101, 110, 116, 115, 8, 0, 9, 4, 0, 46, 91,
+    109, 101, 116, 104, 111, 100, 93, 111, 117, 116, 112, 117, 116, 45, 115, 116, 114, 101, 97,
+    109, 46, 98, 108, 111, 99, 107, 105, 110, 103, 45, 119, 114, 105, 116, 101, 45, 97, 110, 100,
+    45, 102, 108, 117, 115, 104, 1, 10]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 4: import wasi:io/streams@0.2.0
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_import, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 0, 21, 119, 97, 115, 105, 58, 105, 111, 47, 115, 116, 114, 101, 97, 109, 115, 64, 48, 46, 50, 46, 48, 5, 2]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 5: alias output-stream type from import 1
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 3, 0, 1, 13, 111, 117, 116, 112, 117, 116, 45, 115, 116, 114, 101, 97, 109]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 6: type — wasi:cli/stdout instance type (get-stdout func)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 66, 5, 2, 3, 2, 1, 3, 4, 0, 13, 111, 117, 116, 112, 117, 116, 45, 115, 116, 114, 101, 97,
+    109, 3, 0, 0, 1, 105, 1, 1, 64, 0, 0, 2, 4, 0, 10, 103, 101, 116, 45, 115, 116, 100, 111,
+    117, 116, 1, 3]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 7: import wasi:cli/stdout@0.2.0
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_import, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 0, 21, 119, 97, 115, 105, 58, 99, 108, 105, 47, 115, 116, 100, 111, 117, 116, 64, 48, 46, 50, 46, 48, 5, 4]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 8: alias get-stdout func (func 0) and write func (func 1) from component imports
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    2, 1, 0, 2, 10, 103, 101, 116, 45, 115, 116, 100, 111, 117, 116, 1, 0, 1, 46, 91, 109, 101,
+    116, 104, 111, 100, 93, 111, 117, 116, 112, 117, 116, 45, 115, 116, 114, 101, 97, 109, 46, 98,
+    108, 111, 99, 107, 105, 110, 103, 45, 119, 114, 105, 116, 101, 45, 97, 110, 100, 45, 102, 108,
+    117, 115, 104]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
 
-  // Alias section: core func (run) and core memory from instance 0
-  let %alias_sec = cm_wrap_section(section_id: wdefs.cm_sec_alias,
-                                    content: build_p2_alias_section(run_func_export))
-  let %out = bb.push_buf(%out, src: &alias_sec)
-  bb.free(buf: %alias_sec)
+  // Sec 9: core module 0 = stub (exports non-shared memory 256/65536).
+  // Non-shared is required for canon lower write (component model canonical ABI
+  // rejects shared memory as the memory option). Nexus in p2 builds uses a
+  // non-shared import as well (codegen sets p2_component:true in build_import_section).
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_core_module, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    0, 97, 115, 109, 1, 0, 0, 0, 5, 7, 1, 1, 128, 2, 128, 128, 4, 7, 10, 1, 6, 109, 101, 109, 111, 114, 121, 2, 0]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
 
-  // Component type section: result<none,none> and func()->result
-  let %type_sec = cm_wrap_section(section_id: wdefs.cm_sec_type, content: build_p2_type_section())
-  let %out = bb.push_buf(%out, src: &type_sec)
-  bb.free(buf: %type_sec)
+  // Sec 10: core module 1 = adapter (implements wasi_snapshot_preview1 via p2 imports)
+  // Imports: env.memory (non-shared 256/65536), p2.get-stdout ()->i32, p2.write (i32,i32,i32,i32)
+  // Exports: fd_write, proc_exit, environ_sizes_get, environ_get, args_sizes_get, args_get,
+  //          clock_time_get, fd_prestat_get, fd_prestat_dir_name, fd_close, fd_seek, fd_read,
+  //          path_open, poll_oneoff, fd_readdir, path_unlink_file, path_create_directory,
+  //          path_filestat_get, fd_filestat_get, fd_fdstat_get, random_get, sched_yield
+  // fd_seek signature: (fd:i32, offset:i64, whence:i32, newoffset_ptr:i32) -> errno:i32
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_core_module, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    0, 97, 115, 109, 1, 0, 0, 0, 1, 88, 12, 96, 0, 1, 127, 96, 4, 127, 127, 127, 127, 0, 96, 4,
+    127, 127, 127, 127, 1, 127, 96, 1, 127, 0, 96, 2, 127, 127, 1, 127, 96, 3, 127, 126, 127, 1,
+    127, 96, 3, 127, 127, 127, 1, 127, 96, 1, 127, 1, 127, 96, 4, 127, 126, 127, 127, 1, 127, 96,
+    9, 127, 127, 127, 127, 127, 126, 126, 127, 127, 1, 127, 96, 5, 127, 127, 127, 126, 127, 1,
+    127, 96, 5, 127, 127, 127, 127, 127, 1, 127, 2, 46, 3, 3, 101, 110, 118, 6, 109, 101, 109,
+    111, 114, 121, 2, 1, 128, 2, 128, 128, 4, 2, 112, 50, 10, 103, 101, 116, 45, 115, 116, 100,
+    111, 117, 116, 0, 0, 2, 112, 50, 5, 119, 114, 105, 116, 101, 0, 1, 3, 23, 22, 2, 3, 4, 4, 4,
+    4, 5, 4, 6, 7, 8, 2, 9, 6, 10, 6, 6, 11, 4, 4, 4, 0, 7, 208, 2, 22, 8, 102, 100, 95, 119,
+    114, 105, 116, 101, 0, 2, 9, 112, 114, 111, 99, 95, 101, 120, 105, 116, 0, 3, 17, 101, 110,
+    118, 105, 114, 111, 110, 95, 115, 105, 122, 101, 115, 95, 103, 101, 116, 0, 4, 11, 101, 110,
+    118, 105, 114, 111, 110, 95, 103, 101, 116, 0, 5, 14, 97, 114, 103, 115, 95, 115, 105, 122,
+    101, 115, 95, 103, 101, 116, 0, 6, 8, 97, 114, 103, 115, 95, 103, 101, 116, 0, 7, 14, 99,
+    108, 111, 99, 107, 95, 116, 105, 109, 101, 95, 103, 101, 116, 0, 8, 14, 102, 100, 95, 112,
+    114, 101, 115, 116, 97, 116, 95, 103, 101, 116, 0, 9, 19, 102, 100, 95, 112, 114, 101, 115,
+    116, 97, 116, 95, 100, 105, 114, 95, 110, 97, 109, 101, 0, 10, 8, 102, 100, 95, 99, 108, 111,
+    115, 101, 0, 11, 7, 102, 100, 95, 115, 101, 101, 107, 0, 12, 7, 102, 100, 95, 114, 101, 97,
+    100, 0, 13, 9, 112, 97, 116, 104, 95, 111, 112, 101, 110, 0, 14, 11, 112, 111, 108, 108, 95,
+    111, 110, 101, 111, 102, 102, 0, 15, 10, 102, 100, 95, 114, 101, 97, 100, 100, 105, 114, 0,
+    16, 16, 112, 97, 116, 104, 95, 117, 110, 108, 105, 110, 107, 95, 102, 105, 108, 101, 0, 17,
+    21, 112, 97, 116, 104, 95, 99, 114, 101, 97, 116, 101, 95, 100, 105, 114, 101, 99, 116, 111,
+    114, 121, 0, 18, 17, 112, 97, 116, 104, 95, 102, 105, 108, 101, 115, 116, 97, 116, 95, 103,
+    101, 116, 0, 19, 15, 102, 100, 95, 102, 105, 108, 101, 115, 116, 97, 116, 95, 103, 101, 116,
+    0, 20, 13, 102, 100, 95, 102, 100, 115, 116, 97, 116, 95, 103, 101, 116, 0, 21, 10, 114, 97,
+    110, 100, 111, 109, 95, 103, 101, 116, 0, 22, 11, 115, 99, 104, 101, 100, 95, 121, 105, 101,
+    108, 100, 0, 23, 10, 197, 1, 22, 91, 1, 5, 127, 16, 0, 33, 4, 65, 0, 33, 5, 2, 64, 3, 64,
+    32, 5, 32, 2, 79, 13, 1, 32, 1, 32, 5, 65, 8, 108, 106, 40, 2, 0, 33, 6, 32, 1, 32, 5, 65,
+    8, 108, 65, 4, 106, 106, 40, 2, 0, 33, 7, 32, 4, 32, 6, 32, 7, 65, 128, 128, 8, 16, 1, 32,
+    8, 32, 7, 106, 33, 8, 32, 5, 65, 1, 106, 33, 5, 12, 0, 11, 11, 32, 3, 32, 8, 54, 2, 0, 65,
+    0, 11, 3, 0, 0, 11, 4, 0, 65, 0, 11, 4, 0, 65, 0, 11, 4, 0, 65, 0, 11, 4, 0, 65, 0, 11, 4,
+    0, 65, 8, 11, 4, 0, 65, 8, 11, 4, 0, 65, 0, 11, 4, 0, 65, 0, 11, 4, 0, 65, 0, 11, 4, 0, 65,
+    8, 11, 4, 0, 65, 8, 11, 4, 0, 65, 8, 11, 4, 0, 65, 8, 11, 4, 0, 65, 8, 11, 4, 0, 65, 8, 11,
+    4, 0, 65, 8, 11, 4, 0, 65, 8, 11, 4, 0, 65, 0, 11, 4, 0, 65, 0, 11, 4, 0, 65, 0, 11]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
 
-  // Canon section: lift core func 0 with memory(0) to component func 0, type 1
-  let %canon_sec = cm_wrap_section(section_id: wdefs.cm_sec_canon,
-                                    content: build_p2_canon_lift_section(core_func_idx: 0, mem_idx: 0, type_idx: 1))
-  let %out = bb.push_buf(%out, src: &canon_sec)
-  bb.free(buf: %canon_sec)
+  // Sec 11: core module 2 = nexus core_wasm (dynamic)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_core_module, content: %core_wasm)
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
 
-  // Component instance section: {run = func 0}
-  let %inst2_sec = cm_wrap_section(section_id: wdefs.cm_sec_instance,
-                                    content: build_p2_instance_section(lift_func_idx: 0))
-  let %out = bb.push_buf(%out, src: &inst2_sec)
-  bb.free(buf: %inst2_sec)
+  // Sec 12: instantiate stub (module 0) with no args → core instance 0
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_core_instance,
+                            content: bb.push_bytes(buf: bb.empty(), bytes: [1, 0, 0, 0]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
 
-  // Component export section: wasi_iface = instance 0
-  let %export_sec = cm_wrap_section(section_id: wdefs.cm_sec_export,
-                                     content: build_p2_export_section(wasi_iface, instance_idx: 0))
-  let %out = bb.push_buf(%out, src: &export_sec)
-  bb.free(buf: %export_sec)
+  // Sec 13: canon lower get-stdout (component func 0) → core func 0
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_canon,
+                            content: bb.push_bytes(buf: bb.empty(), bytes: [1, 1, 0, 0, 0]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  // Sec 14: alias core memory from instance 0 → core memory 0
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias,
+                            content: bb.push_bytes(buf: bb.empty(), bytes: [1, 0, 2, 1, 0, 6, 109, 101, 109, 111, 114, 121]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  // Sec 15: canon lower write (component func 1) with memory 0 → core func 1
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_canon,
+                            content: bb.push_bytes(buf: bb.empty(), bytes: [1, 1, 0, 1, 1, 3, 0]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  // Sec 16: four core instances (1-4): stub-dup, from-exports, adapter, nexus
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_core_instance,
+                            content: build_p2_core_instance_section())
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  // Sec 17: alias run func from nexus instance (4) → core func 2
+  let %alias_body = bb.empty()
+  let %alias_body = bb.push_uleb128(buf: %alias_body, val: 1)
+  let %alias_body = bb.push_bytes(buf: %alias_body, bytes: [0, 0, 1, 4])
+  let %alias_body = bb.push_uleb128(buf: %alias_body, val: str.byte_length(s: run_func_export))
+  let %alias_body = bb.push_string(buf: %alias_body, s: run_func_export)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: %alias_body)
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  // Sec 18: component types: result<_,_> (type 5) and func()->result<_,_> (type 6)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type,
+                            content: bb.push_bytes(buf: bb.empty(), bytes: [2, 106, 0, 0, 64, 0, 0, 5]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  // Sec 19: canon lift core func 2 → component func 2, no options, type 6
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_canon,
+                            content: bb.push_bytes(buf: bb.empty(), bytes: [1, 0, 0, 2, 0, 6]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  // Sec 20: component instance {run: func 2}
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_instance,
+                            content: bb.push_bytes(buf: bb.empty(), bytes: [1, 1, 1, 0, 3, 114, 117, 110, 1, 2]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  // Sec 21: export wasi_iface = component instance 3
+  let %export_body = bb.empty()
+  let %export_body = bb.push_uleb128(buf: %export_body, val: 1)
+  let %export_body = bb.push_bytes(buf: %export_body, bytes: [0])
+  let %export_body = bb.push_uleb128(buf: %export_body, val: str.byte_length(s: wasi_iface))
+  let %export_body = bb.push_string(buf: %export_body, s: wasi_iface)
+  let %export_body = bb.push_bytes(buf: %export_body, bytes: [5, 3, 0])
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_export, content: %export_body)
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
 
   return %out
 end

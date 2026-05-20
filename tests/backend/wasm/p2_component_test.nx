@@ -1,17 +1,17 @@
 // Tests for the WASI preview2 component wrapper binary emitters.
 //
-// Verifies that build_p2_component and its sub-functions emit the correct
-// binary encoding according to the WebAssembly component model binary format.
+// Verifies that build_p2_component produces a structurally valid component
+// that contains the expected sections and strings.
 //
-// Preview2 component structure:
-//   component header (magic + cm_version)
-//   core module 0 (inline)
-//   core instance section: instantiate(module=0, args=[])
-//   alias section: core func "run_export" from inst 0; core memory "memory" from inst 0
-//   type section: result<none,none>; func()->type(0)
-//   canon section: lift(core_func=0, opts=[memory(0)], type=1)
-//   instance section: FromExports({run=func(0)})
-//   export section: wasi_iface = instance(0)
+// Preview2 component structure (22 sections):
+//   Secs 0-8: Component type/import/alias sections for WASI interfaces
+//   Sec 9:  core module 0 = stub (exports non-shared memory)
+//   Sec 10: core module 1 = adapter (implements wasi_snapshot_preview1 via p2)
+//   Sec 11: core module 2 = nexus core_wasm (dynamic)
+//   Sec 12-15: canon lower sections
+//   Sec 16: core instance section (4 instances)
+//   Sec 17: alias run func
+//   Sec 18-21: canon lift, instance, export
 
 import * as test_assert from "std:test/assert"
 import * as bb from "std:bytebuffer"
@@ -53,22 +53,9 @@ let list_length = fn (xs: [i64]) -> i64 do
   end
 end
 
-// Minimal core wasm: module with (func (result i32) (i32.const 0) end) + memory export.
-// Binary: magic(4) + version(4) + type_sec(5) + func_sec(3) + memory_sec(4)
-//         + export_sec(size) + code_sec(size)
-//
-// We embed a tiny but valid core wasm that exports:
-//   "wasi:cli/run@0.2.0#run" as func returning i32
-//   "memory" as memory
-//
-// Pre-computed bytes matching:
-// (module
-//   (type (func (result i32)))
-//   (func (type 0) i32.const 0)
-//   (memory 1)
-//   (export "memory" (memory 0))
-//   (export "wasi:cli/run@0.2.0#run" (func 0))
-// )
+// Minimal core wasm: a module that imports env.memory (non-shared, min=256 max=65536)
+// and exports "wasi:cli/run@0.2.6#run" as a func returning i32.
+// This mimics what nexus emits in p2 mode.
 let minimal_core_wasm = fn () -> %ByteBuffer do
   let %buf = bb.empty()
   // magic + version
@@ -77,16 +64,14 @@ let minimal_core_wasm = fn () -> %ByteBuffer do
   let %buf = bb.push_bytes(buf: %buf, bytes: [1, 5, 1, 96, 0, 1, 127])
   // func section: id=3, len=2, count=1, type_idx=0
   let %buf = bb.push_bytes(buf: %buf, bytes: [3, 2, 1, 0])
-  // memory section: id=5, len=3, count=1, flags=0 min=1
-  let %buf = bb.push_bytes(buf: %buf, bytes: [5, 3, 1, 0, 1])
-  // export section: id=7, count=2
-  //   "memory" (6 bytes) mem_kind=2 idx=0
-  //   "wasi:cli/run@0.2.0#run" (22 bytes) func_kind=0 idx=0
-  let %buf = bb.push_bytes(buf: %buf, bytes: [7, 36, 2])
-  let %buf = bb.push_bytes(buf: %buf, bytes: [6, 109, 101, 109, 111, 114, 121, 2, 0])
-  // 22-byte export name for "wasi:cli/run@0.2.0#run"
+  // import section: id=2, count=1: (import "env" "memory" (memory 256 65536))
+  // flags=0x01 (has-max, non-shared), min=256 (0x80 0x02), max=65536 (0x80 0x80 0x04)
+  let %buf = bb.push_bytes(buf: %buf, bytes: [2, 15, 1, 3, 101, 110, 118, 6, 109, 101, 109,
+                                              111, 114, 121, 2, 1, 128, 2, 128, 128, 4])
+  // export section: id=7, count=1: "wasi:cli/run@0.2.6#run" func 0
+  let %buf = bb.push_bytes(buf: %buf, bytes: [7, 26, 1])
   let %buf = bb.push_bytes(buf: %buf, bytes: [22, 119, 97, 115, 105, 58, 99, 108, 105, 47])
-  let %buf = bb.push_bytes(buf: %buf, bytes: [114, 117, 110, 64, 48, 46, 50, 46, 48, 35])
+  let %buf = bb.push_bytes(buf: %buf, bytes: [114, 117, 110, 64, 48, 46, 50, 46, 54, 35])
   let %buf = bb.push_bytes(buf: %buf, bytes: [114, 117, 110, 0, 0])
   // code section: id=10, len=6, count=1, func_len=4, 0 locals, i32.const 0, end
   return bb.push_bytes(buf: %buf, bytes: [10, 6, 1, 4, 0, 65, 0, 11])
@@ -120,7 +105,7 @@ let body = fn () -> unit throws { Exn } do
   let %component = build_p2_component(
     core_wasm: %core,
     wasi_iface: "wasi:cli/run@0.2.0",
-    run_func_export: "wasi:cli/run@0.2.0#run"
+    run_func_export: "wasi:cli/run@0.2.6#run"
   )
   let bytes = read_all(buf: &component)
   bb.free(buf: %component)
@@ -137,65 +122,60 @@ let body = fn () -> unit throws { Exn } do
   test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 6), expected: 1, label: "version[2]=0x01")
   test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 7), expected: 0, label: "version[3]=0x00")
 
-  // ── Check 2: core module section starts at byte 8 ──
-  // cm_sec_core_module = 1
-  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 8), expected: 1,
-    label: "byte 8 is core module section id (0x01)")
+  // ── Check 2: byte 8 is component type section (cm_sec_type = 7) ──
+  // The first section after the header is a component type section (WASI interfaces).
+  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 8), expected: 7,
+    label: "byte 8 is component type section id (0x07)")
 
-  // ── Check 3: core module embedded — starts with wasm magic ──
-  // core module section: id(1) + len(uleb) + core_bytes
-  // The core wasm magic is 0x00 0x61 0x73 0x6d, so starting at byte 10 (after id+1bytelen):
-  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 10), expected: 0, label: "core[0] = wasm magic 0x00")
-  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 11), expected: 97, label: "core[1] = wasm magic 0x61")
-  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 12), expected: 115, label: "core[2] = wasm magic 0x73")
-  test_assert.assert_eq_i64(actual: nth(xs: bytes, idx: 13), expected: 109, label: "core[3] = wasm magic 0x6d")
-
-  // ── Check 4: core instance section present (id=0x02) ──
-  // After the core module bytes comes the core instance section (id=2).
-  // We can find it by searching for the instantiate pattern: 02 04 01 00 00 00
-  // (section_id=2, len=4, count=1, kind=Instantiate(0), module_idx=0, arg_count=0)
+  // ── Check 3: component contains wasm magic in at least one embedded core module ──
+  // The stub module starts with wasm magic: 0x00 0x61 0x73 0x6d = 0 97 115 109
   test_assert.assert_true(
-    cond: find_subseq(haystack: bytes, needle: [2, 4, 1, 0, 0, 0]),
-    label: "component contains core instance section (02 04 01 00 00 00)")
+    cond: find_subseq(haystack: bytes, needle: [0, 97, 115, 109, 1, 0, 0, 0]),
+    label: "component contains embedded wasm magic (00 61 73 6d 01 00 00 00)")
 
-  // ── Check 5: alias section present (id=0x06) with func+memory aliases ──
-  // Alias for core memory "memory": 00 02 01 00 06 memory
-  // 06=len("memory"), then bytes for "memory" = 109 101 109 111 114 121
+  // ── Check 4: component contains "fd_write" string (in adapter module) ──
+  // "fd_write" ascii: 102 100 95 119 114 105 116 101
   test_assert.assert_true(
-    cond: find_subseq(haystack: bytes, needle: [0, 2, 1, 0, 6, 109, 101, 109, 111, 114, 121]),
-    label: "alias section contains memory alias entry (00 02 01 00 06 'memory')")
+    cond: find_subseq(haystack: bytes, needle: [102, 100, 95, 119, 114, 105, 116, 101]),
+    label: "component contains 'fd_write' string (adapter module)")
 
-  // ── Check 6: component type section (id=0x07) contains result<none,none> ──
+  // ── Check 5: component contains "get-stdout" string (p2 import name) ──
+  // "get-stdout" ascii: 103 101 116 45 115 116 100 111 117 116
+  test_assert.assert_true(
+    cond: find_subseq(haystack: bytes, needle: [103, 101, 116, 45, 115, 116, 100, 111, 117, 116]),
+    label: "component contains 'get-stdout' import name")
+
+  // ── Check 6: component type section contains result<none,none> ──
   // result<none,none> encoding: 0x6a 0x00 0x00 (106 0 0)
   test_assert.assert_true(
     cond: find_subseq(haystack: bytes, needle: [106, 0, 0]),
     label: "type section contains result<none,none> (6a 00 00)")
 
-  // ── Check 7: type section contains func()->type(0) ──
-  // func type encoding: 0x40 0x00 0x00 0x00 (64 0 0 0)
-  test_assert.assert_true(
-    cond: find_subseq(haystack: bytes, needle: [64, 0, 0, 0]),
-    label: "type section contains func()->result (40 00 00 00)")
-
-  // ── Check 8: canon lift present (0x00 0x00 discriminant) ──
-  // Lift entry: 00 00 00 01 03 00 01 (lift, core_func=0, 1 opt, memory=0, type=1)
-  test_assert.assert_true(
-    cond: find_subseq(haystack: bytes, needle: [0, 0, 0, 1, 3, 0, 1]),
-    label: "canon section contains lift entry (00 00 00 01 03 00 01)")
-
-  // ── Check 9: instance section (id=0x05) present with "run" export ──
-  // FromExports instance with "run": bytes for "run" = 114 117 110
-  test_assert.assert_true(
-    cond: find_subseq(haystack: bytes, needle: [114, 117, 110]),
-    label: "instance section contains 'run' export name")
-
-  // ── Check 10: component export section (id=0x0b=11) contains interface name ──
-  // "wasi:cli/run@0.2.0" = 18 bytes
-  // The name bytes: 119 97 115 105 58 99 108 105 47 114 117 110 64 48 46 50 46 48
+  // ── Check 7: component export section (id=0x0b=11) contains interface name ──
+  // "wasi:cli/run@0.2.0" = 18 bytes ascii
+  // bytes: 119 97 115 105 58 99 108 105 47 114 117 110 64 48 46 50 46 48
   test_assert.assert_true(
     cond: find_subseq(haystack: bytes, needle: [119, 97, 115, 105, 58, 99, 108, 105, 47,
                                                 114, 117, 110, 64, 48, 46, 50, 46, 48]),
     label: "export section contains 'wasi:cli/run@0.2.0' name")
+
+  // ── Check 8: component contains "run" export name (instance section) ──
+  // "run" ascii: 114 117 110
+  test_assert.assert_true(
+    cond: find_subseq(haystack: bytes, needle: [114, 117, 110]),
+    label: "instance section contains 'run' export name")
+
+  // ── Check 9: canon lower section present (cm_sec_canon = 8) ──
+  // Canon lower get-stdout: section_id=8, len=5, count=1, lower=1, func_idx=0, opts=0
+  test_assert.assert_true(
+    cond: find_subseq(haystack: bytes, needle: [8, 5, 1, 1, 0, 0, 0]),
+    label: "canon section contains lower(get-stdout) entry (08 05 01 01 00 00 00)")
+
+  // ── Check 10: core instance section present (cm_sec_core_instance = 2) ──
+  // The stub instantiation: section_id=2, len=4, count=1, kind=Instantiate(0)
+  test_assert.assert_true(
+    cond: find_subseq(haystack: bytes, needle: [2, 4, 1, 0, 0, 0]),
+    label: "component contains core instance section (02 04 01 00 00 00)")
 
   return ()
 end
