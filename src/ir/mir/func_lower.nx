@@ -1,0 +1,131 @@
+/**
+ * mir/func_lower: HIR function / handler lowering.
+ *
+ * Owns:
+ * - HirParam → MirParam conversion (lower_hir_params)
+ * - Single-function body lowering (lower_function)
+ * - Function-list lowering (lower_functions, lower_functions_go)
+ * - Handler-binding lowering (lower_handler_functions)
+ * - Handler-arm lowering with continuation binders (lower_arms_with_konts)
+ *
+ * All entry points that recurse into statement bodies receive
+ * `lower_stmts_fn` as a callback from mir.nx, where the authoritative
+ * `lower_stmts` definition lives.  This avoids a cyclic import
+ * (lower_stmts → lower_stmt → lower_expr → lower_stmts) while still
+ * keeping each function list-walker in a dedicated file.
+ *
+ * Extracted from src/ir/mir/mir.nx.
+ */
+
+import { HirFunction, HirHandlerBindingEntry, HirHandlerBinding, HirHandlerArm, HirParam, HirStmt, EagerBody, LazyBody } from "src/ir/hir/types.nx"
+import { MirParam, MirFunction, MirCtx, MirStmtsResult, LowerFunctionsResult, LowerFunctionResult } from "src/ir/mir/types.nx"
+import { MirError } from "src/ir/mir/errors.nx"
+import * as list from "std:list"
+
+let ctx_cont_binders = fn (ctx: MirCtx) -> [string] do
+  match ctx do | MirCtx(scope: _, cap_layouts: _, handler_cap_names: _, all_funcs: _, all_handlers: _, all_exts: _, closure_counter: _, lifted_funcs: _, cont_binders: cb, _) -> return cb end
+end
+
+let ctx_with_cont_binders = fn (ctx: MirCtx, binders: [string]) -> MirCtx do
+  match ctx do | MirCtx(scope: sc, cap_layouts: pl, handler_cap_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf, cont_binders: _, value_binding_names: vbns) ->
+    return MirCtx(scope: sc, cap_layouts: pl, handler_cap_names: hpn, all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf, cont_binders: binders, value_binding_names: vbns)
+  end
+end
+
+/** Push each element of `src` (in order) onto `dst`, reversing it. */
+let prepend_reversed = fn (src: [MirFunction], dst: [MirFunction]) -> [MirFunction] throws { MirError } do
+  match src do
+    | [] -> return dst
+    | x :: rest -> return prepend_reversed(src: rest, dst: x :: dst)
+  end
+end
+
+let rev_mir_funcs = fn (lst: [MirFunction], out: [MirFunction]) -> [MirFunction] throws { MirError } do
+  match lst do
+    | [] -> return out
+    | x :: rest -> return rev_mir_funcs(lst: rest, out: x :: out)
+  end
+end
+
+export let lower_hir_params = fn (params: [HirParam]) -> [MirParam] throws { MirError } do
+  return lower_hir_params_go(params, acc: [])
+end
+
+let lower_hir_params_go = fn (params: [HirParam], acc: [MirParam]) -> [MirParam] throws { MirError } do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | HirParam(label: l, name: n, sigil: _, typ: t) :: rest ->
+      return lower_hir_params_go(params: rest, acc: MirParam(label: l, name: n, typ: t) :: acc)
+  end
+end
+
+export let lower_function = fn (func: HirFunction, ctx: MirCtx,
+    lower_stmts_fn: (stmts: [HirStmt], ctx: MirCtx) -> MirStmtsResult throws { MirError }
+  ) -> LowerFunctionResult throws { MirError } do
+  let HirFunction(name: n, type_params: _, params: ps, ret_type: rt, throw_row: _, body: hir_body, span: sp, file: _, requires: _) = func
+  let body = match hir_body do | EagerBody(stmts: s) -> s | LazyBody(_) -> [] end
+  let mir_params = lower_hir_params(params: ps)
+  match lower_stmts_fn(stmts: body, ctx) do | MirStmtsResult(ctx: ctx2, stmts: mir_body) ->
+    return LowerFunctionResult(ctx: ctx2, func: MirFunction(name: n, params: mir_params, ret_type: rt, body: mir_body, span: sp))
+  end
+end
+
+export let lower_functions = fn (functions: [HirFunction], ctx: MirCtx,
+    lower_stmts_fn: (stmts: [HirStmt], ctx: MirCtx) -> MirStmtsResult throws { MirError }
+  ) -> LowerFunctionsResult throws { MirError } do
+  return lower_functions_go(functions, ctx, acc: [], lower_stmts_fn)
+end
+
+let lower_functions_go = fn (functions: [HirFunction], ctx: MirCtx, acc: [MirFunction],
+    lower_stmts_fn: (stmts: [HirStmt], ctx: MirCtx) -> MirStmtsResult throws { MirError }
+  ) -> LowerFunctionsResult throws { MirError } do
+  match functions do
+    | [] -> return LowerFunctionsResult(ctx, funcs: rev_mir_funcs(lst: acc, out: []))
+    | f :: rest ->
+      match lower_function(func: f, ctx, lower_stmts_fn) do | LowerFunctionResult(ctx: ctx2, func: mir_f) ->
+        return lower_functions_go(functions: rest, ctx: ctx2, acc: mir_f :: acc, lower_stmts_fn)
+      end
+  end
+end
+
+export let lower_handler_functions = fn (bindings: [HirHandlerBindingEntry], ctx: MirCtx,
+    lower_stmts_fn: (stmts: [HirStmt], ctx: MirCtx) -> MirStmtsResult throws { MirError }
+  ) -> LowerFunctionsResult throws { MirError } do
+  return lower_handler_functions_go(bindings, ctx, acc: [], lower_stmts_fn)
+end
+
+let lower_handler_functions_go = fn (bindings: [HirHandlerBindingEntry], ctx: MirCtx, acc: [MirFunction],
+    lower_stmts_fn: (stmts: [HirStmt], ctx: MirCtx) -> MirStmtsResult throws { MirError }
+  ) -> LowerFunctionsResult throws { MirError } do
+  match bindings do
+    | [] -> return LowerFunctionsResult(ctx, funcs: rev_mir_funcs(lst: acc, out: []))
+    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(cap_name: _, requires: _, arms)) :: rest ->
+      match lower_arms_with_konts(arms, ctx, lower_stmts_fn) do | LowerFunctionsResult(ctx: ctx2, funcs: lowered) ->
+        let new_acc = prepend_reversed(src: lowered, dst: acc)
+        return lower_handler_functions_go(bindings: rest, ctx: ctx2, acc: new_acc, lower_stmts_fn)
+      end
+  end
+end
+
+let lower_arms_with_konts = fn (arms: [HirHandlerArm], ctx: MirCtx,
+    lower_stmts_fn: (stmts: [HirStmt], ctx: MirCtx) -> MirStmtsResult throws { MirError }
+  ) -> LowerFunctionsResult throws { MirError } do
+  return lower_arms_with_konts_go(arms, ctx, acc: [], lower_stmts_fn)
+end
+
+let lower_arms_with_konts_go = fn (arms: [HirHandlerArm], ctx: MirCtx, acc: [MirFunction],
+    lower_stmts_fn: (stmts: [HirStmt], ctx: MirCtx) -> MirStmtsResult throws { MirError }
+  ) -> LowerFunctionsResult throws { MirError } do
+  match arms do
+    | [] -> return LowerFunctionsResult(ctx, funcs: rev_mir_funcs(lst: acc, out: []))
+    | HirHandlerArm(arm: f, cont_binder: kb) :: rest ->
+      let arm_ctx = match kb do
+        | Some(val: k) -> ctx_with_cont_binders(ctx, binders: [k])
+        | None -> ctx
+      end
+      match lower_function(func: f, ctx: arm_ctx, lower_stmts_fn) do | LowerFunctionResult(ctx: ctx2, func: mf) ->
+        let restored = ctx_with_cont_binders(ctx: ctx2, binders: ctx_cont_binders(ctx))
+        return lower_arms_with_konts_go(arms: rest, ctx: restored, acc: mf :: acc, lower_stmts_fn)
+      end
+  end
+end
