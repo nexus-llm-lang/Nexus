@@ -1178,6 +1178,33 @@ if [ "$TEST_MODE" = "1" ]; then
 
     # ── p2_component fixture ───────────────────────────────────────────
     if [ "$P2C" = "1" ]; then
+      # Parse optional per-fixture headers:
+      #   // p2c-env: KEY=VALUE   → passed as --env KEY=VALUE to wasmtime run
+      #   // expect-msg: TEXT     → TEXT must appear in stdout (substring match)
+      P2C_HEADER_TSV=$(awk "
+        /^[[:space:]]*\\/\\/[[:space:]]*p2c-env:/ {
+          sub(/^[[:space:]]*\\/\\/[[:space:]]*p2c-env:[[:space:]]*/, \"\")
+          print \"env\\t\" \$0
+          next
+        }
+        /^[[:space:]]*\\/\\/[[:space:]]*expect-msg:/ {
+          sub(/^[[:space:]]*\\/\\/[[:space:]]*expect-msg:[[:space:]]*/, \"\")
+          print \"msg\\t\" \$0
+          next
+        }
+        /^[[:space:]]*\$/ { next }
+        /^[[:space:]]*\\/\\// { next }
+        { exit }
+      " "$f")
+      P2C_ENV_FLAGS=""
+      IFS_BAK2=$IFS; IFS="
+"
+      for _kv in $(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^env\t/ { print \$2 }"); do
+        P2C_ENV_FLAGS="$P2C_ENV_FLAGS --env $_kv"
+      done
+      P2C_EXPECT_MSGS=$(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^msg\t/ { print \$2 }")
+      IFS=$IFS_BAK2
+
       t0=$(date +%s%N 2>/dev/null || date +%s000000000)
       if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
@@ -1203,21 +1230,45 @@ if [ "$TEST_MODE" = "1" ]; then
         if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
         exit 0
       fi
+      p2c_out=$(mktemp "${TMPDIR:-/tmp}/nexus-p2c-out.XXXXXX")
+      # shellcheck disable=SC2086
       if ! wasmtime run -W component-model=y,exceptions=y \
           --dir=. --dir="$scratch::/tmp" ${NEXUS_WASMTIME_ARGS:-} \
+          $P2C_ENV_FLAGS \
           "$wasm" \
-          >/dev/null 2>"$elog"; then
+          >"$p2c_out" 2>"$elog"; then
         t2=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t2 - t1) / 1000000 ))
         tail_txt="$(tail -16 "$elog" 2>/dev/null)"
         printf "FAIL\t%s\tp2c-run\t%s\t%s\n" "$ms" "$f" "$tail_txt" \
           > "$RESULTS_DIR/result_$idx.tsv"
         printf "FAIL  %s  (%sms, p2c-run)\n" "$f" "$ms" >&2
+        rm -f "$p2c_out"
         if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
         exit 0
       fi
       t2=$(date +%s%N 2>/dev/null || date +%s000000000)
       ms=$(( (t2 - t1) / 1000000 ))
+      # Check expect-msg substrings against stdout.
+      p2c_miss=""
+      IFS_BAK3=$IFS; IFS="
+"
+      for _sub in $P2C_EXPECT_MSGS; do
+        [ -z "$_sub" ] && continue
+        if ! grep -q -F -- "$_sub" "$p2c_out"; then
+          p2c_miss="$p2c_miss|$_sub"
+        fi
+      done
+      IFS=$IFS_BAK3
+      rm -f "$p2c_out"
+      if [ -n "$p2c_miss" ]; then
+        msg="missing substring(s) in p2c stdout: ${p2c_miss#|}"
+        printf "FAIL\t%s\tp2c-run\t%s\t%s\n" "$ms" "$f" "$msg" \
+          > "$RESULTS_DIR/result_$idx.tsv"
+        printf "FAIL  %s  (%sms, p2c-run, missing-substring)\n" "$f" "$ms" >&2
+        if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
+        exit 0
+      fi
       printf "PASS\t%s\tp2c\t%s\t-\n" "$ms" "$f" \
         > "$RESULTS_DIR/result_$idx.tsv"
       printf "PASS  %s  (%sms, p2c)\n" "$f" "$ms" >&2
