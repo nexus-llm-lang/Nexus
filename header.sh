@@ -1179,12 +1179,18 @@ if [ "$TEST_MODE" = "1" ]; then
     # ── p2_component fixture ───────────────────────────────────────────
     if [ "$P2C" = "1" ]; then
       # Parse optional per-fixture headers:
-      #   // p2c-env: KEY=VALUE   → passed as --env KEY=VALUE to wasmtime run
-      #   // expect-msg: TEXT     → TEXT must appear in stdout (substring match)
+      #   // p2c-env: KEY=VALUE          → passed as --env KEY=VALUE to wasmtime run
+      #   // p2c-dir: HOST_PATH::GUEST   → passed as --dir HOST_PATH::GUEST to wasmtime run
+      #   // expect-msg: TEXT            → TEXT must appear in stdout (substring match)
       P2C_HEADER_TSV=$(awk "
         /^[[:space:]]*\\/\\/[[:space:]]*p2c-env:/ {
           sub(/^[[:space:]]*\\/\\/[[:space:]]*p2c-env:[[:space:]]*/, \"\")
           print \"env\\t\" \$0
+          next
+        }
+        /^[[:space:]]*\\/\\/[[:space:]]*p2c-dir:/ {
+          sub(/^[[:space:]]*\\/\\/[[:space:]]*p2c-dir:[[:space:]]*/, \"\")
+          print \"dir\\t\" \$0
           next
         }
         /^[[:space:]]*\\/\\/[[:space:]]*expect-msg:/ {
@@ -1197,10 +1203,14 @@ if [ "$TEST_MODE" = "1" ]; then
         { exit }
       " "$f")
       P2C_ENV_FLAGS=""
+      P2C_DIR_FLAGS=""
       IFS_BAK2=$IFS; IFS="
 "
       for _kv in $(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^env\t/ { print \$2 }"); do
         P2C_ENV_FLAGS="$P2C_ENV_FLAGS --env $_kv"
+      done
+      for _dv in $(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^dir\t/ { print \$2 }"); do
+        P2C_DIR_FLAGS="$P2C_DIR_FLAGS --dir $_dv"
       done
       P2C_EXPECT_MSGS=$(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^msg\t/ { print \$2 }")
       IFS=$IFS_BAK2
@@ -1234,7 +1244,7 @@ if [ "$TEST_MODE" = "1" ]; then
       # shellcheck disable=SC2086
       if ! wasmtime run -W component-model=y,exceptions=y \
           --dir=. --dir="$scratch::/tmp" ${NEXUS_WASMTIME_ARGS:-} \
-          $P2C_ENV_FLAGS \
+          $P2C_ENV_FLAGS $P2C_DIR_FLAGS \
           "$wasm" \
           >"$p2c_out" 2>"$elog"; then
         t2=$(date +%s%N 2>/dev/null || date +%s000000000)
