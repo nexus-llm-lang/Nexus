@@ -1179,9 +1179,13 @@ if [ "$TEST_MODE" = "1" ]; then
     # ── p2_component fixture ───────────────────────────────────────────
     if [ "$P2C" = "1" ]; then
       # Parse optional per-fixture headers:
-      #   // p2c-env: KEY=VALUE          → passed as --env KEY=VALUE to wasmtime run
-      #   // p2c-dir: HOST_PATH::GUEST   → passed as --dir HOST_PATH::GUEST to wasmtime run
-      #   // expect-msg: TEXT            → TEXT must appear in stdout (substring match)
+      #   // p2c-env: KEY=VALUE              → passed as --env KEY=VALUE to wasmtime run
+      #   // p2c-dir: HOST_PATH::GUEST       → passed as --dir HOST_PATH::GUEST to wasmtime run
+      #   // p2c-http                        → passed as -S http to wasmtime run (wasi:http)
+      #   // p2c-http-serve: RELATIVE_DIR    → start python3 http.server on free port serving
+      #                                         RELATIVE_DIR; injects HTTP_TEST_PORT and
+      #                                         HTTP_TEST_URL env vars; implies p2c-http
+      #   // expect-msg: TEXT                → TEXT must appear in stdout (substring match)
       P2C_HEADER_TSV=$(awk "
         /^[[:space:]]*\\/\\/[[:space:]]*p2c-env:/ {
           sub(/^[[:space:]]*\\/\\/[[:space:]]*p2c-env:[[:space:]]*/, \"\")
@@ -1191,6 +1195,15 @@ if [ "$TEST_MODE" = "1" ]; then
         /^[[:space:]]*\\/\\/[[:space:]]*p2c-dir:/ {
           sub(/^[[:space:]]*\\/\\/[[:space:]]*p2c-dir:[[:space:]]*/, \"\")
           print \"dir\\t\" \$0
+          next
+        }
+        /^[[:space:]]*\\/\\/[[:space:]]*p2c-http-serve:/ {
+          sub(/^[[:space:]]*\\/\\/[[:space:]]*p2c-http-serve:[[:space:]]*/, \"\")
+          print \"http-serve\\t\" \$0
+          next
+        }
+        /^[[:space:]]*\\/\\/[[:space:]]*p2c-http/ {
+          print \"http\\t1\"
           next
         }
         /^[[:space:]]*\\/\\/[[:space:]]*expect-msg:/ {
@@ -1204,6 +1217,8 @@ if [ "$TEST_MODE" = "1" ]; then
       " "$f")
       P2C_ENV_FLAGS=""
       P2C_DIR_FLAGS=""
+      P2C_HTTP_FLAGS=""
+      P2C_HTTP_SERVER_PID=""
       IFS_BAK2=$IFS; IFS="
 "
       for _kv in $(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^env\t/ { print \$2 }"); do
@@ -1212,6 +1227,25 @@ if [ "$TEST_MODE" = "1" ]; then
       for _dv in $(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^dir\t/ { print \$2 }"); do
         P2C_DIR_FLAGS="$P2C_DIR_FLAGS --dir $_dv"
       done
+      if printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^http\t/" | grep -q .; then
+        P2C_HTTP_FLAGS="-S http"
+      fi
+      _p2c_serve_dir=$(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^http-serve\t/ { print \$2; exit }")
+      if [ -n "$_p2c_serve_dir" ]; then
+        P2C_HTTP_FLAGS="-S http"
+        # find a free port
+        _p2c_port=$(python3 -c "import socket; s=socket.socket(); s.bind((str(),0)); print(s.getsockname()[1]); s.close()")
+        python3 -m http.server "$_p2c_port" --directory "$_p2c_serve_dir" \
+          >/dev/null 2>/dev/null &
+        P2C_HTTP_SERVER_PID=$!
+        # wait for the server to be ready (max 3s)
+        _p2c_wait=0
+        until curl -sf "http://127.0.0.1:${_p2c_port}/" >/dev/null 2>&1 || [ "$_p2c_wait" -ge 30 ]; do
+          _p2c_wait=$((_p2c_wait + 1))
+          sleep 0.1
+        done
+        P2C_ENV_FLAGS="$P2C_ENV_FLAGS --env HTTP_TEST_PORT=${_p2c_port} --env HTTP_TEST_URL=http://127.0.0.1:${_p2c_port}"
+      fi
       P2C_EXPECT_MSGS=$(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^msg\t/ { print \$2 }")
       IFS=$IFS_BAK2
 
@@ -1244,7 +1278,7 @@ if [ "$TEST_MODE" = "1" ]; then
       # shellcheck disable=SC2086
       if ! wasmtime run -W component-model=y,exceptions=y \
           --dir=. --dir="$scratch::/tmp" ${NEXUS_WASMTIME_ARGS:-} \
-          $P2C_ENV_FLAGS $P2C_DIR_FLAGS \
+          $P2C_HTTP_FLAGS $P2C_ENV_FLAGS $P2C_DIR_FLAGS \
           "$wasm" \
           >"$p2c_out" 2>"$elog"; then
         t2=$(date +%s%N 2>/dev/null || date +%s000000000)
@@ -1254,6 +1288,7 @@ if [ "$TEST_MODE" = "1" ]; then
           > "$RESULTS_DIR/result_$idx.tsv"
         printf "FAIL  %s  (%sms, p2c-run)\n" "$f" "$ms" >&2
         rm -f "$p2c_out"
+        [ -n "$P2C_HTTP_SERVER_PID" ] && kill "$P2C_HTTP_SERVER_PID" 2>/dev/null; P2C_HTTP_SERVER_PID=""
         if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
         exit 0
       fi
@@ -1271,6 +1306,7 @@ if [ "$TEST_MODE" = "1" ]; then
       done
       IFS=$IFS_BAK3
       rm -f "$p2c_out"
+      [ -n "$P2C_HTTP_SERVER_PID" ] && kill "$P2C_HTTP_SERVER_PID" 2>/dev/null; P2C_HTTP_SERVER_PID=""
       if [ -n "$p2c_miss" ]; then
         msg="missing substring(s) in p2c stdout: ${p2c_miss#|}"
         printf "FAIL\t%s\tp2c-run\t%s\t%s\n" "$ms" "$f" "$msg" \

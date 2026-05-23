@@ -340,15 +340,33 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
         let expanded_fs = expand_groups_in_functions(funcs: resolved, groups: heg)
         let expanded_hb = expand_groups_in_handler_bindings(bindings: hb, groups: heg)
         let trimmed_reach = reach.collect_reachable_no_thread_start(functions: expanded_fs, handler_bindings: expanded_hb)
-        let final_fs = if reach.any_canonical_lazy_spawn(names: trimmed_reach) then expanded_fs
-          else reach.filter_reachable_functions(functions: expanded_fs, reachable: trimmed_reach)
+        // Compute which handler bindings are actually used — either via explicit
+        // `inject` stmts or via implicit cap method calls (Console.println, etc.)
+        // — starting from `main`.  This reachable set is used to:
+        //   1. Filter handler bindings for MIR: only used handlers' arm functions
+        //      are lowered, so their callees (w_fd_close, etc.) are transitively
+        //      included in final_reach and emitted by codegen.
+        //   2. Exclude host imports for capabilities never used (e.g.
+        //      `wasi_snapshot_preview1::http_request` when Net is unused).
+        // When lazy.spawn is active the WASI-threads plumbing must be live, so
+        // we fall back to the full seeded reachability for functions and use the
+        // full expanded_hb for MIR.
+        let has_lazy_spawn = reach.any_canonical_lazy_spawn(names: trimmed_reach)
+        let injected_reach = if has_lazy_spawn then trimmed_reach
+          else reach.collect_reachable_from_main(functions: expanded_fs, handler_bindings: expanded_hb)
         end
-        let final_reach = if reach.any_canonical_lazy_spawn(names: trimmed_reach) then
-            reach.collect_reachable(functions: final_fs, handler_bindings: expanded_hb)
-          else trimmed_reach
+        let injected_hb = if has_lazy_spawn then expanded_hb
+          else reach.filter_reachable_handler_bindings(bindings: expanded_hb, reachable: injected_reach)
+        end
+        let final_reach = if has_lazy_spawn then
+            reach.collect_reachable(functions: expanded_fs, handler_bindings: expanded_hb)
+          else reach.collect_reachable_no_thread_start(functions: expanded_fs, handler_bindings: injected_hb)
+        end
+        let final_fs = if has_lazy_spawn then expanded_fs
+          else reach.filter_reachable_functions(functions: expanded_fs, reachable: final_reach)
         end
         let filtered_exts = reach.filter_reachable_externals(externals: he, reachable: final_reach)
-        HirProgram(caps: hp, functions: final_fs, externals: filtered_exts, handler_bindings: expanded_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds, visible_enum_names: hven)
+        HirProgram(caps: hp, functions: final_fs, externals: filtered_exts, handler_bindings: injected_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds, visible_enum_names: hven)
     end
     let t4b = Clock.now()
     if verbose then Console.eprintln(val: "[nexus] resolve (" ++ str.from_i64(val: t4b - t4) ++ "ms)") end
@@ -464,8 +482,22 @@ let main = fn (args: [string]) -> unit require { PermClock, PermConsole, PermFs,
     if verbose then Console.eprintln(val: "[nexus] codegen (" ++ str.from_i64(val: t9 - t8c) ++ "ms)") end
 
     let CapsWriteResult(caps: caps, ok: ok) = if p2_component_enabled then
+        // Streaming heap-reset strategy (mirrors the P3 path):
+        // Writing the core wasm to a temp file before the heap_reset ensures
+        // the bytes survive the bump-pointer rewind.  After heap_reset the bump
+        // is back at pipeline_mark (~32 KB), giving the component-model builder
+        // ~211 MB of fresh arena instead of the ~0 MB left after a full
+        // compilation, which was causing silent memory.grow failures.
         let caps_now = find_main_caps(defs: get_defs(prog))
-        let ok_now = write_emit_p2_component(core_wasm: %wasm_buf, has_fs: list_has_str(xs: caps_now, s: "Fs"), has_net: list_has_str(xs: caps_now, s: "Net"), output_path)
+        let has_fs_now = list_has_str(xs: caps_now, s: "Fs")
+        let has_net_now = list_has_str(xs: caps_now, s: "Net")
+        let temp_core_path = output_path ++ ".core.tmp"
+        let _ = bb.write_file(buf: &wasm_buf, path: temp_core_path)
+        bb.free(buf: %wasm_buf)
+        arena.heap_reset(mark: pipeline_mark)
+        let %core_wasm_fresh = bb.read_binary_file(path: temp_core_path)
+        let ok_now = write_emit_p2_component(core_wasm: %core_wasm_fresh, has_fs: has_fs_now, has_net: has_net_now, output_path)
+        let _ = Fs.remove_file(path: temp_core_path)
         CapsWriteResult(caps: caps_now, ok: ok_now)
       else if p3_component_enabled then
         // Streaming component-model write: capture the raw wasm ptr/len, free the

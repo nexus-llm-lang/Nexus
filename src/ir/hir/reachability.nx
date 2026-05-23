@@ -193,6 +193,31 @@ export let collect_reachable_no_thread_start = fn (functions: [HirFunction], han
   return reachable_go(worklist, visited: [], seen: seen0, func_index, handler_bindings)
 end
 
+/** Reachability set starting only from `main` (no handler/trampoline seeds).
+ *  Used exclusively for filtering externals: a wasm import is kept only when
+ *  an actual call-path from `main` reaches the external's canonical name.
+ *
+ *  Why this differs from `collect_reachable_no_thread_start`:
+ *  - Handler seeds unconditionally mark every handler-arm body as reachable,
+ *    including handlers whose capability is never injected in the program.
+ *    For externals this is wrong: if `Net` is never injected, the
+ *    `http_request` wasm import must NOT appear in the binary (preview1
+ *    wasmtime cannot satisfy it).
+ *  - The Inject stmt collector already adds the handler binding name to
+ *    reachable when the capability IS injected, so programs that do inject
+ *    Net will transitively reach `http_request` via
+ *    find_calls_in_handlers → arm bodies → callee chain.
+ *  - `filter_reachable_functions` still uses the handler-seeded set so that
+ *    `__handler_*` functions and inject-targeted arm functions remain in the
+ *    final function list (they are needed by inject codegen even when DCE
+ *    prunes the handler binding name itself from the main-only reachable set).
+ */
+export let collect_reachable_from_main = fn (functions: [HirFunction], handler_bindings: [HirHandlerBindingEntry]) -> [string] do
+  let func_index = build_func_index(functions, acc: smap.empty())
+  let seen0: StrMap<i64> = smap.empty()
+  return reachable_go(worklist: ["main"], visited: [], seen: seen0, func_index, handler_bindings)
+end
+
 /** name → defining function, so worklist steps are a hash lookup rather than
  *  an O(|functions|) list scan. Later entries shadow earlier ones; the
  *  compiler has already rejected genuine duplicate definitions upstream.
@@ -333,13 +358,109 @@ let lookup_function = fn (name: string, functions: [HirFunction]) -> Option<HirF
   end
 end
 
+/** Check if `name` looks like a capability method call (`<module>#<Cap>.<method>`)
+ *  by testing whether any handler binding's cap_name is a prefix of `name`
+ *  followed by `.`.  Returns the method name substring on success, or "" on
+ *  failure (empty string is not a valid method name so it is safe as a sentinel).
+ */
+let detect_cap_method_call = fn (name: string, bindings: [HirHandlerBindingEntry]) -> string do
+  match bindings do
+    | [] -> return ""
+    | HirHandlerBindingEntry(name: _, binding: HirHandlerBinding(cap_name: cname, requires: _, arms: _)) :: rest ->
+      let prefix = cname ++ "."
+      let plen = str.length(s: prefix)
+      let nlen = str.length(s: name)
+      if nlen > plen && str.substring(s: name, start: 0, len: plen) == prefix then
+        return str.substring(s: name, start: plen, len: nlen - plen)
+      end
+      return detect_cap_method_call(name, bindings: rest)
+  end
+end
+
+/** When a name looks like a cap method call, find the handler arm for that cap+method
+ *  and return its function name plus body calls (so the worklist expands correctly).
+ */
+let find_arm_for_cap_method = fn (name: string, method_name: string, bindings: [HirHandlerBindingEntry]) -> [string] do
+  match bindings do
+    | [] -> return []
+    | HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(cap_name: cname, requires: _, arms)) :: rest ->
+      let prefix = cname ++ "."
+      let plen = str.length(s: prefix)
+      let nlen = str.length(s: name)
+      if nlen > plen && str.substring(s: name, start: 0, len: plen) == prefix then
+        let fs = arms_to_funcs(arms)
+        let arm_func = lookup_function_by_method(method_name, funcs: fs)
+        match arm_func do
+          | Some(val: HirFunction(name: arm_n, type_params: _, params: _, ret_type: _, throw_row: _, body: EagerBody(stmts: body), _)) ->
+            // Include the binding name (`bname`) so that
+            // `filter_reachable_handler_bindings` recognises this handler as
+            // used and keeps it in `injected_hb`.
+            return bname :: arm_n :: collect_calls_stmts(stmts: body)
+          | Some(val: HirFunction(name: arm_n, type_params: _, params: _, ret_type: _, throw_row: _, body: LazyBody(_), _)) ->
+            return bname :: arm_n :: []
+          | None ->
+            // The binding has this cap but no matching arm — skip and try next
+            return find_arm_for_cap_method(name, method_name, bindings: rest)
+        end
+      end
+      return find_arm_for_cap_method(name, method_name, bindings: rest)
+  end
+end
+
+/** Look up a handler arm function by its method name suffix.
+ *  Handler arm functions are named `__handler_<binding>_<method>`, so we
+ *  match by checking if the name ends with `_<method>`.
+ */
+let lookup_function_by_method = fn (method_name: string, funcs: [HirFunction]) -> Option<HirFunction> do
+  match funcs do
+    | [] -> return None
+    | f :: rest ->
+      let HirFunction(name: n, type_params: _, params: _, ret_type: _, _) = f
+      let suffix = "_" ++ method_name
+      if str_ends_with_suffix(s: n, suffix) then return Some(val: f)
+      else return lookup_function_by_method(method_name, funcs: rest)
+      end
+  end
+end
+
 let find_calls_in_handlers = fn (name: string, bindings: [HirHandlerBindingEntry]) -> [string] do
+  let result = find_calls_in_handlers_exact(name, bindings)
+  if str_list_nonempty(result) then return result end
+  // Last resort: check if `name` is a cap method call (e.g.
+  // `nxlib_stdlib_io_stdio_nx#Console.println`) and resolve to the
+  // corresponding handler arm.  This allows `collect_reachable_from_main`
+  // (which does not unconditionally seed all handler arms) to still follow
+  // cap calls that are not guarded by an explicit `inject` stmt (i.e.
+  // implicit Console / Fs / Clock usage).
+  let method = detect_cap_method_call(name, bindings)
+  if str.length(s: method) > 0 then
+    return find_arm_for_cap_method(name, method_name: method, bindings)
+  end
+  return []
+end
+
+let str_list_nonempty = fn (xs: [string]) -> bool do
+  match xs do
+    | [] -> return false
+    | _ -> return true
+  end
+end
+
+let find_calls_in_handlers_exact = fn (name: string, bindings: [HirHandlerBindingEntry]) -> [string] do
   match bindings do
     | [] -> return []
     | HirHandlerBindingEntry(name: bname, binding: HirHandlerBinding(cap_name: _, requires: _, arms)) :: rest ->
       let fs = arms_to_funcs(arms)
       if bname == name then
-        return collect_calls_functions(funcs: fs)
+        // When the handler BINDING name is looked up (e.g. because an `inject`
+        // stmt named it), add BOTH the arm function names AND the direct calls
+        // from arm bodies. The arm function names enter the worklist so that
+        // `reachable_go` can transitively walk their own bodies (via the `else`
+        // branch below), ensuring every callee of every arm — including
+        // externals like `w_fd_close` — reaches `visited`.
+        let func_names = collect_handler_func_names(funcs: fs)
+        let calls = collect_calls_functions(funcs: fs)
+        return concat_str_lists(a: func_names, b: calls)
       else
         let found = lookup_function(name, functions: fs)
         match found do
@@ -347,13 +468,20 @@ let find_calls_in_handlers = fn (name: string, bindings: [HirHandlerBindingEntry
             return collect_calls_stmts(stmts: body)
           | Some(val: HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: _, body: LazyBody(_), _)) ->
             return []
-          | None -> return find_calls_in_handlers(name, bindings: rest)
+          | None -> return find_calls_in_handlers_exact(name, bindings: rest)
         end
       end
   end
 end
 
-/** Filter functions to only reachable ones (plus __handler_* functions, always kept). */
+/** Filter functions to only reachable ones.
+ *  Handler arm functions (`__handler_*`) that are actually used will be in
+ *  `reachable` via the handler-binding seeds produced by
+ *  `collect_reachable_no_thread_start`; those for capabilities not in
+ *  `injected_hb` (e.g. Net when never injected) must NOT be kept, because
+ *  their callees (e.g. `w_http_request`, `exists_path`) will also be absent
+ *  from the filtered function list, causing E3001 at codegen.
+ */
 export let filter_reachable_functions = fn (functions: [HirFunction], reachable: [string]) -> [HirFunction] do
   return filter_reachable_functions_go(functions, reachable, acc: [])
 end
@@ -363,10 +491,34 @@ let filter_reachable_functions_go = fn (functions: [HirFunction], reachable: [st
     | [] -> return list.reverse(xs: acc)
     | f :: rest ->
       let HirFunction(name: n, type_params: _, params: _, ret_type: _, _) = f
-      if str_in_list(s: n, xs: reachable) || str.starts_with(s: n, prefix: "__handler_") then
+      if str_in_list(s: n, xs: reachable) then
         return filter_reachable_functions_go(functions: rest, reachable, acc: f :: acc)
       else
         return filter_reachable_functions_go(functions: rest, reachable, acc)
+      end
+  end
+end
+
+/** Filter handler bindings to those whose binding name appears in `reachable`.
+ *  Used to restrict `lower_handler_functions` to only handlers that are
+ *  actually injected (directly or transitively) from `main`, so that
+ *  handler arm functions for uninvoked capabilities (e.g. Net when the
+ *  program never injects Net) are not emitted — avoiding unsatisfied WASM
+ *  imports (e.g. `wasi_snapshot_preview1::http_request`) in preview1 builds.
+ */
+export let filter_reachable_handler_bindings = fn (bindings: [HirHandlerBindingEntry], reachable: [string]) -> [HirHandlerBindingEntry] do
+  return filter_reachable_handler_bindings_go(bindings, reachable, acc: [])
+end
+
+let filter_reachable_handler_bindings_go = fn (bindings: [HirHandlerBindingEntry], reachable: [string], acc: [HirHandlerBindingEntry]) -> [HirHandlerBindingEntry] do
+  match bindings do
+    | [] -> return list.reverse(xs: acc)
+    | b :: rest ->
+      let HirHandlerBindingEntry(name: n, binding: _) = b
+      if str_in_list(s: n, xs: reachable) then
+        return filter_reachable_handler_bindings_go(bindings: rest, reachable, acc: b :: acc)
+      else
+        return filter_reachable_handler_bindings_go(bindings: rest, reachable, acc)
       end
   end
 end
@@ -386,8 +538,15 @@ let filter_reachable_externals_go = fn (externals: [HirExternal], reachable: [st
   match externals do
     | [] -> return list.reverse(xs: acc)
     | e :: rest ->
-      let HirExternal(name: n, wasm_module: _, wasm_name: _, type_params: _, params: _, ret_type: _, throw_row: _) = e
-      if str_in_list(s: n, xs: reachable) then
+      let HirExternal(name: n, wasm_module: m, wasm_name: _, type_params: _, params: _, ret_type: _, throw_row: _) = e
+      // nexus:intrinsic and nexus:runtime/* externals are emitted as inline WASM
+      // instructions by codegen rather than as host imports; they must always be
+      // kept in filtered_exts so codegen can register them in the external_func_map
+      // for emit_atom_var name lookups. Reachability filtering applies only to
+      // genuine host imports (wasi_snapshot_preview1, etc.) where emitting an
+      // unsatisfied import prevents wasmtime instantiation.
+      let is_intrinsic = m == "nexus:intrinsic" || str.starts_with(s: m, prefix: "nexus:runtime/") || str.starts_with(s: m, prefix: "nexus:std/")
+      if is_intrinsic || str_in_list(s: n, xs: reachable) then
         return filter_reachable_externals_go(externals: rest, reachable, acc: e :: acc)
       else
         return filter_reachable_externals_go(externals: rest, reachable, acc)
