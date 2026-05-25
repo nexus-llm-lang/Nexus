@@ -1,0 +1,358 @@
+/**
+ * wasm/section/p2/assembly: WASI preview2 top-level component assembler.
+ *
+ * Contains build_p2_component (the entry point) and the supporting helpers
+ * for alias, type, canon-lift, instance, and export sections that finalize
+ * the component binary after all subsystem sections are assembled.
+ */
+
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import * as str from "std:str"
+import * as wdefs from "src/backend/wasm/defs.nx"
+import { cm_wrap_section } from "src/backend/wasm/section/cm_common.nx"
+import { p2_build_wasi_header_sections } from "src/backend/wasm/section/p2/wasi_header.nx"
+import { p2_build_fs_sections } from "src/backend/wasm/section/p2/fs.nx"
+import { p2_build_http_sections } from "src/backend/wasm/section/p2/http.nx"
+import { p2_build_socket_sections } from "src/backend/wasm/section/p2/socket.nx"
+import { p2_build_core_modules } from "src/backend/wasm/section/p2/core_modules.nx"
+import { p2_build_canon_lower } from "src/backend/wasm/section/p2/canon_lower.nx"
+import { build_p2_core_instance_section } from "src/backend/wasm/section/p2/core_instance.nx"
+
+
+/** Build a core alias entry for a function export from a core instance.
+ *  Encoding: 0x00(CoreInstanceExport) 0x00(Func) 0x01(ExportAlias) instance_idx name
+ */
+let p2_alias_core_func_entry = fn (instance_idx: i64, name: string) -> %ByteBuffer do
+  let %out = bb.empty()
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 0, 1])
+  let %out = bb.push_uleb128(buf: %out, val: instance_idx)
+  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: name))
+  return bb.push_string(buf: %out, s: name)
+end
+
+/** Build a core alias entry for a memory export from a core instance.
+ *  Encoding: 0x00(CoreInstanceExport) 0x02(Memory) 0x01(ExportAlias) instance_idx name
+ */
+let p2_alias_core_memory_entry = fn (instance_idx: i64, name: string) -> %ByteBuffer do
+  let %out = bb.empty()
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 2, 1])
+  let %out = bb.push_uleb128(buf: %out, val: instance_idx)
+  let %out = bb.push_uleb128(buf: %out, val: str.byte_length(s: name))
+  return bb.push_string(buf: %out, s: name)
+end
+
+/** Build the alias section aliasing a core func and core memory from core instance 0.
+ *  run_func_export is the wasm export name of the run entry point (e.g. "wasi:cli/run@0.2.0#run").
+ */
+let build_p2_alias_section = fn (run_func_export: string) -> %ByteBuffer do
+  let %fn_entry = p2_alias_core_func_entry(instance_idx: 0, name: run_func_export)
+  let %mem_entry = p2_alias_core_memory_entry(instance_idx: 0, name: "memory")
+  let %out = bb.empty()
+  let %out = bb.push_uleb128(buf: %out, val: 2)
+  let %out = bb.push_buf(buf: %out, src: &fn_entry)
+  bb.free(buf: %fn_entry)
+  let %out = bb.push_buf(buf: %out, src: &mem_entry)
+  bb.free(buf: %mem_entry)
+  return %out
+end
+
+/** Build the component type section for the WASI run interface:
+ *  type 0 = result<none,none>       (0x6a 0x00 0x00)
+ *  type 1 = func() -> type(0)       (0x40 0x00 0x00 0x00)
+ *
+ *  0x6a = component defined-type: result
+ *  0x40 = component functype
+ *  param-count=0 then result-discriminant=0x00 (single unnamed result) + type_idx=0
+ */
+let build_p2_type_section = fn () -> %ByteBuffer do
+  let %out = bb.empty()
+  let %out = bb.push_uleb128(buf: %out, val: 2)
+  let %out = bb.push_bytes(buf: %out, bytes: [106, 0, 0])
+  let %out = bb.push_bytes(buf: %out, bytes: [64, 0, 0, 0])
+  return %out
+end
+
+/** Build the canonical function section lifting one core func as a component func.
+ *  core_func_idx: the aliased core function index
+ *  mem_idx: the aliased core memory index
+ *  type_idx: the component type index for the lifted function
+ *
+ *  Encoding: count=1, [0x00 0x00] core_func_idx opt_count [0x03 mem_idx] type_idx
+ *  The two leading 0x00 bytes are the canon lift discriminant in the component model binary.
+ */
+let build_p2_canon_lift_section = fn (core_func_idx: i64, mem_idx: i64, type_idx: i64) -> %ByteBuffer do
+  let %out = bb.empty()
+  let %out = bb.push_uleb128(buf: %out, val: 1)
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 0])
+  let %out = bb.push_uleb128(buf: %out, val: core_func_idx)
+  let %out = bb.push_uleb128(buf: %out, val: 1)
+  let %out = bb.push_bytes(buf: %out, bytes: [3])
+  let %out = bb.push_uleb128(buf: %out, val: mem_idx)
+  return bb.push_uleb128(buf: %out, val: type_idx)
+end
+
+/** Build the component instance section exporting a single func as "run".
+ *  lift_func_idx is the component-level func index (the canon-lifted run function).
+ *
+ *  Encoding: count=1, kind=FromExports(0x01), export_count=1,
+ *  [0x00 name(3,"run") sort=func(0x01) idx]
+ *  The 0x00 before name is the externname URL-option byte (absent = 0x00).
+ */
+let build_p2_instance_section = fn (lift_func_idx: i64) -> %ByteBuffer do
+  let %out = bb.empty()
+  let %out = bb.push_uleb128(buf: %out, val: 1)
+  let %out = bb.push_bytes(buf: %out, bytes: [1, 1, 0, 3])
+  let %out = bb.push_string(buf: %out, s: "run")
+  let %out = bb.push_byte(buf: %out, byte: 1)
+  return bb.push_uleb128(buf: %out, val: lift_func_idx)
+end
+
+
+// 8-way helpers for p2_build_alias_type_canon index selection.
+// Using early returns avoids nested if-else-end which Nexus can't parse.
+let p2_nexus_alias_inst = fn (has_fs: bool, has_net: bool, has_server: bool) -> i64 do
+  // no-fs+no-net=9, has-fs+no-net=11
+  // no-fs+has-net+no-srv=11, no-fs+has-net+has-srv=13
+  // has-fs+has-net+no-srv=13, has-fs+has-net+has-srv=15
+  // (has-server adds +2 core instances: p2sock_raw + p2sock)
+  if has_fs then
+    if has_net then
+      if has_server then return 15 end
+      return 13
+    end
+    return 11
+  end
+  if has_net then
+    if has_server then return 13 end
+    return 11
+  end
+  return 9
+end
+
+let p2_result_type_byte = fn (has_fs: bool, has_net: bool, has_server: bool) -> i64 do
+  // Byte for result type index:
+  // no-fs+no-net=11, has-fs+no-net=15
+  // no-fs+has-net+no-srv=19, no-fs+has-net+has-srv=33
+  // has-fs+has-net+no-srv=23, has-fs+has-net+has-srv=37
+  // has-server adds +14 (socket type/alias sections); has-net+no-srv adds +8 (http sections).
+  if has_fs then
+    if has_net then
+      if has_server then return 37 end
+      return 23
+    end
+    return 15
+  end
+  if has_net then
+    if has_server then return 33 end
+    return 19
+  end
+  return 11
+end
+
+let p2_canon_lift_bytes_nofs_nonet = fn () -> %ByteBuffer do
+  return bb.push_bytes(buf: bb.empty(), bytes: [1, 0, 0, 10, 0, 12])
+end
+let p2_canon_lift_bytes_nofs_hasnet_nosrv = fn () -> %ByteBuffer do
+  // no-fs+has-net+no-server: core func 22 = run, result type=19, func type=20.
+  // base10 + http12 = 22; no socket canon lowers.
+  return bb.push_bytes(buf: bb.empty(), bytes: [1, 0, 0, 22, 0, 20])
+end
+let p2_canon_lift_bytes_nofs_hasnet_hassrv = fn () -> %ByteBuffer do
+  // no-fs+has-net+has-server: core func 37 = run, lifted as comp func 21 using type 34.
+  // base10 + http12 + sock15 = 37; result type=33, func type=34.
+  return bb.push_bytes(buf: bb.empty(), bytes: [1, 0, 0, 37, 0, 34])
+end
+let p2_canon_lift_bytes_hasfs_nonet = fn () -> %ByteBuffer do
+  // has-fs+no-net: core func 18 = run, lifted as comp func 17 using type 16.
+  // +2 core funcs from readdir (read-directory + read-directory-entry canon lowers).
+  return bb.push_bytes(buf: bb.empty(), bytes: [1, 0, 0, 18, 0, 16])
+end
+let p2_canon_lift_bytes_hasfs_hasnet_nosrv = fn () -> %ByteBuffer do
+  // has-fs+has-net+no-server: core func 30 = run, result type=23, func type=24.
+  // base10 + fs8 + http12 = 30; no socket canon lowers.
+  return bb.push_bytes(buf: bb.empty(), bytes: [1, 0, 0, 30, 0, 24])
+end
+let p2_canon_lift_bytes_hasfs_hasnet_hassrv = fn () -> %ByteBuffer do
+  // has-fs+has-net+has-server: core func 45 = run, lifted as comp func 29 using type 38.
+  // base10 + fs8 + http12 + sock15 = 45; result type=37, func type=38.
+  return bb.push_bytes(buf: bb.empty(), bytes: [1, 0, 0, 45, 0, 38])
+end
+
+let p2_run_inst_byte = fn (has_fs: bool, has_net: bool, has_server: bool) -> i64 do
+  // Comp lift func index:
+  // no-fs+no-net=9, has-fs+no-net=17
+  // no-fs+has-net+no-srv=21, no-fs+has-net+has-srv=31
+  // has-fs+has-net+no-srv=29, has-fs+has-net+has-srv=39
+  // has-fs updated +2 for readdir's extra canon lowers; has-server adds +10 over no-server.
+  if has_fs then
+    if has_net then
+      if has_server then return 39 end
+      return 29
+    end
+    return 17
+  end
+  if has_net then
+    if has_server then return 31 end
+    return 21
+  end
+  return 9
+end
+
+// Emit canon lift section for run func using has_fs/has_net/has_server dispatch.
+// Avoids nested if-else-end which Nexus parser rejects.
+let p2_build_alias_canon_lift_section = fn (has_fs: bool, has_net: bool, has_server: bool, base: %ByteBuffer) -> %ByteBuffer do
+  if has_fs then
+    if has_net then
+      if has_server then
+        let %lb = p2_canon_lift_bytes_hasfs_hasnet_hassrv()
+        let %sc = cm_wrap_section(section_id: wdefs.cm_sec_canon, content: %lb)
+        let %o = bb.push_buf(buf: %base, src: &sc)
+        bb.free(buf: %sc)
+        return %o
+      end
+      let %lb = p2_canon_lift_bytes_hasfs_hasnet_nosrv()
+      let %sc = cm_wrap_section(section_id: wdefs.cm_sec_canon, content: %lb)
+      let %o = bb.push_buf(buf: %base, src: &sc)
+      bb.free(buf: %sc)
+      return %o
+    end
+    let %lb = p2_canon_lift_bytes_hasfs_nonet()
+    let %sc = cm_wrap_section(section_id: wdefs.cm_sec_canon, content: %lb)
+    let %o = bb.push_buf(buf: %base, src: &sc)
+    bb.free(buf: %sc)
+    return %o
+  end
+  if has_net then
+    if has_server then
+      let %lb = p2_canon_lift_bytes_nofs_hasnet_hassrv()
+      let %sc = cm_wrap_section(section_id: wdefs.cm_sec_canon, content: %lb)
+      let %o = bb.push_buf(buf: %base, src: &sc)
+      bb.free(buf: %sc)
+      return %o
+    end
+    let %lb = p2_canon_lift_bytes_nofs_hasnet_nosrv()
+    let %sc = cm_wrap_section(section_id: wdefs.cm_sec_canon, content: %lb)
+    let %o = bb.push_buf(buf: %base, src: &sc)
+    bb.free(buf: %sc)
+    return %o
+  end
+  let %lb = p2_canon_lift_bytes_nofs_nonet()
+  let %sc = cm_wrap_section(section_id: wdefs.cm_sec_canon, content: %lb)
+  let %o = bb.push_buf(buf: %base, src: &sc)
+  bb.free(buf: %sc)
+  return %o
+end
+
+let p2_export_inst_byte = fn (has_fs: bool, has_net: bool, has_server: bool) -> i64 do
+  // Export inst idx:
+  // no-fs+no-net=8, has-fs+no-net=10
+  // no-fs+has-net+no-srv=11, no-fs+has-net+has-srv=15
+  // has-fs+has-net+no-srv=13, has-fs+has-net+has-srv=17
+  // has-server adds +4 comp instances (wasi:sockets/{network,instance-network,tcp,tcp-create-socket}).
+  if has_fs then
+    if has_net then
+      if has_server then return 17 end
+      return 13
+    end
+    return 10
+  end
+  if has_net then
+    if has_server then return 15 end
+    return 11
+  end
+  return 8
+end
+
+// Builds alias + type + canon-lift + instance sections (first half of lift+export).
+let p2_build_alias_type_canon = fn (has_fs: bool, has_net: bool, has_server: bool, run_func_export: string, base: %ByteBuffer) -> %ByteBuffer do
+  // Alias run func from nexus instance.
+  // 8-way index: no-fs+no-net=9, no-fs+has-net+no-srv=11, no-fs+has-net+has-srv=13, etc.
+  let nexus_inst = p2_nexus_alias_inst(has_fs, has_net, has_server)
+  let %alias_body = bb.empty()
+  let %alias_body = bb.push_uleb128(buf: %alias_body, val: 1)
+  let %alias_body = bb.push_bytes(buf: %alias_body, bytes: [0, 0, 1])
+  let %alias_body = bb.push_uleb128(buf: %alias_body, val: nexus_inst)
+  let %alias_body = bb.push_uleb128(buf: %alias_body, val: str.byte_length(s: run_func_export))
+  let %alias_body = bb.push_string(buf: %alias_body, s: run_func_export)
+  let %sa = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: %alias_body)
+  let %out = bb.push_buf(buf: %base, src: &sa)
+  bb.free(buf: %sa)
+
+  // Component types: result<_,_> and func()->result<_,_>.
+  // 8-way result type idx.
+  let result_type_byte = p2_result_type_byte(has_fs, has_net, has_server)
+  let %type_body = bb.push_bytes(buf: bb.empty(), bytes: [2, 106, 0, 0, 64, 0, 0])
+  let %type_body = bb.push_uleb128(buf: %type_body, val: result_type_byte)
+  let %st = cm_wrap_section(section_id: wdefs.cm_sec_type, content: %type_body)
+  let %out = bb.push_buf(buf: %out, src: &st)
+  bb.free(buf: %st)
+
+  // Canon lift run core func → component func (8-way).
+  // Use p2_build_alias_canon_lift_section to avoid nested if-else-end which Nexus can't parse.
+  let %out = p2_build_alias_canon_lift_section(has_fs, has_net, has_server, base: %out)
+
+  // Component instance {run: comp lift func idx} (8-way).
+  let run_inst_byte = p2_run_inst_byte(has_fs, has_net, has_server)
+  let %inst_body = bb.push_bytes(buf: bb.empty(), bytes: [1, 1, 1, 0, 3, 114, 117, 110, 1])
+  let %inst_body = bb.push_uleb128(buf: %inst_body, val: run_inst_byte)
+  let %si = cm_wrap_section(section_id: wdefs.cm_sec_instance, content: %inst_body)
+  let %out = bb.push_buf(buf: %out, src: &si)
+  bb.free(buf: %si)
+
+  return %out
+end
+
+// Builds export section and assembles the full lift+export result.
+let p2_build_instance_lift_export = fn (has_fs: bool, has_net: bool, has_server: bool, wasi_iface: string, run_func_export: string) -> %ByteBuffer do
+  // Sec 39: core instances — 8-way count based on has_fs×has_net×has_server.
+  let %core_inst_content = build_p2_core_instance_section(has_fs: has_fs, has_net: has_net, has_server: has_server)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_core_instance, content: %core_inst_content)
+  let %out = bb.empty()
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  let %out = p2_build_alias_type_canon(has_fs: has_fs, has_net: has_net, has_server: has_server, run_func_export: run_func_export, base: %out)
+
+  // Export wasi_iface = locally created component instance.
+  // 8-way export inst idx.
+  let export_idx = p2_export_inst_byte(has_fs, has_net, has_server)
+  let %export_body = bb.empty()
+  let %export_body = bb.push_uleb128(buf: %export_body, val: 1)
+  let %export_body = bb.push_bytes(buf: %export_body, bytes: [0])
+  let %export_body = bb.push_uleb128(buf: %export_body, val: str.byte_length(s: wasi_iface))
+  let %export_body = bb.push_string(buf: %export_body, s: wasi_iface)
+  let %export_body = bb.push_bytes(buf: %export_body, bytes: [5])
+  let %export_body = bb.push_uleb128(buf: %export_body, val: export_idx)
+  let %export_body = bb.push_bytes(buf: %export_body, bytes: [0])
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_export, content: %export_body)
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  return %out
+end
+
+// has_server: when true, add wasi:sockets TCP component imports and p2sock_bridge.
+// Set only when core wasm imports http_listen (Net.listen/accept/respond/stop path).
+// Net.get-only programs (has_net=true, has_server=false) omit socket sections.
+export let build_p2_component = fn (core_wasm: %ByteBuffer, wasi_iface: string, run_func_export: string, has_fs: bool, has_net: bool, has_server: bool) -> %ByteBuffer do
+  let %wasi = p2_build_wasi_header_sections()
+  let %fs = p2_build_fs_sections(has_fs)
+  let %http = p2_build_http_sections(has_fs, has_net)
+  let %sock = p2_build_socket_sections(has_fs, has_server)
+  let %mods = p2_build_core_modules(core_wasm: %core_wasm, has_fs, has_net, has_server)
+  let %canon_lo = p2_build_canon_lower(has_fs, has_net, has_server)
+  let %canon_hi = p2_build_instance_lift_export(has_fs, has_net, has_server, wasi_iface, run_func_export)
+  let %out = bb.push_buf(buf: %wasi, src: &fs)
+  bb.free(buf: %fs)
+  let %out = bb.push_buf(buf: %out, src: &http)
+  bb.free(buf: %http)
+  let %out = bb.push_buf(buf: %out, src: &sock)
+  bb.free(buf: %sock)
+  let %out = bb.push_buf(buf: %out, src: &mods)
+  bb.free(buf: %mods)
+  let %out = bb.push_buf(buf: %out, src: &canon_lo)
+  bb.free(buf: %canon_lo)
+  let %out = bb.push_buf(buf: %out, src: &canon_hi)
+  bb.free(buf: %canon_hi)
+  return %out
+end

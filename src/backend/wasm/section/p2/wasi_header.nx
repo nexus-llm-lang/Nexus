@@ -1,0 +1,291 @@
+/**
+ * wasm/section/p2/wasi_header: WASI preview2 component header sections.
+ *
+ * Builds the component header, type imports, alias, and instance sections
+ * for the WASI preview2 standard interfaces (stdout, stdin, exit, clock,
+ * random, environment).  Called first by build_p2_component.
+ */
+
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import * as wdefs from "src/backend/wasm/defs.nx"
+import { cm_wrap_section } from "src/backend/wasm/section/cm_common.nx"
+
+/** Build a minimal WASI preview2 component wrapping `core_wasm`.
+ *
+ *  The component structure:
+ *    Secs 0-8:   WASI stdout interfaces (wasi:io/error, unified wasi:io/streams,
+ *               wasi:cli/stdout) — types 0-5, component instances 0-2, comp funcs 0-1.
+ *               Sec 5 aliases BOTH output-stream (type 3) and input-stream (type 4) from
+ *               the single unified io/streams import.
+ *    Secs 9-14: WASI exit+clock interfaces (wasi:cli/exit, wasi:clocks/monotonic-clock).
+ *    Secs 15-20: WASI random+stdin interfaces (wasi:random/random, wasi:cli/stdin) —
+ *               types 8-9, component instances 5-6, comp funcs 4-6.
+ *    Sec  21: Core module 0 = stub (exports memory + cabi_realloc bump allocator).
+ *    Sec  22: Core module 1 = adapter (wasi_snapshot_preview1 via p2+p2ext).
+ *    Sec  23: Core module 2 = p2ext (bridges canon-lowered p2 funcs to adapter).
+ *    Sec  24: Core module 3 = nexus core_wasm (dynamic).
+ *    Sec  25: Instantiate stub → core instance 0.
+ *    Sec  26: Canon lower get-stdout → core func 0.
+ *    Sec  27: Alias core memory from instance 0 → core memory 0.
+ *    Sec  28: Canon lower write with memory 0 → core func 1.
+ *    Sec  29: Canon lower exit → core func 2.
+ *    Sec  30: Canon lower now → core func 3.
+ *    Sec  31: Alias cabi_realloc from stub → core func 4.
+ *    Sec  32: Canon lower get-random-bytes with mem=0, realloc=4 → core func 5.
+ *    Sec  33: Canon lower blocking-read with mem=0, realloc=4 → core func 6.
+ *    Sec  34: Canon lower get-stdin → core func 7.
+ *    Sec  35: Eight core instances (1-8): stub-dup, p2, p2ext_raw, p2rand, p2stdin,
+ *             p2ext, adapter, nexus.
+ *    Sec  36: Alias run func from nexus (instance 8) → core func 8.
+ *    Sec  37: Component types: result<_,_> + func()->result (types 10,11).
+ *    Sec  38: Canon lift core func 8 → component func 7, type 11.
+ *    Sec  39: Component instance {run: func 7}.
+ *    Sec  40: Component export wasi_iface = component instance 8.
+ *
+ *  Component instances 0-6: imported WASI interfaces.
+ *  Component instance 7: locally created {run: func 7}.
+ *
+ *  The nexus core module must:
+ *    - Import "wasi_snapshot_preview1" functions (fd_write, proc_exit, etc.)
+ *    - Import "env" "memory" (not define its own memory — MemoryImported("env"))
+ *    - Export run_func_export returning i32
+ *
+ *  Validated with: wasm-tools validate --features component-model
+ *  Runnable with:  wasmtime run -W component-model=y,exceptions=y
+ *
+ *  Preview1→preview2 mappings in effect:
+ *    fd_write        → wasi:io/streams [method]output-stream.blocking-write-and-flush
+ *    proc_exit       → wasi:cli/exit exit (result<none,none>)
+ *    clock_time_get  → wasi:clocks/monotonic-clock now (u64 nanoseconds)
+ *    random_get      → wasi:random/random get-random-bytes(len) -> list<u8>
+ *    fd_read(fd=0)   → wasi:cli/stdin get-stdin + [method]input-stream.blocking-read
+ *    environ_get/args_get → stub returning 0 count (no env or args forwarded)
+ */
+export let p2_build_wasi_header_sections = fn () -> %ByteBuffer do
+  let %out = bb.empty()
+
+  // Component magic + version (8 bytes)
+  let %out = bb.push_bytes(buf: %out, bytes: [0, 97, 115, 109])
+  let %out = bb.push_bytes(buf: %out, bytes: [wdefs.cm_version_byte0, wdefs.cm_version_byte1,
+                                              wdefs.cm_version_byte2, wdefs.cm_version_byte3])
+
+  // Secs 0-8: WASI stdout interface type+import+alias sections.
+  // Component instances 0=io/error, 1=io/streams, 2=cli/stdout.
+  // Component types 0-4: io/error-instance, error-alias, io/streams-instance,
+  //                       output-stream-alias, cli/stdout-instance.
+  // Sec 0: type — wasi:io/error instance type (error resource)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 66, 1, 4, 0, 5, 101, 114, 114, 111, 114, 3, 1]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 1: import wasi:io/error@0.2.0
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_import, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 0, 19, 119, 97, 115, 105, 58, 105, 111, 47, 101, 114, 114, 111, 114, 64, 48, 46, 50, 46, 48, 5, 0]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 2: alias error resource type from import 0
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 3, 0, 0, 5, 101, 114, 114, 111, 114]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 3: type — unified wasi:io/streams instance type (output-stream, input-stream, and both methods).
+  // Types 3 and 4 (output-stream alias, input-stream alias) are both aliased from this single import in Sec 5.
+  // Uses the original outer-alias + variant encoding for stream-error (wasmtime expects a VARIANT, not a resource).
+  // 18 inner entries: original 12 entries for error/stream-error/output-stream/blocking-write-and-flush,
+  // plus 6 new entries for input-stream/blocking-read.
+  // Inner type map:
+  //   0: outer alias of component type 1 (error resource from wasi:io/error)
+  //   1: Eq(0) — "error" export type
+  //   2: own(1)
+  //   3: own(0)
+  //   4: variant stream-error {last-operation-failed(own<error>), closed}
+  //   5: Eq(4) — "stream-error" export type
+  //   6: output-stream SubResource — "output-stream" export type
+  //   7: borrow(6)
+  //   8: list<u8>
+  //   9: result<none, own<stream-error>>=result<ok=none, err=type5>
+  //  10: func(self:borrow<output-stream>, contents:list<u8>) → result<none, stream-error>
+  //      → export "[method]output-stream.blocking-write-and-flush" (blocking-write=(i32 i32 i32 i32))
+  //  11: input-stream SubResource — "input-stream" export type
+  //  12: borrow(11)
+  //  13: list<u8>
+  //  14: result<list<u8>, own<stream-error>>=result<ok=type13, err=type5>
+  //  15: func(self:borrow<input-stream>, len:u64) → result<list<u8>, stream-error>
+  //      → export "[method]input-stream.blocking-read" (blocking-read=(i32 i64 i32))
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    // count=18, type 0x42=instance-type
+    1, 66, 18,
+    // entry 0: outer alias of component type 1 (wasi:io/error's error resource)
+    2, 3, 2, 1, 1,
+    // entry 1: Eq(0) — "error" export  (export name=5:"error", type=SubResource=3, idx=0)
+    4, 0, 5, 101, 114, 114, 111, 114, 3, 0, 0,
+    // entry 2: own(1)   entry 3: own(0)
+    1, 105, 1, 1, 105, 0,
+    // entry 4: variant stream-error: last-operation-failed(own<error>)=case 0 with payload type 3, closed=case 1 with no payload
+    1, 113, 2, 21, 108, 97, 115, 116, 45, 111, 112, 101, 114, 97, 116, 105, 111, 110, 45, 102,
+    97, 105, 108, 101, 100, 1, 3, 0, 6, 99, 108, 111, 115, 101, 100, 0, 0,
+    // entry 5: Eq(4) — "stream-error" export  (export name=12:"stream-error", SubResource=3, idx=4)
+    4, 0, 12, 115, 116, 114, 101, 97, 109, 45, 101, 114, 114, 111, 114, 3, 0, 4,
+    // entry 6: output-stream SubResource — "output-stream" export  (export name=13:"output-stream", SubResource=3, idx=1 → new resource)
+    4, 0, 13, 111, 117, 116, 112, 117, 116, 45, 115, 116, 114, 101, 97, 109, 3, 1,
+    // entry 7: borrow(6)   entry 8: list<u8>
+    1, 104, 6, 1, 112, 125,
+    // entry 9: result<ok=none, err=type5>
+    1, 106, 0, 1, 5,
+    // entry 10: func(self:type7, contents:type8) → type9  → "[method]output-stream.blocking-write-and-flush"
+    1, 64, 2, 4, 115, 101, 108, 102, 7, 8, 99, 111, 110, 116, 101, 110, 116, 115, 8, 0, 9,
+    4, 0, 46, 91, 109, 101, 116, 104, 111, 100, 93, 111, 117, 116, 112, 117, 116, 45, 115, 116,
+    114, 101, 97, 109, 46, 98, 108, 111, 99, 107, 105, 110, 103, 45, 119, 114, 105, 116, 101,
+    45, 97, 110, 100, 45, 102, 108, 117, 115, 104, 1, 10,
+    // entry 11: input-stream SubResource — "input-stream" export  (export name=12:"input-stream", SubResource=3, idx=1 → new resource)
+    4, 0, 12, 105, 110, 112, 117, 116, 45, 115, 116, 114, 101, 97, 109, 3, 1,
+    // entry 12: borrow(11)   entry 13: list<u8>
+    1, 104, 11, 1, 112, 125,
+    // entry 14: result<ok=type13, err=type5>
+    1, 106, 1, 13, 1, 5,
+    // entry 15: func(self:type12, len:u64) → type14  → "[method]input-stream.blocking-read"
+    1, 64, 2, 4, 115, 101, 108, 102, 12, 3, 108, 101, 110, 119, 0, 14,
+    4, 0, 34, 91, 109, 101, 116, 104, 111, 100, 93, 105, 110, 112, 117, 116, 45, 115, 116, 114,
+    101, 97, 109, 46, 98, 108, 111, 99, 107, 105, 110, 103, 45, 114, 101, 97, 100, 1, 15]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 4: import wasi:io/streams@0.2.0
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_import, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 0, 21, 119, 97, 115, 105, 58, 105, 111, 47, 115, 116, 114, 101, 97, 109, 115, 64, 48, 46, 50, 46, 48, 5, 2]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 5: alias output-stream (type 3) AND input-stream (type 4) from unified io/streams import (instance 1).
+  // Combined into one alias section (count=2): both type aliases from the same instance.
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    2, 3, 0, 1, 13, 111, 117, 116, 112, 117, 116, 45, 115, 116, 114, 101, 97, 109,
+    3, 0, 1, 12, 105, 110, 112, 117, 116, 45, 115, 116, 114, 101, 97, 109]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 6: type — wasi:cli/stdout instance type (get-stdout func)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 66, 5, 2, 3, 2, 1, 3, 4, 0, 13, 111, 117, 116, 112, 117, 116, 45, 115, 116, 114, 101, 97,
+    109, 3, 0, 0, 1, 105, 1, 1, 64, 0, 0, 2, 4, 0, 10, 103, 101, 116, 45, 115, 116, 100, 111,
+    117, 116, 1, 3]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 7: import wasi:cli/stdout@0.2.0 (instance 2, type 5; +1 from type 4 in prior scheme due to input-stream alias inserted at type 4)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_import, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 0, 21, 119, 97, 115, 105, 58, 99, 108, 105, 47, 115, 116, 100, 111, 117, 116, 64, 48, 46, 50, 46, 48, 5, 5]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 8: alias get-stdout func (comp func 0) and write func (comp func 1) from component imports
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    2, 1, 0, 2, 10, 103, 101, 116, 45, 115, 116, 100, 111, 117, 116, 1, 0, 1, 46, 91, 109, 101,
+    116, 104, 111, 100, 93, 111, 117, 116, 112, 117, 116, 45, 115, 116, 114, 101, 97, 109, 46, 98,
+    108, 111, 99, 107, 105, 110, 103, 45, 119, 114, 105, 116, 101, 45, 97, 110, 100, 45, 102, 108,
+    117, 115, 104]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  // Secs 9-14: WASI exit+clock interfaces.
+  // Component instances 3=cli/exit, 4=clocks/monotonic-clock.
+  // Component types 6=cli/exit-instance, 7=monotonic-clock-instance (+1 from prior scheme due to input-stream alias at type 4).
+  // Component funcs 2=exit, 3=now (aliased from instances 3,4).
+  // Sec 9: type — wasi:cli/exit instance type (exit func taking result<none,none>)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 66, 3, 1, 106, 0, 0, 1, 64, 1, 6, 115, 116, 97, 116, 117, 115, 0, 1, 0, 4, 0, 4, 101, 120,
+    105, 116, 1, 1]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 10: import wasi:cli/exit@0.2.0 (instance 3, type 6)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_import, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 0, 19, 119, 97, 115, 105, 58, 99, 108, 105, 47, 101, 120, 105, 116, 64, 48, 46, 50, 46, 48, 5, 6]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 11: alias exit from instance 3 → component func 2
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 1, 0, 3, 4, 101, 120, 105, 116]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 12: type — wasi:clocks/monotonic-clock instance type (now func returning u64)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 66, 2, 1, 64, 0, 0, 119, 4, 0, 3, 110, 111, 119, 1, 0]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 13: import wasi:clocks/monotonic-clock@0.2.0 (instance 4, type 7)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_import, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 0, 33, 119, 97, 115, 105, 58, 99, 108, 111, 99, 107, 115, 47, 109, 111, 110, 111, 116, 111,
+    110, 105, 99, 45, 99, 108, 111, 99, 107, 64, 48, 46, 50, 46, 48, 5, 7]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 14: alias now from instance 4 → component func 3
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 1, 0, 4, 3, 110, 111, 119]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+
+  // Secs 15-20: WASI random+stdin interfaces.
+  // Component instances 5=wasi:random/random, 6=wasi:cli/stdin (no separate io/streams import).
+  // Component types 8=rand-instance, 9=cli/stdin-instance.
+  // input-stream (type 4) and blocking-read (comp func 5) aliased from unified io/streams instance 1 above.
+  // Component funcs 4=get-random-bytes, 5=blocking-read, 6=get-stdin.
+  // Sec 15: type — wasi:random/random instance type (get-random-bytes func)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 66, 3, 1, 112, 125, 1, 64, 1, 3, 108, 101, 110, 119, 0, 0, 4, 0, 16, 103, 101, 116, 45,
+    114, 97, 110, 100, 111, 109, 45, 98, 121, 116, 101, 115, 1, 1]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 16: import wasi:random/random@0.2.0 (instance 5, type 8)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_import, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 0, 24, 119, 97, 115, 105, 58, 114, 97, 110, 100, 111, 109, 47, 114, 97, 110, 100, 111, 109,
+    64, 48, 46, 50, 46, 48, 5, 8]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 17: alias get-random-bytes from instance 5 → component func 4
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 1, 0, 5, 16, 103, 101, 116, 45, 114, 97, 110, 100, 111, 109, 45, 98, 121, 116, 101, 115]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 18: alias [method]input-stream.blocking-read from unified io/streams instance 1 → component func 5
+  // (No separate io/streams import needed — we reuse instance 1 which exports both streams.)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 1, 0, 1, 34, 91, 109, 101, 116, 104, 111, 100, 93, 105, 110, 112, 117, 116, 45, 115, 116,
+    114, 101, 97, 109, 46, 98, 108, 111, 99, 107, 105, 110, 103, 45, 114, 101, 97, 100]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 19: type — wasi:cli/stdin instance type (get-stdin returning own<input-stream>)
+  // Outer alias index 4 = component type 4 = input-stream alias (from unified io/streams Sec 5).
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 66, 4, 2, 3, 2, 1, 4, 1, 105, 0, 1, 64, 0, 0, 1, 4, 0, 9, 103, 101, 116, 45, 115, 116,
+    100, 105, 110, 1, 2]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 20: import wasi:cli/stdin@0.2.0 (instance 6, type 9)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_import, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 0, 20, 119, 97, 115, 105, 58, 99, 108, 105, 47, 115, 116, 100, 105, 110, 64, 48, 46, 50,
+    46, 48, 5, 9]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 21: alias get-stdin from instance 6 → component func 6
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 1, 0, 6, 9, 103, 101, 116, 45, 115, 116, 100, 105, 110]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 21b: type — wasi:cli/environment instance type (type 10)
+  // Inner type map: 0=list<string>, 1=tuple<string,string>, 2=list<tuple>, 3=func()->type2,
+  //                  export "get-environment"=func(3), 4=func()->type0, export "get-arguments"=func(4).
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_type, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 66, 7, 1, 112, 115, 1, 111, 2, 115, 115, 1, 112, 1, 1, 64, 0, 0, 2, 4, 0, 15, 103, 101, 116,
+    45, 101, 110, 118, 105, 114, 111, 110, 109, 101, 110, 116, 1, 3, 1, 64, 0, 0, 0, 4, 0, 13, 103,
+    101, 116, 45, 97, 114, 103, 117, 109, 101, 110, 116, 115, 1, 4]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 21c: import wasi:cli/environment@0.2.0 (component instance 7, type 10)
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_import, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    1, 0, 26, 119, 97, 115, 105, 58, 99, 108, 105, 47, 101, 110, 118, 105, 114, 111, 110, 109, 101,
+    110, 116, 64, 48, 46, 50, 46, 48, 5, 10]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  // Sec 21d: alias get-environment (comp func 7) and get-arguments (comp func 8) from instance 7
+  let %s = cm_wrap_section(section_id: wdefs.cm_sec_alias, content: bb.push_bytes(buf: bb.empty(), bytes: [
+    2, 1, 0, 7, 15, 103, 101, 116, 45, 101, 110, 118, 105, 114, 111, 110, 109, 101, 110, 116,
+    1, 0, 7, 13, 103, 101, 116, 45, 97, 114, 103, 117, 109, 101, 110, 116, 115]))
+  let %out = bb.push_buf(buf: %out, src: &s)
+  bb.free(buf: %s)
+  return %out
+end
