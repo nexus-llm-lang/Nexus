@@ -54,6 +54,9 @@ stderr, `2` = bad usage. Don't claim an edit works until it type-checks.
   `<sanitized_path>#<name>` form; `explain` without `--file` searches the whole project.
 - Before finishing, `nexus fmt --check <file>` and `nexus lint <file>` are the
   formatting / style safety pass (run `nexus help` for the full subcommand list).
+  To auto-fix lint findings and compiler diagnostics (E2005/E2007), use
+  `nexus lint --fix <file>` (writes in place) or `nexus lint --fix-diff <file>`
+  (preview only). The standalone `nexus fix` subcommand no longer exists.
 
 ## Quick Reference
 

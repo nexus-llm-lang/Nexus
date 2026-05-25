@@ -1,12 +1,19 @@
 /**
- * lint: `nexus lint [--check] FILE [FILE...]` driver wrapper for the
- * AST-driven lint pack in src/lint/lint.nx (V1).
+ * lint: `nexus lint [--check|--fix|--fix-diff] FILE [FILE...]` driver
+ * wrapper for the AST-driven lint pack in src/lint/lint.nx (V1).
  *
  * Modes:
  *   default          run every lint rule, emit findings to stdout, exit 0
  *                    when no findings, exit 1 when any L-code fires.
  *   `--check`        same as default but exit 1 on any finding even when
  *                    stdout was redirected (CI-friendly; mirrors `fmt --check`).
+ *   `--fix`          run AST lint rules AND the front-end pipeline (parse ->
+ *                    HIR -> linearity -> typecheck), collect all fixable
+ *                    diagnostics (L0001/L0002 hints + E2005/E2007 span
+ *                    rewrites), apply in one pass, loop to fixpoint.
+ *                    Rewrites files in place.
+ *   `--fix-diff`     same analysis as `--fix` but shows a before/after diff
+ *                    without modifying any files.
  *
  * Output format mirrors `format_error` in src/common/error.nx:
  *
@@ -26,6 +33,10 @@
  * Small invocations (N <= PARALLEL_THRESHOLD, e.g. the 1-file
  * lint_check_mode_test fixture) take a sequential path that never calls
  * `lazy.force_all`, so they work in wasm contexts without `-S threads`.
+ *
+ * Note: `--fix` / `--fix-diff` (the heavier front-end coupling) are
+ * confined to fix mode only. Plain `lint` / `--check` remain AST-only,
+ * fast, and partial-program-tolerant.
  */
 
 import { Option, Some, None } from "std:option"
@@ -34,7 +45,7 @@ import * as list from "std:list"
 import * as lazy from "std:lazy"
 import { Fs, FileNotFound } from "std:fs"
 import { Console } from "std:stdio"
-import { InvalidUsage } from "src/common/error.nx"
+import { InvalidUsage }, * as err from "src/common/error.nx"
 import {
   ArgSpec, SubcommandHit,
   spec_flag, spec_positional,
@@ -48,6 +59,22 @@ import {
   lint_program, format_finding
 } from "src/lint/lint.nx"
 import { apply_suppressions } from "src/lint/suppress.nx"
+import {
+  Fixit, apply_fixit, fixit_for_exn,
+  format_check_line, format_diff_block, slice_old_text
+} from "src/tools/fix.nx"
+import { iterative_resolve, resolve_all_lazy_no_filter } from "src/ir/hir/demand.nx"
+import * as main_wrap from "src/ir/main_wrap.nx"
+import { HirProgram } from "src/ir/hir/types.nx"
+import { expand_groups_in_functions, expand_groups_in_handler_bindings } from "src/ir/hir/build/accum.nx"
+import * as linearity from "src/ir/shared/linearity.nx"
+import * as tc from "src/typecheck/check.nx"
+import * as tc_linearity from "src/typecheck/linearity.nx"
+import { HirBuildResult, build_hir } from "src/pipeline.nx"
+import { extract_function_names } from "src/ir/shared/resolve.nx"
+import { get_defs } from "src/ir/shared/imports.nx"
+import { LazyBindingUnused, LinearUnused } from "src/typecheck/errors.nx"
+import { Span } from "src/common/token.nx"
 
 /** Detection result for the `lint` subcommand. */
 export type ParsedLintSubcommand = ParsedLintSubcommand(remaining: [ string ], is_lint: bool)
@@ -61,11 +88,13 @@ export let strip_lint_subcommand = fn (xs: [ string ]) -> ParsedLintSubcommand d
   end
 end
 
-export type LintOptions = LintOptions(check_mode: bool, paths: [ string ])
+export type LintOptions = LintOptions(check_mode: bool, fix_mode: bool, fix_diff: bool, paths: [ string ])
 
 let lint_specs = fn () -> [ ArgSpec ] do
   return [
     spec_flag(name: "check", short: "", long: "--check", help: "exit 1 if any finding (CI mode)"),
+    spec_flag(name: "fix", short: "", long: "--fix", help: "apply fix-its in place (lint rules + E2005/E2007; loops to fixpoint)"),
+    spec_flag(name: "fix-diff", short: "", long: "--fix-diff", help: "show before/after diff for all fix-its without writing"),
     spec_positional(name: "paths", required: false, help: "files to lint"),
   ]
 end
@@ -78,8 +107,16 @@ let parse_lint_options = fn (args: [ string ]) -> LintOptions throws { InvalidUs
     throw InvalidUsage(detail: "nexus lint: " ++ first_error(result))
   end
   let check = get_flag(result, name: "check")
+  let fix = get_flag(result, name: "fix")
+  let fix_diff = get_flag(result, name: "fix-diff")
   let paths = get_positionals_all(result)
-  return LintOptions(check_mode: check, paths)
+  if fix && fix_diff then
+    throw InvalidUsage(detail: "nexus lint: --fix and --fix-diff are mutually exclusive")
+  end
+  if check && (fix || fix_diff) then
+    throw InvalidUsage(detail: "nexus lint: --check cannot be combined with --fix / --fix-diff")
+  end
+  return LintOptions(check_mode: check, fix_mode: fix, fix_diff, paths)
 end
 
 /** Per-file analysis result: the path and the findings collected from it.
@@ -187,6 +224,178 @@ end
  */
 let parallel_threshold = fn () -> i64 do return 2 end
 
+//
+// Fix mode: front-end pipeline runner
+//
+// In `--fix` / `--fix-diff` mode the lint runner must also invoke the full
+// typecheck pipeline to catch E2005/E2007 diagnostics.  The logic mirrors
+// src/cli/build.nx's `typecheck_for_fix` / `fix_loop` but is integrated
+// here so the lint command is the single entry point for all fix-its.
+
+let fix_max_passes = fn () -> i64 do return 32 end
+
+/** Outcome of a single pipeline pass: did we find a fix-it or not? */
+type LintFixOutcome = LintFixClean | LintFixSkipped(message: string) | LintFixFound(sp: Span, fix: Fixit)
+
+// Run parse + HIR + linearity + typecheck, catch the first fix-able diagnostic.
+let pipeline_for_fix = fn (src: string, input_path: string) -> LintFixOutcome require { Console, Fs } do
+  try
+    let tokens = lexer.tokenize(src)
+    let ParseDiagnostics(prog, diags: _) = parser.parse_collect(tokens, file: input_path)
+    let HirBuildResult(program: hir_raw, import_cache: _) = build_hir(prog, source_file: input_path, verbose: false)
+    let hir_resolved = match hir_raw do
+      | HirProgram(caps: hp, functions: hf, externals: he, handler_bindings: hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds, visible_enum_names: hven) ->
+        let resolved = resolve_all_lazy_no_filter(funcs: hf)
+        let expanded_fs = expand_groups_in_functions(funcs: resolved, groups: heg)
+        let expanded_hb = expand_groups_in_handler_bindings(bindings: hb, groups: heg)
+        HirProgram(caps: hp, functions: expanded_fs, externals: he, handler_bindings: expanded_hb, enum_defs: hed, exception_groups: heg, value_binding_names: hvbns, type_defs: htds, visible_enum_names: hven)
+    end
+    let hir_wrapped = main_wrap.wrap_main_if_needed(prog: hir_resolved)
+    linearity.check_program(prog: hir_wrapped)
+    let local_names = main_wrap.user_main_name() :: extract_function_names(defs: get_defs(prog), source: input_path)
+    let hir_checked = tc.check_program(hir: hir_wrapped, local_names, require_main: false)
+    tc_linearity.check_program(prog: hir_checked)
+    return LintFixClean
+  catch e ->
+    match e do
+      | LazyBindingUnused(name: _, span: sp) ->
+        match fixit_for_exn(src, err: e) do
+          | Some(val: fix) -> return LintFixFound(sp, fix)
+          | None -> return LintFixSkipped(message: err.format_error(err: e))
+        end
+      | LinearUnused(name: _, span: sp) ->
+        match fixit_for_exn(src, err: e) do
+          | Some(val: fix) -> return LintFixFound(sp, fix)
+          | None -> return LintFixSkipped(message: err.format_error(err: e))
+        end
+      | _ -> return LintFixSkipped(message: err.format_error(err: e))
+    end
+  end
+end
+
+// Collect lint fix-its from a parsed source (AST-only, fast path).
+// Returns only fixits that have a non-zero len (i.e. can be applied).
+let collect_lint_fixits = fn (src: string, path: string) -> [ Fixit ] do
+  let tokens = lexer.tokenize(src)
+  let ParseDiagnostics(prog, diags: _) = parser.parse_collect(tokens, file: path)
+  let raw_findings = lint_program(prog)
+  let findings = apply_suppressions(src, findings: raw_findings)
+  return extract_applicable_fixits(findings, acc: [])
+end
+
+let extract_applicable_fixits = fn (findings: [ LintFinding ], acc: [ Fixit ]) -> [ Fixit ] do
+  match findings do
+    | [] -> return list.reverse(xs: acc)
+    | LintFinding(code: _, severity: _, message: _, fix_it, span: _) :: rest ->
+      match fix_it do
+        | None -> return extract_applicable_fixits(findings: rest, acc: acc)
+        | Some(val: fix) ->
+          match fix do | Fixit(start: _, len, replacement: _, code: _, message: _) ->
+            // Only include fixits with a non-zero len (real span rewrites).
+            // Hint-only fixits (len=0, e.g. L0001/L0002 in V1) are reported
+            // in the human text but not auto-applied.
+            let acc2 = if len > 0 then fix :: acc else acc end
+            return extract_applicable_fixits(findings: rest, acc: acc2)
+          end
+      end
+  end
+end
+
+// One fix pass on a single file: collect lint findings + pipeline diagnostics,
+// apply the first applicable fixit. Returns whether something was applied.
+type FixPassResult = FixPassNoChange | FixPassApplied(new_src: string, sp: Span, fix: Fixit) | FixPassPipelineError(message: string)
+
+let run_fix_pass = fn (src: string, path: string) -> FixPassResult require { Console, Fs } do
+  // First: collect lint-based fixits (AST-only).
+  let lint_fixits = collect_lint_fixits(src, path)
+  // Second: run the pipeline to find E2005/E2007 fixits.
+  let pipeline_outcome = pipeline_for_fix(src, input_path: path)
+  match pipeline_outcome do
+    | LintFixClean ->
+      // No pipeline diagnostic. Try lint fixits.
+      match lint_fixits do
+        | [] -> return FixPassNoChange
+        | fix :: _ ->
+          match fix do | Fixit(start: _, len: _, replacement: _, code: _, message: _) ->
+            let new_src = apply_fixit(src, fix)
+            let sp = Span(offset: 0, line: 1, col: 1)
+            return FixPassApplied(new_src, sp, fix)
+          end
+      end
+    | LintFixSkipped(message) ->
+      // Non-fixable pipeline error. Try lint fixits or report error.
+      match lint_fixits do
+        | [] -> return FixPassPipelineError(message)
+        | fix :: _ ->
+          match fix do | Fixit(start: _, len: _, replacement: _, code: _, message: _) ->
+            let new_src = apply_fixit(src, fix)
+            let sp = Span(offset: 0, line: 1, col: 1)
+            return FixPassApplied(new_src, sp, fix)
+          end
+      end
+    | LintFixFound(sp, fix) ->
+      // Pipeline found a fix-it. Apply it; lint fixits will be picked up next pass.
+      let new_src = apply_fixit(src, fix)
+      return FixPassApplied(new_src, sp, fix)
+  end
+end
+
+// Fix loop for a single file: iterate until fixpoint or iteration cap.
+let fix_loop_for_file = fn (path: string, src: string, fix_diff: bool, pass: i64, fixes_applied: i64) -> i64 require { Console, Fs } do
+  if pass >= fix_max_passes() then
+    Console.eprintln(val: "nexus lint --fix: iteration cap reached for " ++ path ++ "; remaining fix-its skipped")
+    return 0
+  end
+  let result = run_fix_pass(src, path)
+  match result do
+    | FixPassNoChange ->
+      return 0
+    | FixPassPipelineError(message) ->
+      Console.eprintln(val: message)
+      if fixes_applied > 0 then return 0 end
+      return 1
+    | FixPassApplied(new_src, sp, fix) ->
+      if fix_diff then
+        let old_text = slice_old_text(src, fix)
+        Console.println(val: format_diff_block(file: path, fix, old_text))
+        return fix_loop_for_file(path, src: new_src, fix_diff, pass: pass + 1, fixes_applied: fixes_applied + 1)
+      else
+        match fix do | Fixit(start: _, len: _, replacement: _, code: _, message: _) ->
+          Fs.write_string(path, content: new_src)
+          Console.println(val: format_check_line(file: path, sp, fix))
+        end
+        return fix_loop_for_file(path, src: new_src, fix_diff, pass: pass + 1, fixes_applied: fixes_applied + 1)
+      end
+  end
+end
+
+// Run fix mode on a single file.
+let run_fix_on_lint_file = fn (path: string, fix_diff: bool) -> i64 require { Console, Fs } do
+  if Fs.exists(path) == false then
+    Console.eprintln(val: "nexus lint --fix: file not found: " ++ path)
+    return 1
+  end
+  try
+    let src = Fs.read_to_string(path)
+    return fix_loop_for_file(path, src, fix_diff, pass: 0, fixes_applied: 0)
+  catch e ->
+    Console.eprintln(val: err.format_error(err: e))
+    return 1
+  end
+end
+
+// Run fix mode over a list of files.
+let run_fix_each_file = fn (paths: [ string ], fix_diff: bool, all_ok: bool) -> i64 require { Console, Fs } do
+  match paths do
+    | [] ->
+      if all_ok then return 0 else return 1 end
+    | p :: rest ->
+      let rc = run_fix_on_lint_file(path: p, fix_diff)
+      let ok2 = all_ok && (rc == 0)
+      return run_fix_each_file(paths: rest, fix_diff, all_ok: ok2)
+  end
+end
+
 /** Execute `nexus lint`. Returns exit code:
  *   0 — no findings (both modes), or findings present without --check
  *   1 — at least one finding AND --check was passed (CI gate), OR a
@@ -196,17 +405,24 @@ let parallel_threshold = fn () -> i64 do return 2 end
  * Mode summary:
  *   default (no --check)  emit findings to stdout, exit 0 (warning-only)
  *   --check               emit findings to stdout, exit 1 if any fired (CI gate)
+ *   --fix                 apply fix-its in place (lint + E2005/E2007; loops to fixpoint)
+ *   --fix-diff            show before/after diff without writing
  *
  * Parallelism: analysis runs in parallel (via lazy.force_all / WASI threads)
  * when list.length(paths) > parallel_threshold(); sequential otherwise.
+ * Note: --fix / --fix-diff always runs sequentially (the pipeline is heavy
+ * enough that parallel overhead outweighs the benefit for fix workloads).
  */
 export let run_lint_subcommand = fn (args: [ string ]) -> i64 require { Console, Fs } do
   try
     let opts = parse_lint_options(args)
-    let LintOptions(check_mode, paths) = opts
+    let LintOptions(check_mode, fix_mode, fix_diff, paths) = opts
     if list.is_empty(xs: paths) then
-      Console.eprintln(val: "Usage: nexus lint [--check] FILE [FILE...]")
+      Console.eprintln(val: "Usage: nexus lint [--check|--fix|--fix-diff] FILE [FILE...]")
       return 2
+    end
+    if fix_mode || fix_diff then
+      return run_fix_each_file(paths, fix_diff, all_ok: true)
     end
     let n = list.length(xs: paths)
     let results = if n <= parallel_threshold() then
