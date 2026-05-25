@@ -1,0 +1,454 @@
+/**
+ * unused_cap: L0002 rule — `require { Cap }` declared but never called.
+ *
+ * Extracted from src/lint/lint.nx. Pure code movement; no logic change.
+ */
+
+import { Option, Some } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+import { Fixit } from "src/tools/fix.nx"
+import { Span } from "src/common/token.nx"
+import {
+  SpannedExpr, Expr, ExprLambda, ExprCall, ExprIf, ExprMatch, ExprWhile,
+  ExprFor, ExprBinaryOp, ExprUnaryOp, ExprArray, ExprList, ExprRecord,
+  ExprIndex, ExprFieldAccess, ExprRaise, ExprForce, ExprHandler,
+  ExprConstructor,
+  SpannedStmt, Stmt, StmtLet, StmtLetPattern, StmtExpr, StmtReturn,
+  StmtAssign, StmtIndexAssign, StmtTry, StmtInject,
+  TypeExpr, TyRow, TyUserDefined,
+  HandlerArm, MatchCase, CatchArm, Function,
+  NamedExpr, CallArg, CtorArg
+} from "src/common/ast.nx"
+import * as rdr from "src/ir/shared/rdrname.nx"
+import { LintFinding, LintWarning } from "src/lint/types.nx"
+
+//
+// A capability appears in the source as a bare `TyUserDefined(name: C, args:
+// [])` entry inside the function's `require {…}` row. The set of names that
+// look like capabilities for L0002 purposes is the set of "Cap-shaped" idents
+// — capitalised, no `Perm` prefix (those are permission tokens consumed by
+// system handlers, not user-facing cap surfaces). Permission tokens are
+// excluded because the user does not call methods on `PermConsole`; only
+// `Console.*` is callable.
+
+let starts_with_upper = fn (s: string) -> bool do
+  if str.length(s) == 0 then return false end
+  let c = str.char_at(s, idx: 0)
+  return c >= 'A' && c <= 'Z'
+end
+
+let is_perm_token = fn (name: string) -> bool do
+  return str.starts_with(s: name, prefix: "Perm")
+end
+
+/** Extract capability names declared in a `TyRow` requires-clause. Skips
+ *  `PermX` permission tokens (those are system-handler private surfaces)
+ *  and any non-identifier-shaped entry. Order-preserving so the lint
+ *  reports findings in declaration order.
+ */
+let cap_names_in_row = fn (row: TypeExpr) -> [ string ] do
+  match row do
+    | TyRow(types: ts, rest: _) -> return cap_names_in_row_loop(xs: ts, acc: [])
+    | _ -> return []
+  end
+end
+
+let cap_names_in_row_loop = fn (xs: [ TypeExpr ], acc: [ string ]) -> [ string ] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | TyUserDefined(name: n, args: _) :: rest ->
+      if is_perm_token(name: n) then
+        return cap_names_in_row_loop(xs: rest, acc: acc)
+      end
+      if !starts_with_upper(s: n) then
+        return cap_names_in_row_loop(xs: rest, acc: acc)
+      end
+      return cap_names_in_row_loop(xs: rest, acc: n :: acc)
+    | _ :: rest -> return cap_names_in_row_loop(xs: rest, acc: acc)
+  end
+end
+
+//
+// A `Console.println(val: "x")` parses as `ExprCall(func: <qualified-rdr>,
+// args: …)`. The rdr's first segment (or only segment in unqual form) is
+// the cap name. To stay seed-compatible we walk the rdr via the rdr.nx
+// helpers rather than pattern-matching the variant directly.
+
+let call_targets_cap = fn (func: rdr.RdrName, c_name: string) -> bool do
+  let s = rdr.rdr_to_string(r: func)
+  // The renamed string form is `Cap.method` for qualified cap-method
+  // calls. Strict prefix check: `Console` must not also fire on
+  // `ConsoleEx.method` if such a name ever exists.
+  let needle = c_name ++ "."
+  return str.starts_with(s, prefix: needle)
+end
+
+let any_call_to_cap_in_expr = fn (e: SpannedExpr, c_name: string) -> bool do
+  match e do | SpannedExpr(node, span: _) ->
+    return any_call_to_cap_in_node(e: node, c_name: c_name)
+  end
+end
+
+let any_call_to_cap_in_node = fn (e: Expr, c_name: string) -> bool do
+  match e do
+    | ExprCall(func, args) ->
+      if call_targets_cap(func: func, c_name: c_name) then return true end
+      return any_call_to_cap_in_args(args: args, c_name: c_name)
+    | ExprBinaryOp(left, op: _, right) ->
+      if any_call_to_cap_in_expr(e: left, c_name: c_name) then return true end
+      return any_call_to_cap_in_expr(e: right, c_name: c_name)
+    | ExprUnaryOp(op: _, operand) ->
+      return any_call_to_cap_in_expr(e: operand, c_name: c_name)
+    | ExprConstructor(name: _, args, sigil: _) ->
+      return any_call_to_cap_in_ctor_args(args: args, c_name: c_name)
+    | ExprArray(elements) ->
+      return any_call_to_cap_in_exprs(es: elements, c_name: c_name)
+    | ExprList(elements) ->
+      return any_call_to_cap_in_exprs(es: elements, c_name: c_name)
+    | ExprRecord(fields) ->
+      return any_call_to_cap_in_record_fields(fs: fields, c_name: c_name)
+    | ExprIndex(target, index) ->
+      if any_call_to_cap_in_expr(e: target, c_name: c_name) then return true end
+      return any_call_to_cap_in_expr(e: index, c_name: c_name)
+    | ExprFieldAccess(target, field: _) ->
+      return any_call_to_cap_in_expr(e: target, c_name: c_name)
+    | ExprIf(cond, then_branch, else_branch) ->
+      if any_call_to_cap_in_expr(e: cond, c_name: c_name) then return true end
+      if any_call_to_cap_in_stmts(ss: then_branch, c_name: c_name) then return true end
+      return any_call_to_cap_in_stmts(ss: else_branch, c_name: c_name)
+    | ExprMatch(target, cases) ->
+      if any_call_to_cap_in_expr(e: target, c_name: c_name) then return true end
+      return any_call_to_cap_in_cases(cs: cases, c_name: c_name)
+    | ExprWhile(cond, body) ->
+      if any_call_to_cap_in_expr(e: cond, c_name: c_name) then return true end
+      return any_call_to_cap_in_stmts(ss: body, c_name: c_name)
+    | ExprFor(var: _, start, end_expr, body) ->
+      if any_call_to_cap_in_expr(e: start, c_name: c_name) then return true end
+      if any_call_to_cap_in_expr(e: end_expr, c_name: c_name) then return true end
+      return any_call_to_cap_in_stmts(ss: body, c_name: c_name)
+    | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
+      // A nested lambda introduces its own require-clause, but its body
+      // can still reference the outer cap as a captured handler. Treat
+      // the inner body as part of the outer for L0002 purposes — under
+      // this check, the cap is "used" if any textual `Cap.` call appears
+      // anywhere reachable from the function body.
+      return any_call_to_cap_in_stmts(ss: body, c_name: c_name)
+    | ExprRaise(value) ->
+      return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | ExprForce(value) ->
+      return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | ExprHandler(coeffect_name: _, requires: _, arms) ->
+      return any_call_to_cap_in_handler_arms(arms: arms, c_name: c_name)
+    | _ -> return false
+  end
+end
+
+let any_call_to_cap_in_args = fn (args: [ CallArg ], c_name: string) -> bool do
+  match args do
+    | [] -> return false
+    | a :: rest ->
+      match a do | CallArg(name: _, value) ->
+        if any_call_to_cap_in_expr(e: value, c_name: c_name) then return true end
+        return any_call_to_cap_in_args(args: rest, c_name: c_name)
+      end
+  end
+end
+
+let any_call_to_cap_in_ctor_args = fn (args: [ CtorArg ], c_name: string) -> bool do
+  match args do
+    | [] -> return false
+    | a :: rest ->
+      match a do | CtorArg(name: _, value) ->
+        if any_call_to_cap_in_expr(e: value, c_name: c_name) then return true end
+        return any_call_to_cap_in_ctor_args(args: rest, c_name: c_name)
+      end
+  end
+end
+
+let any_call_to_cap_in_exprs = fn (es: [ SpannedExpr ], c_name: string) -> bool do
+  match es do
+    | [] -> return false
+    | e :: rest ->
+      if any_call_to_cap_in_expr(e: e, c_name: c_name) then return true end
+      return any_call_to_cap_in_exprs(es: rest, c_name: c_name)
+  end
+end
+
+let any_call_to_cap_in_record_fields = fn (fs: [ NamedExpr ], c_name: string) -> bool do
+  match fs do
+    | [] -> return false
+    | f :: rest ->
+      match f do | NamedExpr(name: _, value) ->
+        if any_call_to_cap_in_expr(e: value, c_name: c_name) then return true end
+        return any_call_to_cap_in_record_fields(fs: rest, c_name: c_name)
+      end
+  end
+end
+
+let any_call_to_cap_in_cases = fn (cs: [ MatchCase ], c_name: string) -> bool do
+  match cs do
+    | [] -> return false
+    | c :: rest ->
+      match c do | MatchCase(pattern: _, body) ->
+        if any_call_to_cap_in_stmts(ss: body, c_name: c_name) then return true end
+        return any_call_to_cap_in_cases(cs: rest, c_name: c_name)
+      end
+  end
+end
+
+let any_call_to_cap_in_handler_arms = fn (arms: [ HandlerArm ], c_name: string) -> bool do
+  match arms do
+    | [] -> return false
+    | a :: rest ->
+      match a do | HandlerArm(arm, cont_binder: _, span: _) ->
+        match arm do | Function(name: _, is_public: _, type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body, span: _) ->
+          if any_call_to_cap_in_stmts(ss: body, c_name: c_name) then return true end
+          return any_call_to_cap_in_handler_arms(arms: rest, c_name: c_name)
+        end
+      end
+  end
+end
+
+let any_call_to_cap_in_stmts = fn (ss: [ SpannedStmt ], c_name: string) -> bool do
+  match ss do
+    | [] -> return false
+    | s :: rest ->
+      match s do | SpannedStmt(node, span: _) ->
+        if any_call_to_cap_in_stmt(s: node, c_name: c_name) then return true end
+        return any_call_to_cap_in_stmts(ss: rest, c_name: c_name)
+      end
+  end
+end
+
+let any_call_to_cap_in_stmt = fn (s: Stmt, c_name: string) -> bool do
+  match s do
+    | StmtLet(name: _, sigil: _, typ: _, value) | StmtLetPattern(pattern: _, value) -> return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | StmtExpr(expr) -> return any_call_to_cap_in_expr(e: expr, c_name: c_name)
+    | StmtReturn(value) | StmtAssign(target: _, value) -> return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | StmtIndexAssign(target, index, value) ->
+      if any_call_to_cap_in_expr(e: target, c_name: c_name) then return true end
+      if any_call_to_cap_in_expr(e: index, c_name: c_name) then return true end
+      return any_call_to_cap_in_expr(e: value, c_name: c_name)
+    | StmtTry(body, catch_arms) ->
+      if any_call_to_cap_in_stmts(ss: body, c_name: c_name) then return true end
+      return any_call_to_cap_in_catch_arms(arms: catch_arms, c_name: c_name)
+    | StmtInject(handlers, body) ->
+      // Handler expression list may itself reference Cap.method as a
+      // value (rare but possible). Walk both.
+      if any_call_to_cap_in_exprs(es: handlers, c_name: c_name) then return true end
+      return any_call_to_cap_in_stmts(ss: body, c_name: c_name)
+  end
+end
+
+let any_call_to_cap_in_catch_arms = fn (arms: [ CatchArm ], c_name: string) -> bool do
+  match arms do
+    | [] -> return false
+    | a :: rest ->
+      match a do | CatchArm(pattern: _, body) ->
+        if any_call_to_cap_in_stmts(ss: body, c_name: c_name) then return true end
+        return any_call_to_cap_in_catch_arms(arms: rest, c_name: c_name)
+      end
+  end
+end
+
+/** Walk a single function definition: extract its declared cap names and
+ *  test each against the body's syntactic `Cap.<method>` call set. Emits
+ *  one L0002 finding per unused cap, ordered by appearance in the require
+ *  row.
+ */
+export let check_unused_caps_in_function = fn (
+  name: string,
+  requires: TypeExpr,
+  body: [ SpannedStmt ],
+  fn_span: Span,
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  let caps = cap_names_in_row(row: requires)
+  let has_call = has_any_call_in_stmts(ss: body)
+  return check_each_cap(caps: caps, name: name, body: body, fn_span: fn_span, has_any_call: has_call, acc: acc)
+end
+
+let check_each_cap = fn (
+  caps: [ string ],
+  name: string,
+  body: [ SpannedStmt ],
+  fn_span: Span,
+  has_any_call: bool,
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  match caps do
+    | [] -> return acc
+    | cn :: rest ->
+      let used = any_call_to_cap_in_stmts(ss: body, c_name: cn)
+      // L0002 fires only when the body is also call-free overall: a
+      // function that makes ANY other call could be transitively
+      // consuming the cap through a helper, which the syntactic walker
+      // cannot see. The narrower rule has no documented false positives
+      // — it catches the "stub function with over-declared row" pattern
+      // which is the LLM-frequent error the bd targets. Cases where a
+      // cap is declared but only used by a sub-call are handled by the
+      // deferred L0003 / effect-analysis follow-up.
+      let acc2 = if used || has_any_call then acc else
+          let msg = "function '" ++ name ++ "' declares capability '" ++ cn
+                ++ "' in its `require {…}` row but never calls `" ++ cn ++ ".*`"
+                ++ " (and the body has no calls that could consume it transitively)"
+          let fix_msg = "remove '" ++ cn ++ "' from the `require {…}` clause"
+          LintFinding(
+            code: "L0002",
+            severity: LintWarning,
+            message: msg,
+            fix_it: Some(val: Fixit(
+              start: 0,
+              len: 0,
+              // replacement carries the cap name so the fix driver can
+              // locate and delete it in the require row without re-parsing.
+              replacement: cn,
+              code: "L0002",
+              message: fix_msg
+            )),
+            span: fn_span
+          ) :: acc
+        end
+      return check_each_cap(caps: rest, name: name, body: body, fn_span: fn_span, has_any_call: has_any_call, acc: acc2)
+  end
+end
+
+// `has_any_call_in_*`: any function-call in expression position. Mirrors
+// the cap walker minus the per-cap predicate; runs once per function.
+let has_any_call_in_expr = fn (e: SpannedExpr) -> bool do
+  match e do | SpannedExpr(node, span: _) ->
+    return has_any_call_in_node(e: node)
+  end
+end
+
+let has_any_call_in_node = fn (e: Expr) -> bool do
+  match e do
+    | ExprCall(func: _, args: _) -> return true
+    | ExprBinaryOp(left, op: _, right) ->
+      if has_any_call_in_expr(e: left) then return true end
+      return has_any_call_in_expr(e: right)
+    | ExprUnaryOp(op: _, operand) -> return has_any_call_in_expr(e: operand)
+    | ExprConstructor(name: _, args, sigil: _) -> return has_any_call_in_ctor_args(args: args)
+    | ExprArray(elements) | ExprList(elements) -> return has_any_call_in_exprs(es: elements)
+    | ExprRecord(fields) -> return has_any_call_in_record_fields(fs: fields)
+    | ExprIndex(target, index) ->
+      if has_any_call_in_expr(e: target) then return true end
+      return has_any_call_in_expr(e: index)
+    | ExprFieldAccess(target, field: _) -> return has_any_call_in_expr(e: target)
+    | ExprIf(cond, then_branch, else_branch) ->
+      if has_any_call_in_expr(e: cond) then return true end
+      if has_any_call_in_stmts(ss: then_branch) then return true end
+      return has_any_call_in_stmts(ss: else_branch)
+    | ExprMatch(target, cases) ->
+      if has_any_call_in_expr(e: target) then return true end
+      return has_any_call_in_cases(cs: cases)
+    | ExprWhile(cond, body) ->
+      if has_any_call_in_expr(e: cond) then return true end
+      return has_any_call_in_stmts(ss: body)
+    | ExprFor(var: _, start, end_expr, body) ->
+      if has_any_call_in_expr(e: start) then return true end
+      if has_any_call_in_expr(e: end_expr) then return true end
+      return has_any_call_in_stmts(ss: body)
+    | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
+      return has_any_call_in_stmts(ss: body)
+    | ExprRaise(value) | ExprForce(value) -> return has_any_call_in_expr(e: value)
+    | ExprHandler(coeffect_name: _, requires: _, arms) -> return has_any_call_in_handler_arms(arms: arms)
+    | _ -> return false
+  end
+end
+
+let has_any_call_in_exprs = fn (es: [ SpannedExpr ]) -> bool do
+  match es do
+    | [] -> return false
+    | e :: rest ->
+      if has_any_call_in_expr(e: e) then return true end
+      return has_any_call_in_exprs(es: rest)
+  end
+end
+
+let has_any_call_in_ctor_args = fn (args: [ CtorArg ]) -> bool do
+  match args do
+    | [] -> return false
+    | a :: rest ->
+      match a do | CtorArg(name: _, value) ->
+        if has_any_call_in_expr(e: value) then return true end
+        return has_any_call_in_ctor_args(args: rest)
+      end
+  end
+end
+
+let has_any_call_in_record_fields = fn (fs: [ NamedExpr ]) -> bool do
+  match fs do
+    | [] -> return false
+    | f :: rest ->
+      match f do | NamedExpr(name: _, value) ->
+        if has_any_call_in_expr(e: value) then return true end
+        return has_any_call_in_record_fields(fs: rest)
+      end
+  end
+end
+
+let has_any_call_in_cases = fn (cs: [ MatchCase ]) -> bool do
+  match cs do
+    | [] -> return false
+    | c :: rest ->
+      match c do | MatchCase(pattern: _, body) ->
+        if has_any_call_in_stmts(ss: body) then return true end
+        return has_any_call_in_cases(cs: rest)
+      end
+  end
+end
+
+let has_any_call_in_handler_arms = fn (arms: [ HandlerArm ]) -> bool do
+  match arms do
+    | [] -> return false
+    | a :: rest ->
+      match a do | HandlerArm(arm, cont_binder: _, span: _) ->
+        match arm do | Function(name: _, is_public: _, type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body, span: _) ->
+          if has_any_call_in_stmts(ss: body) then return true end
+          return has_any_call_in_handler_arms(arms: rest)
+        end
+      end
+  end
+end
+
+let has_any_call_in_stmts = fn (ss: [ SpannedStmt ]) -> bool do
+  match ss do
+    | [] -> return false
+    | s :: rest ->
+      match s do | SpannedStmt(node, span: _) ->
+        if has_any_call_in_stmt(s: node) then return true end
+        return has_any_call_in_stmts(ss: rest)
+      end
+  end
+end
+
+let has_any_call_in_stmt = fn (s: Stmt) -> bool do
+  match s do
+    | StmtLet(name: _, sigil: _, typ: _, value) | StmtLetPattern(pattern: _, value) -> return has_any_call_in_expr(e: value)
+    | StmtExpr(expr) -> return has_any_call_in_expr(e: expr)
+    | StmtReturn(value) | StmtAssign(target: _, value) -> return has_any_call_in_expr(e: value)
+    | StmtIndexAssign(target, index, value) ->
+      if has_any_call_in_expr(e: target) then return true end
+      if has_any_call_in_expr(e: index) then return true end
+      return has_any_call_in_expr(e: value)
+    | StmtTry(body, catch_arms) ->
+      if has_any_call_in_stmts(ss: body) then return true end
+      return has_any_call_in_catch_arms(arms: catch_arms)
+    | StmtInject(handlers, body) ->
+      if has_any_call_in_exprs(es: handlers) then return true end
+      return has_any_call_in_stmts(ss: body)
+  end
+end
+
+let has_any_call_in_catch_arms = fn (arms: [ CatchArm ]) -> bool do
+  match arms do
+    | [] -> return false
+    | a :: rest ->
+      match a do | CatchArm(pattern: _, body) ->
+        if has_any_call_in_stmts(ss: body) then return true end
+        return has_any_call_in_catch_arms(arms: rest)
+      end
+  end
+end
