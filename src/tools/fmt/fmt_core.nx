@@ -9,15 +9,24 @@
  * that surfaces when a large reachable set of stdlib helpers comes
  * along for the ride.
  *
- * Scope mirrors the v1 spec from fmt.nx:
+ * Scope mirrors the v1 spec from fmt.nx, plus v2 inner-spacing:
  *   1. Tab → 2 spaces in leading indentation.
  *   2. Strip trailing whitespace on every line.
  *   3. Collapse runs of 2+ blank lines down to a single blank line.
  *   4. Ensure exactly one trailing newline at EOF.
+ *   5. Record literals `{a: 1}` → `{ a: 1 }` (inner spaces).
+ *   6. List literals `[a, b]` → `[ a, b ]` (inner spaces).
+ *      Index expressions `arr[i]` stay TIGHT (no spaces added).
+ *      Empty `{}` and `[]` stay tight.
  *
  * The pass is byte-level and preserves string/char literals, line
  * comments, block comments (nested), and bracket strings `[=[ ... ]=]`
  * byte-for-byte — including any newlines they contain.
+ *
+ * Literal vs. index `[` classification: `[` is treated as an index
+ * (no inner spacing) when the last emitted code byte (non-ws, non-nl)
+ * is a letter, digit, `_`, `)`, or `]`. All other positions yield a
+ * list literal and receive inner spaces.
  */
 
 import * as str from "std:str"
@@ -46,6 +55,15 @@ import { Option, Some, None } from "std:option"
 //     leading blank lines at the top of the file.
 //   - at_line_start: true iff next non-newline non-whitespace byte will be
 //     the first non-blank on its line. Drives the tab-as-indent expansion.
+//   - last_code_byte: the last byte written to buf that is not whitespace
+//     or a newline (0 = nothing written yet). Used to classify `[` as
+//     literal vs. index and to decide whether to inject a closing space.
+//   - bracket_depth: total count of unclosed `[` (both literal and index).
+//   - lit_bracket_depth: count of unclosed literal `[` only. When
+//     bracket_depth == lit_bracket_depth, the innermost open bracket is
+//     literal and the closing `]` should receive a space.
+//   - brace_depth: count of unclosed `{`. Every `{` in Nexus is a record
+//     or row (never a block), so all braces receive inner spacing.
 export type FmtState = FmtState(
   src: string,
   len: i64,
@@ -55,7 +73,11 @@ export type FmtState = FmtState(
   pending_nls: i64,
   pending_indent: i64,
   emitted_anything: bool,
-  at_line_start: bool
+  at_line_start: bool,
+  last_code_byte: i64,
+  bracket_depth: i64,
+  lit_bracket_depth: i64,
+  brace_depth: i64
 )
 
 // Walk the source looking for any token that starts a protected region but
@@ -144,9 +166,9 @@ export let format_source = fn (src: string) -> string do
   let len = str.byte_length(s: src)
   if contains_unterminated_token(src, len, pos: 0) then return src end
   let %buf = bb.empty()
-  let st = FmtState(src, len, pos: 0, buf: %buf, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: false, at_line_start: true)
+  let st = FmtState(src, len, pos: 0, buf: %buf, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: false, at_line_start: true, last_code_byte: 0, bracket_depth: 0, lit_bracket_depth: 0, brace_depth: 0)
   let st_final = walk(st)
-  match st_final do | FmtState(src: _, len: _, pos: _, buf: %final_buf, ws_run_len: _, pending_nls: _, pending_indent: _, emitted_anything, at_line_start: _) ->
+  match st_final do | FmtState(src: _, len: _, pos: _, buf: %final_buf, ws_run_len: _, pending_nls: _, pending_indent: _, emitted_anything, at_line_start: _, last_code_byte: _, bracket_depth: _, lit_bracket_depth: _, brace_depth: _) ->
     // Trailing newline policy: if we emitted any content, end with exactly
     // one '\n'. If the file was empty (or all whitespace), produce empty
     // output rather than a lone newline — keeps `format("") == ""`.
@@ -179,25 +201,42 @@ let push_n_newlines = fn (buf: %ByteBuffer, n: i64) -> %ByteBuffer do
   return push_n_newlines(buf: %buf2, n: n - 1)
 end
 
+// Returns true if `last_code_byte` indicates the `[` at the current position
+// is a subscript/index expression rather than a list literal.
+// `[` is an index when immediately preceded (in the output) by a letter,
+// digit, `_`, `)`, or `]` — the end of a value that can be subscripted.
+let is_index_context = fn (last_code_byte: i64) -> bool do
+  if last_code_byte == 0 then return false end
+  let b = last_code_byte
+  if b == ')' then return true end
+  if b == ']' then return true end
+  if b == '_' then return true end
+  if b >= 'a' && b <= 'z' then return true end
+  if b >= 'A' && b <= 'Z' then return true end
+  if b >= '0' && b <= '9' then return true end
+  return false
+end
+
+
 let walk = fn (st: FmtState) -> FmtState do
-  match st do | FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start) ->
-    if pos >= len then return FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start) end
+  match st do | FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth) ->
+    if pos >= len then return FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth) end
     let b = str.byte_at(s: src, idx: pos)
     // ── Newline ──────────────────────────────────────────────────────────
     if b == '\n' then
-      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len: 0, pending_nls: pending_nls + 1, pending_indent: 0, emitted_anything, at_line_start: true))
+      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len: 0, pending_nls: pending_nls + 1, pending_indent: 0, emitted_anything, at_line_start: true, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth))
     end
     // ── Carriage return ──────────────────────────────────────────────────
     if b == '\r' then
-      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start))
+      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth))
     end
     // ── Whitespace ───────────────────────────────────────────────────────
     if b == ' ' || b == '\t' then
       if at_line_start then
         let add = if b == '\t' then 2 else 1 end
-        return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len: 0, pending_nls, pending_indent: pending_indent + add, emitted_anything, at_line_start: true))
+        return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len: 0, pending_nls, pending_indent: pending_indent + add, emitted_anything, at_line_start: true, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth))
       end
-      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len: ws_run_len + 1, pending_nls, pending_indent, emitted_anything, at_line_start: false))
+      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf, ws_run_len: ws_run_len + 1, pending_nls, pending_indent, emitted_anything, at_line_start: false, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth))
     end
     // ── Protected regions (line/block comments, strings, chars, bracket) ─
     if b == '/' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '/' then
@@ -208,37 +247,143 @@ let walk = fn (st: FmtState) -> FmtState do
       let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
       let chunk = str.byte_substring(s: src, start: pos, len: body_end - pos)
       let %buf_done = bb.push_string(buf: %buf_ws, s: chunk)
-      return walk(st: FmtState(src, len, pos: line_end, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false))
+      // The last byte of a line comment is just before line_end (a non-ws char).
+      // We don't update last_code_byte for comments since comments are
+      // skipped by the parser — whatever preceded the comment determines context.
+      return walk(st: FmtState(src, len, pos: line_end, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth))
     end
     if b == '/' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '*' then
-      return emit_protected_chunk(st: FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start), end_pos: scan_block_comment(src, pos: pos + 2, len, depth: 1))
+      return emit_protected_chunk(st: FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth), end_pos: scan_block_comment(src, pos: pos + 2, len, depth: 1))
     end
     if b == '"' then
-      return emit_protected_chunk(st: FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start), end_pos: scan_string(src, pos: pos + 1, len))
+      return emit_protected_chunk(st: FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth), end_pos: scan_string(src, pos: pos + 1, len))
     end
     if b == '\'' then
       let end_pos_opt = scan_char(src, pos: pos + 1, len)
       match end_pos_opt do
         | Some(val: end_pos) ->
-          return emit_protected_chunk(st: FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start), end_pos)
+          return emit_protected_chunk(st: FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth), end_pos)
         | None ->
           let %buf_nl = flush_pending_nls(buf: %buf, pending_nls, emitted_anything)
           let %buf_ind = flush_pending_indent(buf: %buf_nl, pending_indent)
           let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
           let %buf_done = bb.push_byte(buf: %buf_ws, byte: char.ord(c: b))
-          return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false))
+          return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false, last_code_byte: char.ord(c: b), bracket_depth, lit_bracket_depth, brace_depth))
       end
     end
     if b == '[' && pos + 1 < len && str.byte_at(s: src, idx: pos + 1) == '='
        && pos + 2 < len && str.byte_at(s: src, idx: pos + 2) == '[' then
-      return emit_protected_chunk(st: FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start), end_pos: scan_bracket_string(src, pos: pos + 3, len))
+      return emit_protected_chunk(st: FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth), end_pos: scan_bracket_string(src, pos: pos + 3, len))
+    end
+    // ── Record open `{` ───────────────────────────────────────────────────
+    // Every `{` in Nexus is a record literal or a row constraint — never a
+    // block delimiter (`do`/`end` are used for blocks). So all `{` receive
+    // inner spacing, unless the collection is empty (`{}`) or the next byte
+    // is already a space/newline (source already has spacing).
+    if b == '{' then
+      let %buf_nl = flush_pending_nls(buf: %buf, pending_nls, emitted_anything)
+      let %buf_ind = flush_pending_indent(buf: %buf_nl, pending_indent)
+      let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
+      let %buf1 = bb.push_byte(buf: %buf_ws, byte: char.ord(c: '{'))
+      // Check the immediately next byte (do NOT skip whitespace). If it is
+      // `}`, `\n`, `\r`, ` `, `\t`, or EOF, no space is needed:
+      //   - `}` → empty record `{}`, stay tight.
+      //   - space/tab → source already has a space, natural ws buffering handles it.
+      //   - newline → multiline record, first element is on its own line.
+      // Any other byte means a code byte follows without a gap → inject a space.
+      let next_b = if pos + 1 < len then str.byte_at(s: src, idx: pos + 1) else 0 end
+      let inject_sp = next_b != '}' && next_b != ' ' && next_b != '\t' && next_b != '\n' && next_b != '\r' && next_b != 0
+      let %buf2 = if inject_sp then
+        bb.push_byte(buf: %buf1, byte: char.ord(c: ' '))
+      else
+        %buf1
+      end
+      let new_brace_depth = brace_depth + 1
+      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf2, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false, last_code_byte: char.ord(c: '{'), bracket_depth, lit_bracket_depth, brace_depth: new_brace_depth))
+    end
+    // ── Record close `}` ──────────────────────────────────────────────────
+    // Inject a space before `}` when the last code byte is not `{` (which
+    // would mean the collection is empty — `{}`).
+    if b == '}' then
+      let %buf_nl = flush_pending_nls(buf: %buf, pending_nls, emitted_anything)
+      let %buf_ind = flush_pending_indent(buf: %buf_nl, pending_indent)
+      // Inject space before `}` if needed: no pending ws, no pending newlines
+      // (which would mean `}` is on its own line in a multiline record), and
+      // the previous content byte is not the matching `{` (empty record).
+      let needs_sp = ws_run_len == 0 && pending_indent == 0 && pending_nls == 0 && last_code_byte != '{' && last_code_byte != 0
+      let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
+      let %buf1 = if needs_sp then
+        bb.push_byte(buf: %buf_ws, byte: char.ord(c: ' '))
+      else
+        %buf_ws
+      end
+      let %buf2 = bb.push_byte(buf: %buf1, byte: char.ord(c: '}'))
+      let new_brace_depth = if brace_depth > 0 then brace_depth - 1 else 0 end
+      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf2, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false, last_code_byte: char.ord(c: '}'), bracket_depth, lit_bracket_depth, brace_depth: new_brace_depth))
+    end
+    // ── List literal open `[` (not `[=[ ... ]=]` bracket string) ─────────
+    // Classify `[` as literal or index based on the last emitted code byte.
+    // Literal `[` gets a space after it (unless the list is empty `[]`).
+    // Index `[` is left tight (`arr[i]` stays `arr[i]`).
+    if b == '[' then
+      let %buf_nl = flush_pending_nls(buf: %buf, pending_nls, emitted_anything)
+      let %buf_ind = flush_pending_indent(buf: %buf_nl, pending_indent)
+      let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
+      let %buf1 = bb.push_byte(buf: %buf_ws, byte: char.ord(c: '['))
+      let is_idx = is_index_context(last_code_byte)
+      // Check the immediately next byte (do NOT skip whitespace). If it is
+      // `]`, `|` (array literal `[|`), ` `, `\t`, `\n`, `\r`, or EOF, no
+      // space is needed:
+      //   - `]` → empty list `[]`, stay tight.
+      //   - `|` → array literal `[| ... |]`; the `[|` delimiter is its own
+      //     token — do not insert a space inside it.
+      //   - space/tab → source already has spacing.
+      //   - newline → multiline list, first element on its own line.
+      let next_b2 = if pos + 1 < len then str.byte_at(s: src, idx: pos + 1) else 0 end
+      let inject_sp2 = !is_idx && next_b2 != ']' && next_b2 != '|' && next_b2 != ' ' && next_b2 != '\t' && next_b2 != '\n' && next_b2 != '\r' && next_b2 != 0
+      let %buf2 = if inject_sp2 then
+        bb.push_byte(buf: %buf1, byte: char.ord(c: ' '))
+      else
+        %buf1
+      end
+      let new_bracket_depth = bracket_depth + 1
+      let new_lit_bracket_depth = if is_idx then lit_bracket_depth else lit_bracket_depth + 1 end
+      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf2, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false, last_code_byte: char.ord(c: '['), bracket_depth: new_bracket_depth, lit_bracket_depth: new_lit_bracket_depth, brace_depth))
+    end
+    // ── List close `]` ────────────────────────────────────────────────────
+    // Inject a space before `]` only when closing a literal bracket and the
+    // last code byte is not `[` (empty list stays tight).
+    if b == ']' then
+      // Determine whether the closest open bracket is a literal.
+      // When bracket_depth == lit_bracket_depth, all open brackets are
+      // literal, so the innermost one is literal.
+      let closing_literal = bracket_depth > 0 && bracket_depth == lit_bracket_depth
+      let %buf_nl = flush_pending_nls(buf: %buf, pending_nls, emitted_anything)
+      let %buf_ind = flush_pending_indent(buf: %buf_nl, pending_indent)
+      // Do not inject a space if:
+      //   - last_code_byte == '[' (empty `[]`)
+      //   - last_code_byte == '|' (inside array literal `[| ... |]`, the
+      //     closing `|]` should stay tight)
+      //   - last_code_byte == 0 (nothing emitted)
+      //   - pending_nls > 0 (closing `]` is on its own line in a multiline list)
+      let needs_sp = closing_literal && ws_run_len == 0 && pending_indent == 0 && pending_nls == 0 && last_code_byte != '[' && last_code_byte != '|' && last_code_byte != 0
+      let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
+      let %buf1 = if needs_sp then
+        bb.push_byte(buf: %buf_ws, byte: char.ord(c: ' '))
+      else
+        %buf_ws
+      end
+      let %buf2 = bb.push_byte(buf: %buf1, byte: char.ord(c: ']'))
+      let new_bracket_depth = if bracket_depth > 0 then bracket_depth - 1 else 0 end
+      let new_lit_bracket_depth = if closing_literal && lit_bracket_depth > 0 then lit_bracket_depth - 1 else lit_bracket_depth end
+      return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf2, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false, last_code_byte: char.ord(c: ']'), bracket_depth: new_bracket_depth, lit_bracket_depth: new_lit_bracket_depth, brace_depth))
     end
     // ── Code byte ────────────────────────────────────────────────────────
     let %buf_nl = flush_pending_nls(buf: %buf, pending_nls, emitted_anything)
     let %buf_ind = flush_pending_indent(buf: %buf_nl, pending_indent)
     let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
     let %buf_done = bb.push_byte(buf: %buf_ws, byte: char.ord(c: b))
-    return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false))
+    return walk(st: FmtState(src, len, pos: pos + 1, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: false, last_code_byte: char.ord(c: b), bracket_depth, lit_bracket_depth, brace_depth))
   end
 end
 
@@ -249,14 +394,19 @@ let flush_pending_indent = fn (buf: %ByteBuffer, n: i64) -> %ByteBuffer do
 end
 
 let emit_protected_chunk = fn (st: FmtState, end_pos: i64) -> FmtState do
-  match st do | FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start: _) ->
+  match st do | FmtState(src, len, pos, buf: %buf, ws_run_len, pending_nls, pending_indent, emitted_anything, at_line_start: _, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth) ->
     let %buf_nl = flush_pending_nls(buf: %buf, pending_nls, emitted_anything)
     let %buf_ind = flush_pending_indent(buf: %buf_nl, pending_indent)
     let %buf_ws = flush_ws(buf: %buf_ind, src, ws_run_len, pos)
     let chunk = str.byte_substring(s: src, start: pos, len: end_pos - pos)
     let %buf_done = bb.push_string(buf: %buf_ws, s: chunk)
     let new_at_ls = chunk_ended_on_newline(s: chunk)
-    return walk(st: FmtState(src, len, pos: end_pos, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: new_at_ls))
+    // The last code byte of a protected chunk is the last byte of the chunk
+    // (important so that a closing `"` counts as a non-identifier context,
+    // which is correct — `"foo"[i]` would be a string-index, classified as
+    // index if `"` counts here; but we do NOT update last_code_byte for
+    // protected chunks because the content is opaque). Keep it unchanged.
+    return walk(st: FmtState(src, len, pos: end_pos, buf: %buf_done, ws_run_len: 0, pending_nls: 0, pending_indent: 0, emitted_anything: true, at_line_start: new_at_ls, last_code_byte, bracket_depth, lit_bracket_depth, brace_depth))
   end
 end
 
