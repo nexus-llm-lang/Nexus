@@ -16,11 +16,22 @@
  * The fix-it line is only present when the rule supplied one. Each finding
  * is one stdout entry; multiple files separate cleanly because every line
  * is prefixed with the file path.
+ *
+ * Parallelism: when more than PARALLEL_THRESHOLD files are requested, the
+ * analysis phase (read + tokenize + parse + lint_program) runs in parallel
+ * via `lazy.force_all` / WASI threads, mirroring `test_runner.nx`'s
+ * `run_all` + `build_test_thunks`.  The emit phase (Console output + exit
+ * code tallying) is always sequential so output order matches input order.
+ *
+ * Small invocations (N <= PARALLEL_THRESHOLD, e.g. the 1-file
+ * lint_check_mode_test fixture) take a sequential path that never calls
+ * `lazy.force_all`, so they work in wasm contexts without `-S threads`.
  */
 
 import { Option, Some, None } from "std:option"
 import * as str from "std:str"
 import * as list from "std:list"
+import * as lazy from "std:lazy"
 import { Fs, FileNotFound } from "std:fs"
 import { Console } from "std:stdio"
 import { InvalidUsage } from "src/common/error.nx"
@@ -69,24 +80,45 @@ let parse_lint_options = fn (args: [string]) -> LintOptions throws { InvalidUsag
   return LintOptions(check_mode: check, paths)
 end
 
-/** Lint one file. Returns the number of findings emitted. Parse failures
- *  are reported to stderr and counted as a single "finding" so the caller
- *  can still throw the right exit code without conflating per-rule counts.
+/** Per-file analysis result: the path and the findings collected from it.
+ *  No Console dependency — the analysis phase reads and lints only; the
+ *  emit phase (emit_results) attaches the Console cap separately.
  */
-let lint_file = fn (path: string) -> i64 require { Console, Fs } do
+export type LintFileResult = LintFileResult(path: string, findings: [LintFinding])
+
+/** Analyse one file: read, tokenize, parse (best-effort), lint.
+ *  Returns LintFileResult carrying the path and findings list.
+ *  No findings are emitted here — Console is not required.
+ *  A missing file returns an empty findings list (the existence check
+ *  mirrors lint_file's pre-read guard).
+ */
+let lint_collect_one = fn (path: string) -> LintFileResult require { Fs } do
   if Fs.exists(path) == false then
-    Console.eprintln(val: "nexus lint: file not found: " ++ path)
-    return 1
+    return LintFileResult(path, findings: [])
   end
   let src = Fs.read_to_string(path)
   let tokens = lexer.tokenize(src)
   let ParseDiagnostics(prog, diags: _) = parser.parse_collect(tokens, file: path)
-  // Parse errors do not block lint: the AST returned by parse_collect is
-  // best-effort (skipped definitions become gaps, valid ones survive).
-  // Per-finding emit only — `diags` lives in the parse-error pipeline.
   let findings = lint_program(prog)
-  emit_findings(file: path, fs: findings)
-  return list.length(xs: findings)
+  return LintFileResult(path, findings)
+end
+
+/** Emit findings for one result and return the finding count. */
+let emit_one_result = fn (r: LintFileResult) -> i64 require { Console } do
+  match r do | LintFileResult(path, findings) ->
+    emit_findings(file: path, fs: findings)
+    return list.length(xs: findings)
+  end
+end
+
+/** Emit all findings across a list of results; return the total count. */
+let emit_results = fn (results: [LintFileResult], total: i64) -> i64 require { Console } do
+  match results do
+    | [] -> return total
+    | r :: rest ->
+      let n = emit_one_result(r)
+      return emit_results(results: rest, total: total + n)
+  end
 end
 
 let emit_findings = fn (file: string, fs: [LintFinding]) -> unit require { Console } do
@@ -98,14 +130,44 @@ let emit_findings = fn (file: string, fs: [LintFinding]) -> unit require { Conso
   end
 end
 
-let lint_each = fn (paths: [string], total: i64) -> i64 require { Console, Fs } do
+/** Sequential collect: map lint_collect_one over paths in order.
+ *  Used for small invocations (N <= PARALLEL_THRESHOLD) and any wasm
+ *  context without WASI threads (e.g. the lint_check_mode_test fixture).
+ */
+let collect_sequential = fn (paths: [string], acc: [LintFileResult]) -> [LintFileResult] require { Fs } do
   match paths do
-    | [] -> return total
+    | [] -> return list.reverse(xs: acc)
     | p :: rest ->
-      let n = lint_file(path: p)
-      return lint_each(paths: rest, total: total + n)
+      let r = lint_collect_one(path: p)
+      return collect_sequential(paths: rest, acc: r :: acc)
   end
 end
+
+/** Parallel collect: bind each lint_collect_one call as an @LintFileResult
+ *  thunk, then hand the list to lazy.force_all.  Results arrive in input
+ *  order (force_all joins left-to-right), so output order is deterministic.
+ *  Requires WASI threads; only called when N > PARALLEL_THRESHOLD.
+ */
+let collect_parallel = fn (paths: [string]) -> [LintFileResult] require { Fs } do
+  let thunks = build_lint_thunks(paths, acc: [])
+  return lazy.force_all(tasks: thunks)
+end
+
+let build_lint_thunks = fn (paths: [string], acc: [@LintFileResult]) -> [@LintFileResult] require { Fs } do
+  match paths do
+    | [] -> return list.reverse(xs: acc)
+    | p :: rest ->
+      let @t = lint_collect_one(path: p)
+      return build_lint_thunks(paths: rest, acc: @t :: acc)
+  end
+end
+
+/** File-count threshold below which the sequential path is taken.
+ *  Set to 2 so that the 1-file lint_check_mode_test fixture never
+ *  reaches force_all (which requires WASI threads).  The CI gate runs
+ *  over ~150 files and always takes the parallel path.
+ */
+let parallel_threshold = fn () -> i64 do return 2 end
 
 /** Execute `nexus lint`. Returns exit code:
  *   0 — no findings (both modes), or findings present without --check
@@ -116,6 +178,9 @@ end
  * Mode summary:
  *   default (no --check)  emit findings to stdout, exit 0 (warning-only)
  *   --check               emit findings to stdout, exit 1 if any fired (CI gate)
+ *
+ * Parallelism: analysis runs in parallel (via lazy.force_all / WASI threads)
+ * when list.length(paths) > parallel_threshold(); sequential otherwise.
  */
 export let run_lint_subcommand = fn (args: [string]) -> i64 require { Console, Fs } do
   try
@@ -125,7 +190,13 @@ export let run_lint_subcommand = fn (args: [string]) -> i64 require { Console, F
         Console.eprintln(val: "Usage: nexus lint [--check] FILE [FILE...]")
         return 2
       end
-      let total = lint_each(paths, total: 0)
+      let n = list.length(xs: paths)
+      let results = if n <= parallel_threshold() then
+        collect_sequential(paths, acc: [])
+      else
+        collect_parallel(paths)
+      end
+      let total = emit_results(results, total: 0)
       if check_mode && total > 0 then return 1 else return 0 end
     end
   catch
