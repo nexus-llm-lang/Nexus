@@ -38,7 +38,7 @@ import {
   vars_equal, lin_push_frame, lin_pop_frame, lin_top_frame,
   join_simple, lin_set_vars, lin_get_must_consume, find_live_must_consume,
   lin_state_vars, lin_state_consumed, lin_restore_state, filter_not_in,
-  append_consumed
+  append_consumed, filter_in
 } from "src/typecheck/linearity/state.nx"
 import {
   lin_field_is_linear, lin_variant_is_known, lin_any_record_has_linear_field,
@@ -452,24 +452,47 @@ let check_expr_kind = fn (
         | Some(val: ebs) ->
           let else_diverges = stmts_diverge(stmts: ebs)
           let st_else = check_stmts(stmts: ebs, st: st1, sigs, tdefs, enum_defs)
+          // Both arms (divergent or not) must consume all inner-scope linears they
+          // introduce. Project each arm's exit state onto outer_vars to get the
+          // outer-projected remaining (linears NOT consumed by that arm).
+          let outer_vars = lin_state_vars(st: st1)
+          check_divergent_arm_unused(arm_out: st_then, outer_vars, span)
+          check_divergent_arm_unused(arm_out: st_else, outer_vars, span)
+          let outer_rem_then = filter_in(xs: lin_state_vars(st: st_then), keep: outer_vars, acc: [])
+          let outer_rem_else = filter_in(xs: lin_state_vars(st: st_else), keep: outer_vars, acc: [])
+          // Consistency rules (nexus-v3xa.12/13):
+          // - Non-divergent vs non-divergent: require equality.
+          // - Non-divergent vs divergent: require div_rem ⊆ non_div_rem.
+          // - Both divergent: require equality AND require all outer linears consumed.
           if then_diverges && else_diverges then
-            // All paths diverge: each arm must have consumed all linears.
+            // All-diverged: both arms must agree on outer consumption.
+            if !vars_equal(a: outer_rem_then, b: outer_rem_else) then
+              throw LinearMismatch(detail: "match arms diverge on outer-linear consumption", span)
+            end
+            // Additionally, all outer linears must have been consumed: the join
+            // point is unreachable, so any outer linear still live is a real leak.
             check_divergent_arm_linears(arm_out: st_then, span)
-            check_divergent_arm_linears(arm_out: st_else, span)
             return lin_set_vars(st: st1, vs: [])
           end
           if then_diverges then
-            check_divergent_arm_unused(arm_out: st_then, outer_vars: lin_state_vars(st: st1), span)
-            return st_else
+            // Then diverges, else does not: then_rem ⊆ else_rem.
+            if !outer_rem_subset_of(a: outer_rem_then, b: outer_rem_else) then
+              throw LinearMismatch(detail: "match arms diverge on outer-linear consumption", span)
+            end
+            return lin_set_vars(st: st1, vs: outer_rem_else)
           end
           if else_diverges then
-            check_divergent_arm_unused(arm_out: st_else, outer_vars: lin_state_vars(st: st1), span)
-            return st_then
+            // Else diverges, then does not: else_rem ⊆ then_rem.
+            if !outer_rem_subset_of(a: outer_rem_else, b: outer_rem_then) then
+              throw LinearMismatch(detail: "match arms diverge on outer-linear consumption", span)
+            end
+            return lin_set_vars(st: st1, vs: outer_rem_then)
           end
-          if !vars_equal(a: lin_state_vars(st: st_then), b: lin_state_vars(st: st_else)) then
-            throw LinearMismatch(detail: "if/else branches diverge on linear set: then=" ++ join_simple(xs: lin_state_vars(st: st_then)) ++ " else=" ++ join_simple(xs: lin_state_vars(st: st_else)), span)
+          // Neither diverges: require equality.
+          if !vars_equal(a: outer_rem_then, b: outer_rem_else) then
+            throw LinearMismatch(detail: "match arms diverge on outer-linear consumption", span)
           end
-          return st_then
+          return lin_set_vars(st: st1, vs: outer_rem_then)
       end
     | Match(target: t, cases: cs) ->
       // P-Var: determine if the scrutinee is a live linear variable *before*
@@ -590,63 +613,120 @@ let check_match_cases = fn (
   cases: [ HirMatchCase ], st: LinState, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ], span: Span,
   scrutinee_linear: bool
 ) -> LinState throws { TypeError } do
-  return check_match_cases_go(cases, st, sigs, tdefs, enum_defs, span, ref_set: None, scrutinee_linear, diverged_arms: [])
+  return check_match_cases_go(cases, st, sigs, tdefs, enum_defs, span, join_ref: None, div_rems: [], scrutinee_linear)
+end
+
+// ─── Branch-consistency helpers ───────────────────────────────────────────────
+
+/** True when every element of `a` appears in `b` (a ⊆ b). */
+let outer_rem_subset_of = fn (a: [ string ], b: [ string ]) -> bool do
+  // filter_in keeps items of `a` that are also in `b`; if result equals `a`, then a ⊆ b.
+  return vars_equal(a: filter_in(xs: a, keep: b, acc: []), b: a)
+end
+
+/** Check that all accumulated divergent arm outer-rems are subsets of `join_rem`. */
+let check_div_rems_subset = fn (
+  div_rems: [ [ string ] ], join_rem: [ string ], span: Span
+) -> unit throws { TypeError } do
+  match div_rems do
+    | [] -> return ()
+    | dr :: rest ->
+      if !outer_rem_subset_of(a: dr, b: join_rem) then
+        throw LinearMismatch(detail: "match arms diverge on outer-linear consumption", span)
+      end
+      return check_div_rems_subset(div_rems: rest, join_rem, span)
+  end
+end
+
+/** Check that all accumulated divergent arm outer-rems are equal to `ref_rem`.
+ *  Used in the all-diverged case. */
+let check_div_rems_equal = fn (
+  div_rems: [ [ string ] ], ref_rem: [ string ], span: Span
+) -> unit throws { TypeError } do
+  match div_rems do
+    | [] -> return ()
+    | dr :: rest ->
+      if !vars_equal(a: dr, b: ref_rem) then
+        throw LinearMismatch(detail: "match arms diverge on outer-linear consumption", span)
+      end
+      return check_div_rems_equal(div_rems: rest, ref_rem, span)
+  end
 end
 
 let check_match_cases_go = fn (
   cases: [ HirMatchCase ], st: LinState, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ], span: Span,
-  ref_set: Option<[ string ]>, scrutinee_linear: bool, diverged_arms: [ LinState ]
+  join_ref: Option<[ string ]>, div_rems: [ [ string ] ], scrutinee_linear: bool
 ) -> LinState throws { TypeError } do
+  // `join_ref` = outer-projected remaining agreed upon by non-divergent arms seen so far.
+  // `div_rems` = list of outer-projected remainders from divergent arms seen so far.
+  // Divergent arms must consume AT LEAST the outer linears the join state consumed,
+  // i.e. div_rem ⊆ join_rem (subset check).
+  // Non-divergent arms must all agree (equality), and accumulated div_rems must be subsets.
+  // All-diverged case: all div_rems must be equal to each other.
+  let outer_vars = lin_state_vars(st)
   match cases do
     | [] ->
-      match ref_set do
+      match join_ref do
         | None ->
-          // All arms diverged.  Each arm must have consumed its outer-scope
-          // linears — verify now using the accumulated arm-exit states
-          check_all_diverged_arms(diverged_arms, span)
-          return lin_set_vars(st, vs: [])
-        | Some(val: vs) -> return lin_set_vars(st, vs)
+          // All arms diverged (or no arms). Check all div_rems are equal.
+          match div_rems do
+            | [] ->
+              // No arms at all — vacuously OK, outer_vars unchanged.
+              return lin_set_vars(st, vs: outer_vars)
+            | ref_rem :: rest_rems ->
+              check_div_rems_equal(div_rems: rest_rems, ref_rem, span)
+              // All-diverged: the join point is unreachable. Outer linears still
+              // live in any arm are a real leak — require ref_rem (the agreed
+              // remainder) to be empty (all outer linears consumed in every arm).
+              require_empty_or_droppable(vars: ref_rem, params: [], span)
+              return lin_set_vars(st, vs: [])
+          end
+        | Some(val: jr) ->
+          // Mixed: check any remaining div_rems are subsets of join state.
+          check_div_rems_subset(div_rems, join_rem: jr, span)
+          return lin_set_vars(st, vs: jr)
       end
     | HirMatchCase(pattern: p, body: b) :: rest ->
       // Pattern binders that introduce linear vars (`%v` patterns, or plain
       // patterns that receive a linear scrutinee) are added before walking
       // the body. scrutinee_linear propagates to bind_pattern_linear so that
       // `| x ->` patterns on a linear scrutinee track x as linear (P-Var).
-      let case_state = lin_set_vars(st, vs: lin_state_vars(st))
+      let case_state = lin_set_vars(st, vs: outer_vars)
       let case_state2 = bind_pattern_linear(pat: p, st: case_state, scrutinee_linear, tdefs, enum_defs)
-      let case_diverges = stmts_diverge(stmts: b)
       let case_out = check_stmts(stmts: b, st: case_state2, sigs, tdefs, enum_defs)
+      // Every arm (divergent or not) must have consumed all inner-scope linears.
+      check_divergent_arm_unused(arm_out: case_out, outer_vars, span)
+      // Outer-projected remaining: outer linears still live after this arm.
+      let case_outer_rem = filter_in(xs: lin_state_vars(st: case_out), keep: outer_vars, acc: [])
+      let case_diverges = stmts_diverge(stmts: b)
       if case_diverges then
-        // Verify inner-scope linears were consumed before divergence.
-        // Outer-scope linears are checked later if ALL arms diverge.
-        check_divergent_arm_unused(arm_out: case_out, outer_vars: lin_state_vars(st), span)
-        return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set, scrutinee_linear, diverged_arms: case_out :: diverged_arms)
+        // Divergent arm: immediate subset check against any known join_ref,
+        // then accumulate into div_rems.
+        match join_ref do
+          | None -> ()
+          | Some(val: jr) ->
+            if !outer_rem_subset_of(a: case_outer_rem, b: jr) then
+              throw LinearMismatch(detail: "match arms diverge on outer-linear consumption", span)
+            end
+        end
+        return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, join_ref, div_rems: case_outer_rem :: div_rems, scrutinee_linear)
+      else
+        // Non-divergent arm: check equality with any existing join_ref.
+        // Also check all accumulated div_rems are subsets of this arm's rem.
+        match join_ref do
+          | None ->
+            // First non-divergent arm: validate all previously seen div_rems are subsets.
+            check_div_rems_subset(div_rems, join_rem: case_outer_rem, span)
+            return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, join_ref: Some(val: case_outer_rem), div_rems: [], scrutinee_linear)
+          | Some(val: jr) ->
+            if !vars_equal(a: jr, b: case_outer_rem) then
+              throw LinearMismatch(detail: "match arms diverge on outer-linear consumption", span)
+            end
+            // div_rems accumulated since last non-divergent arm must all be subsets.
+            check_div_rems_subset(div_rems, join_rem: case_outer_rem, span)
+            return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, join_ref, div_rems: [], scrutinee_linear)
+        end
       end
-      let case_vars = lin_state_vars(st: case_out)
-      match ref_set do
-        | None ->
-          return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set: Some(val: case_vars), scrutinee_linear, diverged_arms: [])
-        | Some(val: rv) ->
-          if !vars_equal(a: rv, b: case_vars) then
-            throw LinearMismatch(detail: "match arms diverge on linear set", span)
-          end
-          return check_match_cases_go(cases: rest, st, sigs, tdefs, enum_defs, span, ref_set, scrutinee_linear, diverged_arms: [])
-      end
-  end
-end
-
-/** After determining that every match arm diverged, verify that each arm's
- *  exit state has no remaining linear vars.  Inner-scope leaks were already
- *  caught by `check_divergent_arm_unused`; this pass additionally catches
- *  outer-scope linears that were never consumed. */
-let check_all_diverged_arms = fn (
-  diverged_arms: [ LinState ], span: Span
-) -> unit throws { TypeError } do
-  match diverged_arms do
-    | [] -> return ()
-    | arm :: rest ->
-      check_divergent_arm_linears(arm_out: arm, span)
-      return check_all_diverged_arms(diverged_arms: rest, span)
   end
 end
 
