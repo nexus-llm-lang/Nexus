@@ -826,7 +826,7 @@ if [ "$TEST_MODE" = "1" ]; then
     P3C_FILES=$(find "$TEST_PATH" -type f -path '*/p3_component/*.nx' 2>/dev/null)
     P2C_FILES=$(find "$TEST_PATH" -type f -path '*/p2_component/*.nx' 2>/dev/null)
     REPL_FILES=$(find "$TEST_PATH" -type f -path '*/repl/*.in.txt' 2>/dev/null)
-    FILES=$(printf '%s\n%s\n%s\n%s\n%s\n' "$POS_FILES" "$NEG_FILES" "$P3C_FILES" "$P2C_FILES" "$REPL_FILES" | grep -v '^$' | sort)
+    FILES=$(printf '%s\n%s\n%s\n%s\n%s\n' "$POS_FILES" "$NEG_FILES" "$P3C_FILES" "$P2C_FILES" "$REPL_FILES" | grep -v '^$' | sort -u)
   fi
   N=$(printf '%s\n' "$FILES" | grep -c '^.' || true)
   if [ "$N" = "0" ]; then
@@ -1209,6 +1209,11 @@ if [ "$TEST_MODE" = "1" ]; then
           print \"tcp-serve\\t1\"
           next
         }
+        /^[[:space:]]*\\/\\/[[:space:]]*p2c-tcp-port:/ {
+          sub(/^[[:space:]]*\\/\\/[[:space:]]*p2c-tcp-port:[[:space:]]*/, \"\")
+          print \"tcp-port\\t\" \$0
+          next
+        }
         /^[[:space:]]*\\/\\/[[:space:]]*p2c-http/ {
           print \"http\\t1\"
           next
@@ -1228,6 +1233,7 @@ if [ "$TEST_MODE" = "1" ]; then
       P2C_HTTP_SERVER_PID=""
       P2C_TCP_SERVE_PID=""
       P2C_TCP_SERVE_PORT=""
+
       IFS_BAK2=$IFS; IFS="
 "
       for _kv in $(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^env\t/ { print \$2 }"); do
@@ -1256,9 +1262,18 @@ if [ "$TEST_MODE" = "1" ]; then
         P2C_ENV_FLAGS="$P2C_ENV_FLAGS --env HTTP_TEST_PORT=${_p2c_port} --env HTTP_TEST_URL=http://127.0.0.1:${_p2c_port}"
       fi
       if printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^tcp-serve\t/" | grep -q .; then
-        P2C_HTTP_FLAGS="-S tcp=y -S inherit-network"
-        P2C_TCP_SERVE_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")
-        P2C_ENV_FLAGS="$P2C_ENV_FLAGS --env LISTEN_PORT=${P2C_TCP_SERVE_PORT}"
+        P2C_HTTP_FLAGS="-S http -S tcp=y -S inherit-network"
+        # If the test hardcodes a port via // p2c-tcp-port: <N>, use that directly.
+        # Otherwise fall back to dynamic allocation (requires Env.get in the component
+        # to read NEXUS_TCP_PORT, but Env.get before Net.listen conflicts with
+        # the p2sock_bridge cabi_realloc bump-allocator at address 65536).
+        _p2c_tcp_fixed_port=$(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^tcp-port\t/ { print \$2; exit }")
+        if [ -n "$_p2c_tcp_fixed_port" ]; then
+          P2C_TCP_SERVE_PORT=$_p2c_tcp_fixed_port
+        else
+          P2C_TCP_SERVE_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind((\"\",0)); print(s.getsockname()[1]); s.close()")
+          P2C_ENV_FLAGS="$P2C_ENV_FLAGS --env NEXUS_TCP_PORT=${P2C_TCP_SERVE_PORT}"
+        fi
       fi
       P2C_EXPECT_MSGS=$(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^msg\t/ { print \$2 }")
       IFS=$IFS_BAK2
@@ -1299,10 +1314,11 @@ if [ "$TEST_MODE" = "1" ]; then
             "$wasm" \
             >"$p2c_srv_out" 2>"$elog" &
         P2C_TCP_SERVE_PID=$!
-        # Wait up to 5s for the component to print "listening" or port to open.
+        # Wait up to 5s for the component to print "listening".
+        # NOTE: do NOT curl in the polling loop — the server handles only one request,
+        # and the poll curl would consume it before the test curl below runs.
         _p2c_srv_wait=0
         until grep -q "listening" "$p2c_srv_out" 2>/dev/null || \
-              curl -sf "http://127.0.0.1:${P2C_TCP_SERVE_PORT}/" >/dev/null 2>&1 || \
               [ "$_p2c_srv_wait" -ge 50 ]; do
           _p2c_srv_wait=$((_p2c_srv_wait + 1))
           sleep 0.1
