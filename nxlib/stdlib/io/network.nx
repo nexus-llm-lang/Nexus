@@ -1,5 +1,5 @@
 /** net: HTTP networking operations. */
-import { length as str_length, substring, index_of, to_i64_raw } from "std:str"
+import { length as str_length, substring, index_of, to_i64_raw, ends_with, to_lower, char_code, scan_digits } from "std:str"
 import * as bb from "std:bytebuffer"
 import { ByteBuffer } from "std:bytebuffer"
 import external "wasi_snapshot_preview1"
@@ -82,6 +82,585 @@ let http_respond_chunk_write = fn (req_id: i64, body_chunk: string) -> bool do r
 let http_respond_chunk_finish = fn (req_id: i64) -> bool do return false end
 let http_request_with_options = fn (method: string, url: string, headers: string, body: string, timeout_ms: i64) -> string do return "" end
 let http_cancel_accept = fn (server_id: i64) -> bool do return false end
+
+// ── SSRF guard ────────────────────────────────────────────────────────────────
+// Pure host/IP classifier. Denies private, loopback, link-local, metadata,
+// multicast, broadcast, ULA, and IPv4-mapped forms of the above. Hard-wired
+// deny-by-default; no sub-capability (allow_net_private) is added — callers
+// with allow_net still cannot reach private endpoints through this gate.
+//
+// KNOWN LIMITATION: DNS rebinding is not defended. The check is performed on
+// the URL-declared host string before any DNS resolution; an attacker-
+// controlled domain that resolves to a public IP at guard-time and later to a
+// private IP at connect-time bypasses this guard. Atomic resolve-then-validate
+// requires socket-level API not exposed by wasi:http/outgoing-handler.
+// Tracking: nexus-xjbs.5 — marked as a follow-up.
+
+// Internal parsed IPv4 result (valid=false signals parse failure).
+type Ip4Parsed = Ip4Parsed(a: i64, b: i64, c: i64, d: i64, valid: bool)
+
+// Internal parsed IPv6 result. Stores 8 16-bit segments (valid=false=failure).
+type Ip6Parsed = Ip6Parsed(
+  valid: bool,
+  s0: i64, s1: i64, s2: i64, s3: i64,
+  s4: i64, s5: i64, s6: i64, s7: i64
+)
+
+// Parse a decimal unsigned integer at position pos in s.
+// Returns (value, end_pos) encoded as value * 100000 + end_pos, or -1 on failure.
+// Values are bounded to [0, 65535] to cover both IPv4 octets and IPv6 segments.
+let ssrf_parse_uint = fn (s: string, pos: i64, max_val: i64) -> i64 do
+  let slen = str_length(s)
+  if pos >= slen then
+    return -1
+  else
+    let end_pos = scan_digits_in(s, pos)
+    if end_pos == pos then
+      return -1
+    else
+      let token = substring(s, start: pos, len: end_pos - pos)
+      let val = to_i64_raw(s: token)
+      if val < 0 then
+        return -1
+      else if val > max_val then
+        return -1
+      else
+        return val * 100000 + end_pos
+      end
+    end
+  end
+end
+
+// Scan digits from pos; returns end_pos (may equal pos if no digits).
+// Delegates to the imported scan_digits from std:str.
+let scan_digits_in = fn (s: string, pos: i64) -> i64 do
+  return scan_digits(s, start: pos)
+end
+
+// Get Unicode codepoint at character position (0 if out of bounds).
+// For ASCII input (URLs/IPs) this is identical to the byte value.
+let char_code_at = fn (s: string, pos: i64) -> i64 do
+  let slen = str_length(s)
+  if pos < 0 then
+    return 0
+  else if pos >= slen then
+    return 0
+  else
+    return char_code(s, idx: pos)
+  end
+end
+
+// Parse a single hex digit char (code) to 0-15, or -1 on failure.
+let hex_digit_val = fn (code: i64) -> i64 do
+  if code >= 48 && code <= 57 then
+    return code - 48
+  else if code >= 65 && code <= 70 then
+    return code - 55
+  else if code >= 97 && code <= 102 then
+    return code - 87
+  else
+    return -1
+  end
+end
+
+// Scan hex digits from pos; returns end_pos (position of first non-hex char).
+let scan_hex_digits = fn (s: string, pos: i64) -> i64 do
+  let slen = str_length(s)
+  let ~p = pos
+  let ~going = 1
+  while ~p < slen && ~going > 0 do
+    let b = char_code_at(s, pos: ~p)
+    let hv = hex_digit_val(code: b)
+    if hv >= 0 then
+      ~p <- ~p + 1
+    else
+      ~going <- 0
+    end
+  end
+  return ~p
+end
+
+// Parse hex string to i64, return -1 if empty or invalid.
+let parse_hex_str = fn (s: string, start: i64, end_pos: i64) -> i64 do
+  let len = end_pos - start
+  if len == 0 then
+    return -1
+  else if len > 4 then
+    return -1
+  else
+    let ~val = 0
+    let ~i = start
+    while ~i < end_pos do
+      let b = char_code_at(s, pos: ~i)
+      let hv = hex_digit_val(code: b)
+      if hv < 0 then
+        ~val <- -1
+        ~i <- end_pos + 1
+      else
+        ~val <- ~val * 16 + hv
+        ~i <- ~i + 1
+      end
+    end
+    if ~i > end_pos then
+      return -1
+    else
+      return ~val
+    end
+  end
+end
+
+// Parse IPv4 dotted quad (a.b.c.d) from the string s.
+// Returns Ip4Parsed with valid=false if s is not a well-formed dotted quad.
+let parse_ipv4 = fn (s: string) -> Ip4Parsed do
+  let slen = str_length(s)
+  // Parse octet a
+  let r0 = ssrf_parse_uint(s, pos: 0, max_val: 255)
+  if r0 < 0 then
+    return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
+  else
+    let a = r0 / 100000
+    let p1 = r0 - a * 100000
+    if p1 >= slen then
+      return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
+    else
+      let dot1 = char_code_at(s, pos: p1)
+      if dot1 != 46 then
+        return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
+      else
+        let r1 = ssrf_parse_uint(s, pos: p1 + 1, max_val: 255)
+        if r1 < 0 then
+          return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
+        else
+          let b = r1 / 100000
+          let p2 = r1 - b * 100000
+          if p2 >= slen then
+            return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
+          else
+            let dot2 = char_code_at(s, pos: p2)
+            if dot2 != 46 then
+              return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
+            else
+              let r2 = ssrf_parse_uint(s, pos: p2 + 1, max_val: 255)
+              if r2 < 0 then
+                return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
+              else
+                let c = r2 / 100000
+                let p3 = r2 - c * 100000
+                if p3 >= slen then
+                  return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
+                else
+                  let dot3 = char_code_at(s, pos: p3)
+                  if dot3 != 46 then
+                    return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
+                  else
+                    let r3 = ssrf_parse_uint(s, pos: p3 + 1, max_val: 255)
+                    if r3 < 0 then
+                      return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
+                    else
+                      let d = r3 / 100000
+                      let p4 = r3 - d * 100000
+                      if p4 != slen then
+                        return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
+                      else
+                        return Ip4Parsed(a, b, c, d, valid: true)
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+// Check if a parsed IPv4 is in a blocked range.
+let ipv4_is_blocked = fn (ip: Ip4Parsed) -> bool do
+  let Ip4Parsed(a: aa, b: bb, c: cc, d: dd, valid: _) = ip
+  // unspecified 0.0.0.0
+  if aa == 0 && bb == 0 && cc == 0 && dd == 0 then
+    return true
+  else if aa == 127 then
+    // loopback 127.0.0.0/8
+    return true
+  else if aa == 169 && bb == 254 then
+    // link-local 169.254.0.0/16 (includes cloud metadata 169.254.169.254)
+    return true
+  else if aa == 10 then
+    // private 10.0.0.0/8
+    return true
+  else if aa == 172 && bb >= 16 && bb <= 31 then
+    // private 172.16.0.0/12
+    return true
+  else if aa == 192 && bb == 168 then
+    // private 192.168.0.0/16
+    return true
+  else if aa >= 224 && aa <= 239 then
+    // multicast 224.0.0.0/4
+    return true
+  else if aa == 255 && bb == 255 && cc == 255 && dd == 255 then
+    // broadcast 255.255.255.255
+    return true
+  else if aa == 192 && bb == 0 && cc == 2 then
+    // documentation 192.0.2.0/24 (TEST-NET-1)
+    return true
+  else if aa == 198 && bb == 51 && cc == 100 then
+    // documentation 198.51.100.0/24 (TEST-NET-2)
+    return true
+  else if aa == 203 && bb == 0 && cc == 113 then
+    // documentation 203.0.113.0/24 (TEST-NET-3)
+    return true
+  else
+    return false
+  end
+end
+
+// Parse IPv6: returns Ip6Parsed with valid=false on parse failure.
+// Handles ::, :: with embedded IPv4 (::ffff:a.b.c.d), and full/compressed forms.
+let parse_ipv6 = fn (s: string) -> Ip6Parsed do
+  let slen = str_length(s)
+  // collect raw groups left of :: and right of ::
+  let fail = Ip6Parsed(valid: false, s0: 0, s1: 0, s2: 0, s3: 0, s4: 0, s5: 0, s6: 0, s7: 0)
+  if slen == 0 then
+    return fail
+  else
+    return parse_ipv6_inner(s, slen, fail)
+  end
+end
+
+let parse_ipv6_inner = fn (s: string, slen: i64, fail: Ip6Parsed) -> Ip6Parsed do
+  // Find :: position (-1 if not present)
+  let dcolon_pos = index_of(s, sub: "::")
+  if dcolon_pos < 0 then
+    // No ::, must have exactly 8 colon-separated groups
+    return parse_ipv6_full(s, slen, fail)
+  else
+    // Has :: — parse left and right sides, fill in zeros
+    let left_str = substring(s, start: 0, len: dcolon_pos)
+    let right_start = dcolon_pos + 2
+    let right_len = slen - right_start
+    let right_str = substring(s, start: right_start, len: right_len)
+    return parse_ipv6_with_dcolon(left_str, right_str, fail)
+  end
+end
+
+// Parse full IPv6 (no ::): 8 groups of hex separated by ':'
+let parse_ipv6_full = fn (s: string, slen: i64, fail: Ip6Parsed) -> Ip6Parsed do
+  let segs = parse_ipv6_groups(s, slen)
+  let IpSegList(cnt, g0, g1, g2, g3, g4, g5, g6, g7, valid: gvalid) = segs
+  if gvalid && cnt == 8 then
+    return Ip6Parsed(valid: true, s0: g0, s1: g1, s2: g2, s3: g3, s4: g4, s5: g5, s6: g6, s7: g7)
+  else
+    return fail
+  end
+end
+
+// Internal: list of up to 8 parsed hex groups.
+type IpSegList = IpSegList(cnt: i64, g0: i64, g1: i64, g2: i64, g3: i64, g4: i64, g5: i64, g6: i64, g7: i64, valid: bool)
+
+// Parse colon-separated hex groups from s. Up to 8 groups; last group may be
+// an IPv4 quad (treated as 2 segments). Returns IpSegList with valid=false on error.
+let parse_ipv6_groups = fn (s: string, slen: i64) -> IpSegList do
+  let fail_segs = IpSegList(cnt: 0, g0: 0, g1: 0, g2: 0, g3: 0, g4: 0, g5: 0, g6: 0, g7: 0, valid: false)
+  if slen == 0 then
+    return IpSegList(cnt: 0, g0: 0, g1: 0, g2: 0, g3: 0, g4: 0, g5: 0, g6: 0, g7: 0, valid: true)
+  else
+    return parse_ipv6_groups_go(s, slen, pos: 0, cnt: 0, g0: 0, g1: 0, g2: 0, g3: 0, g4: 0, g5: 0, g6: 0, g7: 0, fail_segs)
+  end
+end
+
+let parse_ipv6_groups_go = fn (s: string, slen: i64, pos: i64, cnt: i64, g0: i64, g1: i64, g2: i64, g3: i64, g4: i64, g5: i64, g6: i64, g7: i64, fail_segs: IpSegList) -> IpSegList do
+  if pos >= slen then
+    return IpSegList(cnt, g0, g1, g2, g3, g4, g5, g6, g7, valid: true)
+  else if cnt >= 8 then
+    return fail_segs
+  else
+    // check if this could be an embedded IPv4 (contains '.')
+    let dot_pos = index_of_from(s, sub: ".", start_pos: pos)
+    let colon_pos = index_of_from(s, sub: ":", start_pos: pos)
+    if dot_pos >= pos && dot_pos < slen && (colon_pos < 0 || dot_pos < colon_pos) then
+      // embedded IPv4
+      let ipv4_str = substring(s, start: pos, len: slen - pos)
+      let ip4 = parse_ipv4(s: ipv4_str)
+      let Ip4Parsed(a: a4, b: b4, c: c4, d: d4, valid: v4) = ip4
+      if v4 then
+        let seg_hi = a4 * 256 + b4
+        let seg_lo = c4 * 256 + d4
+        let new_cnt = cnt + 2
+        let r = store_seg(idx: cnt, g0, g1, g2, g3, g4, g5, g6, g7, val: seg_hi)
+        let IpSegList(cnt: _, g0: rg0, g1: rg1, g2: rg2, g3: rg3, g4: rg4, g5: rg5, g6: rg6, g7: rg7, valid: _) = r
+        let cnt1 = cnt + 1
+        let r2 = store_seg(idx: cnt1, g0: rg0, g1: rg1, g2: rg2, g3: rg3, g4: rg4, g5: rg5, g6: rg6, g7: rg7, val: seg_lo)
+        let IpSegList(cnt: _, g0: r2g0, g1: r2g1, g2: r2g2, g3: r2g3, g4: r2g4, g5: r2g5, g6: r2g6, g7: r2g7, valid: _) = r2
+        return IpSegList(cnt: new_cnt, g0: r2g0, g1: r2g1, g2: r2g2, g3: r2g3, g4: r2g4, g5: r2g5, g6: r2g6, g7: r2g7, valid: true)
+      else
+        return fail_segs
+      end
+    else
+      // hex group
+      let hex_end = scan_hex_digits(s, pos)
+      let grp_val = parse_hex_str(s, start: pos, end_pos: hex_end)
+      if grp_val < 0 then
+        return fail_segs
+      else
+        let r = store_seg(idx: cnt, g0, g1, g2, g3, g4, g5, g6, g7, val: grp_val)
+        let IpSegList(cnt: _, g0: rg0, g1: rg1, g2: rg2, g3: rg3, g4: rg4, g5: rg5, g6: rg6, g7: rg7, valid: _) = r
+        let next_cnt = cnt + 1
+        if hex_end >= slen then
+          return IpSegList(cnt: next_cnt, g0: rg0, g1: rg1, g2: rg2, g3: rg3, g4: rg4, g5: rg5, g6: rg6, g7: rg7, valid: true)
+        else
+          let sep = char_code_at(s, pos: hex_end)
+          if sep != 58 then
+            return fail_segs
+          else
+            return parse_ipv6_groups_go(s, slen, pos: hex_end + 1, cnt: next_cnt, g0: rg0, g1: rg1, g2: rg2, g3: rg3, g4: rg4, g5: rg5, g6: rg6, g7: rg7, fail_segs)
+          end
+        end
+      end
+    end
+  end
+end
+
+// Store a segment value at position idx in the segment record.
+let store_seg = fn (idx: i64, g0: i64, g1: i64, g2: i64, g3: i64, g4: i64, g5: i64, g6: i64, g7: i64, val: i64) -> IpSegList do
+  if idx == 0 then
+    return IpSegList(cnt: 0, g0: val, g1, g2, g3, g4, g5, g6, g7, valid: true)
+  else if idx == 1 then
+    return IpSegList(cnt: 0, g0, g1: val, g2, g3, g4, g5, g6, g7, valid: true)
+  else if idx == 2 then
+    return IpSegList(cnt: 0, g0, g1, g2: val, g3, g4, g5, g6, g7, valid: true)
+  else if idx == 3 then
+    return IpSegList(cnt: 0, g0, g1, g2, g3: val, g4, g5, g6, g7, valid: true)
+  else if idx == 4 then
+    return IpSegList(cnt: 0, g0, g1, g2, g3, g4: val, g5, g6, g7, valid: true)
+  else if idx == 5 then
+    return IpSegList(cnt: 0, g0, g1, g2, g3, g4, g5: val, g6, g7, valid: true)
+  else if idx == 6 then
+    return IpSegList(cnt: 0, g0, g1, g2, g3, g4, g5, g6: val, g7, valid: true)
+  else if idx == 7 then
+    return IpSegList(cnt: 0, g0, g1, g2, g3, g4, g5, g6, g7: val, valid: true)
+  else
+    return IpSegList(cnt: 0, g0, g1, g2, g3, g4, g5, g6, g7, valid: false)
+  end
+end
+
+// Find position of `sub` starting at `start_pos` offset. Returns -1 if not found.
+let index_of_from = fn (s: string, sub: string, start_pos: i64) -> i64 do
+  let slen = str_length(s)
+  let sublen = str_length(s: sub)
+  if start_pos < 0 || start_pos >= slen || sublen == 0 then
+    return -1
+  else
+    let rest = substring(s, start: start_pos, len: slen - start_pos)
+    let idx = index_of(s: rest, sub)
+    if idx < 0 then
+      return -1
+    else
+      return start_pos + idx
+    end
+  end
+end
+
+// Parse IPv6 with :: compression.
+let parse_ipv6_with_dcolon = fn (left_str: string, right_str: string, fail: Ip6Parsed) -> Ip6Parsed do
+  let left_len = str_length(s: left_str)
+  let right_len = str_length(s: right_str)
+  let left_segs = parse_ipv6_groups(s: left_str, slen: left_len)
+  let right_segs = parse_ipv6_groups(s: right_str, slen: right_len)
+  let IpSegList(cnt: lc, g0: lg0, g1: lg1, g2: lg2, g3: lg3, g4: lg4, g5: lg5, g6: lg6, g7: lg7, valid: lv) = left_segs
+  let IpSegList(cnt: rc, g0: rg0, g1: rg1, g2: rg2, g3: rg3, g4: rg4, g5: rg5, g6: rg6, g7: rg7, valid: rv) = right_segs
+  if lv && rv && lc + rc <= 8 then
+    // zero-fill the gap between left and right
+    let total_zeros = 8 - lc - rc
+    // Assemble full 8 segments: left segs, zeros, right segs
+    let all = assemble_ipv6(lc, lg0, lg1, lg2, lg3, lg4, lg5, lg6, lg7, zc: total_zeros, rc, rg0, rg1, rg2, rg3, rg4, rg5, rg6, rg7)
+    return all
+  else
+    return fail
+  end
+end
+
+// Assemble 8 IPv6 segments from left(lc segs) + zeros(zc) + right(rc segs).
+let assemble_ipv6 = fn (lc: i64, lg0: i64, lg1: i64, lg2: i64, lg3: i64, lg4: i64, lg5: i64, lg6: i64, lg7: i64, zc: i64, rc: i64, rg0: i64, rg1: i64, rg2: i64, rg3: i64, rg4: i64, rg5: i64, rg6: i64, rg7: i64) -> Ip6Parsed do
+  // Build a flat 16-entry array emulated as indexed accesses.
+  // We have at most 8 left + 8 right segments. Use a position tracker.
+  // Left segments occupy positions 0..lc-1, zeros lc..lc+zc-1, right lc+zc..7.
+  let s0 = pick_assembled(pos: 0, lc, lg0, lg1, lg2, lg3, lg4, lg5, lg6, lg7, zc, rg0, rg1, rg2, rg3, rg4, rg5, rg6, rg7)
+  let s1 = pick_assembled(pos: 1, lc, lg0, lg1, lg2, lg3, lg4, lg5, lg6, lg7, zc, rg0, rg1, rg2, rg3, rg4, rg5, rg6, rg7)
+  let s2 = pick_assembled(pos: 2, lc, lg0, lg1, lg2, lg3, lg4, lg5, lg6, lg7, zc, rg0, rg1, rg2, rg3, rg4, rg5, rg6, rg7)
+  let s3 = pick_assembled(pos: 3, lc, lg0, lg1, lg2, lg3, lg4, lg5, lg6, lg7, zc, rg0, rg1, rg2, rg3, rg4, rg5, rg6, rg7)
+  let s4 = pick_assembled(pos: 4, lc, lg0, lg1, lg2, lg3, lg4, lg5, lg6, lg7, zc, rg0, rg1, rg2, rg3, rg4, rg5, rg6, rg7)
+  let s5 = pick_assembled(pos: 5, lc, lg0, lg1, lg2, lg3, lg4, lg5, lg6, lg7, zc, rg0, rg1, rg2, rg3, rg4, rg5, rg6, rg7)
+  let s6 = pick_assembled(pos: 6, lc, lg0, lg1, lg2, lg3, lg4, lg5, lg6, lg7, zc, rg0, rg1, rg2, rg3, rg4, rg5, rg6, rg7)
+  let s7 = pick_assembled(pos: 7, lc, lg0, lg1, lg2, lg3, lg4, lg5, lg6, lg7, zc, rg0, rg1, rg2, rg3, rg4, rg5, rg6, rg7)
+  return Ip6Parsed(valid: true, s0, s1, s2, s3, s4, s5, s6, s7)
+end
+
+// Pick segment at position pos from the assembled left+zeros+right layout.
+let pick_assembled = fn (pos: i64, lc: i64, lg0: i64, lg1: i64, lg2: i64, lg3: i64, lg4: i64, lg5: i64, lg6: i64, lg7: i64, zc: i64, rg0: i64, rg1: i64, rg2: i64, rg3: i64, rg4: i64, rg5: i64, rg6: i64, rg7: i64) -> i64 do
+  if pos < lc then
+    return pick_left_seg(idx: pos, g0: lg0, g1: lg1, g2: lg2, g3: lg3, g4: lg4, g5: lg5, g6: lg6, g7: lg7)
+  else if pos < lc + zc then
+    return 0
+  else
+    let rpos = pos - lc - zc
+    return pick_left_seg(idx: rpos, g0: rg0, g1: rg1, g2: rg2, g3: rg3, g4: rg4, g5: rg5, g6: rg6, g7: rg7)
+  end
+end
+
+// Pick from an 8-tuple by index.
+let pick_left_seg = fn (idx: i64, g0: i64, g1: i64, g2: i64, g3: i64, g4: i64, g5: i64, g6: i64, g7: i64) -> i64 do
+  if idx == 0 then return g0
+  else if idx == 1 then return g1
+  else if idx == 2 then return g2
+  else if idx == 3 then return g3
+  else if idx == 4 then return g4
+  else if idx == 5 then return g5
+  else if idx == 6 then return g6
+  else return g7
+  end
+end
+
+// Check if a parsed IPv6 is in a blocked range.
+let ipv6_is_blocked = fn (ip: Ip6Parsed) -> bool do
+  let Ip6Parsed(valid: _, s0, s1, s2, s3, s4, s5, s6, s7) = ip
+  // unspecified ::
+  if s0 == 0 && s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0 && s5 == 0 && s6 == 0 && s7 == 0 then
+    return true
+  else if s0 == 0 && s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0 && s5 == 0 && s6 == 0 && s7 == 1 then
+    // loopback ::1
+    return true
+  else if s0 & 65024 == 64512 then
+    // ULA fc00::/7 (0xfe00=65024, 0xfc00=64512)
+    return true
+  else if s0 & 65472 == 65152 then
+    // link-local fe80::/10 (0xffc0=65472, 0xfe80=65152)
+    return true
+  else if s0 >= 65280 then
+    // multicast ff00::/8 (0xff00=65280)
+    return true
+  else if s0 == 0 && s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0 && s5 == 65535 then
+    // IPv4-mapped ::ffff:a.b.c.d
+    let a4 = s6 / 256
+    let b4 = s6 - a4 * 256
+    let c4 = s7 / 256
+    let d4 = s7 - c4 * 256
+    let ip4 = Ip4Parsed(a: a4, b: b4, c: c4, d: d4, valid: true)
+    return ipv4_is_blocked(ip: ip4)
+  else if s0 == 0 && s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0 && s5 == 0 then
+    // IPv4-compatible ::a.b.c.d (deprecated but still reject)
+    if s6 == 0 && s7 == 0 then
+      // :: already handled as unspecified above
+      return false
+    else
+      let a4 = s6 / 256
+      let b4 = s6 - a4 * 256
+      let c4 = s7 / 256
+      let d4 = s7 - c4 * 256
+      let ip4 = Ip4Parsed(a: a4, b: b4, c: c4, d: d4, valid: true)
+      return ipv4_is_blocked(ip: ip4)
+    end
+  else
+    return false
+  end
+end
+
+// Check if a hostname string (already lowercased) is a blocked well-known name.
+let blocked_hostname = fn (lower_host: string) -> bool do
+  if lower_host == "localhost" then return true
+  else if lower_host == "ip6-localhost" then return true
+  else if lower_host == "ip6-loopback" then return true
+  else if lower_host == "metadata.google.internal" then return true
+  else if lower_host == "metadata.goog" then return true
+  else if ends_with(s: lower_host, suffix: ".localhost") then return true
+  else if ends_with(s: lower_host, suffix: ".local") then return true
+  else return false
+  end
+end
+
+// Extract the host from a URL string: strips scheme (if any), then returns
+// the authority (host[:port]) portion. Then further strips port and brackets.
+let extract_host = fn (url: string) -> string do
+  let slen = str_length(s: url)
+  // skip scheme: find "://" and advance past it
+  let scheme_end = index_of(s: url, sub: "://")
+  let auth_start = if scheme_end < 0 then 0 else scheme_end + 3 end
+  let after_scheme = substring(s: url, start: auth_start, len: slen - auth_start)
+  // strip path/query/fragment: find first '/' or '?' or '#'
+  let slash_pos = index_of(s: after_scheme, sub: "/")
+  let query_pos = index_of(s: after_scheme, sub: "?")
+  let frag_pos = index_of(s: after_scheme, sub: "#")
+  let after_scheme_len = str_length(s: after_scheme)
+  let qs_end = min_positive(a: query_pos, b: frag_pos, fallback: after_scheme_len)
+  let auth_end = min_positive(a: slash_pos, b: qs_end, fallback: after_scheme_len)
+  let auth = substring(s: after_scheme, start: 0, len: auth_end)
+  // strip userinfo (everything before '@')
+  let at_pos = index_of(s: auth, sub: "@")
+  let auth_len_for_part = str_length(s: auth)
+  let host_part = if at_pos < 0 then auth else substring(s: auth, start: at_pos + 1, len: auth_len_for_part - at_pos - 1) end
+  // strip port: if not IPv6 bracketed, find last ':'
+  let auth_len = str_length(s: host_part)
+  if auth_len > 0 && char_code_at(s: host_part, pos: 0) == 91 then
+    // IPv6 bracketed: strip '[' and ']' (and optional ':port' after ']')
+    let close = index_of(s: host_part, sub: "]")
+    if close < 0 then
+      return host_part
+    else
+      return substring(s: host_part, start: 1, len: close - 1)
+    end
+  else
+    // strip ':port'
+    let colon = index_of(s: host_part, sub: ":")
+    if colon < 0 then
+      return host_part
+    else
+      return substring(s: host_part, start: 0, len: colon)
+    end
+  end
+end
+
+// Return the smaller of a and b, treating negative as "not present" → fallback.
+let min_positive = fn (a: i64, b: i64, fallback: i64) -> i64 do
+  if a < 0 && b < 0 then return fallback
+  else if a < 0 then return b
+  else if b < 0 then return a
+  else if a < b then return a
+  else return b
+  end
+end
+
+// Main SSRF guard: returns true if the URL target host is blocked.
+// Exported for testability; not part of the Net capability surface.
+// Design: hard deny-by-default; no sub-capability (allow_net_private).
+export let ssrf_is_blocked = fn (url: string) -> bool do
+  let host = extract_host(url)
+  let host_lower = to_lower(s: host)
+  let host_len = str_length(s: host)
+  if host_len == 0 then
+    return false
+  else
+    // Try IPv4
+    let ip4 = parse_ipv4(s: host)
+    let Ip4Parsed(a: _, b: _, c: _, d: _, valid: v4) = ip4
+    if v4 then
+      return ipv4_is_blocked(ip: ip4)
+    else
+      // Try IPv6 (may arrive with or without brackets — extract_host already stripped brackets)
+      let ip6 = parse_ipv6(s: host)
+      let Ip6Parsed(valid: v6, s0: _, s1: _, s2: _, s3: _, s4: _, s5: _, s6: _, s7: _) = ip6
+      if v6 then
+        return ipv6_is_blocked(ip: ip6)
+      else
+        // Hostname check (lowercased)
+        return blocked_hostname(lower_host: host_lower)
+      end
+    end
+  end
+end
+
+// ── end SSRF guard ─────────────────────────────────────────────────────────────
 
 /** Create a Header. */
 export let header = fn (name: string, value: string) -> Header do
@@ -196,23 +775,35 @@ let request_path = fn (req: &Request) -> string do
   return p
 end
 
-/** HTTP GET request. Returns the response body. Raises on failure. */
+/** HTTP GET request. Returns the response body. Raises on failure.
+ *  SSRF guard: blocks private/loopback/link-local/metadata hosts before connecting.
+ */
 let get = fn (url: string) -> string throws { RequestError } do
-  let res = decode_response(raw: http_request(method: "GET", url, headers: "", body: ""))
-  if response_status(res) == 0 then
+  if ssrf_is_blocked(url) then
     throw RequestError(url)
   else
-    return response_body(res)
+    let res = decode_response(raw: http_request(method: "GET", url, headers: "", body: ""))
+    if response_status(res) == 0 then
+      throw RequestError(url)
+    else
+      return response_body(res)
+    end
   end
 end
 
-/** HTTP request with custom method and raw header string. Raises on failure. */
+/** HTTP request with custom method and raw header string. Raises on failure.
+ *  SSRF guard: blocks private/loopback/link-local/metadata hosts before connecting.
+ */
 let request_raw = fn (method: string, url: string, headers: string, body: string) -> Response throws { RequestError } do
-  let res = decode_response(raw: http_request(method, url, headers, body))
-  if response_status(res) == 0 then
+  if ssrf_is_blocked(url) then
     throw RequestError(url)
   else
-    return res
+    let res = decode_response(raw: http_request(method, url, headers, body))
+    if response_status(res) == 0 then
+      throw RequestError(url)
+    else
+      return res
+    end
   end
 end
 
@@ -320,15 +911,20 @@ end
 HTTP request with custom method, headers, body, and a per-call
 timeout (milliseconds). `timeout_ms = 0` ⇒ no timeout (identical to
 `request`). Raises `RequestError` on failure (including timeout).
+SSRF guard: blocks private/loopback/link-local/metadata hosts before connecting.
 */
 let request_with_timeout = fn (method: string, url: string, headers: [ Header ], body: string, timeout_ms: i64) -> Response throws { RequestError } do
-  let encoded = encode_headers(headers)
-  let raw = http_request_with_options(method, url, headers: encoded, body, timeout_ms)
-  let res = decode_response(raw)
-  if response_status(res) == 0 then
+  if ssrf_is_blocked(url) then
     throw RequestError(url)
   else
-    return res
+    let encoded = encode_headers(headers)
+    let raw = http_request_with_options(method, url, headers: encoded, body, timeout_ms)
+    let res = decode_response(raw)
+    if response_status(res) == 0 then
+      throw RequestError(url)
+    else
+      return res
+    end
   end
 end
 
