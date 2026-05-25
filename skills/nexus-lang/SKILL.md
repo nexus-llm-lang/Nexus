@@ -21,6 +21,40 @@ Nexus is a programming language designed for LLM-friendly code generation. Its p
 
 - Non-Nexus programming tasks
 
+## Ground Your Work in the Compiler — `nexus` Introspection CLI
+
+Don't guess what the compiler sees — ask it. These subcommands are **read-only**
+(they write no files and are safe to run at any point), and take either one `.nx`
+file or resolve project-wide. Reach for them by situation:
+
+| Situation | Command |
+|-----------|---------|
+| Just edited a file — does it still compile? | `nexus typecheck <file>` |
+| What is this symbol — signature, kind, defining file, docstring? | `nexus explain <symbol> [--file <file>]` |
+| What type did the compiler infer (unannotated `let`s, effect rows)? | `nexus types <file> [--transitive]` |
+| Does this function touch Fs / Net / Console / …? Which caps to `require`? | `nexus caps <symbol> <file>` |
+| Where is X defined / every call site of X? | `nexus grep '<kind> <name>' [path]` |
+| Orienting in an unfamiliar file: defs, exports, import edges | `nexus context <file>` |
+| Debug how syntax actually parsed (punning, sigils, precedence) | `nexus ast <file>` |
+| Debug `let`/`fn`/handler desugaring or effect-row inference | `nexus hir <file>` |
+| Chase a codegen bug / size a function's wasm output | `nexus lir <file>` |
+
+**The feedback loop.** After every edit, run `nexus typecheck <file>` — it runs only
+the front-end (parse → resolve → HIR → full typecheck incl. effect rows + linearity),
+so it is fast and is the pre-commit target. Exit `0` = clean, `1` = diagnostic on
+stderr, `2` = bad usage. Don't claim an edit works until it type-checks.
+
+**Notes.**
+- Append `--format json` to `ast`/`hir`/`lir`/`types`/`caps`/`explain`/`context` for
+  machine-readable output (effect rows appear in `types --format json`).
+- `nexus grep` is **AST-aware**, not textual: `<kind>` ∈ `let|fn|call|var` (default
+  `call`), `<name>` is a literal or a `$`-wildcard (`$_` = any). Prefer it over text
+  search for "every call to `Fs.open_read`" or "the `let` named `helper`".
+- `nexus explain` / `nexus caps` accept a bare symbol suffix or the qualified
+  `<sanitized_path>#<name>` form; `explain` without `--file` searches the whole project.
+- Before finishing, `nexus fmt --check <file>` and `nexus lint <file>` are the
+  formatting / style safety pass (run `nexus help` for the full subcommand list).
+
 ## Quick Reference
 
 ### File Extension
