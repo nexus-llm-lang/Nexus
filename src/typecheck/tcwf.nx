@@ -30,7 +30,7 @@
 import { Span } from "src/common/token.nx"
 import { TypeExpr, TyRef, TyArrow, TyLinear, TyLazy, TyBorrow, TyArray, TyList, TyRecord, TyRow, TyUserDefined, NamedType, EnumDef, VariantDef, VariantField, RecordDef } from "src/common/ast.nx"
 import { HirCap, HirCapMethod, ExceptionGroupEntry, HirProgram, HirFunction, HirHandlerArm, HirHandlerBindingEntry, HirHandlerBinding, HirParam } from "src/ir/hir/types.nx"
-import { TypeError, UnknownCapability, UnknownThrowVariant, RefEscapes, RefInnerLinear } from "src/typecheck/errors.nx"
+import { TypeError, UnknownCapability, UnknownThrowVariant, RefEscapes, RefInnerLinear, ReservedDeclarationName, DuplicateDeclaration, InvalidGroupMember } from "src/typecheck/errors.nx"
 import { VariantIndex, VariantInfo }, * as vidx from "src/common/variant_index.nx"
 import { Option, Some, None } from "std:option"
 import * as str from "std:str"
@@ -539,13 +539,139 @@ let walk_type_defs = fn (
   end
 end
 
+// ─── D-Exception / D-Cap / D-ExceptionGroup name-binding validation ───────────
+//
+// Spec §type-system-formal.md §D-Exception, §D-Cap, §D-ExceptionGroup.
+// These checks enforce the freshness/membership premises on the BOUND NAME(s)
+// that wfCap/wfThrow at row-position sites do NOT cover:
+//
+//   D-Exception : C ∉ {Exn} ∪ SysCaps ∪ dom(methods) ∪ variants(Exn)
+//   D-Cap       : X ∉ {Exn} ∪ SysCaps ∪ dom(methods)
+//   D-ExceptionGroup: ∀i. C_i ∈ variants(Exn) ∧ distinct(C_1..C_n)
+
+// Return the first method span of a cap, falling back to Span(0,0,0).
+let cap_first_span = fn (methods: [ HirCapMethod ]) -> Span do
+  match methods do
+    | [] -> return Span(offset: 0, line: 0, col: 0)
+    | HirCapMethod(name: _, requires: _, span: sp, throw_row: _, typ_params: _, typ_ret: _) :: _ -> return sp
+  end
+end
+
+// Check whether `name` already exists as a variant in `names`.
+let str_list_has = fn (names: [ string ], s: string) -> bool do
+  match names do
+    | [] -> return false
+    | n :: rest ->
+      if n == s then return true end
+      return str_list_has(names: rest, s)
+  end
+end
+
+// ── D-Exception: validate each exception (Exn variant) name ────────────────
+
+let check_exn_decl_names = fn (defs: [ EnumDef ]) -> unit throws { TypeError } do
+  match defs do
+    | [] -> return ()
+    | EnumDef(name: n, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      if n == "Exn" then
+        // Only the Exn enum carries user-declared exceptions.
+        return check_exn_variants(variants: vs, seen: [])
+      end
+      return check_exn_decl_names(defs: rest)
+  end
+end
+
+// Walk Exn variants in declaration order. Variants added by register_exn_variant
+// are prepended (last-wins build), so the list is in reverse declaration order;
+// that is fine — we only need to detect duplicates and reserved names.
+let check_exn_variants = fn (variants: [ VariantDef ], seen: [ string ]) -> unit throws { TypeError } do
+  match variants do
+    | [] -> return ()
+    | VariantDef(name: vn, fields: _) :: rest ->
+      // Built-in variants seeded into empty_accum: RuntimeError, InvalidIndex.
+      // We must not flag them — only user-declared names that are reserved.
+      // A variant is "built-in" only if it was seeded before any TLException;
+      // we cannot distinguish by position here, so check only the two
+      // invariants that apply regardless of source:
+      //   1. name == "Exn" is always reserved.
+      //   2. name matches a SysCap name.
+      //   3. duplicate within this file's own exception declarations.
+      let span0 = Span(offset: 0, line: 0, col: 0)
+      if vn == "Exn" then
+        throw ReservedDeclarationName(kind: "exception", name: vn, span: span0)
+      end
+      if is_sys_cap(name: vn) then
+        throw ReservedDeclarationName(kind: "exception", name: vn, span: span0)
+      end
+      if str_list_has(names: seen, s: vn) then
+        throw DuplicateDeclaration(kind: "exception", name: vn, span: span0)
+      end
+      return check_exn_variants(variants: rest, seen: vn :: seen)
+  end
+end
+
+// ── D-Cap: validate each cap name ──────────────────────────────────────────
+
+let check_cap_decl_names = fn (caps: [ HirCap ], seen: [ string ]) -> unit throws { TypeError } do
+  match caps do
+    | [] -> return ()
+    | HirCap(name: qn, methods) :: rest ->
+      let bn = base_name_of(qualified: qn)
+      let sp = cap_first_span(methods)
+      if bn == "Exn" then
+        throw ReservedDeclarationName(kind: "cap", name: bn, span: sp)
+      end
+      if is_sys_cap(name: bn) then
+        throw ReservedDeclarationName(kind: "cap", name: bn, span: sp)
+      end
+      if str_list_has(names: seen, s: bn) then
+        throw DuplicateDeclaration(kind: "cap", name: bn, span: sp)
+      end
+      return check_cap_decl_names(caps: rest, seen: bn :: seen)
+  end
+end
+
+// ── D-ExceptionGroup: validate each group's members ────────────────────────
+
+let check_group_decls = fn (groups: [ ExceptionGroupEntry ], vidx_: VariantIndex) -> unit throws { TypeError } do
+  match groups do
+    | [] -> return ()
+    | ExceptionGroupEntry(name: gn, members: ms) :: rest ->
+      check_group_members(group_name: gn, members: ms, seen: [], vidx_)
+      return check_group_decls(groups: rest, vidx_)
+  end
+end
+
+let check_group_members = fn (group_name: string, members: [ string ], seen: [ string ], vidx_: VariantIndex) -> unit throws { TypeError } do
+  match members do
+    | [] -> return ()
+    | m :: rest ->
+      let span0 = Span(offset: 0, line: 0, col: 0)
+      if !is_exn_variant(name: m, vidx_) then
+        throw InvalidGroupMember(group_name, member: m, reason: "not a declared exception constructor", span: span0)
+      end
+      if str_list_has(names: seen, s: m) then
+        throw InvalidGroupMember(group_name, member: m, reason: "duplicate member", span: span0)
+      end
+      return check_group_members(group_name, members: rest, seen: m :: seen, vidx_)
+  end
+end
+
 /** Run wfCap and wfThrow over every introduction site in the program.
  *  Pre-DCE so unused functions with typo'd rows are still rejected.
  *  Covers D-Cap method signatures: ∀j∈J. wfCap(α_j) ∧ wfThrow(β_j).
+ *  Also validates declaration name-binding premises:
+ *    D-Exception: C ∉ {Exn} ∪ SysCaps ∧ C ∉ variants(Exn) (no reserved/duplicate)
+ *    D-Cap: X ∉ {Exn} ∪ SysCaps ∧ X ∉ dom(caps) (no reserved/duplicate)
+ *    D-ExceptionGroup: ∀i. C_i ∈ variants(Exn) ∧ distinct(C_1..C_n)
  */
 export let check_program_wf_rows = fn (prog: HirProgram) -> unit throws { TypeError } do
   let HirProgram(caps, functions: funcs, externals: _, handler_bindings: hbs, enum_defs: edefs, exception_groups: egs, value_binding_names: _, type_defs: tdefs, visible_enum_names: _) = prog
   let vi = variant_index_of(enum_defs: edefs)
+  // D-Exception / D-Cap / D-ExceptionGroup name-binding validation.
+  check_exn_decl_names(defs: edefs)
+  check_cap_decl_names(caps, seen: [])
+  check_group_decls(groups: egs, vidx_: vi)
   walk_caps(caps, all_caps: caps, vidx_: vi, groups: egs)
   // Gravity rule (¬escapesRef) + wfRef on D-Cap method signatures.
   walk_caps_wf_ref(caps, vidx_: vi, groups: egs, tdefs)
