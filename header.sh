@@ -1264,9 +1264,8 @@ if [ "$TEST_MODE" = "1" ]; then
       if printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^tcp-serve\t/" | grep -q .; then
         P2C_HTTP_FLAGS="-S http -S tcp=y -S inherit-network"
         # If the test hardcodes a port via // p2c-tcp-port: <N>, use that directly.
-        # Otherwise fall back to dynamic allocation (requires Env.get in the component
-        # to read NEXUS_TCP_PORT, but Env.get before Net.listen conflicts with
-        # the p2sock_bridge cabi_realloc bump-allocator at address 65536).
+        # Otherwise fall back to dynamic allocation: harness passes NEXUS_TCP_PORT
+        # via --env and the component reads it via Env.get before calling Net.listen.
         _p2c_tcp_fixed_port=$(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^tcp-port\t/ { print \$2; exit }")
         if [ -n "$_p2c_tcp_fixed_port" ]; then
           P2C_TCP_SERVE_PORT=$_p2c_tcp_fixed_port
