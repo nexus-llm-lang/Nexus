@@ -1,0 +1,166 @@
+// Smoke test for inline lint-suppress directives (apply_suppressions).
+//
+// Exercises the suppress module directly on source strings:
+//   - lint:allow on the same line drops the finding for that code
+//   - lint:allow-next drops the finding on the NEXT line
+//   - lint:allow-file drops the finding anywhere in the file
+//   - without a directive the finding is preserved
+//   - directive for a different code does not suppress an unrelated code
+//
+// Strategy: parse a source string via the AST path, collect findings via
+// lint_program, then pipe them through apply_suppressions with the same
+// source string.  No Proc.exec / file I/O required.
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import * as lexer from "src/frontend/lexer.nx"
+import { ParseDiagnostics }, * as parser from "src/frontend/parser.nx"
+import { LintFinding, lint_program } from "src/lint/lint.nx"
+import { apply_suppressions } from "src/lint/suppress.nx"
+
+// Parse src and run lint_program; return raw findings before suppression.
+let lint_raw = fn (src: string) -> [LintFinding] do
+  let tokens = lexer.tokenize(src: src)
+  let ParseDiagnostics(prog, diags: _) = parser.parse_collect(tokens: tokens, file: "fixture.nx")
+  return lint_program(prog: prog)
+end
+
+// Run full pipeline: lint then apply_suppressions.
+let lint_with_suppress = fn (src: string) -> [LintFinding] do
+  let raw = lint_raw(src)
+  return apply_suppressions(src, findings: raw)
+end
+
+let has_code = fn (fs: [LintFinding], code: string) -> bool do
+  match fs do
+    | [] -> return false
+    | LintFinding(code: fcode, severity: _, message: _, fix_it: _, span: _) :: rest ->
+      if fcode == code then return true end
+      return has_code(fs: rest, code)
+  end
+end
+
+// A source that produces an L0002 finding on the `let main = fn` line.
+// The `main` function declares `Console` but never calls Console.*.
+let l0002_src_plain = fn () -> string do
+  return "import { Console } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { Console } do\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+end
+
+// ─── Baseline: finding fires without a directive ─────────────────────────────
+
+let test_baseline_l0002_fires = fn () -> unit throws { Exn } do
+  let src = l0002_src_plain()
+  let findings = lint_with_suppress(src)
+  test_assert.assert(cond: has_code(fs: findings, code: "L0002"),
+    label: "suppress: L0002 fires on plain source (no directive)")
+  return ()
+end
+
+// ─── lint:allow on the same line ─────────────────────────────────────────────
+
+// The span for an L0002 finding lands on the `let f = fn` line (fn_span).
+// We put lint:allow L0002 on that exact line via an inline comment.
+//
+// In practice the AST span for a top-level lambda is the span of the
+// ExprLambda, which starts at the `fn` keyword. The source line that
+// contains `fn` is line 2 (0-indexed: the import is line 1).
+// We append `// lint:allow L0002` to line 2 to silence it there.
+let test_allow_same_line = fn () -> unit throws { Exn } do
+  let src = "import { Console } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { Console } do // lint:allow L0002\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_with_suppress(src)
+  test_assert.assert(cond: !has_code(fs: findings, code: "L0002"),
+    label: "suppress: lint:allow on same line drops L0002")
+  return ()
+end
+
+// ─── lint:allow-next (directive sits ABOVE the finding line) ─────────────────
+
+let test_allow_next = fn () -> unit throws { Exn } do
+  let src = "import { Console } from \"std:stdio\"\n"
+    ++ "// lint:allow-next L0002\n"
+    ++ "let main = fn () -> unit require { Console } do\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_with_suppress(src)
+  test_assert.assert(cond: !has_code(fs: findings, code: "L0002"),
+    label: "suppress: lint:allow-next above the fn line drops L0002")
+  return ()
+end
+
+// ─── lint:allow-file anywhere in file ────────────────────────────────────────
+
+let test_allow_file = fn () -> unit throws { Exn } do
+  let src = "// lint:allow-file L0002\n"
+    ++ "import { Console } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { Console } do\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_with_suppress(src)
+  test_assert.assert(cond: !has_code(fs: findings, code: "L0002"),
+    label: "suppress: lint:allow-file drops L0002 anywhere in file")
+  return ()
+end
+
+// ─── Directive for different code does not suppress the finding ───────────────
+
+let test_allow_wrong_code = fn () -> unit throws { Exn } do
+  let src = "import { Console } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { Console } do // lint:allow L0001\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_with_suppress(src)
+  test_assert.assert(cond: has_code(fs: findings, code: "L0002"),
+    label: "suppress: lint:allow L0001 does not silence L0002")
+  return ()
+end
+
+// ─── Bare directive suppresses all codes on that line ────────────────────────
+
+let test_allow_bare = fn () -> unit throws { Exn } do
+  let src = "import { Console } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { Console } do // lint:allow\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+  let findings = lint_with_suppress(src)
+  test_assert.assert(cond: !has_code(fs: findings, code: "L0002"),
+    label: "suppress: bare lint:allow suppresses all codes on that line")
+  return ()
+end
+
+// ─── Runner ─────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit throws { Exn } do
+  test_baseline_l0002_fires()
+  test_allow_same_line()
+  test_allow_next()
+  test_allow_file()
+  test_allow_wrong_code()
+  test_allow_bare()
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end

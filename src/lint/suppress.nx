@@ -1,0 +1,181 @@
+/**
+ * suppress: post-filter lint findings by inline comment directives.
+ *
+ * Comments are stripped at lex time, so directives never reach the AST.
+ * This module re-scans the raw source text to extract directives, then
+ * filters the findings list produced by lint_program.
+ *
+ * Directive syntax (on any line of the source file):
+ *   // lint:allow L0001           suppress that code on the SAME line
+ *   // lint:allow-next L0001      suppress that code on the NEXT line
+ *   // lint:allow-file L0001      suppress that code for the whole file
+ *   // lint:allow L0001, L0002    comma-separated list of codes
+ *   // lint:allow                 bare form — suppresses ALL codes on the line
+ *
+ * The directive prefix is matched anywhere in the line (not just the start),
+ * so `some_call() // lint:allow L0001` also works.
+ *
+ * Suppression is applied ONLY to findings whose span.line matches the target
+ * line (on-line or allow-next) or whose code is in the file-wide set.
+ */
+
+import * as str from "std:str"
+import * as list from "std:list"
+import { Span } from "src/common/token.nx"
+import { LintFinding } from "src/lint/lint.nx"
+
+// ─── Directive parsing ───────────────────────────────────────────────────────
+
+// Prefix tokens
+let prefix_allow = fn () -> string do return "lint:allow" end
+let prefix_allow_next = fn () -> string do return "lint:allow-next" end
+let prefix_allow_file = fn () -> string do return "lint:allow-file" end
+
+// Extract the code-list portion of a directive line, given the portion of
+// the line after the prefix keyword. E.g. for "lint:allow L0001, L0002" the
+// tail is " L0001, L0002". Returns a list of trimmed code strings, or []
+// for a bare directive (meaning "all codes").
+let parse_code_list = fn (tail: string) -> [string] do
+  let t = str.trim(s: tail)
+  if str.length(s: t) == 0 then return [] end
+  let parts = str.split(s: t, sep: ",")
+  return trim_parts(xs: parts, acc: [])
+end
+
+let trim_parts = fn (xs: [string], acc: [string]) -> [string] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | p :: rest ->
+      let trimmed = str.trim(s: p)
+      if str.length(s: trimmed) == 0 then
+        return trim_parts(xs: rest, acc: acc)
+      end
+      return trim_parts(xs: rest, acc: trimmed :: acc)
+  end
+end
+
+// Try to find a directive prefix in the line. Returns the tail after the
+// prefix keyword, or "" if this prefix is not present.
+// We search for the prefix after "lint:" which always begins directives.
+let after_prefix = fn (line: string, prefix: string) -> string do
+  let idx = str.index_of(s: line, sub: prefix)
+  if idx < 0 then return "" end
+  let after = idx + str.length(s: prefix)
+  return str.byte_substring(s: line, start: after, len: str.byte_length(s: line) - after)
+end
+
+// ─── Suppression record ──────────────────────────────────────────────────────
+
+// A suppression entry: target line (1-based, -1 for file-wide) and list of
+// codes (empty list = all codes).
+type Suppression = Suppression(target_line: i64, codes: [string])
+
+// ─── Build suppression list from source ──────────────────────────────────────
+
+/** Scan the source text and return a list of Suppression records. */
+let build_suppressions = fn (src: string) -> [Suppression] do
+  let lines = str.split(s: src, sep: "\n")
+  return scan_lines(lines, line_no: 1, acc: [])
+end
+
+let scan_lines = fn (lines: [string], line_no: i64, acc: [Suppression]) -> [Suppression] do
+  match lines do
+    | [] -> return acc
+    | ln :: rest ->
+      let acc2 = process_line(line: ln, line_no: line_no, acc: acc)
+      return scan_lines(lines: rest, line_no: line_no + 1, acc: acc2)
+  end
+end
+
+let process_line = fn (line: string, line_no: i64, acc: [Suppression]) -> [Suppression] do
+  // Check lint:allow-file (whole-file suppression)
+  if str.contains(s: line, sub: prefix_allow_file()) then
+    let tail = after_prefix(line, prefix: prefix_allow_file())
+    let codes = parse_code_list(tail)
+    return Suppression(target_line: -1, codes) :: acc
+  end
+  // Check lint:allow-next (next-line suppression)
+  if str.contains(s: line, sub: prefix_allow_next()) then
+    let tail = after_prefix(line, prefix: prefix_allow_next())
+    let codes = parse_code_list(tail)
+    return Suppression(target_line: line_no + 1, codes) :: acc
+  end
+  // Check lint:allow (same-line suppression — only when neither -next nor -file)
+  if str.contains(s: line, sub: prefix_allow()) then
+    let tail = after_prefix(line, prefix: prefix_allow())
+    let codes = parse_code_list(tail)
+    return Suppression(target_line: line_no, codes) :: acc
+  end
+  return acc
+end
+
+// ─── Matching logic ──────────────────────────────────────────────────────────
+
+// Does a single suppression entry suppress this finding?
+let suppression_covers = fn (s: Suppression, f: LintFinding) -> bool do
+  match s do | Suppression(target_line, codes) ->
+    // -1 = file-wide suppression; skip line check
+    if target_line >= 0 then
+      match f do | LintFinding(code: _, severity: _, message: _, fix_it: _, span) ->
+        match span do | Span(offset: _, line: fl, col: _) ->
+          if fl != target_line then return false end
+        end
+      end
+    end
+    // Empty codes list = all codes on that line are suppressed
+    if list.is_empty(xs: codes) then return true end
+    match f do | LintFinding(code, severity: _, message: _, fix_it: _, span: _) ->
+      return code_in_list(code, xs: codes)
+    end
+  end
+end
+
+let code_in_list = fn (code: string, xs: [string]) -> bool do
+  match xs do
+    | [] -> return false
+    | c :: rest ->
+      if c == code then return true end
+      return code_in_list(code, xs: rest)
+  end
+end
+
+// Is the finding covered by ANY suppression?
+let is_suppressed = fn (f: LintFinding, suppressions: [Suppression]) -> bool do
+  match suppressions do
+    | [] -> return false
+    | s :: rest ->
+      if suppression_covers(s, f) then return true end
+      return is_suppressed(f, suppressions: rest)
+  end
+end
+
+// ─── Main API ────────────────────────────────────────────────────────────────
+
+/** Filter out findings that are covered by inline lint-suppress directives.
+ *  Pure: reads only `src` and `findings`, no I/O or caps required.
+ *
+ *  Directive forms recognised:
+ *    // lint:allow L0001           same-line suppression
+ *    // lint:allow-next L0001      next-line suppression (above the finding)
+ *    // lint:allow-file L0001      whole-file suppression
+ *    // lint:allow L0001, L0002    comma list
+ *    // lint:allow                 bare = suppress all codes on that line
+ */
+export let apply_suppressions = fn (src: string, findings: [LintFinding]) -> [LintFinding] do
+  if list.is_empty(xs: findings) then return findings end
+  let suppressions = build_suppressions(src)
+  if list.is_empty(xs: suppressions) then return findings end
+  return filter_findings(findings, suppressions, acc: [])
+end
+
+let filter_findings = fn (findings: [LintFinding], suppressions: [Suppression], acc: [LintFinding]) -> [LintFinding] do
+  match findings do
+    | [] -> return list.reverse(xs: acc)
+    | f :: rest ->
+      if is_suppressed(f, suppressions) then
+        return filter_findings(findings: rest, suppressions, acc)
+      else
+        return filter_findings(findings: rest, suppressions, acc: f :: acc)
+      end
+  end
+end
