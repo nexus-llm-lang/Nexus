@@ -274,28 +274,177 @@ let pipeline_for_fix = fn (src: string, input_path: string) -> LintFixOutcome re
 end
 
 // Collect lint fix-its from a parsed source (AST-only, fast path).
-// Returns only fixits that have a non-zero len (i.e. can be applied).
+// Returns only fixits that have a non-zero len (i.e. can be applied),
+// including L0001/L0002 fixits whose spans are computed by source scanning.
 let collect_lint_fixits = fn (src: string, path: string) -> [ Fixit ] do
   let tokens = lexer.tokenize(src)
   let ParseDiagnostics(prog, diags: _) = parser.parse_collect(tokens, file: path)
   let raw_findings = lint_program(prog)
   let findings = apply_suppressions(src, findings: raw_findings)
-  return extract_applicable_fixits(findings, acc: [])
+  return extract_applicable_fixits(src, findings, acc: [])
 end
 
-let extract_applicable_fixits = fn (findings: [ LintFinding ], acc: [ Fixit ]) -> [ Fixit ] do
+// Source-scanning helpers for L0001 / L0002 span enrichment.
+// These live here (not in lint.nx) because they need the raw source string
+// which is only available in the fix-mode driver, not the AST linter.
+
+let lint_is_ident_ch = fn (c: char) -> bool do
+  if c >= 'a' && c <= 'z' then return true end
+  if c >= 'A' && c <= 'Z' then return true end
+  if c >= '0' && c <= '9' then return true end
+  if c == '_' then return true end
+  return false
+end
+
+// Find `word` as a whole word (both adjacent bytes are non-ident) starting
+// at `start`. `window` is the max bytes to scan. Returns byte offset or -1.
+let find_word_in = fn (src: string, start: i64, window: i64, word: string) -> i64 do
+  let n = str.byte_length(s: src)
+  let m = str.byte_length(s: word)
+  let scan_end = if start + window > n then n else start + window end
+  return find_word_in_loop(src: src, i: start, limit: scan_end, word: word, m: m)
+end
+
+let find_word_in_loop = fn (src: string, i: i64, limit: i64, word: string, m: i64) -> i64 do
+  let n = str.byte_length(s: src)
+  if i + m > limit then return 0 - 1 end
+  let w = str.byte_substring(s: src, start: i, len: m)
+  if w == word then
+    let prev_ok = if i == 0 then true else !lint_is_ident_ch(c: str.byte_at(s: src, idx: i - 1)) end
+    let next_ok = if i + m >= n then true else !lint_is_ident_ch(c: str.byte_at(s: src, idx: i + m)) end
+    if prev_ok && next_ok then return i end
+  end
+  return find_word_in_loop(src: src, i: i + 1, limit: limit, word: word, m: m)
+end
+
+// Scan backward from `i` down to `limit` for a ',' byte.
+// Returns its position or -1 if not found.
+let find_comma_before_loop = fn (src: string, i: i64, limit: i64) -> i64 do
+  if i < limit then return 0 - 1 end
+  let c = str.byte_at(s: src, idx: i)
+  if c == ',' then return i end
+  return find_comma_before_loop(src: src, i: i - 1, limit: limit)
+end
+
+// Enrich an L0001 fixit: the AST produced `start=0, len=0` as a placeholder.
+// We scan from `span.offset` (the `inject` keyword) forward for the whole-word
+// `end` that closes the empty inject body, and replace the entire
+// `inject … do end` text with "" (empty replacement = delete).
+// Returns None if the scan window does not find `end` (defensive).
+let enrich_l0001_fixit = fn (src: string, sp: Span, fix: Fixit) -> Option<Fixit> do
+  let n = str.byte_length(s: src)
+  match sp do | Span(offset, line: _, col: _) ->
+    let end_pos = find_word_in(src, start: offset, window: 4096, word: "end")
+    if end_pos < 0 then return None end
+    let real_start = offset
+    let raw_len = end_pos + 3 - real_start
+    // Consume a trailing newline so the removed line doesn't leave a blank.
+    let real_len = if end_pos + 3 < n then
+        let nc = str.byte_at(s: src, idx: end_pos + 3)
+        if nc == '\n' then raw_len + 1 else raw_len end
+      else raw_len end
+    match fix do | Fixit(start: _, len: _, replacement: _, code, message) ->
+      return Some(val: Fixit(start: real_start, len: real_len, replacement: "", code, message))
+    end
+  end
+end
+
+// Enrich an L0002 fixit: the AST produced `start=0, len=0, replacement=<cap_name>`.
+// We scan from `span.offset` (the fn keyword) forward for the `require` clause,
+// locate the cap name inside `{…}`, and compute the span to delete:
+//   - single cap: delete the entire `require { Cap }` phrase (plus leading space)
+//   - multi cap:  delete `Cap` plus its adjacent `, ` or ` ,` separator
+// Returns None if the scan fails (defensive; caller falls back to hint-only).
+let enrich_l0002_fixit = fn (src: string, sp: Span, fix: Fixit) -> Option<Fixit> do
+  let n = str.byte_length(s: src)
+  match fix do | Fixit(start: _, len: _, replacement: cn, code, message) ->
+    let cn_len = str.byte_length(s: cn)
+    if cn_len == 0 then return None end
+    match sp do | Span(offset: offset, line: _, col: _) ->
+      // Locate `require` keyword from the fn keyword.
+      let req_pos = find_word_in(src, start: offset, window: 2048, word: "require")
+      if req_pos < 0 then return None end
+      // Find the opening `{` of the require row.
+      let brace_open = str.find_byte(s: src, start: req_pos + 7, ch: '{')
+      if brace_open < 0 then return None end
+      // Find the closing `}`.
+      let brace_close = str.find_byte(s: src, start: brace_open + 1, ch: '}')
+      if brace_close < 0 then return None end
+      // Locate the cap name inside the braces.
+      let inner_window = brace_close - brace_open
+      let cn_pos = find_word_in(src, start: brace_open + 1, window: inner_window, word: cn)
+      if cn_pos < 0 then return None end
+      // Is there a comma inside the braces (→ multi-cap row)?
+      let comma_in_block = str.find_byte(s: src, start: brace_open + 1, ch: ',')
+      let is_single = comma_in_block < 0 || comma_in_block >= brace_close
+      if is_single then
+        // Remove the entire `require { Cap }`, including one leading space.
+        let rm_start = if req_pos > 0 then
+            let prev = str.byte_at(s: src, idx: req_pos - 1)
+            if prev == ' ' then req_pos - 1 else req_pos end
+          else req_pos end
+        let rm_len = brace_close + 1 - rm_start
+        return Some(val: Fixit(start: rm_start, len: rm_len, replacement: "", code, message))
+      else
+        // Multi-cap: remove `Cap` + adjacent comma+space.
+        let after_cn = cn_pos + cn_len
+        // Check if comma follows cn: `cn, NextCap` pattern.
+        let comma_after = if after_cn < brace_close then str.byte_at(s: src, idx: after_cn) else ' ' end
+        if comma_after == ',' then
+          // Remove `cn,` plus any space after the comma.
+          let space_after = after_cn + 1
+          let skip = if space_after < brace_close then
+              let sc = str.byte_at(s: src, idx: space_after)
+              if sc == ' ' then space_after + 1 else space_after end
+            else space_after end
+          let rm_len = skip - cn_pos
+          return Some(val: Fixit(start: cn_pos, len: rm_len, replacement: "", code, message))
+        else
+          // Comma precedes cn: `PrevCap, cn` pattern — find the comma before cn.
+          let comma_pos = find_comma_before_loop(src: src, i: cn_pos - 1, limit: brace_open + 1)
+          if comma_pos < 0 then return None end
+          let rm_len = cn_pos + cn_len - comma_pos
+          return Some(val: Fixit(start: comma_pos, len: rm_len, replacement: "", code, message))
+        end
+      end
+    end
+  end
+end
+
+// Attempt enrichment of a zero-len fixit for L0001 or L0002.
+// Returns the updated accumulator (with enriched fixit prepended if successful).
+let enrich_zero_len_fixit = fn (src: string, sp: Span, fix: Fixit, acc: [ Fixit ], code: string) -> [ Fixit ] do
+  if code == "L0001" then
+    match enrich_l0001_fixit(src: src, sp: sp, fix: fix) do
+      | Some(val: real_fix) -> return real_fix :: acc
+      | None -> return acc
+    end
+  end
+  if code == "L0002" then
+    match enrich_l0002_fixit(src: src, sp: sp, fix: fix) do
+      | Some(val: real_fix) -> return real_fix :: acc
+      | None -> return acc
+    end
+  end
+  return acc
+end
+
+let extract_applicable_fixits = fn (src: string, findings: [ LintFinding ], acc: [ Fixit ]) -> [ Fixit ] do
   match findings do
     | [] -> return list.reverse(xs: acc)
-    | LintFinding(code: _, severity: _, message: _, fix_it, span: _) :: rest ->
+    | LintFinding(code: _, severity: _, message: _, fix_it, span) :: rest ->
       match fix_it do
-        | None -> return extract_applicable_fixits(findings: rest, acc: acc)
+        | None -> return extract_applicable_fixits(src, findings: rest, acc: acc)
         | Some(val: fix) ->
-          match fix do | Fixit(start: _, len, replacement: _, code: _, message: _) ->
-            // Only include fixits with a non-zero len (real span rewrites).
-            // Hint-only fixits (len=0, e.g. L0001/L0002 in V1) are reported
-            // in the human text but not auto-applied.
-            let acc2 = if len > 0 then fix :: acc else acc end
-            return extract_applicable_fixits(findings: rest, acc: acc2)
+          match fix do | Fixit(start: _, len, replacement: _, code, message: _) ->
+            let acc2 = if len > 0 then
+                // Real span: apply as-is (E2005/E2007 style).
+                fix :: acc
+              else
+                // len=0: attempt source-scan enrichment for L0001/L0002.
+                enrich_zero_len_fixit(src: src, sp: span, fix: fix, acc: acc, code: code)
+              end
+            return extract_applicable_fixits(src, findings: rest, acc: acc2)
           end
       end
   end
