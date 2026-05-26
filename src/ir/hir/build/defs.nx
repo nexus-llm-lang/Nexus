@@ -85,7 +85,8 @@ import {
   HirHandlerBinding,
   HirHandlerBindingEntry,
   HirAccum,
-  ExceptionGroupEntry
+  ExceptionGroupEntry,
+  ExtWasmDep
 } from "src/ir/hir/types.nx"
 import { convert_expr, convert_expr_toplevel, convert_params } from "src/ir/hir/convert/core.nx"
 import { register_exn_variant } from "src/ir/hir/build/accum.nx"
@@ -208,6 +209,44 @@ let find_last_slash = fn (s: string, pos: i64) -> i64 do
   let c = str.byte_at(s, idx: pos)
   if c == '/' then return pos end
   return find_last_slash(s, pos: pos - 1)
+end
+
+/** Extract the directory part of a file path: "foo/bar/baz.nx" -> "foo/bar".
+ *  Returns "" when there is no slash (bare filename like "baz.nx").
+ */
+let file_dir = fn (path: string) -> string do
+  let len = str.byte_length(s: path)
+  let slash_pos = find_last_slash(s: path, pos: len - 1)
+  if slash_pos < 0 then return "" end
+  return str.substring(s: path, start: 0, len: slash_pos)
+end
+
+/** Resolve a wasm_path relative to the directory of source_file.
+ *  If wasm_path is already absolute (starts with '/'), return it unchanged.
+ *  If source_file has no directory (bare filename), return wasm_path unchanged.
+ *  Otherwise return "<source_dir>/<wasm_path>".
+ */
+let resolve_wasm_path = fn (wasm_path: string, source_file: string) -> string do
+  if str.byte_length(s: wasm_path) > 0 then
+    if str.byte_at(s: wasm_path, idx: 0) == '/' then
+      return wasm_path
+    end
+  end
+  let dir = file_dir(path: source_file)
+  if str.length(s: dir) == 0 then return wasm_path end
+  return dir ++ "/" ++ wasm_path
+end
+
+/** Check whether a module path refers to an external WASM file
+ *  (ends with ".wasm" and is not a nexus:std/ or nexus:intrinsic module).
+ */
+let is_wasm_file_module = fn (path: string) -> bool do
+  if str.ends_with(s: path, suffix: ".wasm") then
+    if str.starts_with(s: path, prefix: "nexus:") then return false end
+    if str.starts_with(s: path, prefix: "wasi") then return false end
+    return true
+  end
+  return false
 end
 
 /** Extract type params from a raw AST expression. */
@@ -399,7 +438,16 @@ let synthesize_handler_arms_go = fn (
           // Synthesised `with @k` continuation binder: TyLazy already triggers
           // type-side linearity; sigil mirrors the implicit `@k` shape.
           // Pure thunk continuation: no deferred effects (require {} throws {}).
-          let k_p = HirParam(label: k, name: k, sigil: SigilLazy, typ: TyLazy(inner: rt, require_row: TyRow(types: [], rest: None), throw_row: TyRow(types: [], rest: None)))
+          let k_p = HirParam(
+            label: k,
+            name: k,
+            sigil: SigilLazy,
+            typ: TyLazy(
+              inner: rt,
+              require_row: TyRow(types: [], rest: None),
+              throw_row: TyRow(types: [], rest: None)
+            )
+          )
           list.concat(xs: ps, ys: [ k_p ])
         | None -> ps
       end
@@ -438,7 +486,8 @@ let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, typ
     exception_groups: egs,
     value_binding_names: vbns,
     type_defs: tds,
-    visible_enum_names: vens
+    visible_enum_names: vens,
+    ext_wasm_deps: ewds
   ) = accum
   // Stdlib files: full convert_expr (handlers/externals/constants are cheap,
   // and keeping them as EagerBody avoids cumulative OOM during lazy resolve).
@@ -503,13 +552,13 @@ let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, typ
           entries
         ), span, file: source_file, requires: lambda_requires)
       return HirAccum(caps: ps, functions: func :: fs,
-        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: new_vbns, type_defs: tds, visible_enum_names: vens)
+        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: new_vbns, type_defs: tds, visible_enum_names: vens, ext_wasm_deps: ewds)
     | Handler(cap_name: pname, requires: handler_req, arms: handler_arms) ->
       let binding = synthesize_handler(
         binding_name: qname, cap_name: pname, requires: handler_req, arms: handler_arms, source_file)
       return HirAccum(caps: ps, functions: fs, externals: exts,
         handler_bindings: binding :: hbs,
-        enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens)
+        enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens, ext_wasm_deps: ewds)
     | ExternalRef(symbol: sym, type_params: tps, arg_names: anames, typ: t) ->
       match wmod do
         | Some(val: wm) ->
@@ -524,7 +573,7 @@ let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, typ
             wasm_name: effective_sym, type_params: tps, arg_names: anames, typ: t)
           return HirAccum(caps: ps, functions: fs,
             externals: ext :: exts,
-            handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens)
+            handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens, ext_wasm_deps: ewds)
         | None ->
           let Span(offset: _, line: l, col: c) = span
           throw SymbolNotFound(name: qname, kind: SkExternal,
@@ -545,7 +594,7 @@ let process_tl_let = fn (qname: string, orig_name: string, val: SpannedExpr, typ
         file: source_file,
         requires: TyRow(types: [], rest: None))
       return HirAccum(caps: ps, functions: func :: fs,
-        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: qname :: vbns, type_defs: tds, visible_enum_names: vens)
+        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: qname :: vbns, type_defs: tds, visible_enum_names: vens, ext_wasm_deps: ewds)
   end
 end
 
@@ -567,14 +616,28 @@ let process_top_level = fn (
     exception_groups: egs,
     value_binding_names: vbns,
     type_defs: tds,
-    visible_enum_names: vens
+    visible_enum_names: vens,
+    ext_wasm_deps: ewds
   ) = accum
   match node do
     | TLImport(def: ImportDef(path, alias: _, items: _, is_external: is_ext)) ->
       if is_ext then
         let mapped = map_stdlib_to_wit(ext_path: path, source_file)
+        // When the import path refers to a real .wasm file, record a dep so
+        // the build pipeline can link it via merge_with_deps.  The module_name
+        // is the verbatim path (used as the wasm import-module string in
+        // codegen).  The wasm_path is resolved relative to the source file's
+        // directory so it points to a real file on disk.
+        let new_ewds = if is_wasm_file_module(path: mapped) then
+          ExtWasmDep(
+            module_name: mapped,
+            wasm_path: resolve_wasm_path(wasm_path: path, source_file)
+          ) :: ewds
+        else
+          ewds
+        end
         return HirAccum(caps: ps, functions: fs, externals: exts,
-          handler_bindings: hbs, enum_defs: eds, wasm_module: Some(val: mapped), exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens)
+          handler_bindings: hbs, enum_defs: eds, wasm_module: Some(val: mapped), exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens, ext_wasm_deps: new_ewds)
       else
         return accum
       end
@@ -589,7 +652,7 @@ let process_top_level = fn (
       let qname = symtab.rename(name: pname, entries)
       let hir_cap = HirCap(name: qname, methods: convert_cap_sigs(sigs, span))
       return HirAccum(caps: hir_cap :: ps, functions: fs,
-        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens)
+        externals: exts, handler_bindings: hbs, enum_defs: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens, ext_wasm_deps: ewds)
     | TLEnum(def: ed) ->
       // D-Export: non-public enums from imported files must not expose their
       // constructors to the importing module. We track which enum names are
@@ -619,23 +682,23 @@ let process_top_level = fn (
           end
           return HirAccum(caps: ps, functions: fs, externals: exts,
             handler_bindings: hbs,
-            enum_defs: ed_stored :: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: new_vens)
+            enum_defs: ed_stored :: eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: new_vens, ext_wasm_deps: ewds)
       end
     | TLTypeDef(def: rd) ->
       return HirAccum(caps: ps, functions: fs, externals: exts,
         handler_bindings: hbs, enum_defs: eds, wasm_module: wmod,
-        exception_groups: egs, value_binding_names: vbns, type_defs: rd :: tds, visible_enum_names: vens)
+        exception_groups: egs, value_binding_names: vbns, type_defs: rd :: tds, visible_enum_names: vens, ext_wasm_deps: ewds)
     | TLException(def: ExceptionDef(name: ename, is_public: _, fields: efields)) ->
       let updated_eds = register_exn_variant(enum_defs: eds, vname: ename, vfields: efields)
       return HirAccum(caps: ps, functions: fs, externals: exts,
-        handler_bindings: hbs, enum_defs: updated_eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens)
+        handler_bindings: hbs, enum_defs: updated_eds, wasm_module: wmod, exception_groups: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens, ext_wasm_deps: ewds)
     | TLExceptionGroup(def: ExceptionGroupDef(name: gname, is_public: _, members: gmembers)) ->
       return HirAccum(caps: ps, functions: fs, externals: exts,
         handler_bindings: hbs, enum_defs: eds, wasm_module: wmod,
         exception_groups: ExceptionGroupEntry(
           name: gname,
           members: gmembers
-        ) :: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens)
+        ) :: egs, value_binding_names: vbns, type_defs: tds, visible_enum_names: vens, ext_wasm_deps: ewds)
   end
 end
 

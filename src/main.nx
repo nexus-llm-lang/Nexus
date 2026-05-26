@@ -23,7 +23,8 @@ import { iterative_resolve, resolve_all_lazy_no_filter } from "src/ir/hir/demand
 import * as reach from "src/ir/hir/reachability.nx"
 import * as canon_match from "src/ir/hir/canonicalize_match.nx"
 import * as main_wrap from "src/ir/main_wrap.nx"
-import { HirProgram } from "src/ir/hir/types.nx"
+import { HirProgram, ExtWasmDep } from "src/ir/hir/types.nx"
+import { merge_with_deps, DepSpec } from "src/backend/wasm/merge.nx"
 import {
   expand_groups_in_functions,
   expand_groups_in_handler_bindings,
@@ -110,6 +111,38 @@ import {
   try_dispatch_help,
   print_usage
 } from "src/cli/help.nx"
+
+let str_list_has = fn (xs: [ string ], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true end
+      return str_list_has(xs: rest, s)
+  end
+end
+
+// Convert a list of ExtWasmDep to DepSpec list for merge_with_deps.
+// Deduplicates by module_name (keeps first occurrence) to avoid double-linking
+// a dep that appears via multiple imports in the same compilation.
+let ext_wasm_deps_to_specs = fn (deps: [ ExtWasmDep ]) -> [ DepSpec ] do
+  return ext_wasm_deps_to_specs_go(deps, seen: [], acc: [])
+end
+
+let ext_wasm_deps_to_specs_go = fn (
+  deps: [ ExtWasmDep ],
+  seen: [ string ],
+  acc: [ DepSpec ]
+) -> [ DepSpec ] do
+  match deps do
+    | [] -> return list.reverse(xs: acc)
+    | ExtWasmDep(module_name: mn, wasm_path: wp) :: rest ->
+      if str_list_has(xs: seen, s: mn) then
+        return ext_wasm_deps_to_specs_go(deps: rest, seen, acc)
+      end
+      let spec = DepSpec(module_prefix: mn, wasm_path: wp)
+      return ext_wasm_deps_to_specs_go(deps: rest, seen: mn :: seen, acc: spec :: acc)
+  end
+end
 
 let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermFs, PermProc } do
   inject stdio.system_handler, fs_mod.system_handler, clock_mod.system_handler, proc.system_handler do
@@ -426,6 +459,12 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
 
     tcwf.check_program_wf_rows(prog: hir_raw)
 
+    let ext_wasm_deps = match hir_raw do
+      | HirProgram(caps: _, functions: _, externals: _, handler_bindings: _,
+          enum_defs: _, exception_groups: _, value_binding_names: _, type_defs: _, visible_enum_names: _,
+          ext_wasm_deps: ewds) ->
+        ewds
+    end
     let hir_resolved = match hir_raw do
       | HirProgram(
         caps: hp,
@@ -436,7 +475,8 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
         exception_groups: heg,
         value_binding_names: hvbns,
         type_defs: htds,
-        visible_enum_names: hven
+        visible_enum_names: hven,
+        ext_wasm_deps: hewds
       ) ->
         let resolved = iterative_resolve(funcs: hf, hb, max_rounds: 100)
         let expanded_fs = expand_groups_in_functions(funcs: resolved, groups: heg)
@@ -489,7 +529,8 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
           exception_groups: heg,
           value_binding_names: hvbns,
           type_defs: htds,
-          visible_enum_names: hven
+          visible_enum_names: hven,
+          ext_wasm_deps: hewds
         )
     end
     let t4b = Clock.now()
@@ -520,7 +561,8 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
         exception_groups: heg,
         value_binding_names: hvbns,
         type_defs: htds,
-        visible_enum_names: hven
+        visible_enum_names: hven,
+        ext_wasm_deps: hewds
       ) ->
         let all_fs = resolve_all_lazy_no_filter(funcs: hf)
         let all_expanded = expand_groups_in_functions(funcs: all_fs, groups: heg)
@@ -534,7 +576,8 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
           exception_groups: heg,
           value_binding_names: hvbns,
           type_defs: htds,
-          visible_enum_names: hven
+          visible_enum_names: hven,
+          ext_wasm_deps: hewds
         )
     end
     let hir_for_tc_canon = canon_match.canonicalize_program(prog: hir_for_tc)
@@ -627,12 +670,26 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
 
     let str_base = 32
     let coverage_flag = (if coverage_enabled then 1 else 0 end) | (if p3_enabled then 2 else 0 end) | (if p3_component_enabled then 4 else 0 end) | (if p2_component_enabled then 8 else 0 end)
-    let %wasm_buf = codegen.compile_lir_to_wasm_with_coverage(program: lir_opt, string_data_base: str_base,
+    let %wasm_buf_raw = codegen.compile_lir_to_wasm_with_coverage(program: lir_opt, string_data_base: str_base,
                                                   effect_map: &effect_map,
                                                   coverage_flag)
     emap.free_effect_map(em: %effect_map)
     let t9 = Clock.now()
     if verbose then Console.eprintln(val: "[nexus] codegen (" ++ str.from_i64(val: t9 - t8c) ++ "ms)") end
+
+    // Link external .wasm dependencies collected from `import external "X.wasm"`
+    // declarations.  Each dep is folded into the core wasm via merge_with_deps
+    // so the final binary has no unresolved external-module imports.
+    let %wasm_buf = if list.is_empty(xs: ext_wasm_deps) then
+      %wasm_buf_raw
+    else
+      let dep_specs = ext_wasm_deps_to_specs(deps: ext_wasm_deps)
+      merge_with_deps(core_wasm: %wasm_buf_raw, deps: dep_specs)
+    end
+    let t9b = Clock.now()
+    if verbose && !list.is_empty(xs: ext_wasm_deps) then
+      Console.eprintln(val: "[nexus] ext-wasm-merge (" ++ str.from_i64(val: t9b - t9) ++ "ms)")
+    end
 
     let CapsWriteResult(caps: caps, ok: ok) = if p2_component_enabled then
         // Streaming heap-reset strategy (mirrors the P3 path):
