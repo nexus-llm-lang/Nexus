@@ -1,0 +1,284 @@
+// nexus-mk4q8 — unit tests for src/backend/profile.nx.
+//
+// Strategy: construct hand-rolled LirPrograms with known call sites, invoke
+// emit_profile to a /tmp scratch file, read it back, and assert over the
+// JSONL content.  The pure helpers (atom_is_const, classify_args, build_jsonl,
+// serialize_call_site) are not exported, so we exercise them end-to-end
+// through emit_profile with Fs.
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import { None } from "std:option"
+import { TypeExpr, TyUnit, TyI64, TyRow } from "src/common/ast.nx"
+import {
+  LirProgram,
+  LirFunction,
+  LirAtom,
+  LirAtomUnit,
+  LirAtomInt,
+  LirAtomFloat,
+  LirAtomBool,
+  LirAtomString,
+  LirAtomVar,
+  LirExpr,
+  LirExprAtom,
+  LirExprCall,
+  LirCallArg,
+  LirStmt,
+  LirStmtLet
+} from "src/ir/lir/types.nx"
+import { Span } from "src/common/token.nx"
+import { emit_profile } from "src/backend/profile.nx"
+
+// Shared scratch path — unique prefix avoids collisions with other tests.
+let scratch_path = fn () -> string do
+  return "/tmp/.nexus_mk4q8_profile_test.jsonl"
+end
+
+let dummy_span = fn () -> Span do
+  return Span(offset: 0, line: 1, col: 1)
+end
+
+let empty_throw_row = fn () -> TypeExpr do
+  return TyRow(types: [], rest: None)
+end
+
+// Build a minimal LirFunction with the given body stmts that returns unit.
+let mk_fn = fn (name: string, body: [ LirStmt ]) -> LirFunction do
+  return LirFunction(
+    name,
+    params: [],
+    ret_type: TyUnit,
+    body,
+    ret: LirAtomUnit,
+    span: dummy_span()
+  )
+end
+
+// Build a LirStmtLet holding a direct call expression.
+let mk_call_stmt = fn (callee: string, args: [ LirCallArg ]) -> LirStmt do
+  return LirStmtLet(
+    name: "_r",
+    typ: TyUnit,
+    expr: LirExprCall(func: callee, args, typ: TyUnit)
+  )
+end
+
+let mk_arg = fn (lbl: string, atom: LirAtom) -> LirCallArg do
+  return LirCallArg(label: lbl, value: atom)
+end
+
+let cleanup = fn () -> unit require { Fs } do
+  try
+    Fs.remove_file(path: scratch_path())
+    return ()
+  catch _ -> return ()
+  end
+end
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+// Count occurrences of `sub` in `s` via split: split(s, sub) produces N+1
+// parts when sub appears N times.
+let count_occurrences = fn (s: string, sub: string) -> i64 do
+  let parts = str.split(s, sep: sub)
+  return list.length(xs: parts) - 1
+end
+
+// ─── tests ──────────────────────────────────────────────────────────────────
+
+// An empty program (no functions) → emit_profile writes an empty file.
+let test_empty_program_produces_empty_jsonl = fn () -> unit require { Console, Fs } throws { Exn } do
+  let prog = LirProgram(functions: [], externals: [])
+  let ok = emit_profile(program: prog, path: scratch_path())
+  test_assert.assert_true(cond: ok,
+    label: "mk4q8/profile: emit_profile returns true on empty program")
+  let content = Fs.read_to_string(path: scratch_path())
+  test_assert.assert_eq_string(
+    actual: content,
+    expected: "",
+    label: "mk4q8/profile: empty program yields empty JSONL"
+  )
+  return ()
+end
+
+// A function with one call site whose arg is a literal integer (const=true).
+let test_int_const_arg_is_classified_const = fn () -> unit require { Console, Fs } throws { Exn } do
+  let arg1 = mk_arg(lbl: "n", atom: LirAtomInt(val: 42))
+  let body = [ mk_call_stmt(callee: "callee_fn", args: [ arg1 ]) ]
+  let func = mk_fn(name: "caller_fn", body)
+  let prog = LirProgram(functions: [ func ], externals: [])
+  let _ = emit_profile(program: prog, path: scratch_path())
+  let content = Fs.read_to_string(path: scratch_path())
+  // One JSONL line → exactly one newline.
+  test_assert.assert_eq_i64(
+    actual: count_occurrences(s: content, sub: "\n"),
+    expected: 1,
+    label: "mk4q8/profile: one call site yields one JSONL line"
+  )
+  // caller/callee fields present.
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"caller\":\"caller_fn\""),
+    label: "mk4q8/profile: JSONL line contains caller field"
+  )
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"callee\":\"callee_fn\""),
+    label: "mk4q8/profile: JSONL line contains callee field"
+  )
+  // site_idx=0 (first and only call in this function).
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"site_idx\":0"),
+    label: "mk4q8/profile: first call site has site_idx=0"
+  )
+  // The arg is const → const:true, const_val:"42".
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"const\":true"),
+    label: "mk4q8/profile: integer literal classified as const"
+  )
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"const_val\":\"42\""),
+    label: "mk4q8/profile: integer literal const_val is 42"
+  )
+  return ()
+end
+
+// A function with one call site whose arg is a variable (const=false).
+let test_var_arg_is_classified_non_const = fn () -> unit require { Console, Fs } throws { Exn } do
+  let arg1 = mk_arg(lbl: "x", atom: LirAtomVar(name: "x", typ: TyI64))
+  let body = [ mk_call_stmt(callee: "callee_fn", args: [ arg1 ]) ]
+  let func = mk_fn(name: "caller_fn", body)
+  let prog = LirProgram(functions: [ func ], externals: [])
+  let _ = emit_profile(program: prog, path: scratch_path())
+  let content = Fs.read_to_string(path: scratch_path())
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"const\":false"),
+    label: "mk4q8/profile: variable arg classified as non-const"
+  )
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"const_val\":null"),
+    label: "mk4q8/profile: variable arg const_val is null"
+  )
+  return ()
+end
+
+// Mixed args: first is string literal (const), second is variable (non-const).
+let test_mixed_args_classified_correctly = fn () -> unit require { Console, Fs } throws { Exn } do
+  let arg_s = mk_arg(lbl: "s", atom: LirAtomString(val: "hello"))
+  let arg_y = mk_arg(lbl: "y", atom: LirAtomVar(name: "y", typ: TyI64))
+  let body = [ mk_call_stmt(callee: "mixed_callee", args: [ arg_s, arg_y ]) ]
+  let func = mk_fn(name: "mixed_caller", body)
+  let prog = LirProgram(functions: [ func ], externals: [])
+  let _ = emit_profile(program: prog, path: scratch_path())
+  let content = Fs.read_to_string(path: scratch_path())
+  // Two arg objects → two label keys.
+  test_assert.assert_eq_i64(
+    actual: count_occurrences(s: content, sub: "\"label\""),
+    expected: 2,
+    label: "mk4q8/profile: two args yield two label entries in JSONL"
+  )
+  // First arg is const (string literal).
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"const_val\":\"hello\""),
+    label: "mk4q8/profile: string literal arg has const_val=hello"
+  )
+  return ()
+end
+
+// Two call sites in the same function get sequential site_idx values.
+let test_two_call_sites_have_sequential_indices = fn () -> unit require { Console, Fs } throws { Exn } do
+  let body = [
+    mk_call_stmt(callee: "first_callee", args: []),
+    mk_call_stmt(callee: "second_callee", args: [])
+  ]
+  let func = mk_fn(name: "caller_fn", body)
+  let prog = LirProgram(functions: [ func ], externals: [])
+  let _ = emit_profile(program: prog, path: scratch_path())
+  let content = Fs.read_to_string(path: scratch_path())
+  // Two lines in JSONL.
+  test_assert.assert_eq_i64(
+    actual: count_occurrences(s: content, sub: "\n"),
+    expected: 2,
+    label: "mk4q8/profile: two call sites yield two JSONL lines"
+  )
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"site_idx\":0"),
+    label: "mk4q8/profile: first call site has site_idx=0"
+  )
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"site_idx\":1"),
+    label: "mk4q8/profile: second call site has site_idx=1"
+  )
+  return ()
+end
+
+// Bool and float literal atoms are also classified as const.
+let test_bool_and_float_atoms_are_const = fn () -> unit require { Console, Fs } throws { Exn } do
+  let arg_b = mk_arg(lbl: "b", atom: LirAtomBool(val: true))
+  let arg_f = mk_arg(lbl: "f", atom: LirAtomFloat(val: "3.14"))
+  let body = [ mk_call_stmt(callee: "target", args: [ arg_b, arg_f ]) ]
+  let func = mk_fn(name: "src_fn", body)
+  let prog = LirProgram(functions: [ func ], externals: [])
+  let _ = emit_profile(program: prog, path: scratch_path())
+  let content = Fs.read_to_string(path: scratch_path())
+  // Both args are const.
+  test_assert.assert_eq_i64(
+    actual: count_occurrences(s: content, sub: "\"const\":true"),
+    expected: 2,
+    label: "mk4q8/profile: bool and float atoms both classified as const"
+  )
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"const_val\":\"true\""),
+    label: "mk4q8/profile: bool literal const_val is \"true\""
+  )
+  test_assert.assert_true(
+    cond: str.contains(s: content, sub: "\"const_val\":\"3.14\""),
+    label: "mk4q8/profile: float literal const_val is \"3.14\""
+  )
+  return ()
+end
+
+// ─── runner ─────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit require { Console, Fs } throws { Exn } do
+  cleanup()
+  try
+    test_empty_program_produces_empty_jsonl()
+    cleanup()
+    test_int_const_arg_is_classified_const()
+    cleanup()
+    test_var_arg_is_classified_non_const()
+    cleanup()
+    test_mixed_args_classified_correctly()
+    cleanup()
+    test_two_call_sites_have_sequential_indices()
+    cleanup()
+    test_bool_and_float_atoms_are_const()
+    cleanup()
+    return ()
+  catch e ->
+    cleanup()
+    throw e
+  end
+end
+
+let safe_run = fn () -> i64 require { Console, Fs } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole, PermFs } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
