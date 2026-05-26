@@ -36,6 +36,17 @@ An LLM has no design authority. Comments must describe **what the code does**
   **invent** it. And do not manufacture a spec/doc to justify a claim — if a
   rationale isn't already established by the designer, ask; don't write it as fact.
 
+## Module placement (src/ layout)
+
+**`src/tools/` holds CLI subcommand surfaces (drivers); reusable engines get
+their own top-level dir.** A subcommand's thin driver (arg handling + calling
+into an engine) lives flat in `tools/` (e.g. `tools/lint.nx`, `tools/fmt.nx`);
+the engine it drives — reusable by other surfaces such as the LSP — lives in a
+top-level dir (`lint/`, `fmt/`, ...). Shared support is purpose-named, not a
+catch-all: `syntax/` (ast/token/source_pos), `util/` (generic data structures),
+`diagnostics/` (errors), `ir/support/` (compiler-internal helpers). Do not
+reintroduce a `common/` grab-bag.
+
 ## Session Completion
 1. Create issues for remaining work (`bd create`)
 2. Run quality gates if code changed
