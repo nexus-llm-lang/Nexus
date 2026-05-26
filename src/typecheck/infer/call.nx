@@ -37,7 +37,7 @@ import {
 } from "src/typecheck/infer/call_args.nx"
 import {
   RaiseAdmissionResult, RaiseOk, RaiseRejected,
-  check_call_throw_row_admitted
+  check_call_throw_row_admitted, check_force_require_row
 } from "src/typecheck/infer/control_flow.nx"
 import { TypeError } from "src/typecheck/errors.nx"
 
@@ -54,12 +54,42 @@ export let infer_call = fn (
     | Some(val: sch) ->
       match instantiate_scheme(state, scheme: sch) do
         | InstantiateResult(state: st1, typ: func_type_raw) ->
-          // Peel `%`/`@` modality wrappers introduced by linear-capture or
-          // lazy-capture lambdas: `let f = mk_capture(b)` gives
-          // `f : %(z: i64) -> i64`, but calling `f(z: 0)` should still
-          // resolve the inner arrow shape.
+          // Peel `%` modality wrapper (linear-capture lambda) or perform
+          // T-Force elaboration for `@` (lazy thunk callee).  The lazy case
+          // surfaces the thunk's deferred throw_row and require_row before
+          // delegating the arrow call to the inner type (spec §T-App thunk-callee,
+          // .17 ruleset): `f(args)` where `f : @(arrow; ρ_q'; ρ_e')` elaborates
+          // to force(f) then app on the forced arrow, so ρ_e' and ρ_q' are
+          // discharged at the call site exactly as T-Force requires.
           let func_type = match func_type_raw do
-            | TyLinear(inner: u) | TyLazy(inner: u, require_row: _, throw_row: _) -> u
+            | TyLinear(inner: u) -> u
+            | TyLazy(inner: u, require_row: lazy_rq, throw_row: lazy_thr) ->
+              // T-Force: surface deferred throw_row into the ambient throw check.
+              let lazy_caller_row = tctypes.state_throw_row(state: st1)
+              let groups1 = tctypes.state_exception_groups(state: st1)
+              let fn_pure_set1 = tctypes.state_fn_pure_set(state: st1)
+              match check_call_throw_row_admitted(
+                callee_row: lazy_thr,
+                caller_row: lazy_caller_row,
+                groups: groups1,
+                func,
+                fn_pure_set: fn_pure_set1
+              ) do
+                | RaiseRejected(message: m) -> return InferExprErr(message: "force " ++ func ++ ": " ++ m, span)
+                | RaiseOk ->
+                  // T-Force: check deferred require_row against ambient.
+                  let ambient_rq = tctypes.state_require_row(state: st1)
+                  match check_force_require_row(thunk_require_row: lazy_rq, ambient_require_row: ambient_rq) do
+                    | Some(val: missing) ->
+                      return InferExprErr(
+                        message: "force " ++ func ++ ": thunk requires capability '" ++ missing
+                          ++ "' which is not in the ambient require row",
+                        span
+                      )
+                    | None -> ()
+                  end
+              end
+              u
             | _ -> func_type_raw
           end
           match func_type do
