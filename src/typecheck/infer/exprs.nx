@@ -19,7 +19,7 @@
 import { Span } from "src/common/token.nx"
 import {
   TypeExpr, TyI64, TyBool, TyUnit, TyArray, TyRecord, TyLazy, TyLinear,
-  TyBorrow, TyRef, TyUserDefined, TyArrow,
+  TyBorrow, TyRef, TyUserDefined, TyArrow, TyRow,
   NamedType, RecordDef
 } from "src/common/ast.nx"
 import { HirExpr, HirStmt, HirNamedExpr, HirMatchCase, HirParam } from "src/ir/hir/types.nx"
@@ -39,6 +39,7 @@ import { append_env, bind_pattern } from "src/typecheck/infer/statements.nx"
 import {
   infer_stmts_tail_diverges,
   check_raise_admitted, exception_name_of_raised,
+  check_call_throw_row_admitted,
   RaiseAdmissionResult, RaiseOk, RaiseRejected
 } from "src/typecheck/infer/control_flow.nx"
 import { build_param_named_types, add_params_to_env } from "src/typecheck/infer/closure.nx"
@@ -190,7 +191,7 @@ export let infer_index = fn (
                 | TyArray(elem: e)
                 | TyBorrow(inner: TyArray(elem: e))
                 | TyLinear(inner: TyArray(elem: e))
-                | TyLazy(inner: TyArray(elem: e)) -> return InferExprOk(
+                | TyLazy(inner: TyArray(elem: e), require_row: _, throw_row: _) -> return InferExprOk(
                   state: st2,
                   subst: sf,
                   typ: e
@@ -717,6 +718,11 @@ export let infer_raise = fn (
   end
 end
 
+// Helper: closed empty row `{}`.
+let lazy_empty_row = fn () -> TypeExpr do
+  return TyRow(types: [], rest: None)
+end
+
 export let infer_force = fn (
   state: CheckState, inner: HirExpr, ret_type: TypeExpr, span: Span,
   infer_expr_fn: (
@@ -729,19 +735,52 @@ export let infer_force = fn (
     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
     | InferExprOk(state: st1, subst: s1, typ: t) ->
       match t do
-        | TyLazy(inner: u) -> return InferExprOk(state: st1, subst: s1, typ: u)
+        | TyLazy(inner: u, require_row: _, throw_row: thr) ->
+          // T-Force: discharge the thunk's deferred throw_row against the
+          // caller's active throw_row.  A `throws {}` caller (closed empty row)
+          // must not force a thunk whose throw_row is non-empty.
+          let caller_row = subst.subst_apply(subst: s1, typ: tctypes.state_throw_row(state: st1))
+          let groups = tctypes.state_exception_groups(state: st1)
+          let fn_pure_set = tctypes.state_fn_pure_set(state: st1)
+          match check_call_throw_row_admitted(
+            callee_row: subst.subst_apply(subst: s1, typ: thr),
+            caller_row,
+            groups,
+            func: "force",
+            fn_pure_set
+          ) do
+            | RaiseRejected(message: m2) -> return InferExprErr(message: m2, span)
+            | RaiseOk -> return InferExprOk(state: st1, subst: s1, typ: u)
+          end
         | _ ->
           // T-Force spec: unify(τ, @β) with fresh β, so that unresolved ?α
           // gets pinned to TyLazy(?β) rather than falling through to an error.
           let FreshResult(state: st2, typ: tv) = tctypes.tc_fresh_var(state: st1)
-          let tdefs = tctypes.state_typedefs(state: st2)
-          match unify.unify(t1: t, t2: TyLazy(inner: tv), tdefs) do
+          // Fresh require_row and throw_row variables for the thunk shape.
+          let FreshResult(state: st3, typ: tv_rq) = tctypes.tc_fresh_var(state: st2)
+          let FreshResult(state: st4, typ: tv_thr) = tctypes.tc_fresh_var(state: st3)
+          let tdefs = tctypes.state_typedefs(state: st4)
+          match unify.unify(t1: t, t2: TyLazy(inner: tv, require_row: tv_rq, throw_row: tv_thr), tdefs) do
             | UnifyErr(_) -> return InferExprErr(
                 message: "force: expected lazy type '@T', got non-lazy value",
                 span)
             | UnifyOk(subst: s2) ->
               let sc = subst.subst_compose(s1, s2)
-              return InferExprOk(state: st2, subst: sc, typ: subst.subst_apply(subst: sc, typ: tv))
+              let resolved_thr = subst.subst_apply(subst: sc, typ: tv_thr)
+              // Check the resolved throw_row against the caller's throw_row.
+              let caller_row = subst.subst_apply(subst: sc, typ: tctypes.state_throw_row(state: st4))
+              let groups = tctypes.state_exception_groups(state: st4)
+              let fn_pure_set = tctypes.state_fn_pure_set(state: st4)
+              match check_call_throw_row_admitted(
+                callee_row: resolved_thr,
+                caller_row,
+                groups,
+                func: "force",
+                fn_pure_set
+              ) do
+                | RaiseRejected(message: m2) -> return InferExprErr(message: m2, span)
+                | RaiseOk -> return InferExprOk(state: st4, subst: sc, typ: subst.subst_apply(subst: sc, typ: tv))
+              end
           end
       end
   end
@@ -756,9 +795,20 @@ export let infer_thunk = fn (
   ) -> InferExprResult throws { TypeError }
 ) -> InferExprResult throws { TypeError } do
   let _ = span
+  // T-LetThunk: type the body, then wrap the result type as @(τ ; {} ; ?ρ_e)
+  // where ?ρ_e is a fresh throw-row variable.  The fresh variable is
+  // effect-polymorphic — it unifies with the annotated row when the thunk is
+  // used at a typed binding site (`let @x: @(T throws {E}) = ...`), or remains
+  // unconstrained (open) otherwise, preserving backward-compatibility with
+  // existing unannotated thunk code.
   match infer_expr_fn(state, expr: body, ret_type) do
     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
     | InferExprOk(state: st1, subst: s1, typ: t) ->
-      return InferExprOk(state: st1, subst: s1, typ: TyLazy(inner: t))
+      let FreshResult(state: st2, typ: tv_thr) = tctypes.tc_fresh_var(state: st1)
+      return InferExprOk(
+        state: st2,
+        subst: s1,
+        typ: TyLazy(inner: t, require_row: lazy_empty_row(), throw_row: tv_thr)
+      )
   end
 end
