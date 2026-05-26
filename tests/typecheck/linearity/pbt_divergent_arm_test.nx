@@ -1,0 +1,430 @@
+// nexus-v3xa.16 PBT: divergent-arm linear consumption (Gap 2).
+//
+// Background. L_if / L_match arm-equality rules (spec §Linearity) require
+// that every NON-DIVERGENT arm finishes with the same live-linear set. A
+// DIVERGENT arm (one whose control flow never reaches the join point — it
+// ends with `throw` / `return`) is exempt from this equality obligation for
+// its own consumption, UNLESS no non-divergent arm exists (all-divergent),
+// in which case the outer linears must still be consumed (nexus-v3xa.12).
+//
+// The specific soundness hole covered:
+//   v3xa.12 — a divergent arm that does NOT consume an outer linear that a
+//              non-divergent arm DOES consume was previously accepted.  The
+//              resource leaked on the divergent path.  After the fix, this
+//              must raise LinearMismatch (E2009).
+//
+// Strategy. We synthesise self-contained programs (no std imports needed in
+// the wrapper beyond what's already in the program text) and drive
+// parse → import-resolve → HIR build → tc_linearity.check_program
+// in-process, exactly as pbt_arm_equality_test.nx does.
+//
+// Three families of generated shapes, each with 50 iterations:
+//
+//   P1 (all-divergent, positive): both arms diverge (throw + return).
+//      The outer linears %a and %b are consumed by BOTH arms before
+//      diverging.  Must PASS.
+//
+//   P2 (one-divergent-consumes, positive): one arm diverges and DOES
+//      consume both %a and %b before throwing; the other arm is
+//      non-divergent and also consumes both.  Must PASS.
+//
+//   P3 (divergent-leak, negative): one arm diverges WITHOUT consuming
+//      %a or %b (the divergent path leaks both resources); the other arm
+//      is non-divergent and consumes both.  Must raise LinearMismatch
+//      (E2009).
+//
+// Also includes four targeted probe cases (non-PBT) exercising if and match
+// level variants of each family directly.
+
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as parser from "src/frontend/parser.nx"
+import * as state_mod from "src/lsp/state/program_state.nx"
+import { process_defs } from "src/ir/hir/build/defs.nx"
+import { accum_to_program } from "src/ir/hir/build/accum.nx"
+import * as tc_linearity from "src/typecheck/linearity.nx"
+import { ProgramState } from "src/lsp/state/program_state.nx"
+import { HirProgram } from "src/ir/hir/types.nx"
+import { resolve_all_lazy_no_filter } from "src/ir/hir/demand.nx"
+import { LinearMismatch } from "src/typecheck/errors.nx"
+import { Pair } from "std:tuple"
+import { Gen } from "std:pbt"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+// ─── DivShape sum ─────────────────────────────────────────────────────────────
+//
+// Encodes the structural variant spliced into the synthesised program.
+//
+//   AllDivIf    — if/else; both arms diverge (throw then return)
+//   AllDivMatch — match/T1/T2; both arms diverge (throw then return)
+//   OneDivIf    — if/else; then-arm diverges after consuming; else non-divergent
+//   OneDivMatch — match T1/T2; T1 diverges after consuming; T2 non-divergent
+//   LeakIf      — if/else; then-arm diverges WITHOUT consuming; else non-divergent
+//   LeakMatch   — match T1/T2; T1 diverges WITHOUT consuming; T2 non-divergent
+
+type DivShape =
+  AllDivIf
+  | AllDivMatch
+  | OneDivIf
+  | OneDivMatch
+  | LeakIf
+  | LeakMatch
+
+let pick_pos_shape = fn (n: i64) -> DivShape do
+  let r = if n < 0 then 0 - n else n end
+  let c = r - (r / 4) * 4
+  if c == 0 then return AllDivIf end
+  if c == 1 then return AllDivMatch end
+  if c == 2 then return OneDivIf end
+  return OneDivMatch
+end
+
+let pick_neg_shape = fn (n: i64) -> DivShape do
+  let r = if n < 0 then 0 - n else n end
+  let c = r - (r / 2) * 2
+  if c == 0 then return LeakIf end
+  return LeakMatch
+end
+
+let render_div_shape = fn (s: DivShape) -> string do
+  match s do
+    | AllDivIf -> return "AllDivIf"
+    | AllDivMatch -> return "AllDivMatch"
+    | OneDivIf -> return "OneDivIf"
+    | OneDivMatch -> return "OneDivMatch"
+    | LeakIf -> return "LeakIf"
+    | LeakMatch -> return "LeakMatch"
+  end
+end
+
+// ─── Wrapper prelude ─────────────────────────────────────────────────────────
+
+let div_wrapper_prelude = fn () -> string do
+  return "type R = R(id: i64)\n"
+      ++ "type Tag = T1 | T2\n"
+      ++ "exception E\n"
+      ++ "let mk = fn () -> R do return R(id: 0) end\n"
+      ++ "let drop_r = fn (%x: R) -> unit do\n"
+      ++ "  match %x do | R(id: _) -> () end\n"
+      ++ "  return ()\n"
+      ++ "end\n"
+end
+
+// ─── Splice body generators ───────────────────────────────────────────────────
+//
+// Each function returns the body text to splice into the synthesised wrapper.
+// The strings da/db/thrw/ret are LOCAL variables to avoid top-level thunk
+// inference (top-level `let x = "..."` becomes `() -> string` in Nexus).
+
+// AllDiv: both arms diverge; each arm consumes %a and %b before diverging.
+let allDiv_body_if = fn () -> string do
+  let da = "    drop_r(x: %a)\n"
+  let db = "    drop_r(x: %b)\n"
+  return "  if cond then\n" ++ da ++ db ++ "    throw E\n"
+      ++ "  else\n" ++ da ++ db ++ "    return ()\n" ++ "  end\n"
+end
+
+let allDiv_body_match = fn () -> string do
+  let da = "    drop_r(x: %a)\n"
+  let db = "    drop_r(x: %b)\n"
+  return "  match t do\n"
+      ++ "    | T1 ->\n" ++ da ++ db ++ "      throw E\n"
+      ++ "    | T2 ->\n" ++ da ++ db ++ "      return ()\n"
+      ++ "  end\n"
+end
+
+// OneDiv: then/T1 diverges (consumes then throws), else/T2 non-divergent consumes.
+let oneDiv_body_if = fn () -> string do
+  let da = "    drop_r(x: %a)\n"
+  let db = "    drop_r(x: %b)\n"
+  return "  if cond then\n" ++ da ++ db ++ "    throw E\n"
+      ++ "  else\n" ++ da ++ db ++ "  end\n"
+end
+
+let oneDiv_body_match = fn () -> string do
+  let da = "    drop_r(x: %a)\n"
+  let db = "    drop_r(x: %b)\n"
+  return "  match t do\n"
+      ++ "    | T1 ->\n" ++ da ++ db ++ "      throw E\n"
+      ++ "    | T2 ->\n" ++ da ++ db
+      ++ "  end\n"
+end
+
+// Leak: then/T1 diverges WITHOUT consuming; else/T2 non-divergent DOES consume.
+// The divergent path leaks %a and %b — must fire E2009.
+let leak_body_if = fn () -> string do
+  let da = "    drop_r(x: %a)\n"
+  let db = "    drop_r(x: %b)\n"
+  return "  if cond then\n" ++ "    throw E\n"
+      ++ "  else\n" ++ da ++ db ++ "  end\n"
+end
+
+let leak_body_match = fn () -> string do
+  let da = "    drop_r(x: %a)\n"
+  let db = "    drop_r(x: %b)\n"
+  return "  match t do\n"
+      ++ "    | T1 ->\n" ++ "      throw E\n"
+      ++ "    | T2 ->\n" ++ da ++ db
+      ++ "  end\n"
+end
+
+let body_for_div_shape = fn (s: DivShape) -> string do
+  match s do
+    | AllDivIf -> return allDiv_body_if()
+    | AllDivMatch -> return allDiv_body_match()
+    | OneDivIf -> return oneDiv_body_if()
+    | OneDivMatch -> return oneDiv_body_match()
+    | LeakIf -> return leak_body_if()
+    | LeakMatch -> return leak_body_match()
+  end
+end
+
+// synth_div_program: wrap a body into a self-contained program.
+let synth_div_program = fn (s: DivShape, body_text: string) -> string do
+  let sig = match s do
+    | AllDivMatch | OneDivMatch | LeakMatch ->
+      "let test_fn = fn (cond: bool, t: Tag) -> unit throws { E } do\n"
+    | _ -> "let test_fn = fn (cond: bool) -> unit throws { E } do\n"
+  end
+  let main_call = match s do
+    | AllDivMatch | OneDivMatch | LeakMatch ->
+      "  test_fn(cond: true, t: T1)\n"
+    | _ -> "  test_fn(cond: true)\n"
+  end
+  return div_wrapper_prelude()
+      ++ sig
+      ++ "  let %a = mk()\n"
+      ++ "  let %b = mk()\n"
+      ++ body_text
+      ++ "  return ()\n"
+      ++ "end\n"
+      ++ "let main = fn () -> unit throws { E } do\n"
+      ++ main_call
+      ++ "  return ()\n"
+      ++ "end\n"
+end
+
+// ─── In-process tc_linearity pipeline (mirrors pbt_arm_equality_test) ─────────
+
+type DivOutcome =
+  DivOk
+  | DivMismatch
+  | DivOtherTypeError
+  | DivHirError
+  | DivParseError
+
+let build_hir_div = fn (
+  state: ProgramState,
+  source_file: string
+) -> HirProgram require { Console, Fs } throws { Exn } do
+  let ProgramState(
+    prog: _,
+    defs,
+    cache: _,
+    accum,
+    self_entries: _,
+    caller_entries: _,
+    all_entries
+  ) = state
+  let accum2 = process_defs(defs, entries: all_entries, accum, source_file, is_defining: 1)
+  let raw = accum_to_program(accum: accum2)
+  match raw do | HirProgram(
+    caps: hp,
+    functions: hf,
+    externals: he,
+    handler_bindings: hb,
+    enum_defs: hed,
+    exception_groups: heg,
+    value_binding_names: hvbns,
+    type_defs: htds,
+    visible_enum_names: hven
+  ) ->
+    let resolved = resolve_all_lazy_no_filter(funcs: hf)
+    return HirProgram(caps: hp, functions: resolved, externals: he,
+      handler_bindings: hb, enum_defs: hed, exception_groups: heg,
+      value_binding_names: hvbns, type_defs: htds, visible_enum_names: hven)
+  end
+end
+
+let run_div_linearity = fn (src: string, file: string) -> DivOutcome require { Console, Fs } do
+  try
+    let prog = parser.parse_source(src)
+    try
+      let pstate = state_mod.resolve_imports_for(prog, file)
+      try
+        let hir_prog = build_hir_div(state: pstate, source_file: file)
+        try
+          tc_linearity.check_program(prog: hir_prog)
+          return DivOk
+        catch
+          | LinearMismatch(detail: _, span: _) -> return DivMismatch
+          | _ -> return DivOtherTypeError
+        end
+      catch _ -> return DivHirError
+      end
+    catch _ -> return DivHirError
+    end
+  catch _ -> return DivParseError
+  end
+end
+
+// ─── Iteration drivers ────────────────────────────────────────────────────────
+
+let pos_div_seed = 53
+let neg_div_seed = 149
+
+let one_iter_div_pos = fn (g: Gen<i64>, seed: i64) -> Pair<bool, i64> require { Console, Fs } do
+  let Gen(run: g_run, shrink: _, render: _) = g
+  let Pair(left: v, right: s1) = g_run(seed)
+  let shape = pick_pos_shape(n: v)
+  let body_str = body_for_div_shape(s: shape)
+  let src = synth_div_program(s: shape, body_text: body_str)
+  let outcome = run_div_linearity(
+    src,
+    file: "buffer://div_pos_" ++ render_div_shape(s: shape) ++ ".nx"
+  )
+  let ok = match outcome do
+    | DivOk -> true
+    | _ -> false
+  end
+  return Pair(left: ok, right: s1)
+end
+
+let one_iter_div_neg = fn (g: Gen<i64>, seed: i64) -> Pair<bool, i64> require { Console, Fs } do
+  let Gen(run: g_run, shrink: _, render: _) = g
+  let Pair(left: v, right: s1) = g_run(seed)
+  let shape = pick_neg_shape(n: v)
+  let body_str = body_for_div_shape(s: shape)
+  let src = synth_div_program(s: shape, body_text: body_str)
+  let outcome = run_div_linearity(
+    src,
+    file: "buffer://div_neg_" ++ render_div_shape(s: shape) ++ ".nx"
+  )
+  let ok = match outcome do
+    | DivMismatch -> true
+    | _ -> false
+  end
+  return Pair(left: ok, right: s1)
+end
+
+let run_div_pos_loop = fn (
+  g: Gen<i64>,
+  cnt: i64,
+  seed: i64,
+  ok_count: i64
+) -> i64 require { Console, Fs } do
+  if cnt <= 0 then return ok_count end
+  let Pair(left: ok, right: s1) = one_iter_div_pos(g, seed)
+  let next = if ok then ok_count + 1 else ok_count end
+  return run_div_pos_loop(g, cnt: cnt - 1, seed: s1, ok_count: next)
+end
+
+let run_div_neg_loop = fn (
+  g: Gen<i64>,
+  cnt: i64,
+  seed: i64,
+  ok_count: i64
+) -> i64 require { Console, Fs } do
+  if cnt <= 0 then return ok_count end
+  let Pair(left: ok, right: s1) = one_iter_div_neg(g, seed)
+  let next = if ok then ok_count + 1 else ok_count end
+  return run_div_neg_loop(g, cnt: cnt - 1, seed: s1, ok_count: next)
+end
+
+// ─── Body ─────────────────────────────────────────────────────────────────────
+
+let iter_count = 50
+
+let body = fn () -> unit require { Console, Fs } throws { Exn } do
+  // ── Probes: hand-rolled sanity check before PBT loops ──────────────────
+  //
+  // Probe A (positive): all-divergent if, both arms consume. Must pass.
+  let probe_a_src = synth_div_program(s: AllDivIf, body_text: allDiv_body_if())
+  let probe_a_out = run_div_linearity(
+    src: probe_a_src,
+    file: "buffer://div_probe_a.nx"
+  )
+  let probe_a_ok = match probe_a_out do | DivOk -> true | _ -> false end
+  test_assert.assert_eq_bool(
+    actual: probe_a_ok, expected: true,
+    label: "v3xa.16 div probe A: all-divergent if (both consume) passes linearity"
+  )
+
+  // Probe B (positive): one-divergent if (diverges after consuming). Must pass.
+  let probe_b_src = synth_div_program(s: OneDivIf, body_text: oneDiv_body_if())
+  let probe_b_out = run_div_linearity(
+    src: probe_b_src,
+    file: "buffer://div_probe_b.nx"
+  )
+  let probe_b_ok = match probe_b_out do | DivOk -> true | _ -> false end
+  test_assert.assert_eq_bool(
+    actual: probe_b_ok, expected: true,
+    label: "v3xa.16 div probe B: one-divergent if (diverges+consumes) passes linearity"
+  )
+
+  // Probe C (negative): leak if (divergent arm does NOT consume). Must raise LinearMismatch.
+  let probe_c_src = synth_div_program(s: LeakIf, body_text: leak_body_if())
+  let probe_c_out = run_div_linearity(
+    src: probe_c_src,
+    file: "buffer://div_probe_c.nx"
+  )
+  let probe_c_ok = match probe_c_out do | DivMismatch -> true | _ -> false end
+  test_assert.assert_eq_bool(
+    actual: probe_c_ok, expected: true,
+    label: "v3xa.16 div probe C: leak if (divergent leaks) raises LinearMismatch"
+  )
+
+  // Probe D (negative): leak match. Must raise LinearMismatch.
+  let probe_d_src = synth_div_program(s: LeakMatch, body_text: leak_body_match())
+  let probe_d_out = run_div_linearity(
+    src: probe_d_src,
+    file: "buffer://div_probe_d.nx"
+  )
+  let probe_d_ok = match probe_d_out do | DivMismatch -> true | _ -> false end
+  test_assert.assert_eq_bool(
+    actual: probe_d_ok, expected: true,
+    label: "v3xa.16 div probe D: leak match (divergent leaks) raises LinearMismatch"
+  )
+
+  let g = pbt.small_int
+
+  // ── P1/P2 (positive): 50 iterations across all-divergent + one-divergent shapes.
+  // Every generated positive shape must pass tc_linearity cleanly.
+  let pos_ok = run_div_pos_loop(g, cnt: iter_count, seed: pos_div_seed, ok_count: 0)
+  test_assert.assert_eq_i64(
+    actual: pos_ok,
+    expected: iter_count,
+    label: "v3xa.16 P1+P2: 50 pos iterations (all-div + one-div shapes) pass linearity"
+  )
+
+  // ── P3 (negative): 50 iterations of leak shapes.
+  // Every generated negative shape must raise LinearMismatch (E2009).
+  let neg_ok = run_div_neg_loop(g, cnt: iter_count, seed: neg_div_seed, ok_count: 0)
+  test_assert.assert_eq_i64(
+    actual: neg_ok,
+    expected: iter_count,
+    label: "v3xa.16 P3: 50 neg iterations (leak shapes) all raise LinearMismatch"
+  )
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console, Fs } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole, PermFs } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end

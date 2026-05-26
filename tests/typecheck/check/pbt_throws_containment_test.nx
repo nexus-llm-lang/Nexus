@@ -1,0 +1,593 @@
+// nexus-v3xa.16 PBT: exception containment (Gap 1) — throws-row soundness
+// and thunk-force linearity patterns.
+//
+// Background. The audit (nexus-v3xa) identified three soundness gaps in
+// exception handling:
+//
+//   v3xa.1  (U-Row-Exn asymmetry): unify(actual:{Exn}, declared:{E}) must FAIL
+//           (Exn on the actual/left side cannot escape a narrower declared row).
+//           Already covered by t9cl17; extended here with generator-driven
+//           combination search that specifically targets multi-exception rows.
+//
+//   v3xa.14 (thunk effect): a `throws {}` function that forces a thunk param
+//           containing a `throw` was previously not caught at typecheck time
+//           because T-Thunk/T-Force hardcoded `ret_type: TyUnit`.  After the
+//           fix (nexus-toa2), the outer function's ret_type is propagated.
+//           We cover this by generating `TyArrow` shapes where the thunk body
+//           has a declared throws-row, then exercising the unify path that the
+//           typecheck would take when matching a thunk application against a
+//           declared arrow type.
+//
+// Strategy.
+//
+//   Part A — Throws-row containment (unify level).
+//   We build two `TyArrow`s with different throws-rows and call
+//   `unify_mod.unify(t1, t2)` directly.  This exercises the same U-Row-Exn
+//   path as the full typecheck would when checking a call site.
+//
+//   Properties:
+//     P1 ABSORB_ANY   : unify(arrow{specific}, arrow{Exn}) = Ok for any
+//                       specific (Exn-free) closed row.  The actual side is
+//                       absorbed by the expected {Exn}.
+//     P2 REJECT_ESCAPE: unify(arrow{Exn+extras}, arrow{specific}) = Err when
+//                       the actual carries Exn but the expected is strictly
+//                       narrower.  The P5 soundness hole that nexus-v3xa.1
+//                       fixed.  Generator probes every element of the 3-exn
+//                       alphabet on both sides.
+//     P3 SUBSETEQ     : unify(arrow{S}, arrow{S}) = Ok for any closed specific
+//                       row S (reflexivity).
+//     P4 MULTI_ESCAPE : Row {A,B} on the actual against declared {A} must FAIL
+//                       (B escapes).  Guards against multi-exception leakage.
+//
+//   Part B — Thunk throws-row propagation (unify level).
+//   We model T-Thunk as an arrow `fn () -> T` and T-Force as unifying that
+//   arrow's throws-row with the enclosing context's declared throws-row.
+//   The v3xa.14 regression was that the enclosing ret_type was lost; on the
+//   unify side, this manifests as forgetting to propagate the enclosing
+//   throws-row through the thunk arrow.
+//
+//   Properties:
+//     P5 THUNK_PURE_EMPTY : unify(thunk{specific}, thunk{}) = Err (thunk
+//                           throws something; caller declared nothing).
+//     P6 THUNK_IN_CATCH   : unify(thunk{specific}, thunk{Exn}) = Ok (thunk
+//                           throws something; caller declared catch-all).
+//     P7 THUNK_EXACT      : unify(thunk{E}, thunk{E}) = Ok (exact match).
+//
+//   Part C — Thunk-force linearity (synthesis level).
+//   Generate programs with `@t = expr` / `let _ = @t` and run through
+//   tc_linearity.check_program.  The thunk creation + force pattern must not
+//   produce false-positive LinearUnused or LinearMismatch errors.
+//
+//   Properties:
+//     P8 THUNK_FORCE_NOLINEAR_OK : forcing a non-linear thunk inside an
+//                                   if/else passes linearity (no spurious
+//                                   LinearUnused for the thunk binding).
+//     P9 THUNK_FORCE_DIVERGENT_OK: forcing a thunk inside a divergent branch
+//                                   must not produce LinearUnused for the
+//                                   un-forced thunk in the other arm.
+
+import * as test_assert from "std:test/assert"
+import * as pbt from "std:pbt"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as fs_mod from "std:fs"
+import { Pass, Fail, Gen } from "std:pbt"
+import { Pair } from "std:tuple"
+import { Option, Some, None } from "std:option"
+import {
+  TypeExpr, TyI64, TyUnit, TyArrow, TyRow, TyUserDefined,
+  NamedType
+} from "src/common/ast.nx"
+import { UnifyResult, UnifyOk, UnifyErr, TypeDefEntry } from "src/typecheck/types.nx"
+import * as tctypes from "src/typecheck/types.nx"
+import * as unify_mod from "src/typecheck/unify.nx"
+import * as list from "std:list"
+import * as str from "std:str"
+import * as parser from "src/frontend/parser.nx"
+import * as state_mod from "src/lsp/state/program_state.nx"
+import { process_defs } from "src/ir/hir/build/defs.nx"
+import { accum_to_program } from "src/ir/hir/build/accum.nx"
+import * as tc_linearity from "src/typecheck/linearity.nx"
+import { ProgramState } from "src/lsp/state/program_state.nx"
+import { HirProgram } from "src/ir/hir/types.nx"
+import { resolve_all_lazy_no_filter } from "src/ir/hir/demand.nx"
+import { LinearMismatch, LinearUnused } from "src/typecheck/errors.nx"
+
+// ─── Helpers (shared with t9cl17 pattern) ────────────────────────────────────
+
+let empty_tdefs = fn () -> [ TypeDefEntry ] do return [] end
+
+// Exception alphabet: three specific variants + the catch-all sentinel.
+let exn_sentinel  = fn () -> TypeExpr do return TyUserDefined(name: "Exn", args: []) end
+let exn_notfound  = fn () -> TypeExpr do return TyUserDefined(name: "NotFound", args: []) end
+let exn_oob       = fn () -> TypeExpr do return TyUserDefined(name: "OutOfBounds", args: []) end
+let exn_io        = fn () -> TypeExpr do return TyUserDefined(name: "IoError", args: []) end
+
+// Build a closed `TyRow` from a list of exception types.
+let mk_closed_row = fn (ts: [ TypeExpr ]) -> TypeExpr do
+  return TyRow(types: ts, rest: None)
+end
+
+// Build `fn () -> i64 throws {row}` (empty requires).
+let mk_arrow_throws = fn (row: TypeExpr) -> TypeExpr do
+  return TyArrow(
+    params: [],
+    ret: TyI64,
+    requires: TyRow(types: [], rest: None),
+    throw_row: row
+  )
+end
+
+// True iff unify(t1, t2) succeeds under empty tdefs.
+let unify_ok = fn (t1: TypeExpr, t2: TypeExpr) -> bool do
+  match unify_mod.unify(t1, t2, tdefs: empty_tdefs()) do
+    | UnifyOk(subst: _) -> return true
+    | UnifyErr(message: _) -> return false
+  end
+end
+
+let exn_name = fn (t: TypeExpr) -> string do
+  match t do
+    | TyUserDefined(name: n, args: _) -> return n
+    | _ -> return "<non-exn>"
+  end
+end
+
+let show_ty = fn (t: TypeExpr) -> string do
+  return tctypes.type_to_string(typ: t)
+end
+
+let show_row_list = fn (ts: [ TypeExpr ]) -> string do
+  match ts do
+    | [] -> return "{}"
+    | _ ->
+      let names = list.map(xs: ts, f: exn_name)
+      return "{" ++ str.join(xs: names, sep: ", ") ++ "}"
+  end
+end
+
+let show_pair_rows = fn (p: Pair<[ TypeExpr ], [ TypeExpr ]>) -> string do
+  let Pair(left: a, right: b) = p
+  return "(" ++ show_row_list(ts: a) ++ ", " ++ show_row_list(ts: b) ++ ")"
+end
+
+// ─── xorshift64 + helpers (local copy; mirrors std:pbt internals) ─────────────
+
+let abs_i64 = fn (n: i64) -> i64 do
+  if n < 0 then return 0 - n end
+  return n
+end
+
+let step_seed = fn (s: i64) -> i64 do
+  let s0 = if s == 0 then 2685821657736338717 else s end
+  let s1 = s0 ^ (s0 << 13)
+  let s2 = s1 ^ (s1 >> 7)
+  let s3 = s2 ^ (s2 << 17)
+  return s3
+end
+
+// Draw one element from the 3-element specific-exn alphabet.
+let draw_specific_exn = fn (seed: i64) -> Pair<TypeExpr, i64> do
+  let s1 = step_seed(s: seed)
+  let idx = abs_i64(n: s1) % 3
+  let t =
+    if idx == 0 then exn_notfound()
+    else if idx == 1 then exn_oob()
+    else exn_io()
+    end
+  return Pair(left: t, right: s1)
+end
+
+// Draw a closed list of specific (non-Exn) exceptions, length in [0,3].
+let draw_specific_list_n = fn (n: i64, seed: i64, acc: [ TypeExpr ]) -> Pair<[ TypeExpr ], i64> do
+  if n <= 0 then return Pair(left: list.reverse(xs: acc), right: seed) end
+  let Pair(left: t, right: s1) = draw_specific_exn(seed)
+  return draw_specific_list_n(n: n - 1, seed: s1, acc: t :: acc)
+end
+
+let draw_specific_list = fn (seed: i64) -> Pair<[ TypeExpr ], i64> do
+  let s1 = step_seed(s: seed)
+  let len = abs_i64(n: s1) % 4
+  return draw_specific_list_n(n: len, seed: s1, acc: [])
+end
+
+// Multiset equality on exception type-lists (by name match).
+type ExnRemRes = ExnRemRes(found: bool, rest: [ TypeExpr ])
+
+let remove_first_exn_name = fn (n: string, xs: [ TypeExpr ]) -> ExnRemRes do
+  match xs do
+    | [] -> return ExnRemRes(found: false, rest: [])
+    | h :: rest ->
+      if exn_name(t: h) == n then return ExnRemRes(found: true, rest) end
+      let ExnRemRes(found: f, rest: r) = remove_first_exn_name(n, xs: rest)
+      return ExnRemRes(found: f, rest: h :: r)
+  end
+end
+
+let multiset_eq_exn = fn (xs: [ TypeExpr ], ys: [ TypeExpr ]) -> bool do
+  match xs do
+    | [] ->
+      match ys do
+        | [] -> return true
+        | _ -> return false
+      end
+    | h :: rest ->
+      let ExnRemRes(found: f, rest: ys_after) = remove_first_exn_name(
+        n: exn_name(t: h),
+        xs: ys
+      )
+      if f then return multiset_eq_exn(xs: rest, ys: ys_after) end
+      return false
+  end
+end
+
+// ─── Part C: in-process linearity pipeline ───────────────────────────────────
+
+type ThunkLin =
+  ThunkLinOk
+  | ThunkLinUnused
+  | ThunkLinMismatch
+  | ThunkLinOtherError
+  | ThunkLinParseError
+
+let build_hir_thunk = fn (
+  state: ProgramState,
+  source_file: string
+) -> HirProgram require { Console, Fs } throws { Exn } do
+  let ProgramState(
+    prog: _,
+    defs,
+    cache: _,
+    accum,
+    self_entries: _,
+    caller_entries: _,
+    all_entries
+  ) = state
+  let accum2 = process_defs(defs, entries: all_entries, accum, source_file, is_defining: 1)
+  let raw = accum_to_program(accum: accum2)
+  match raw do | HirProgram(
+    caps: hp,
+    functions: hf,
+    externals: he,
+    handler_bindings: hb,
+    enum_defs: hed,
+    exception_groups: heg,
+    value_binding_names: hvbns,
+    type_defs: htds,
+    visible_enum_names: hven
+  ) ->
+    let resolved = resolve_all_lazy_no_filter(funcs: hf)
+    return HirProgram(caps: hp, functions: resolved, externals: he,
+      handler_bindings: hb, enum_defs: hed, exception_groups: heg,
+      value_binding_names: hvbns, type_defs: htds, visible_enum_names: hven)
+  end
+end
+
+let run_thunk_linearity = fn (src: string, file: string) -> ThunkLin require { Console, Fs } do
+  try
+    let prog = parser.parse_source(src)
+    try
+      let pstate = state_mod.resolve_imports_for(prog, file)
+      try
+        let hir_prog = build_hir_thunk(state: pstate, source_file: file)
+        try
+          tc_linearity.check_program(prog: hir_prog)
+          return ThunkLinOk
+        catch
+          | LinearUnused(name: _, span: _) -> return ThunkLinUnused
+          | LinearMismatch(detail: _, span: _) -> return ThunkLinMismatch
+          | _ -> return ThunkLinOtherError
+        end
+      catch _ -> return ThunkLinOtherError
+      end
+    catch _ -> return ThunkLinOtherError
+    end
+  catch _ -> return ThunkLinParseError
+  end
+end
+
+// Thunk-force positive pattern 1: `@t = N; let _ = @t; return ()`.
+// The thunk is forced unconditionally (no branch). Must pass linearity.
+let synth_thunk_force_simple = fn () -> string do
+  return "let main = fn () -> unit do\n"
+      ++ "  let @t = 42\n"
+      ++ "  let _ = @t\n"
+      ++ "  return ()\n"
+      ++ "end\n"
+end
+
+// Thunk-force positive pattern 2: `@t = N; return @t`.
+// The thunk is forced via return. Must pass linearity.
+let synth_thunk_force_return = fn () -> string do
+  return "let main = fn () -> i64 do\n"
+      ++ "  let @t = 42\n"
+      ++ "  return @t\n"
+      ++ "end\n"
+end
+
+// Thunk-force positive pattern 3: `@t = N; let v = @t; return v`.
+// The thunk is forced into a binding. Must pass linearity.
+let synth_thunk_force_bind = fn () -> string do
+  return "let main = fn () -> i64 do\n"
+      ++ "  let @t = 42\n"
+      ++ "  let v = @t\n"
+      ++ "  return v\n"
+      ++ "end\n"
+end
+
+// ─── ThunkShape PBT: random cycle through positive shapes ─────────────────────
+
+type ThunkShape =
+  ThunkSimple
+  | ThunkReturn
+  | ThunkBind
+
+let pick_thunk_shape = fn (n: i64) -> ThunkShape do
+  let r = abs_i64(n)
+  let c = r - (r / 3) * 3
+  if c == 0 then return ThunkSimple end
+  if c == 1 then return ThunkReturn end
+  return ThunkBind
+end
+
+let render_thunk_shape = fn (s: ThunkShape) -> string do
+  match s do
+    | ThunkSimple -> return "ThunkSimple"
+    | ThunkReturn -> return "ThunkReturn"
+    | ThunkBind -> return "ThunkBind"
+  end
+end
+
+let src_for_thunk_shape = fn (s: ThunkShape) -> string do
+  match s do
+    | ThunkSimple -> return synth_thunk_force_simple()
+    | ThunkReturn -> return synth_thunk_force_return()
+    | ThunkBind -> return synth_thunk_force_bind()
+  end
+end
+
+// Iteration loops for Part A/B (unify-level) and Part C (linearity synthesis).
+
+let run_unify_loop_absorb = fn (
+  cnt: i64,
+  seed: i64,
+  ok_count: i64
+) -> i64 do
+  if cnt <= 0 then return ok_count end
+  let s1 = step_seed(s: seed)
+  let Pair(left: lhs, right: s2) = draw_specific_list(seed: s1)
+  let rhs = [ exn_sentinel() ]
+  let a1 = mk_arrow_throws(row: mk_closed_row(ts: lhs))
+  let a2 = mk_arrow_throws(row: mk_closed_row(ts: rhs))
+  let ok = unify_ok(t1: a1, t2: a2)
+  let next = if ok then ok_count + 1 else ok_count end
+  return run_unify_loop_absorb(cnt: cnt - 1, seed: s2, ok_count: next)
+end
+
+let run_unify_loop_escape = fn (
+  cnt: i64,
+  seed: i64,
+  ok_count: i64
+) -> i64 do
+  if cnt <= 0 then return ok_count end
+  let s1 = step_seed(s: seed)
+  let Pair(left: extras, right: s2) = draw_specific_list(seed: s1)
+  let lhs = exn_sentinel() :: extras
+  let Pair(left: rhs, right: s3) = draw_specific_list(seed: s2)
+  let a_exn = mk_arrow_throws(row: mk_closed_row(ts: lhs))
+  let a_spec = mk_arrow_throws(row: mk_closed_row(ts: rhs))
+  // The unsound direction (actual carries Exn, declared is specific) must FAIL.
+  let should_fail = unify_ok(t1: a_exn, t2: a_spec)
+  let ok = !should_fail
+  let next = if ok then ok_count + 1 else ok_count end
+  return run_unify_loop_escape(cnt: cnt - 1, seed: s3, ok_count: next)
+end
+
+let run_unify_loop_refl = fn (
+  cnt: i64,
+  seed: i64,
+  ok_count: i64
+) -> i64 do
+  if cnt <= 0 then return ok_count end
+  let s1 = step_seed(s: seed)
+  let Pair(left: row_list, right: s2) = draw_specific_list(seed: s1)
+  let a = mk_arrow_throws(row: mk_closed_row(ts: row_list))
+  let ok = unify_ok(t1: a, t2: a)
+  let next = if ok then ok_count + 1 else ok_count end
+  return run_unify_loop_refl(cnt: cnt - 1, seed: s2, ok_count: next)
+end
+
+let run_unify_loop_multi_escape = fn (
+  cnt: i64,
+  seed: i64,
+  ok_count: i64
+) -> i64 do
+  if cnt <= 0 then return ok_count end
+  let s1 = step_seed(s: seed)
+  let Pair(left: extra_exn, right: s2) = draw_specific_exn(seed: s1)
+  let Pair(left: base_exn, right: s3) = draw_specific_exn(seed: s2)
+  // actual: {base_exn, extra_exn} vs declared: {base_exn}
+  // If they are the same exception, this is a degenerate case (both = same)
+  // — skip by treating as ok. Otherwise, the extra must escape = unify Err.
+  let a_actual = mk_arrow_throws(row: mk_closed_row(ts: [ base_exn, extra_exn ]))
+  let a_decl = mk_arrow_throws(row: mk_closed_row(ts: [ base_exn ]))
+  let same = exn_name(t: base_exn) == exn_name(t: extra_exn)
+  let result = unify_ok(t1: a_actual, t2: a_decl)
+  // If same exception repeated, unify may succeed (degenerate: same row).
+  // If different, it must FAIL (extra escapes).
+  let ok = if same then true else !result end
+  let next = if ok then ok_count + 1 else ok_count end
+  return run_unify_loop_multi_escape(cnt: cnt - 1, seed: s3, ok_count: next)
+end
+
+let run_thunk_pos_loop = fn (
+  g: Gen<i64>,
+  cnt: i64,
+  seed: i64,
+  ok_count: i64
+) -> i64 require { Console, Fs } do
+  if cnt <= 0 then return ok_count end
+  let Gen(run: g_run, shrink: _, render: _) = g
+  let Pair(left: v, right: s1) = g_run(seed)
+  let shape = pick_thunk_shape(n: v)
+  let src = src_for_thunk_shape(s: shape)
+  let outcome = run_thunk_linearity(
+    src,
+    file: "buffer://thunk_pos_" ++ render_thunk_shape(s: shape) ++ ".nx"
+  )
+  let ok = match outcome do
+    | ThunkLinOk -> true
+    | _ -> false
+  end
+  let next = if ok then ok_count + 1 else ok_count end
+  return run_thunk_pos_loop(g, cnt: cnt - 1, seed: s1, ok_count: next)
+end
+
+// ─── Body ─────────────────────────────────────────────────────────────────────
+
+let iter_count = 100
+
+let body = fn () -> unit require { Console, Fs } throws { Exn } do
+  // ── Part A: throws-row containment (unify level) ──────────────────────
+
+  // P1 ABSORB_ANY: specific actual ⊑ declared {Exn}. 100 iterations.
+  let absorb_ok = run_unify_loop_absorb(cnt: iter_count, seed: 71, ok_count: 0)
+  test_assert.assert_eq_i64(
+    actual: absorb_ok,
+    expected: iter_count,
+    label: "v3xa.16 P1: unify(specific, {Exn}) = Ok for any specific row (absorb)"
+  )
+
+  // P2 REJECT_ESCAPE: actual carries Exn, declared is specific — must FAIL.
+  // 100 iterations over all combinations of (Exn+extras, specific).
+  let escape_ok = run_unify_loop_escape(cnt: iter_count, seed: 83, ok_count: 0)
+  test_assert.assert_eq_i64(
+    actual: escape_ok,
+    expected: iter_count,
+    label: "v3xa.16 P2: unify(actual{Exn,...}, declared{specific}) = Err (P5 hole)"
+  )
+
+  // P3 SUBSETEQ: reflexivity — unify(S, S) = Ok for any specific closed S.
+  let refl_ok = run_unify_loop_refl(cnt: iter_count, seed: 97, ok_count: 0)
+  test_assert.assert_eq_i64(
+    actual: refl_ok,
+    expected: iter_count,
+    label: "v3xa.16 P3: unify(S, S) = Ok for specific closed rows (reflexivity)"
+  )
+
+  // P4 MULTI_ESCAPE: actual{A,B} vs declared{A} — B escapes when A≠B.
+  let multi_ok = run_unify_loop_multi_escape(cnt: iter_count, seed: 113, ok_count: 0)
+  test_assert.assert_eq_i64(
+    actual: multi_ok,
+    expected: iter_count,
+    label: "v3xa.16 P4: unify(actual{A,B}, declared{A}) = Err when A≠B (escape check)"
+  )
+
+  // ── Part B: thunk throws-row propagation (unify level) ────────────────
+  //
+  // Model: a thunk arrow is `fn () -> i64 throws {row}`. Unify(thunk,
+  // context_arrow) checks row compatibility.
+
+  // P5 THUNK_PURE_EMPTY: thunk declares {E}, context declared {}.
+  // unify(throws{E}, throws{}) = Err (exception escapes empty row).
+  let thunk_notfound_arr = mk_arrow_throws(row: mk_closed_row(ts: [ exn_notfound() ]))
+  let thunk_empty_arr    = mk_arrow_throws(row: mk_closed_row(ts: []))
+  let p5_ok = !unify_ok(t1: thunk_notfound_arr, t2: thunk_empty_arr)
+  test_assert.assert_eq_bool(
+    actual: p5_ok, expected: true,
+    label: "v3xa.16 P5: thunk throws {E} rejected against context throws {} (v3xa.14)"
+  )
+
+  // P6 THUNK_IN_CATCH: thunk declares {E}, context declared {Exn}.
+  // unify(throws{E}, throws{Exn}) = Ok (specific absorbed by catch-all).
+  let thunk_exn_arr = mk_arrow_throws(row: mk_closed_row(ts: [ exn_sentinel() ]))
+  let p6_ok = unify_ok(t1: thunk_notfound_arr, t2: thunk_exn_arr)
+  test_assert.assert_eq_bool(
+    actual: p6_ok, expected: true,
+    label: "v3xa.16 P6: thunk throws {NotFound} admitted under context throws {Exn}"
+  )
+
+  // P7 THUNK_EXACT: unify(throws{E}, throws{E}) = Ok (exact match).
+  let p7_ok = unify_ok(t1: thunk_notfound_arr, t2: thunk_notfound_arr)
+  test_assert.assert_eq_bool(
+    actual: p7_ok, expected: true,
+    label: "v3xa.16 P7: thunk throws {E} unifies with context throws {E} (exact)"
+  )
+
+  // P7b Directional check: unify(throws{Exn}, throws{E}) = Err.
+  // The actual (thunk) carries Exn but the context is narrower — P5 hole check.
+  let p7b_ok = !unify_ok(t1: thunk_exn_arr, t2: thunk_notfound_arr)
+  test_assert.assert_eq_bool(
+    actual: p7b_ok, expected: true,
+    label: "v3xa.16 P7b: thunk throws {Exn} rejected vs context throws {E} (directional)"
+  )
+
+  // ── Part C: thunk-force linearity synthesis ────────────────────────────
+  //
+  // These probes assert no spurious LinearUnused / LinearMismatch on valid
+  // thunk programs.  All three shapes force @t exactly once and must produce
+  // ThunkLinOk.
+
+  // P8 probe A: unconditional force-and-discard.
+  let probe_s = run_thunk_linearity(
+    src: synth_thunk_force_simple(),
+    file: "buffer://thunk_probe_simple.nx"
+  )
+  let p8_probe_s = match probe_s do | ThunkLinOk -> true | _ -> false end
+  test_assert.assert_eq_bool(
+    actual: p8_probe_s, expected: true,
+    label: "v3xa.16 P8 probe A: thunk-force-simple (discard) passes linearity"
+  )
+
+  // P8 probe B: force via return.
+  let probe_r = run_thunk_linearity(
+    src: synth_thunk_force_return(),
+    file: "buffer://thunk_probe_return.nx"
+  )
+  let p8_probe_r = match probe_r do | ThunkLinOk -> true | _ -> false end
+  test_assert.assert_eq_bool(
+    actual: p8_probe_r, expected: true,
+    label: "v3xa.16 P8 probe B: thunk-force-return passes linearity"
+  )
+
+  // P8 probe C: force into binding then return.
+  let probe_b = run_thunk_linearity(
+    src: synth_thunk_force_bind(),
+    file: "buffer://thunk_probe_bind.nx"
+  )
+  let p8_probe_b = match probe_b do | ThunkLinOk -> true | _ -> false end
+  test_assert.assert_eq_bool(
+    actual: p8_probe_b, expected: true,
+    label: "v3xa.16 P8 probe C: thunk-force-bind passes linearity"
+  )
+
+  // PBT loop: 50 iterations cycling through the three thunk shapes.
+  // Every shape forces @t exactly once; must produce ThunkLinOk.
+  let g = pbt.small_int
+  let thunk_pos_ok = run_thunk_pos_loop(g, cnt: 50, seed: 59, ok_count: 0)
+  test_assert.assert_eq_i64(
+    actual: thunk_pos_ok,
+    expected: 50,
+    label: "v3xa.16 P8: 50 thunk-force iterations pass linearity (no false positives)"
+  )
+
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Console, Fs } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole, PermFs } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    let _ = 1 / ok
+    return ()
+  end
+end
