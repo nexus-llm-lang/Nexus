@@ -9,238 +9,80 @@ import * as list from "std:list"
 import { Fixit } from "src/tools/fix.nx"
 import { Span } from "src/syntax/token.nx"
 import {
-  SpannedExpr, Expr, ExprLambda, ExprCall, ExprIf, ExprMatch, ExprWhile,
-  ExprFor, ExprBinaryOp, ExprUnaryOp, ExprArray, ExprList, ExprRecord,
-  ExprIndex, ExprFieldAccess, ExprRaise, ExprForce, ExprHandler,
-  ExprConstructor,
-  SpannedStmt, Stmt, StmtLet, StmtLetPattern, StmtExpr, StmtReturn,
-  StmtAssign, StmtIndexAssign, StmtTry, StmtInject,
-  HandlerArm, MatchCase, CatchArm, Function,
-  NamedExpr, CallArg, CtorArg
+  SpannedExpr, Expr,
+  SpannedStmt, Stmt, StmtInject
 } from "src/syntax/ast.nx"
 import { LintFinding, LintWarning } from "src/lint/types.nx"
+import { fold_stmts, fold_expr } from "src/lint/rules/ast_fold.nx"
 
 //
 // `inject H1, H2 do end` (zero statements) compiles fine but the wrapper is
 // dead code: the handlers go out of scope unused. Walk every Inject site
 // across function bodies and report when its body is empty.
+//
+// The on_stmt visitor detects StmtInject with an empty body and uses the
+// SpannedStmt's span for the finding location. The on_expr visitor is a
+// no-op since inject-detection happens at the Stmt level.
+// The fold recurses into inject body stmts automatically (after calling the
+// visitor), so nested injects are found in a single pass.
+
+// No-op expr visitor: expr nodes contribute no findings directly.
+let inject_expr_noop = fn (acc: [ LintFinding ], depth: i64, e: Expr) -> [ LintFinding ] do
+  return acc
+end
+
+// Stmt visitor: emit L0001 when we see an inject with an empty body.
+// The `span` is the source location of the inject statement itself.
+let inject_stmt_visitor = fn (
+  acc: [ LintFinding ],
+  depth: i64,
+  s: Stmt,
+  span: Span
+) -> [ LintFinding ] do
+  match s do
+    | StmtInject(handlers: _, body) ->
+      if list.is_empty(xs: body) then
+        return LintFinding(
+          code: "L0001",
+          severity: LintWarning,
+          message: "`inject` block has an empty body; the handler bindings are unreachable",
+          fix_it: Some(val: Fixit(
+            start: 0,
+            len: 0,
+            replacement: "",
+            code: "L0001",
+            message: "remove the surrounding `inject ... do ... end` and keep the (empty) body"
+          )),
+          span: span
+        ) :: acc
+      end
+      return acc
+    | _ -> return acc
+  end
+end
 
 export let collect_empty_injects_in_stmts = fn (
   ss: [ SpannedStmt ],
   acc: [ LintFinding ]
 ) -> [ LintFinding ] do
-  match ss do
-    | [] -> return acc
-    | s :: rest ->
-      let acc2 = match s do | SpannedStmt(node, span) ->
-        collect_empty_injects_in_stmt(s: node, sp: span, acc: acc)
-      end
-      return collect_empty_injects_in_stmts(ss: rest, acc: acc2)
-  end
-end
-
-let collect_empty_injects_in_stmt = fn (
-  s: Stmt,
-  sp: Span,
-  acc: [ LintFinding ]
-) -> [ LintFinding ] do
-  match s do
-    | StmtInject(handlers: _, body) ->
-      let acc2 = if list.is_empty(xs: body) then
-          LintFinding(
-            code: "L0001",
-            severity: LintWarning,
-            message: "`inject` block has an empty body; the handler bindings are unreachable",
-            fix_it: Some(val: Fixit(
-              start: 0,
-              len: 0,
-              replacement: "",
-              code: "L0001",
-              message: "remove the surrounding `inject ... do ... end` and keep the (empty) body"
-            )),
-            span: sp
-          ) :: acc
-        else acc end
-      return collect_empty_injects_in_stmts(ss: body, acc: acc2)
-    | StmtLet(name: _, sigil: _, typ: _, value) | StmtLetPattern(
-      pattern: _,
-      value
-    ) -> return collect_empty_injects_in_expr(e: value, acc: acc)
-    | StmtExpr(expr) -> return collect_empty_injects_in_expr(e: expr, acc: acc)
-    | StmtReturn(value) | StmtAssign(
-      target: _,
-      value
-    ) -> return collect_empty_injects_in_expr(e: value, acc: acc)
-    | StmtIndexAssign(target, index, value) ->
-      let a1 = collect_empty_injects_in_expr(e: target, acc: acc)
-      let a2 = collect_empty_injects_in_expr(e: index, acc: a1)
-      return collect_empty_injects_in_expr(e: value, acc: a2)
-    | StmtTry(body, catch_arms) ->
-      let a1 = collect_empty_injects_in_stmts(ss: body, acc: acc)
-      return collect_empty_injects_in_catch_arms(arms: catch_arms, acc: a1)
-  end
-end
-
-let collect_empty_injects_in_catch_arms = fn (
-  arms: [ CatchArm ],
-  acc: [ LintFinding ]
-) -> [ LintFinding ] do
-  match arms do
-    | [] -> return acc
-    | a :: rest ->
-      let acc2 = match a do | CatchArm(pattern: _, body) ->
-        collect_empty_injects_in_stmts(ss: body, acc: acc)
-      end
-      return collect_empty_injects_in_catch_arms(arms: rest, acc: acc2)
-  end
+  return fold_stmts(
+    ss: ss,
+    acc: acc,
+    depth: 0,
+    on_expr: inject_expr_noop,
+    on_stmt: inject_stmt_visitor
+  )
 end
 
 export let collect_empty_injects_in_expr = fn (
   e: SpannedExpr,
   acc: [ LintFinding ]
 ) -> [ LintFinding ] do
-  match e do | SpannedExpr(node, span: _) ->
-    return collect_empty_injects_in_node(e: node, acc: acc)
-  end
-end
-
-let collect_empty_injects_in_node = fn (e: Expr, acc: [ LintFinding ]) -> [ LintFinding ] do
-  match e do
-    | ExprBinaryOp(left, op: _, right) ->
-      let a1 = collect_empty_injects_in_expr(e: left, acc: acc)
-      return collect_empty_injects_in_expr(e: right, acc: a1)
-    | ExprUnaryOp(op: _, operand) -> return collect_empty_injects_in_expr(e: operand, acc: acc)
-    | ExprCall(func: _, args) -> return collect_empty_injects_in_call_args(args: args, acc: acc)
-    | ExprConstructor(
-      name: _,
-      args,
-      sigil: _
-    ) -> return collect_empty_injects_in_ctor_args(args: args, acc: acc)
-    | ExprArray(elements) | ExprList(elements) -> return collect_empty_injects_in_exprs(
-      es: elements,
-      acc: acc
-    )
-    | ExprRecord(fields) -> return collect_empty_injects_in_record_fields(fs: fields, acc: acc)
-    | ExprIndex(target, index) ->
-      let a1 = collect_empty_injects_in_expr(e: target, acc: acc)
-      return collect_empty_injects_in_expr(e: index, acc: a1)
-    | ExprFieldAccess(target, field: _) -> return collect_empty_injects_in_expr(e: target, acc: acc)
-    | ExprIf(cond, then_branch, else_branch) ->
-      let a1 = collect_empty_injects_in_expr(e: cond, acc: acc)
-      let a2 = collect_empty_injects_in_stmts(ss: then_branch, acc: a1)
-      return collect_empty_injects_in_stmts(ss: else_branch, acc: a2)
-    | ExprMatch(target, cases) ->
-      let a1 = collect_empty_injects_in_expr(e: target, acc: acc)
-      return collect_empty_injects_in_cases(cs: cases, acc: a1)
-    | ExprWhile(cond, body) ->
-      let a1 = collect_empty_injects_in_expr(e: cond, acc: acc)
-      return collect_empty_injects_in_stmts(ss: body, acc: a1)
-    | ExprFor(var: _, start, end_expr, body) ->
-      let a1 = collect_empty_injects_in_expr(e: start, acc: acc)
-      let a2 = collect_empty_injects_in_expr(e: end_expr, acc: a1)
-      return collect_empty_injects_in_stmts(ss: body, acc: a2)
-    | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
-      return collect_empty_injects_in_stmts(ss: body, acc: acc)
-    | ExprRaise(value) | ExprForce(value) -> return collect_empty_injects_in_expr(
-      e: value,
-      acc: acc
-    )
-    | ExprHandler(coeffect_name: _, requires: _, arms) ->
-      return collect_empty_injects_in_handler_arms(arms: arms, acc: acc)
-    | _ -> return acc
-  end
-end
-
-let collect_empty_injects_in_call_args = fn (
-  args: [ CallArg ],
-  acc: [ LintFinding ]
-) -> [ LintFinding ] do
-  match args do
-    | [] -> return acc
-    | a :: rest ->
-      let acc2 = match a do | CallArg(name: _, value) ->
-        collect_empty_injects_in_expr(e: value, acc: acc)
-      end
-      return collect_empty_injects_in_call_args(args: rest, acc: acc2)
-  end
-end
-
-let collect_empty_injects_in_ctor_args = fn (
-  args: [ CtorArg ],
-  acc: [ LintFinding ]
-) -> [ LintFinding ] do
-  match args do
-    | [] -> return acc
-    | a :: rest ->
-      let acc2 = match a do | CtorArg(name: _, value) ->
-        collect_empty_injects_in_expr(e: value, acc: acc)
-      end
-      return collect_empty_injects_in_ctor_args(args: rest, acc: acc2)
-  end
-end
-
-let collect_empty_injects_in_exprs = fn (
-  es: [ SpannedExpr ],
-  acc: [ LintFinding ]
-) -> [ LintFinding ] do
-  match es do
-    | [] -> return acc
-    | e :: rest ->
-      let acc2 = collect_empty_injects_in_expr(e: e, acc: acc)
-      return collect_empty_injects_in_exprs(es: rest, acc: acc2)
-  end
-end
-
-let collect_empty_injects_in_record_fields = fn (
-  fs: [ NamedExpr ],
-  acc: [ LintFinding ]
-) -> [ LintFinding ] do
-  match fs do
-    | [] -> return acc
-    | f :: rest ->
-      let acc2 = match f do | NamedExpr(name: _, value) ->
-        collect_empty_injects_in_expr(e: value, acc: acc)
-      end
-      return collect_empty_injects_in_record_fields(fs: rest, acc: acc2)
-  end
-end
-
-let collect_empty_injects_in_cases = fn (
-  cs: [ MatchCase ],
-  acc: [ LintFinding ]
-) -> [ LintFinding ] do
-  match cs do
-    | [] -> return acc
-    | c :: rest ->
-      let acc2 = match c do | MatchCase(pattern: _, body) ->
-        collect_empty_injects_in_stmts(ss: body, acc: acc)
-      end
-      return collect_empty_injects_in_cases(cs: rest, acc: acc2)
-  end
-end
-
-let collect_empty_injects_in_handler_arms = fn (
-  arms: [ HandlerArm ],
-  acc: [ LintFinding ]
-) -> [ LintFinding ] do
-  match arms do
-    | [] -> return acc
-    | a :: rest ->
-      let acc2 = match a do | HandlerArm(arm, cont_binder: _, span: _) ->
-        match arm do | Function(
-          name: _,
-          is_public: _,
-          type_params: _,
-          params: _,
-          ret_type: _,
-          requires: _,
-          throw_row: _,
-          body,
-          span: _
-        ) ->
-          collect_empty_injects_in_stmts(ss: body, acc: acc)
-        end
-      end
-      return collect_empty_injects_in_handler_arms(arms: rest, acc: acc2)
-  end
+  return fold_expr(
+    e: e,
+    acc: acc,
+    depth: 0,
+    on_expr: inject_expr_noop,
+    on_stmt: inject_stmt_visitor
+  )
 end

@@ -1,0 +1,296 @@
+/**
+ * ast_fold: generic depth-threading AST fold for lint rules.
+ *
+ * Provides two paired entry points:
+ *
+ *   fold_stmts<U>  — left-to-right fold over a statement list
+ *   fold_expr<U>   — fold over a SpannedExpr tree
+ *
+ * Both accept two visitor callbacks:
+ *
+ *   on_expr: (acc: U, depth: i64, e: Expr) -> U
+ *     Called for every Expr node BEFORE recursing into its children.
+ *
+ *   on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+ *     Called for every SpannedStmt BEFORE recursing into its children.
+ *     The span is the source span of the surrounding SpannedStmt node,
+ *     available for findings that need accurate source locations.
+ *
+ * Traversal order (for each node):
+ *   1. Call visitor (on_expr or on_stmt) with current depth.
+ *   2. Recurse into children left-to-right.
+ *      Children that are inner scopes (then/else bodies, while/for bodies,
+ *      match-case bodies, catch-arm bodies, handler-arm bodies) receive
+ *      depth + 1; expression positions (conditions, operands) keep the
+ *      current depth.
+ *
+ * ExprLambda: the lambda body IS recursed (lambdas may contain nested
+ * inject blocks or cap calls that parent rules care about). If a rule
+ * needs to skip lambda bodies (e.g. cognitive-complexity), it should
+ * NOT use this fold and keep a hand-written walker instead.
+ *
+ * ExprCallExpr: NOT recursed (matches existing hand-walker behaviour;
+ * only ExprCall with a named RdrName is walked).
+ *
+ * Callers that do not need depth can pass 0 as the initial depth; the
+ * visitor can then ignore the depth parameter.
+ */
+
+import {
+  SpannedExpr, Expr, ExprLambda, ExprCall, ExprIf,
+  ExprMatch, ExprWhile, ExprFor, ExprBinaryOp, ExprUnaryOp, ExprArray,
+  ExprList, ExprRecord, ExprIndex, ExprFieldAccess, ExprRaise, ExprForce,
+  ExprHandler, ExprConstructor,
+  SpannedStmt, Stmt, StmtLet, StmtLetPattern, StmtExpr, StmtReturn,
+  StmtAssign, StmtIndexAssign, StmtTry, StmtInject,
+  HandlerArm, MatchCase, CatchArm, Function,
+  NamedExpr, CallArg, CtorArg
+} from "src/syntax/ast.nx"
+import { Span } from "src/syntax/token.nx"
+
+// ---------------------------------------------------------------------------
+// fold_stmts / fold_stmt
+// ---------------------------------------------------------------------------
+
+export let fold_stmts = fn <U>(
+  ss: [ SpannedStmt ],
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  match ss do
+    | [] -> return acc
+    | spanned :: rest ->
+      let acc2 = fold_spanned_stmt(spanned, acc, depth, on_expr, on_stmt)
+      return fold_stmts(ss: rest, acc: acc2, depth, on_expr, on_stmt)
+  end
+end
+
+let fold_spanned_stmt = fn <U>(
+  spanned: SpannedStmt,
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  match spanned do | SpannedStmt(node, span) ->
+    let acc2 = on_stmt(acc: acc, depth: depth, s: node, span: span)
+    return fold_stmt_children(s: node, acc: acc2, depth, on_expr, on_stmt)
+  end
+end
+
+let fold_stmt_children = fn <U>(
+  s: Stmt,
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  match s do
+    | StmtLet(name: _, sigil: _, typ: _, value) | StmtLetPattern(pattern: _, value) ->
+      return fold_expr(e: value, acc, depth, on_expr, on_stmt)
+    | StmtExpr(expr) ->
+      return fold_expr(e: expr, acc, depth, on_expr, on_stmt)
+    | StmtReturn(value) | StmtAssign(target: _, value) ->
+      return fold_expr(e: value, acc, depth, on_expr, on_stmt)
+    | StmtIndexAssign(target, index, value) ->
+      let a1 = fold_expr(e: target, acc, depth, on_expr, on_stmt)
+      let a2 = fold_expr(e: index, acc: a1, depth, on_expr, on_stmt)
+      return fold_expr(e: value, acc: a2, depth, on_expr, on_stmt)
+    | StmtTry(body, catch_arms) ->
+      let a1 = fold_stmts(ss: body, acc, depth, on_expr, on_stmt)
+      return fold_catch_arms(arms: catch_arms, acc: a1, depth: depth + 1, on_expr, on_stmt)
+    | StmtInject(handlers, body) ->
+      let a1 = fold_spanned_exprs(es: handlers, acc, depth, on_expr, on_stmt)
+      return fold_stmts(ss: body, acc: a1, depth, on_expr, on_stmt)
+  end
+end
+
+// ---------------------------------------------------------------------------
+// fold_expr / fold_node
+// ---------------------------------------------------------------------------
+
+export let fold_expr = fn <U>(
+  e: SpannedExpr,
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  match e do | SpannedExpr(node, span: _) ->
+    return fold_node(e: node, acc, depth, on_expr, on_stmt)
+  end
+end
+
+let fold_node = fn <U>(
+  e: Expr,
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  let acc2 = on_expr(acc: acc, depth: depth, e: e)
+  match e do
+    | ExprCall(func: _, args) ->
+      return fold_call_args(args: args, acc: acc2, depth, on_expr, on_stmt)
+    | ExprBinaryOp(left, op: _, right) ->
+      let a1 = fold_expr(e: left, acc: acc2, depth, on_expr, on_stmt)
+      return fold_expr(e: right, acc: a1, depth, on_expr, on_stmt)
+    | ExprUnaryOp(op: _, operand) ->
+      return fold_expr(e: operand, acc: acc2, depth, on_expr, on_stmt)
+    | ExprConstructor(name: _, args, sigil: _) ->
+      return fold_ctor_args(args: args, acc: acc2, depth, on_expr, on_stmt)
+    | ExprArray(elements) | ExprList(elements) ->
+      return fold_spanned_exprs(es: elements, acc: acc2, depth, on_expr, on_stmt)
+    | ExprRecord(fields) ->
+      return fold_named_exprs(fs: fields, acc: acc2, depth, on_expr, on_stmt)
+    | ExprIndex(target, index) ->
+      let a1 = fold_expr(e: target, acc: acc2, depth, on_expr, on_stmt)
+      return fold_expr(e: index, acc: a1, depth, on_expr, on_stmt)
+    | ExprFieldAccess(target, field: _) ->
+      return fold_expr(e: target, acc: acc2, depth, on_expr, on_stmt)
+    | ExprIf(cond, then_branch, else_branch) ->
+      let a1 = fold_expr(e: cond, acc: acc2, depth, on_expr, on_stmt)
+      let a2 = fold_stmts(ss: then_branch, acc: a1, depth: depth + 1, on_expr, on_stmt)
+      return fold_stmts(ss: else_branch, acc: a2, depth: depth + 1, on_expr, on_stmt)
+    | ExprMatch(target, cases) ->
+      let a1 = fold_expr(e: target, acc: acc2, depth, on_expr, on_stmt)
+      return fold_match_cases(cs: cases, acc: a1, depth: depth + 1, on_expr, on_stmt)
+    | ExprWhile(cond, body) ->
+      let a1 = fold_expr(e: cond, acc: acc2, depth, on_expr, on_stmt)
+      return fold_stmts(ss: body, acc: a1, depth: depth + 1, on_expr, on_stmt)
+    | ExprFor(var: _, start, end_expr, body) ->
+      let a1 = fold_expr(e: start, acc: acc2, depth, on_expr, on_stmt)
+      let a2 = fold_expr(e: end_expr, acc: a1, depth, on_expr, on_stmt)
+      return fold_stmts(ss: body, acc: a2, depth: depth + 1, on_expr, on_stmt)
+    | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
+      return fold_stmts(ss: body, acc: acc2, depth, on_expr, on_stmt)
+    | ExprRaise(value) | ExprForce(value) ->
+      return fold_expr(e: value, acc: acc2, depth, on_expr, on_stmt)
+    | ExprHandler(coeffect_name: _, requires: _, arms) ->
+      return fold_handler_arms(arms: arms, acc: acc2, depth: depth + 1, on_expr, on_stmt)
+    | _ -> return acc2
+  end
+end
+
+// ---------------------------------------------------------------------------
+// List helpers (private to this module)
+// ---------------------------------------------------------------------------
+
+let fold_spanned_exprs = fn <U>(
+  es: [ SpannedExpr ],
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  match es do
+    | [] -> return acc
+    | e :: rest ->
+      let acc2 = fold_expr(e: e, acc, depth, on_expr, on_stmt)
+      return fold_spanned_exprs(es: rest, acc: acc2, depth, on_expr, on_stmt)
+  end
+end
+
+let fold_call_args = fn <U>(
+  args: [ CallArg ],
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  match args do
+    | [] -> return acc
+    | CallArg(name: _, value) :: rest ->
+      let acc2 = fold_expr(e: value, acc, depth, on_expr, on_stmt)
+      return fold_call_args(args: rest, acc: acc2, depth, on_expr, on_stmt)
+  end
+end
+
+let fold_ctor_args = fn <U>(
+  args: [ CtorArg ],
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  match args do
+    | [] -> return acc
+    | CtorArg(name: _, value) :: rest ->
+      let acc2 = fold_expr(e: value, acc, depth, on_expr, on_stmt)
+      return fold_ctor_args(args: rest, acc: acc2, depth, on_expr, on_stmt)
+  end
+end
+
+let fold_named_exprs = fn <U>(
+  fs: [ NamedExpr ],
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  match fs do
+    | [] -> return acc
+    | NamedExpr(name: _, value) :: rest ->
+      let acc2 = fold_expr(e: value, acc, depth, on_expr, on_stmt)
+      return fold_named_exprs(fs: rest, acc: acc2, depth, on_expr, on_stmt)
+  end
+end
+
+let fold_match_cases = fn <U>(
+  cs: [ MatchCase ],
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  match cs do
+    | [] -> return acc
+    | MatchCase(pattern: _, body) :: rest ->
+      let acc2 = fold_stmts(ss: body, acc, depth, on_expr, on_stmt)
+      return fold_match_cases(cs: rest, acc: acc2, depth, on_expr, on_stmt)
+  end
+end
+
+let fold_catch_arms = fn <U>(
+  arms: [ CatchArm ],
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  match arms do
+    | [] -> return acc
+    | CatchArm(pattern: _, body) :: rest ->
+      let acc2 = fold_stmts(ss: body, acc, depth, on_expr, on_stmt)
+      return fold_catch_arms(arms: rest, acc: acc2, depth, on_expr, on_stmt)
+  end
+end
+
+let fold_handler_arms = fn <U>(
+  arms: [ HandlerArm ],
+  acc: U,
+  depth: i64,
+  on_expr: (acc: U, depth: i64, e: Expr) -> U,
+  on_stmt: (acc: U, depth: i64, s: Stmt, span: Span) -> U
+) -> U do
+  match arms do
+    | [] -> return acc
+    | HandlerArm(arm, cont_binder: _, span: _) :: rest ->
+      match arm do | Function(
+        name: _,
+        is_public: _,
+        type_params: _,
+        params: _,
+        ret_type: _,
+        requires: _,
+        throw_row: _,
+        body,
+        span: _
+      ) ->
+        let acc2 = fold_stmts(ss: body, acc, depth, on_expr, on_stmt)
+        return fold_handler_arms(arms: rest, acc: acc2, depth, on_expr, on_stmt)
+      end
+  end
+end
