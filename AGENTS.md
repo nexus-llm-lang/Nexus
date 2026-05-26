@@ -24,6 +24,18 @@ outside the owner's machine.
 Capture bd context in **commit messages**, **PR descriptions**, and the bd issue body
 itself — never in source comments or test filenames.
 
+## Comments: describe behavior, do not assert design authority
+
+An LLM has no design authority. Comments must describe **what the code does**
+(mechanical, checkable against the code itself).
+
+- Do **not** author design-authority claims — "the sanctioned / canonical /
+  only / intended way", "X counts as Y", "must be done via Z". These declare
+  intent the LLM was never given. State observed behavior instead, or write nothing.
+- You may **transcribe** intent the designer has already stated; you may not
+  **invent** it. And do not manufacture a spec/doc to justify a claim — if a
+  rationale isn't already established by the designer, ask; don't write it as fact.
+
 ## Session Completion
 1. Create issues for remaining work (`bd create`)
 2. Run quality gates if code changed
