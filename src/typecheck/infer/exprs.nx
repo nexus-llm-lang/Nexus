@@ -22,7 +22,7 @@ import {
   TyBorrow, TyRef, TyUserDefined, TyArrow, TyRow,
   NamedType, RecordDef
 } from "src/common/ast.nx"
-import { HirExpr, HirStmt, HirNamedExpr, HirMatchCase, HirParam } from "src/ir/hir/types.nx"
+import { HirExpr, HirStmt, HirNamedExpr, HirMatchCase, HirParam, HirCallArg } from "src/ir/hir/types.nx"
 import {
   SubstEntry, Scheme, CheckState, FreshResult,
   InferExprResult, InferExprOk, InferExprErr,
@@ -44,6 +44,7 @@ import {
   RaiseAdmissionResult, RaiseOk, RaiseRejected
 } from "src/typecheck/infer/control_flow.nx"
 import { build_param_named_types, add_params_to_env } from "src/typecheck/infer/closure.nx"
+import { check_call_args } from "src/typecheck/infer/call.nx"
 import { TypeError, DuplicateRecordLabel, UnknownField, RefEscapes } from "src/typecheck/errors.nx"
 import { suggest_names } from "src/common/levenshtein.nx"
 import * as list from "std:list"
@@ -844,5 +845,68 @@ export let infer_thunk = fn (
         subst: s1,
         typ: TyLazy(inner: t, require_row: lazy_empty_row(), throw_row: tv_thr)
       )
+  end
+end
+
+// T-App on an expression callee (T-Proj + T-App for record-field calls, or
+// postfix-call `(expr)(args)`). Infers the callee expression, peels any
+// modality wrappers, checks it is an arrow type, and delegates argument
+// checking to check_call_args.  Enforces the throw-row side-condition exactly
+// as infer_call does for named-call sites.
+export let infer_call_expr = fn (
+  state: CheckState, callee: HirExpr, args: [ HirCallArg ], span: Span,
+  infer_expr_fn: (
+    state: CheckState,
+    expr: HirExpr,
+    ret_type: TypeExpr
+  ) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  match infer_expr_fn(state, expr: callee, ret_type: TyUnit) do
+    | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+    | InferExprOk(state: st1, subst: s1, typ: callee_raw) ->
+      // Peel `%` / `@` modality wrappers (same as infer_call's scheme peel).
+      let callee_type = match callee_raw do
+        | TyLinear(inner: u) | TyLazy(inner: u, require_row: _, throw_row: _) -> u
+        | _ -> callee_raw
+      end
+      match callee_type do
+        | TyArrow(params, ret, requires: _, throw_row: callee_thr) ->
+          match check_call_args(
+            state: st1,
+            params,
+            args,
+            ret,
+            subst: s1,
+            span,
+            infer_expr_fn
+          ) do
+            | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+            | InferExprOk(state: st2, subst: s_all, typ: rt) ->
+              // Throw-row side-condition: same enforcement as infer_call.
+              let callee_row = subst.subst_apply(subst: s_all, typ: callee_thr)
+              let caller_row = subst.subst_apply(
+                subst: s_all,
+                typ: tctypes.state_throw_row(state: st2)
+              )
+              let groups = tctypes.state_exception_groups(state: st2)
+              let fn_pure_set = tctypes.state_fn_pure_set(state: st2)
+              match check_call_throw_row_admitted(
+                callee_row,
+                caller_row,
+                groups,
+                func: "(callee)",
+                fn_pure_set
+              ) do
+                | RaiseOk -> return InferExprOk(state: st2, subst: s_all, typ: rt)
+                | RaiseRejected(message: m) -> return InferExprErr(message: m, span)
+              end
+          end
+        | _ ->
+          return InferExprErr(
+            message: "callee expression is not a function (got "
+              ++ tctypes.type_to_string(typ: callee_type) ++ ")",
+            span
+          )
+      end
   end
 end
