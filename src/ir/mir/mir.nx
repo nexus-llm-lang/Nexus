@@ -30,7 +30,7 @@ import { MirError, MirCapHandlerNotFound, MirMultiArgSuspend } from "src/ir/mir/
 import { None } from "std:option"
 import * as naming from "src/ir/support/naming.nx"
 import * as list from "std:list"
-import { TypeExpr } from "src/syntax/ast.nx"
+import { TypeExpr, SigilLazy, TyLazy } from "src/syntax/ast.nx"
 import { Span } from "src/syntax/token.nx"
 import {
   HirStmtKind,
@@ -89,7 +89,8 @@ import {
 } from "src/ir/mir/lambda_lift.nx"
 import { lower_functions, lower_handler_functions } from "src/ir/mir/func_lower.nx"
 import {
-  ctx_cont_binders, ctx_value_binding_names, list_has,
+  ctx_cont_binders, ctx_value_binding_names, ctx_thunk_param_names, ctx_with_thunk_param_names,
+  list_has,
   lookup, insert_or_replace, insert_if_absent, activate_handlers, append_name_pairs,
   build_handler_cap_names, build_global_cap_handlers,
   lower_externals,
@@ -142,7 +143,8 @@ export let lower_hir_to_mir = fn (hir: HirProgram) -> MirProgram throws { MirErr
     closure_counter: 0,
     lifted_funcs: [],
     cont_binders: [],
-    value_binding_names: vbns
+    value_binding_names: vbns,
+    thunk_param_names: []
   )
 
   let mir_externals = lower_externals(exts)
@@ -209,7 +211,7 @@ let lower_stmt = fn (
   ctx: MirCtx
 ) -> MirStmtsResult throws { MirError } do
   match stmt do
-    | Let(name: n, sigil: _, typ: t, value: v) ->
+    | Let(name: n, sigil: sig, typ: t, value: v) ->
       // HIR Let.typ is None when the user omits the annotation and typecheck
       // has not back-patched it — the HIR is not rewritten after typecheck.
       // LIR lowering recovers the real type via atom_type / semantic_vars
@@ -222,7 +224,23 @@ let lower_stmt = fn (
         | Some(val: te) -> te
         | None -> TyUnit
       end
-      match lower_expr(expr: v, ctx) do | MirExprResult(ctx: ctx2, expr: mir_val) ->
+      // Track thunk-typed let bindings so Call(func: n, args) can insert
+      // an implicit MirForce when n is a thunk (T-App thunk-callee codegen).
+      let is_thunk_let = match sig do
+        | SigilLazy -> true
+        | _ ->
+          match t do
+            | Some(val: TyLazy(inner: _, require_row: _, throw_row: _)) -> true
+            | _ -> false
+          end
+      end
+      let ctx_for_val = if is_thunk_let then
+        let existing = ctx_thunk_param_names(ctx)
+        ctx_with_thunk_param_names(ctx, names: n :: existing)
+      else
+        ctx
+      end
+      match lower_expr(expr: v, ctx: ctx_for_val) do | MirExprResult(ctx: ctx2, expr: mir_val) ->
         return MirStmtsResult(
           ctx: ctx2,
           stmts: [ MirStmtLet(name: n, typ: mir_typ, expr: mir_val) ]
@@ -273,11 +291,12 @@ let lower_stmt = fn (
         closure_counter: cc,
         lifted_funcs: lf,
         cont_binders: cb,
-        value_binding_names: vbns
+        value_binding_names: vbns,
+        thunk_param_names: tpn
       ) = ctx
       let new_scope = activate_handlers(handler_names: hs, handler_cap_names: hpn, scope)
       let new_ctx = MirCtx(scope: new_scope, cap_layouts: pl, handler_cap_names: hpn,
-                           all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf, cont_binders: cb, value_binding_names: vbns)
+                           all_funcs: af, all_handlers: ah, all_exts: ae, closure_counter: cc, lifted_funcs: lf, cont_binders: cb, value_binding_names: vbns, thunk_param_names: tpn)
       // If any handler in this inject has any arm capturing a continuation,
       // route the body through a stack-switching resume frame: lift the body
       // to a fresh MirFunction and replace the inject site with a single
@@ -301,10 +320,11 @@ let lower_stmt = fn (
             closure_counter: cc2,
             lifted_funcs: lf2,
             cont_binders: cb2,
-            value_binding_names: vbns2
+            value_binding_names: vbns2,
+            thunk_param_names: tpn2
           ) = ctx2
           let restored = MirCtx(scope, cap_layouts: pl2, handler_cap_names: hpn2,
-                                all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2)
+                                all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
           return MirStmtsResult(
             ctx: restored,
             stmts: [ MirStmtInjectResume(body_fn: bfn, handler_arm_fns: arm_fns, handler_arm_tags: arm_tags) ]
@@ -323,10 +343,11 @@ let lower_stmt = fn (
           closure_counter: cc2,
           lifted_funcs: lf2,
           cont_binders: cb2,
-          value_binding_names: vbns2
+          value_binding_names: vbns2,
+          thunk_param_names: tpn2
         ) = ctx2
         let restored = MirCtx(scope, cap_layouts: pl2, handler_cap_names: hpn2,
-                              all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2)
+                              all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
         return MirStmtsResult(ctx: restored, stmts: lowered)
       end
   end
@@ -353,12 +374,13 @@ let lift_inject_body = fn (
     closure_counter: n,
     lifted_funcs: lf,
     cont_binders: cb,
-    value_binding_names: vbns
+    value_binding_names: vbns,
+    thunk_param_names: tpn
   ) = ctx
   let lifted_name = "__inject_" ++ i64_to_str(n)
   let ctx_after_name = MirCtx(scope: sc, cap_layouts: pl, handler_cap_names: hpn,
                               all_funcs: af, all_handlers: ah, all_exts: ae,
-                              closure_counter: n + 1, lifted_funcs: lf, cont_binders: cb, value_binding_names: vbns)
+                              closure_counter: n + 1, lifted_funcs: lf, cont_binders: cb, value_binding_names: vbns, thunk_param_names: tpn)
   match lower_stmts(
     stmts,
     ctx: ctx_after_name
@@ -373,14 +395,15 @@ let lift_inject_body = fn (
       closure_counter: n2,
       lifted_funcs: lf2,
       cont_binders: cb2,
-      value_binding_names: vbns2
+      value_binding_names: vbns2,
+      thunk_param_names: tpn2
     ) = ctx_body
     let lifted_fn = MirFunction(name: lifted_name, params: [], ret_type: TyUnit,
                                 body: mir_body, span)
     let new_lf = append_mir_funcs(a: lf2, b: [ lifted_fn ])
     let ctx_final = MirCtx(scope: sc2, cap_layouts: pl2, handler_cap_names: hpn2,
                            all_funcs: af2, all_handlers: ah2, all_exts: ae2,
-                           closure_counter: n2, lifted_funcs: new_lf, cont_binders: cb2, value_binding_names: vbns2)
+                           closure_counter: n2, lifted_funcs: new_lf, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
     return LiftInjectResult(ctx: ctx_final, body_fn: lifted_name)
   end
 end
@@ -491,13 +514,17 @@ let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExprResult throws { MirEr
               | None ->
                 // f_resolved is a local / parameter holding a closure. LIR
                 // recovers the real return type from semantic_vars.
+                // If the callee is a thunk-typed param/let, insert an implicit
+                // MirForce first (T-App thunk-callee: `f(args)` → `(@f)(args)`).
+                let thunk_names = ctx_thunk_param_names(ctx: ctx1)
+                let callee_expr = if list_has(name: f_resolved, names: thunk_names) then
+                  MirForce(expr: MirVariable(name: f_resolved))
+                else
+                  MirVariable(name: f_resolved)
+                end
                 return MirExprResult(
                   ctx: ctx1,
-                  expr: MirCallClosure(
-                    closure: MirVariable(name: f_resolved),
-                    args: mir_args,
-                    ret_type: TyI64
-                  )
+                  expr: MirCallClosure(closure: callee_expr, args: mir_args, ret_type: TyI64)
                 )
             end
           end
@@ -806,12 +833,13 @@ let lift_lambda = fn (
     closure_counter: n,
     lifted_funcs: lf,
     cont_binders: cb,
-    value_binding_names: vbns
+    value_binding_names: vbns,
+    thunk_param_names: tpn
   ) = ctx
   let lifted_name = "__closure_" ++ i64_to_str(n)
   let ctx_after_name = MirCtx(scope: sc, cap_layouts: pl, handler_cap_names: hpn,
                               all_funcs: af, all_handlers: ah, all_exts: ae,
-                              closure_counter: n + 1, lifted_funcs: lf, cont_binders: cb, value_binding_names: vbns)
+                              closure_counter: n + 1, lifted_funcs: lf, cont_binders: cb, value_binding_names: vbns, thunk_param_names: tpn)
 
   // Free variables: referenced in body but not bound by params or known at
   // top level (functions, externals, handler methods).
@@ -852,12 +880,13 @@ let lift_lambda = fn (
       closure_counter: n2,
       lifted_funcs: lf2,
       cont_binders: cb2,
-      value_binding_names: vbns2
+      value_binding_names: vbns2,
+      thunk_param_names: tpn2
     ) = ctx_body
     let new_lf = append_mir_funcs(a: lf2, b: [ lifted_fn ])
     let ctx_final = MirCtx(scope: sc2, cap_layouts: pl2, handler_cap_names: hpn2,
                            all_funcs: af2, all_handlers: ah2, all_exts: ae2,
-                           closure_counter: n2, lifted_funcs: new_lf, cont_binders: cb2, value_binding_names: vbns2)
+                           closure_counter: n2, lifted_funcs: new_lf, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
 
     let capture_exprs = captures_to_mir_exprs(caps: captures, acc: [])
     return MirExprResult(
