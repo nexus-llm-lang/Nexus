@@ -830,20 +830,25 @@ export let infer_thunk = fn (
   ) -> InferExprResult throws { TypeError }
 ) -> InferExprResult throws { TypeError } do
   span
-  // T-LetThunk: type the body, then wrap the result type as @(τ ; {} ; ?ρ_e)
-  // where ?ρ_e is a fresh throw-row variable.  The fresh variable is
-  // effect-polymorphic — it unifies with the annotated row when the thunk is
-  // used at a typed binding site (`let @x: @(T throws {E}) = ...`), or remains
-  // unconstrained (open) otherwise, preserving backward-compatibility with
-  // existing unannotated thunk code.
-  match infer_expr_fn(state, expr: body, ret_type) do
+  // T-LetThunk: type e in an isolated collecting context (fresh throw_row and
+  // require_row) so the body's effects are NOT charged to the enclosing fn.
+  // The enclosing fn's throw_row and require_row are restored after typing e,
+  // and the captured fresh rows become the thunk type's deferred rows.
+  let FreshResult(state: st0, typ: tv_thr) = tctypes.tc_fresh_var(state)
+  let FreshResult(state: st0b, typ: tv_rq) = tctypes.tc_fresh_var(state: st0)
+  let body_state = tctypes.state_with_throw_row(state: st0b, throw_row: tv_thr)
+  let body_state2 = tctypes.state_with_require_row(state: body_state, require_row: tv_rq)
+  let outer_throw = tctypes.state_throw_row(state)
+  let outer_req = tctypes.state_require_row(state)
+  match infer_expr_fn(state: body_state2, expr: body, ret_type) do
     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
     | InferExprOk(state: st1, subst: s1, typ: t) ->
-      let FreshResult(state: st2, typ: tv_thr) = tctypes.tc_fresh_var(state: st1)
+      let st1r = tctypes.state_with_throw_row(state: st1, throw_row: outer_throw)
+      let st1r2 = tctypes.state_with_require_row(state: st1r, require_row: outer_req)
       return InferExprOk(
-        state: st2,
+        state: st1r2,
         subst: s1,
-        typ: TyLazy(inner: t, require_row: lazy_empty_row(), throw_row: tv_thr)
+        typ: TyLazy(inner: t, require_row: tv_rq, throw_row: tv_thr)
       )
   end
 end
@@ -864,9 +869,36 @@ export let infer_call_expr = fn (
   match infer_expr_fn(state, expr: callee, ret_type: TyUnit) do
     | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
     | InferExprOk(state: st1, subst: s1, typ: callee_raw) ->
-      // Peel `%` / `@` modality wrappers (same as infer_call's scheme peel).
+      // Peel `%` modality wrapper (linear-capture lambda) or perform T-Force
+      // elaboration for `@` (lazy thunk callee, spec §T-App thunk-callee).
       let callee_type = match callee_raw do
-        | TyLinear(inner: u) | TyLazy(inner: u, require_row: _, throw_row: _) -> u
+        | TyLinear(inner: u) -> u
+        | TyLazy(inner: u, require_row: lazy_rq, throw_row: lazy_thr) ->
+          // T-Force: surface deferred throw_row and check deferred require_row.
+          let lazy_caller_row = tctypes.state_throw_row(state: st1)
+          let groups_ce = tctypes.state_exception_groups(state: st1)
+          let fn_pure_set_ce = tctypes.state_fn_pure_set(state: st1)
+          match check_call_throw_row_admitted(
+            callee_row: lazy_thr,
+            caller_row: lazy_caller_row,
+            groups: groups_ce,
+            func: "(callee force)",
+            fn_pure_set: fn_pure_set_ce
+          ) do
+            | RaiseRejected(message: m) -> return InferExprErr(message: "force callee: " ++ m, span)
+            | RaiseOk ->
+              let ambient_rq = tctypes.state_require_row(state: st1)
+              match check_force_require_row(thunk_require_row: lazy_rq, ambient_require_row: ambient_rq) do
+                | Some(val: missing) ->
+                  return InferExprErr(
+                    message: "force callee: thunk requires capability '" ++ missing
+                      ++ "' which is not in the ambient require row",
+                    span
+                  )
+                | None -> ()
+              end
+          end
+          u
         | _ -> callee_raw
       end
       match callee_type do
