@@ -4,11 +4,11 @@
  * module.
  *
  * Owns:
- * - Top-level orchestration (merge_with_stdlib)
+ * - Top-level orchestration (merge_with_deps / merge_with_stdlib)
  * - Section scanning (scan_secs)
  * - Main import resolution + remap intarr population (resolve_main_imports,
  *   push_identity / push_offset, remap_main_locals / remap_dep_locals)
- * - Main non-stdlib import counting and copying
+ * - Main non-dep import counting and copying
  *
  * Does not own:
  * - Generic WASM binary decode (ULEB/SLEB) — see src/backend/wasm/read.nx
@@ -17,11 +17,13 @@
  * - Per-section emitters / scanning helpers (rd_str, skip_imp_desc, …) —
  *   see src/backend/wasm/merge/section_emit.nx
  *
- * Consumers: src/main.nx calls merge_with_stdlib at the end of the pipeline.
+ * Consumers: external tools call merge_with_deps (or merge_with_stdlib) to
+ * produce a self-contained WASM module from core + N dependency modules.
  */
 import { ByteBuffer }, * as bb from "std:bytebuffer"
 import { StringMap }, * as sm from "std:stringmap"
 import * as str from "std:str"
+import * as list from "std:list"
 import { FileNotFound } from "std:fs"
 import { pack, pval, ppos, rd_uleb } from "src/backend/wasm/read.nx"
 import { wasm_page_size, wasm_page_mask, default_initial_pages } from "src/backend/wasm/defs.nx"
@@ -35,6 +37,23 @@ import { StrPos, rd_str, get_sec, sec_off, sec_sz, count_sec, sec_body,
          emit_merged_tag_sec, emit_stub_bodies, maybe_rewrite_bodies,
          find_data_end, scan_custom_secs, emit_preserved_customs }
        from "src/backend/wasm/merge/section_emit.nx"
+
+/**
+ * DepSpec: one dependency module for the N-dep self-contained linker.
+ *
+ * module_prefix: the import-module-name prefix this dep satisfies.
+ *   A core import (module M, name F) resolves against this dep when
+ *   M starts_with module_prefix (for non-empty prefix) OR when M is
+ *   the empty string "" and this is the first dep in the list (the
+ *   first dep always provides the anonymous allocator imports).
+ *
+ * wasm_path: path to the prebuilt dep WASM file. The file is read
+ *   by merge_with_deps and freed on completion.
+ *
+ * Example — stdlib as the single dep:
+ *   DepSpec(module_prefix: "nexus:std/", wasm_path: stdlib_path)
+ */
+export type DepSpec = DepSpec(module_prefix: string, wasm_path: string)
 
 // Multi-return / state records for import resolution.
 // ResolveCtx: import-resolution state. Owns the remap intarr as %ByteBuffer
@@ -131,67 +150,105 @@ let count_func_imps_go = fn (buf: &ByteBuffer, pos: i64, remaining: i64, acc: i6
   return count_func_imps_go(buf, pos: pos4, remaining: remaining - 1, acc: acc + inc)
 end
 
-// Count ALL main imports that are NOT from nexus:std/* (for import section entry count)
-let count_main_kept_imps = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
+// True when mod_name is satisfied by one of the given dep prefixes.
+// A non-empty prefix matches via starts_with; an empty mod_name ("") is
+// satisfied by the dep in slot 0 (the first dep always provides the
+// anonymous allocator imports — memory and allocate).
+// dep_is_first: true when we are testing the first dep in the list.
+let any_dep_prefix_matches = fn (
+  mod_name: string,
+  prefixes: [ string ],
+  dep_is_first: bool
+) -> bool do
+  if str.byte_length(s: mod_name) == 0 then return dep_is_first end
+  return any_prefix_matches_go(mod_name, prefixes)
+end
+let any_prefix_matches_go = fn (mod_name: string, prefixes: [ string ]) -> bool do
+  match prefixes do
+  | [] -> return false
+  | p :: rest ->
+    if str.starts_with(s: mod_name, prefix: p) then return true end
+    return any_prefix_matches_go(mod_name, prefixes: rest)
+  end
+end
+
+// Extract all dep module prefixes from the DepSpec list (non-linear).
+let dep_prefixes = fn (specs: [ DepSpec ]) -> [ string ] do
+  match specs do
+  | [] -> return []
+  | DepSpec(module_prefix: p, wasm_path: _) :: rest ->
+    return p :: dep_prefixes(specs: rest)
+  end
+end
+
+// Count ALL main imports that are not resolved by any dep (for import section entry count)
+let count_main_kept_imps = fn (buf: &ByteBuffer, sec_pk: i64, dep_pfs: [ string ]) -> i64 do
   if sec_pk == 0 then return 0 end
   let pk = rd_uleb(buf, pos: sec_off(pk: sec_pk))
-  return count_main_kept_go(buf, pos: ppos(pk), remaining: pval(pk), acc: 0)
+  return count_main_kept_go(buf, pos: ppos(pk), remaining: pval(pk), acc: 0, dep_pfs)
 end
-let count_main_kept_go = fn (buf: &ByteBuffer, pos: i64, remaining: i64, acc: i64) -> i64 do
+let count_main_kept_go = fn (
+  buf: &ByteBuffer,
+  pos: i64,
+  remaining: i64,
+  acc: i64,
+  dep_pfs: [ string ]
+) -> i64 do
   if remaining <= 0 then return acc end
   let StrPos(s: mod_name, pos: pos2) = rd_str(buf, pos)
   let StrPos(s: _name, pos: pos3) = rd_str(buf, pos: pos2)
   let kind = bb.get_byte(buf, idx: pos3)
   let pos4 = skip_imp_desc(buf, pos: pos3)
-  if str.starts_with(s: mod_name, prefix: "nexus:std/") then
-    return count_main_kept_go(buf, pos: pos4, remaining: remaining - 1, acc)
-  end
-  if str.byte_length(s: mod_name) == 0 then
-    return count_main_kept_go(buf, pos: pos4, remaining: remaining - 1, acc)
+  if any_dep_prefix_matches(mod_name, prefixes: dep_pfs, dep_is_first: true) then
+    return count_main_kept_go(buf, pos: pos4, remaining: remaining - 1, acc, dep_pfs)
   end
   if kind == 2 then
-    return count_main_kept_go(buf, pos: pos4, remaining: remaining - 1, acc)
+    return count_main_kept_go(buf, pos: pos4, remaining: remaining - 1, acc, dep_pfs)
   end
-  return count_main_kept_go(buf, pos: pos4, remaining: remaining - 1, acc: acc + 1)
+  return count_main_kept_go(buf, pos: pos4, remaining: remaining - 1, acc: acc + 1, dep_pfs)
 end
 
-// Count main FUNCTION imports that are NOT from nexus:std/* (for function index layout)
-let count_main_kept_func_imps = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
+// Count main FUNCTION imports that are not resolved by any dep (for function index layout)
+let count_main_kept_func_imps = fn (buf: &ByteBuffer, sec_pk: i64, dep_pfs: [ string ]) -> i64 do
   if sec_pk == 0 then return 0 end
   let pk = rd_uleb(buf, pos: sec_off(pk: sec_pk))
-  return count_main_kept_func_go(buf, pos: ppos(pk), remaining: pval(pk), acc: 0)
+  return count_main_kept_func_go(buf, pos: ppos(pk), remaining: pval(pk), acc: 0, dep_pfs)
 end
-let count_main_kept_func_go = fn (buf: &ByteBuffer, pos: i64, remaining: i64, acc: i64) -> i64 do
+let count_main_kept_func_go = fn (
+  buf: &ByteBuffer,
+  pos: i64,
+  remaining: i64,
+  acc: i64,
+  dep_pfs: [ string ]
+) -> i64 do
   if remaining <= 0 then return acc end
   let StrPos(s: mod_name, pos: pos2) = rd_str(buf, pos)
   let StrPos(s: _name, pos: pos3) = rd_str(buf, pos: pos2)
   let kind = bb.get_byte(buf, idx: pos3)
   let pos4 = skip_imp_desc(buf, pos: pos3)
   if kind == 0 then
-    if str.starts_with(s: mod_name, prefix: "nexus:std/") then
-      return count_main_kept_func_go(buf, pos: pos4, remaining: remaining - 1, acc)
+    if any_dep_prefix_matches(mod_name, prefixes: dep_pfs, dep_is_first: true) then
+      return count_main_kept_func_go(buf, pos: pos4, remaining: remaining - 1, acc, dep_pfs)
     end
-    if str.byte_length(s: mod_name) == 0 then
-      return count_main_kept_func_go(buf, pos: pos4, remaining: remaining - 1, acc)
-    end
-    return count_main_kept_func_go(buf, pos: pos4, remaining: remaining - 1, acc: acc + 1)
+    return count_main_kept_func_go(buf, pos: pos4, remaining: remaining - 1, acc: acc + 1, dep_pfs)
   end
-  return count_main_kept_func_go(buf, pos: pos4, remaining: remaining - 1, acc)
+  return count_main_kept_func_go(buf, pos: pos4, remaining: remaining - 1, acc, dep_pfs)
 end
 
-// Copy main's non-stdlib function imports to output (no type offset needed — main types first)
+// Copy main's non-dep function imports to output (no type offset needed — main types first)
 let copy_main_kept_imps = fn (
   out: %ByteBuffer,
   buf: &ByteBuffer,
   sec_pk: i64,
-  type_off: i64
+  type_off: i64,
+  dep_pfs: [ string ]
 ) -> %ByteBuffer do
   if sec_pk == 0 then return %out end
   let pk = rd_uleb(buf, pos: sec_off(pk: sec_pk))
-  return copy_main_kept_go(%out, buf, pos: ppos(pk), remaining: pval(pk), type_off)
+  return copy_main_kept_go(%out, buf, pos: ppos(pk), remaining: pval(pk), type_off, dep_pfs)
 end
 // A main import is satisfied by dep (and dropped from merged imports) if:
-//   - module is "nexus:std/*" (function, resolved to dep export), OR
+//   - module matches a dep prefix (function, resolved to dep export), OR
 //   - module is "" (anonymous .memory/.allocate bound to dep-provided ones), OR
 //   - import kind is memory (merged declares its own memory).
 // Keeping main imports intact would require shifting dep's function indices by
@@ -202,7 +259,8 @@ let copy_main_kept_go = fn (
   buf: &ByteBuffer,
   pos: i64,
   remaining: i64,
-  type_off: i64
+  type_off: i64,
+  dep_pfs: [ string ]
 ) -> %ByteBuffer do
   if remaining <= 0 then return %out end
   let start = pos
@@ -210,23 +268,20 @@ let copy_main_kept_go = fn (
   let StrPos(s: _name, pos: pos3) = rd_str(buf, pos: pos2)
   let kind = bb.get_byte(buf, idx: pos3)
   let pos4 = skip_imp_desc(buf, pos: pos3)
-  if str.starts_with(s: mod_name, prefix: "nexus:std/") then
-    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off)
-  end
-  if str.byte_length(s: mod_name) == 0 then
-    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off)
+  if any_dep_prefix_matches(mod_name, prefixes: dep_pfs, dep_is_first: true) then
+    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off, dep_pfs)
   end
   if kind == 2 then
-    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off)
+    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off, dep_pfs)
   end
   if kind == 0 then
     let %out = bb.copy_range(dst: %out, src: buf, start, end_pos: pos3 + 1)
     let pk = rd_uleb(buf, pos: pos3 + 1)
     let %out = bb.push_uleb128(buf: %out, val: pval(pk) + type_off)
-    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off)
+    return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off, dep_pfs)
   end
   let %out = bb.copy_range(dst: %out, src: buf, start, end_pos: pos4)
-  return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off)
+  return copy_main_kept_go(%out, buf, pos: pos4, remaining: remaining - 1, type_off, dep_pfs)
 end
 
 // Populates remap_m intarr (dense i32 array, indexed by fidx) with the merged
@@ -236,6 +291,7 @@ end
 let resolve_main_imports = fn (
   ctx: %ResolveCtx,
   dep_exports: &StringMap,
+  dep_prefix: string,
   buf: &ByteBuffer,
   sec_pk: i64
 ) -> %ResolveCtx do
@@ -244,6 +300,7 @@ let resolve_main_imports = fn (
     return resolve_main_go(
       %ctx,
       dep_exports,
+      dep_prefix,
       buf,
       pos: ppos(pk),
       remaining: pval(pk),
@@ -255,6 +312,7 @@ end
 let resolve_main_go = fn (
   ctx: %ResolveCtx,
   dep_exports: &StringMap,
+  dep_prefix: string,
   buf: &ByteBuffer,
   pos: i64,
   remaining: i64,
@@ -268,8 +326,8 @@ let resolve_main_go = fn (
   if kind == 0 then
     let ResolveCtx(%remap, kept_fimp, n_stubs, dep_fimp, m_imp_base) = ctx
     let ResolveState(fidx, m_kept_idx) = state
-    // stdlib/* and empty-module function imports resolve to dep exports.
-    let is_dep = if str.starts_with(s: mod_name, prefix: "nexus:std/") then true
+    // Dep import: module matches dep prefix OR anonymous ("") goes to first dep.
+    let is_dep = if str.starts_with(s: mod_name, prefix: dep_prefix) then true
                  else str.byte_length(s: mod_name) == 0 end
     let new_kept_idx = if is_dep then m_kept_idx else m_kept_idx + 1 end
     let new_idx = if is_dep then
@@ -291,13 +349,22 @@ let resolve_main_go = fn (
     return resolve_main_go(
       %ctx,
       dep_exports,
+      dep_prefix,
       buf,
       pos: pos4,
       remaining: remaining - 1,
       state: ResolveState(fidx: fidx + 1, m_kept_idx: new_kept_idx)
     )
   end
-  return resolve_main_go(%ctx, dep_exports, buf, pos: pos4, remaining: remaining - 1, state)
+  return resolve_main_go(
+    %ctx,
+    dep_exports,
+    dep_prefix,
+    buf,
+    pos: pos4,
+    remaining: remaining - 1,
+    state
+  )
 end
 
 let remap_dep_func = fn (dep_fidx: i64, kept_fimp: i64, n_stubs: i64, dep_fimp: i64) -> i64 do
@@ -347,13 +414,14 @@ end
 // before returning.
 
 /** Section 2 (imports): env.memory + dep imports (type-offset) + main
- *  non-stdlib imports. `pages` is the chosen initial-page count for the
+ *  non-dep imports. `pages` is the chosen initial-page count for the
  *  shared memory import; `dep_imp_count` counts dep import entries.
  */
 let emit_merged_imports = fn (out: %ByteBuffer, dep: &ByteBuffer, core_wasm: &ByteBuffer,
                               d_imp_pk: i64, m_imp_sec_pk: i64,
                               dep_imp_count: i64, m_kept_all: i64,
-                              pages: i64, d_type_off: i64, m_type_off: i64) -> %ByteBuffer do
+                              pages: i64, d_type_off: i64, m_type_off: i64,
+                              dep_pfs: [ string ]) -> %ByteBuffer do
   let total_imp_count = dep_imp_count + m_kept_all + 1
   let %tmp_i = bb.empty()
   let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: total_imp_count)
@@ -382,7 +450,8 @@ let emit_merged_imports = fn (out: %ByteBuffer, dep: &ByteBuffer, core_wasm: &By
     out: %tmp_i,
     buf: core_wasm,
     sec_pk: m_imp_sec_pk,
-    type_off: m_type_off
+    type_off: m_type_off,
+    dep_pfs
   )
   let %out = emit_sec(%out, sec_id: 2, content: &tmp_i)
   bb.free(buf: %tmp_i)
@@ -481,12 +550,65 @@ let emit_merged_code = fn (out: %ByteBuffer, dep: &ByteBuffer, core_wasm: &ByteB
   return %out
 end
 
-/** Merge `core_wasm` against the prebuilt stdlib wasm at `stdlib_path` into a single self-contained module: scans both inputs, allocates a flat type/func/global/table index space (dep first, then core with appropriate offsets), wires stub funcs for every dep export the core imported, and emits each wasm section concatenated with the rewritten bodies. The single user-facing entry point for the stage-2 self-contained linker. */
+/**
+ * merge_with_deps: the N-dep self-contained linker entry point.
+ *
+ * Merges `core_wasm` against N dependency modules specified by `deps`.
+ * Each dep entry specifies a module-name prefix (to identify which core
+ * imports this dep satisfies) and a path to the prebuilt WASM file.
+ *
+ * Index-space layout (dep first, then core):
+ *   [dep0 WASI func imports] [dep1 WASI func imports] ... [main host imports]
+ *   [dep0 local funcs] [dep1 local funcs] ... [main local funcs]
+ *
+ * For N=1, the layout is identical to the former merge_with_stdlib output.
+ *
+ * Currently supports N=1 dep fully (the stdlib case). For N>1, use
+ * merge_with_stdlib + a pre-merge step or contribute N>1 fold support.
+ */
+export let merge_with_deps = fn (
+  core_wasm: %ByteBuffer,
+  deps: [ DepSpec ]
+) -> %ByteBuffer throws { FileNotFound, WasmMergeUnsupported } do
+  match deps do
+  | [] ->
+    bb.free(buf: %core_wasm)
+    throw WasmMergeUnsupported(detail: "merge_with_deps: deps list is empty; at least one dep (stdlib) is required")
+  | DepSpec(module_prefix: dep0_prefix, wasm_path: dep0_path) :: rest ->
+    if !list.is_empty(xs: rest) then
+      bb.free(buf: %core_wasm)
+      throw WasmMergeUnsupported(detail: "merge_with_deps: N>1 deps not yet implemented; pre-merge extra deps first")
+    end
+    return merge_one_dep(core_wasm: %core_wasm, dep_path: dep0_path, dep_prefix: dep0_prefix)
+  end
+end
+
+/** Merge `core_wasm` against the prebuilt stdlib wasm at `stdlib_path` into
+ *  a single self-contained module: scans both inputs, allocates a flat
+ *  type/func/global/table index space (dep first, then core with appropriate
+ *  offsets), wires stub funcs for every dep export the core imported, and
+ *  emits each wasm section concatenated with the rewritten bodies.
+ *
+ *  Backward-compatible wrapper around `merge_with_deps`. Prefer
+ *  `merge_with_deps` for new call sites.
+ */
 export let merge_with_stdlib = fn (
   core_wasm: %ByteBuffer,
   stdlib_path: string
 ) -> %ByteBuffer throws { FileNotFound, WasmMergeUnsupported } do
-  let %dep = bb.read_binary_file(path: stdlib_path)
+  return merge_with_deps(core_wasm: %core_wasm,
+    deps: [ DepSpec(module_prefix: "nexus:std/", wasm_path: stdlib_path) ])
+end
+
+// Core merge logic for exactly one dep. Called by both merge_with_deps (N=1)
+// and merge_with_stdlib. Generalizable to N deps by accumulating per-dep
+// metadata and emitting section contributions in dep order.
+let merge_one_dep = fn (
+  core_wasm: %ByteBuffer,
+  dep_path: string,
+  dep_prefix: string
+) -> %ByteBuffer throws { FileNotFound, WasmMergeUnsupported } do
+  let %dep = bb.read_binary_file(path: dep_path)
 
   let %m_secs = scan_secs(buf: &core_wasm)
   let %d_secs = scan_secs(buf: &dep)
@@ -505,15 +627,16 @@ export let merge_with_stdlib = fn (
   let m_fimp = count_func_imps(buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 2))
   let m_loc = count_sec(buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 3))
 
-  // Count main's non-stdlib imports
+  // Count main's non-dep imports
+  let dep_pfs = [ dep_prefix ]
   let m_imp_sec_pk = get_sec(map: &m_secs, sec: 2)
-  // m_kept_all = ALL non-stdlib imports (for import section entry count)
-  let m_kept_all = count_main_kept_imps(buf: &core_wasm, sec_pk: m_imp_sec_pk)
-  // m_kept = non-stdlib FUNCTION imports only (for function index layout)
-  let m_kept = count_main_kept_func_imps(buf: &core_wasm, sec_pk: m_imp_sec_pk)
+  // m_kept_all = ALL non-dep imports (for import section entry count)
+  let m_kept_all = count_main_kept_imps(buf: &core_wasm, sec_pk: m_imp_sec_pk, dep_pfs)
+  // m_kept = non-dep FUNCTION imports only (for function index layout)
+  let m_kept = count_main_kept_func_imps(buf: &core_wasm, sec_pk: m_imp_sec_pk, dep_pfs)
 
   // Dep remap intarr: identity for WASI imports, then offset for dep locals.
-  // All stdlib imports are WASI (indices preserved); only used by element-segment remap.
+  // All dep imports are WASI (indices preserved); only used by element-segment remap.
   let %remap_d = intarr_new()
   let %remap_d = push_identity(arr: %remap_d, i: 0, n: dep_fimp)
   let %remap_d = remap_dep_locals(remap: %remap_d, dep_fimp, d_loc,
@@ -521,7 +644,7 @@ export let merge_with_stdlib = fn (
 
   let %remap_m = intarr_new()
   // kept_fimp+m_kept = base for remap_dep_func (dep locals start after all func imports)
-  // m_imp_base = kept_fimp (base for non-stdlib main func imports, right after dep WASI imports)
+  // m_imp_base = kept_fimp (base for non-dep main func imports, right after dep WASI imports)
   let %resolve_ctx = ResolveCtx(
     remap: %remap_m,
     kept_fimp: kept_fimp + m_kept,
@@ -530,7 +653,8 @@ export let merge_with_stdlib = fn (
     m_imp_base: kept_fimp)
   let %resolve_ctx = resolve_main_imports(
     ctx: %resolve_ctx,
-    &dep_exports,
+    dep_exports: &dep_exports,
+    dep_prefix,
     buf: &core_wasm,
     sec_pk: m_imp_sec_pk
   )
@@ -542,7 +666,7 @@ export let merge_with_stdlib = fn (
     m_imp_base: _
   ) = resolve_ctx
 
-  // Main locals start after: dep WASI imports + main non-stdlib func imports + stubs + dep locals
+  // Main locals start after: dep WASI imports + main non-dep func imports + stubs + dep locals
   let %remap_m = remap_main_locals(remap: %remap_m, m_fimp, m_loc,
     kept_fimp: kept_fimp + m_kept, n_stubs, d_loc)
 
@@ -573,7 +697,7 @@ export let merge_with_stdlib = fn (
   let pages_raw = if dep_pages > min_pages then dep_pages else min_pages end
   let pages = if pages_raw < default_initial_pages then default_initial_pages else pages_raw end
 
-  // Section 2: merged imports (env.memory + dep WASI imports + main non-stdlib).
+  // Section 2: merged imports (env.memory + dep WASI imports + main non-dep).
   // The merged module imports its (shared) linear memory from "env" rather than
   // defining it, so the WASI-threads host hands every worker instance the SAME
   // backing — a *defined* `shared` memory is per-instance under `-S threads`,
@@ -587,7 +711,7 @@ export let merge_with_stdlib = fn (
   let %out = emit_merged_imports(%out, dep: &dep, core_wasm: &core_wasm,
     d_imp_pk, m_imp_sec_pk,
     dep_imp_count, m_kept_all,
-    pages, d_type_off, m_type_off)
+    pages, d_type_off, m_type_off, dep_pfs)
 
   // Section 3: merged func types (count + dep with type offset + main)
   // Invariant (WASM spec §5.5.6/§5.5.10): function-section count must equal
