@@ -1,0 +1,246 @@
+/**
+ * design_authority: L0006 rule — design-authority claim without citation.
+ *
+ * Advisory (LintInfo) only — never trips the `--check` CI gate.
+ *
+ * Flags comments that assert an authority position ("sanctioned",
+ * "the only way", "must be", "counts as", "canonical", "intended",
+ * "by design", "正規", "意図的", "仕様") without an accompanying
+ * citation (a "see ", "docs/", "spec/", RFC reference, issue link,
+ * or "(designer)" marker).  Pure source-text scan; does not require
+ * the parsed AST.
+ */
+
+import { Option, None } from "std:option"
+import * as str from "std:str"
+import * as list from "std:list"
+import { Span } from "src/common/token.nx"
+import { LintFinding, LintInfo } from "src/lint/types.nx"
+
+// ─── authority phrases ────────────────────────────────────────────────────────
+
+// Returns the list of authority phrases to scan for (lower-cased).
+// Intentionally narrow: only strong-claim tokens, not ordinary prose.
+let authority_phrases = fn () -> [ string ] do
+  return [
+    "sanctioned",
+    "the only way",
+    "must be",
+    "counts as",
+    "canonical",
+    "by design",
+    "intended",
+    "正規",
+    "意図的",
+    "仕様"
+  ]
+end
+
+// Returns the list of citation markers that excuse an authority phrase.
+let citation_markers = fn () -> [ string ] do
+  return [ "see ", "docs/", "spec/", "rfc", "issue", "http://", "https://", "(designer)" ]
+end
+
+// Does `text` (already lower-cased) contain any authority phrase?
+let has_authority_phrase = fn (text: string) -> bool do
+  return any_phrase_in(text, phrases: authority_phrases())
+end
+
+let any_phrase_in = fn (text: string, phrases: [ string ]) -> bool do
+  match phrases do
+    | [] -> return false
+    | p :: rest ->
+      if str.contains(s: text, sub: p) then return true end
+      return any_phrase_in(text, phrases: rest)
+  end
+end
+
+// Does `text` (already lower-cased) contain any citation marker?
+let has_citation = fn (text: string) -> bool do
+  return any_phrase_in(text, phrases: citation_markers())
+end
+
+// ─── comment extraction ───────────────────────────────────────────────────────
+
+// A collected comment block: text and the 1-based start line.
+type CommentBlock = CommentBlock(text: string, start_line: i64)
+
+// Scanner state: current line number, inside a block comment, accumulated
+// block-comment text and start line, and the output list (reversed).
+type ScanState = ScanState(
+  line_no: i64,
+  in_block: bool,
+  block_text: string,
+  block_start: i64,
+  blocks: [ CommentBlock ]
+)
+
+let init_scan_state = fn () -> ScanState do
+  return ScanState(line_no: 1, in_block: false, block_text: "", block_start: 1, blocks: [])
+end
+
+// Extract comment blocks from the source text.
+// Line comments produce single-line blocks.
+// Block comments accumulate lines until `*/` appears.
+let extract_comment_blocks = fn (src: string) -> [ CommentBlock ] do
+  let lines = str.split(s: src, sep: "\n")
+  let st = init_scan_state()
+  let st2 = process_lines(lines, st)
+  // If still in a block comment at EOF, flush it.
+  let st3 = match st2 do
+    | ScanState(line_no: _, in_block, block_text: _, block_start: _, blocks: _) ->
+      if in_block then flush_block(st: st2) else st2 end
+  end
+  return match st3 do
+    | ScanState(line_no: _, in_block: _, block_text: _, block_start: _, blocks) ->
+      list.reverse(xs: blocks)
+  end
+end
+
+let process_lines = fn (lines: [ string ], st: ScanState) -> ScanState do
+  match lines do
+    | [] -> return st
+    | ln :: rest ->
+      let st2 = process_line_da(line: ln, st)
+      return process_lines(lines: rest, st: st2)
+  end
+end
+
+let flush_block = fn (st: ScanState) -> ScanState do
+  match st do | ScanState(line_no, in_block: _, block_text, block_start, blocks) ->
+    let b = CommentBlock(text: block_text, start_line: block_start)
+    return ScanState(line_no, in_block: false, block_text: "", block_start: 1, blocks: b :: blocks)
+  end
+end
+
+// Process one source line when we are inside a block comment.
+let process_line_in_block = fn (
+  line: string,
+  line_no: i64,
+  block_text: string,
+  block_start: i64,
+  blocks: [ CommentBlock ]
+) -> ScanState do
+  let close_idx = str.index_of(s: line, sub: "*/")
+  if close_idx >= 0 then
+    // Block comment closes on this line.
+    let extra = str.byte_substring(s: line, start: 0, len: close_idx)
+    let merged = block_text ++ " " ++ extra
+    let b = CommentBlock(text: merged, start_line: block_start)
+    return ScanState(
+      line_no: line_no + 1,
+      in_block: false,
+      block_text: "",
+      block_start: 1,
+      blocks: b :: blocks
+    )
+  end
+  // Whole line is inside block comment.
+  let merged = block_text ++ " " ++ line
+  return ScanState(line_no: line_no + 1, in_block: true, block_text: merged, block_start, blocks)
+end
+
+// Process one source line when we are NOT inside a block comment and a
+// block-comment open `/*` was found at `block_open_idx`.
+let process_line_block_open = fn (
+  line: string,
+  line_no: i64,
+  block_open_idx: i64,
+  blocks: [ CommentBlock ]
+) -> ScanState do
+  let after_open = block_open_idx + 2
+  let rest_len = str.byte_length(s: line) - after_open
+  let rest_text = str.byte_substring(s: line, start: after_open, len: rest_len)
+  // Check if it also closes on the same line.
+  let close_idx = str.index_of(s: rest_text, sub: "*/")
+  if close_idx >= 0 then
+    let inner = str.byte_substring(s: rest_text, start: 0, len: close_idx)
+    let b = CommentBlock(text: inner, start_line: line_no)
+    return ScanState(
+      line_no: line_no + 1,
+      in_block: false,
+      block_text: "",
+      block_start: 1,
+      blocks: b :: blocks
+    )
+  end
+  return ScanState(
+    line_no: line_no + 1,
+    in_block: true,
+    block_text: rest_text,
+    block_start: line_no,
+    blocks
+  )
+end
+
+// Process one source line in the scanner.
+let process_line_da = fn (line: string, st: ScanState) -> ScanState do
+  match st do | ScanState(line_no, in_block, block_text, block_start, blocks) ->
+    if in_block then
+      return process_line_in_block(line, line_no, block_text, block_start, blocks)
+    end
+    // Not in a block comment.
+    let line_comment_idx = str.index_of(s: line, sub: "//")
+    let block_open_idx = str.index_of(s: line, sub: "/*")
+    if line_comment_idx >= 0 && (block_open_idx < 0 || line_comment_idx < block_open_idx) then
+      // Line comment: extract from `//` to end of line.
+      let tail_len = str.byte_length(s: line) - line_comment_idx
+      let comment_text = str.byte_substring(s: line, start: line_comment_idx, len: tail_len)
+      let b = CommentBlock(text: comment_text, start_line: line_no)
+      return ScanState(
+        line_no: line_no + 1,
+        in_block: false,
+        block_text: "",
+        block_start: 1,
+        blocks: b :: blocks
+      )
+    end
+    if block_open_idx >= 0 then
+      return process_line_block_open(line, line_no, block_open_idx, blocks)
+    end
+    // No comment on this line.
+    return ScanState(line_no: line_no + 1, in_block, block_text, block_start, blocks)
+  end
+end
+
+// ─── rule check ───────────────────────────────────────────────────────────────
+
+let l0006_message = fn () -> string do
+  return "design-authority claim without a citation"
+    ++ " — review and confirm or rewrite as a behaviour description"
+end
+
+// Check a single CommentBlock for L0006.
+let check_block = fn (b: CommentBlock, acc: [ LintFinding ]) -> [ LintFinding ] do
+  match b do | CommentBlock(text, start_line) ->
+    let lower = str.to_lower(s: text)
+    if !has_authority_phrase(text: lower) then return acc end
+    if has_citation(text: lower) then return acc end
+    let finding = LintFinding(
+      code: "L0006",
+      severity: LintInfo,
+      message: l0006_message(),
+      fix_it: None,
+      span: Span(offset: 0, line: start_line, col: 1)
+    )
+    return finding :: acc
+  end
+end
+
+let check_blocks = fn (blocks: [ CommentBlock ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match blocks do
+    | [] -> return list.reverse(xs: acc)
+    | b :: rest ->
+      let acc2 = check_block(b, acc)
+      return check_blocks(blocks: rest, acc: acc2)
+  end
+end
+
+/** Scan `src` for design-authority comment findings (L0006 / LintInfo).
+ *  Pure source-text scan; does not require a parsed AST.
+ *  Returns findings in source order (ascending line number).
+ */
+export let lint_design_authority = fn (src: string) -> [ LintFinding ] do
+  let blocks = extract_comment_blocks(src)
+  return check_blocks(blocks, acc: [])
+end
