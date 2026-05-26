@@ -9,7 +9,8 @@
  * that surfaces when a large reachable set of stdlib helpers comes
  * along for the ride.
  *
- * Scope mirrors the v1 spec from fmt.nx, plus v2 inner-spacing and v3 line-wrap:
+ * Scope mirrors the v1 spec from fmt.nx, plus v2 inner-spacing, v3 line-wrap,
+ * and v4 join:
  *   1. Tab → 2 spaces in leading indentation.
  *   2. Strip trailing whitespace on every line.
  *   3. Collapse runs of 2+ blank lines down to a single blank line.
@@ -20,7 +21,10 @@
  *      Empty `{}` and `[]` stay tight.
  *   7. Lines exceeding 100 columns are broken at the first comma-separated
  *      group at the outermost nesting level (pass-2 line-wrapping).
- *      Already-broken (expanded) groups are NOT joined (deferred).
+ *   8. Multi-line groups whose joined form fits in 100 cols are collapsed
+ *      back to one line (pass-3 joining — inverse of pass 2). Passes 2
+ *      and 3 compose to a stable fixpoint: canonical form is one-line
+ *      iff ≤ 100 cols, expanded otherwise.
  *      Re-indentation by do/end depth is NOT applied (deferred).
  *
  * The pass is byte-level and preserves string/char literals, line
@@ -166,6 +170,13 @@ end
 // Pipeline:
 //   Pass 1 (walk): tab→space, trailing-ws strip, blank-collapse, inner spacing.
 //   Pass 2 (wrap_long_lines): break lines > 100 chars at first comma group.
+//   Pass 3 (join_broken_lines): collapse multi-line groups that fit ≤ 100 cols.
+//   Pass 2 again: re-wrap any lines that join produced > 100 cols (no-op in
+//     practice since join only emits ≤ 100-col lines, but keeps the pipeline
+//     visibly closed under composition).
+//
+// Passes 2 and 3 each loop to their own fixpoint. Together they converge to a
+// canonical form: one-line iff the group fits in ≤ 100 cols, expanded otherwise.
 //
 // If the source contains an unterminated protected region (unclosed block
 // comment, unterminated string literal, or unclosed bracket string), the
@@ -213,11 +224,15 @@ export let format_source = fn (src: string) -> string do
       let %buf_final = bb.push_byte(buf: %final_buf, byte: char.ord(c: '\n'))
       let pass1 = bb.to_string(buf: &buf_final)
       bb.free(buf: %buf_final)
-      return wrap_long_lines(src: pass1)
+      let pass2 = wrap_long_lines(src: pass1)
+      let pass3 = join_broken_lines(src: pass2)
+      return wrap_long_lines(src: pass3)
     end
     let pass1 = bb.to_string(buf: &final_buf)
     bb.free(buf: %final_buf)
-    return wrap_long_lines(src: pass1)
+    let pass2 = wrap_long_lines(src: pass1)
+    let pass3 = join_broken_lines(src: pass2)
+    return wrap_long_lines(src: pass3)
   end
 end
 
@@ -966,4 +981,295 @@ let wrap_long_lines = fn (src: string) -> string do
   // exceed the budget with another wrappable group. Re-run until stable so a
   // single `nexus fmt` is idempotent (else `fmt --check` keeps re-flagging).
   if result == src then return result else return wrap_long_lines(src: result) end
+end
+
+// ─── Pass 3: Join over-broken short lines ─────────────────────────────────
+//
+// When a call/list/record was broken across multiple lines by the wrap pass
+// (or by the author) but the joined form would fit within 100 cols, collapse
+// it back to one line. This is the inverse of wrap_long_lines and composes
+// with it to a stable fixpoint: the canonical form is one-line iff ≤ 100 cols.
+//
+// An "expanded group" recognised by this pass has a specific shape (produced
+// by wrap_long_lines, or matching that shape by coincidence):
+//
+//   <indent>prefix(<opener>
+//   <indent+2>item1,
+//   <indent+2>item2
+//   <indent><closer><suffix>
+//
+// Idempotency: join only collapses when the result fits in ≤ 100 cols, so
+// a subsequent wrap pass is a no-op — the loop terminates immediately.
+//
+// Not in this pass: canonical re-indentation by do/end depth (deferred;
+// inline `if/then/else` is net-zero depth and would cause mis-indentation).
+
+// JoinGroup: result of successfully collecting an expanded group.
+type JoinGroup = JoinGroup(
+  items: [ string ],     // item strings in order, trailing commas stripped, trimmed
+  closer_char: i64,      // char ordinal of `)` / `]` / `}`
+  closer_suffix: string, // text after the closer on the closer line (already trimmed)
+  next_pos: i64          // position in src just after the closer line's '\n'
+)
+
+// JoinResult: a successfully built join candidate.
+type JoinResult = JoinResult(joined_line: string, next_pos: i64)
+
+// Scan the last code byte (non-ws, not in protected regions) of src[pos..end_pos).
+// A `//` line comment terminates the scan and we return whatever `last` we had.
+// Returns 0 if no code bytes were found.
+let line_last_code_byte = fn (src: string, pos: i64, end_pos: i64, last: i64) -> i64 do
+  if pos >= end_pos then return last end
+  let b = str.byte_at(s: src, idx: pos)
+  // `//` comment: stop here, return current last
+  if b == '/' && pos + 1 < end_pos && str.byte_at(s: src, idx: pos + 1) == '/' then
+    return last
+  end
+  // block comment: skip over it
+  if b == '/' && pos + 1 < end_pos && str.byte_at(s: src, idx: pos + 1) == '*' then
+    let after = scan_block_comment(src, pos: pos + 2, len: end_pos, depth: 1)
+    return line_last_code_byte(src, pos: after, end_pos, last)
+  end
+  // string literal: skip, last becomes '"'
+  if b == '"' then
+    let after = scan_string(src, pos: pos + 1, len: end_pos)
+    return line_last_code_byte(src, pos: after, end_pos, last: char.ord(c: '"'))
+  end
+  // char literal: skip
+  if b == '\'' then
+    match scan_char(src, pos: pos + 1, len: end_pos) do
+    | Some(val: after) ->
+      return line_last_code_byte(src, pos: after, end_pos, last: char.ord(c: '\''))
+    | None ->
+      return line_last_code_byte(src, pos: pos + 1, end_pos, last: char.ord(c: '\''))
+    end
+  end
+  // bracket string: skip, last becomes ']'
+  if b == '[' && pos + 1 < end_pos && str.byte_at(s: src, idx: pos + 1) == '='
+     && pos + 2 < end_pos && str.byte_at(s: src, idx: pos + 2) == '[' then
+    let after = scan_bracket_string(src, pos: pos + 3, len: end_pos)
+    return line_last_code_byte(src, pos: after, end_pos, last: char.ord(c: ']'))
+  end
+  // whitespace: don't update last
+  if b == ' ' || b == '\t' then
+    return line_last_code_byte(src, pos: pos + 1, end_pos, last)
+  end
+  // code byte: update last
+  return line_last_code_byte(src, pos: pos + 1, end_pos, last: char.ord(c: b))
+end
+
+// Count leading ASCII spaces in src[pos..end_pos).
+let count_leading_spaces_to = fn (src: string, pos: i64, end_pos: i64) -> i64 do
+  if pos >= end_pos then return 0 end
+  let b = str.byte_at(s: src, idx: pos)
+  if b != ' ' then return 0 end
+  return 1 + count_leading_spaces_to(src, pos: pos + 1, end_pos)
+end
+
+// Strip a single trailing comma from a string if present.
+let strip_trailing_comma = fn (s: string) -> string do
+  let n = str.byte_length(s)
+  if n <= 0 then return s end
+  let last = str.byte_at(s, idx: n - 1)
+  if last == ',' then return str.byte_substring(s, start: 0, len: n - 1) end
+  return s
+end
+
+// Join a list of item strings with ", " separator.
+let items_join_str = fn (items: [ string ], acc: string, first: bool) -> string do
+  match items do
+  | [] -> return acc
+  | item :: rest ->
+    let sep = if first then "" else ", " end
+    return items_join_str(items: rest, acc: acc ++ sep ++ item, first: false)
+  end
+end
+
+// Return the expected closer char ordinal for a given opener char ordinal.
+let opener_closer_for = fn (opener: i64) -> i64 do
+  if opener == char.ord(c: '(') then return char.ord(c: ')') end
+  if opener == char.ord(c: '[') then return char.ord(c: ']') end
+  return char.ord(c: '}')
+end
+
+// Collect items and find the closer of an expanded group.
+//   pos: start of first potential item line (right after the opener line's '\n').
+//   item_indent: expected leading spaces for item lines (opener_indent + 2).
+//   opener_indent: leading spaces on the opener line.
+//   expected_closer: ordinal of the closing delimiter we expect.
+//   acc: accumulated item strings (reversed, will be reversed at the end).
+let collect_join_items = fn (
+  src: string,
+  len: i64,
+  pos: i64,
+  item_indent: i64,
+  opener_indent: i64,
+  expected_closer: i64,
+  acc: [ string ]
+) -> Option<JoinGroup> do
+  if pos >= len then return None end
+  let line_end = find_line_end(src, len, pos)
+  let leading = count_leading_spaces_to(src, pos, end_pos: line_end)
+  let line_content_len = line_end - pos
+  // Blank line inside a group: bail out (conservative).
+  if leading >= line_content_len then return None end
+  // Closer line: indent == opener_indent, first code byte is the closer char.
+  if leading == opener_indent then
+    let first_code_pos = pos + leading
+    if first_code_pos >= line_end then return None end
+    let first_b = str.byte_at(s: src, idx: first_code_pos)
+    if char.ord(c: first_b) == expected_closer then
+      // Extract suffix: anything after the closer char on the same line,
+      // with trailing whitespace stripped but leading whitespace preserved
+      // (the space in `) end` is part of the token separator and must be kept).
+      let suffix_start = first_code_pos + 1
+      let suffix_rs = rtrim_in_s(s: src, start: suffix_start, end_p: line_end)
+      let suffix_len = if suffix_rs > suffix_start then suffix_rs - suffix_start else 0 end
+      let suffix = str.byte_substring(s: src, start: suffix_start, len: suffix_len)
+      let next_pos = if line_end < len then line_end + 1 else len end
+      let items_fwd = list.reverse(xs: acc)
+      return Some(val: JoinGroup(
+        items: items_fwd,
+        closer_char: expected_closer,
+        closer_suffix: suffix,
+        next_pos
+      ))
+    end
+    // Same indent as opener but not the closer — bail out.
+    return None
+  end
+  // Item line: indent == item_indent.
+  if leading == item_indent then
+    let item_start = pos + leading
+    // Trim trailing whitespace from item content (excluding the '\n').
+    let item_rs = rtrim_in_s(s: src, start: item_start, end_p: line_end)
+    let item_len = if item_rs > item_start then item_rs - item_start else 0 end
+    let item_raw = str.byte_substring(s: src, start: item_start, len: item_len)
+    // Strip trailing comma to get the pure item text.
+    let item = strip_trailing_comma(s: item_raw)
+    // An empty item indicates an unexpected line shape — bail out.
+    if str.byte_length(s: item) == 0 then return None end
+    let next_line = if line_end < len then line_end + 1 else len end
+    return collect_join_items(
+      src, len,
+      pos: next_line,
+      item_indent,
+      opener_indent,
+      expected_closer,
+      acc: item :: acc
+    )
+  end
+  // Any other indent level: not a clean expanded group — bail out.
+  return None
+end
+
+// Build the candidate joined line from an opener line and a collected group.
+// Returns None if the joined form exceeds 100 cols.
+//   opener_line: content of the opener line WITHOUT trailing '\n' or whitespace.
+//   opener_char: ordinal of the opening delimiter.
+//   group: the collected group data.
+let build_joined_line = fn (
+  opener_line: string,
+  opener_char: i64,
+  group: JoinGroup
+) -> Option<string> do
+  match group do | JoinGroup(items, closer_char, closer_suffix, next_pos: _) ->
+    let joined_items = items_join_str(items, acc: "", first: true)
+    // Inner spacing: `[` and `{` (list/record literals) get a space after the
+    // opener and before the closer. `(` (function calls) does not.
+    let needs_inner_sp = opener_char == char.ord(c: '[') || opener_char == char.ord(c: '{')
+    let open_sp = if needs_inner_sp then " " else "" end
+    let n_items = str.byte_length(s: joined_items)
+    let close_sp = if needs_inner_sp && n_items > 0 then " " else "" end
+    let closer_str = str.from_char_code(code: closer_char)
+    let joined = opener_line ++ open_sp ++ joined_items ++ close_sp ++ closer_str ++ closer_suffix
+    let joined_len = str.byte_length(s: joined)
+    if joined_len > 100 then return None end
+    return Some(val: joined)
+  end
+end
+
+// Try to join the multi-line group that starts at line src[line_start..line_end).
+// Returns Some(JoinResult) with the collapsed single line and the position after
+// the closer line, or None if no join is possible.
+let try_join_at_line = fn (
+  src: string,
+  len: i64,
+  line_start: i64,
+  line_end: i64
+) -> Option<JoinResult> do
+  let line_len = line_end - line_start
+  if line_len <= 0 then return None end
+  // Find last code byte on this line to determine if it ends with an opener.
+  let last_code = line_last_code_byte(src, pos: line_start, end_pos: line_end, last: 0)
+  // Only act on lines ending with `(`, `[`, or `{`.
+  let is_open_paren = last_code == char.ord(c: '(')
+  let is_open_bracket = last_code == char.ord(c: '[')
+  let is_open_brace = last_code == char.ord(c: '{')
+  if !is_open_paren && !is_open_bracket && !is_open_brace then return None end
+  // Compute indentation of the opener line.
+  let opener_indent = count_leading_spaces_to(src, pos: line_start, end_pos: line_end)
+  let item_indent = opener_indent + 2
+  let expected_closer = opener_closer_for(opener: last_code)
+  // Try to collect the group starting on the next line.
+  let after_opener = if line_end < len then line_end + 1 else len end
+  match collect_join_items(
+    src, len,
+    pos: after_opener,
+    item_indent,
+    opener_indent,
+    expected_closer,
+    acc: []
+  ) do
+  | None -> return None
+  | Some(val: group) ->
+    // Build the opener line string (without trailing '\n').
+    let rtrimmed_end = rtrim_in_s(s: src, start: line_start, end_p: line_end)
+    let opener_len = if rtrimmed_end > line_start then rtrimmed_end - line_start else 0 end
+    let opener_line = str.byte_substring(s: src, start: line_start, len: opener_len)
+    match build_joined_line(opener_line, opener_char: last_code, group) do
+    | None -> return None
+    | Some(val: joined) ->
+      match group do | JoinGroup(items: _, closer_char: _, closer_suffix: _, next_pos) ->
+        return Some(val: JoinResult(joined_line: joined, next_pos))
+      end
+    end
+  end
+end
+
+// Main join loop: process source line by line, attempting to join expanded groups.
+let join_lines_go = fn (src: string, len: i64, pos: i64, buf: %ByteBuffer) -> %ByteBuffer do
+  if pos >= len then return buf end
+  let line_end = find_line_end(src, len, pos)
+  match try_join_at_line(src, len, line_start: pos, line_end) do
+  | None ->
+    // Emit this line unchanged (including the '\n').
+    let line_len = line_end - pos
+    let line = str.byte_substring(s: src, start: pos, len: line_len)
+    let %bx = bb.push_string(buf: %buf, s: line)
+    let %by = bb.push_byte(buf: %bx, byte: char.ord(c: '\n'))
+    let next_pos = if line_end < len then line_end + 1 else len end
+    return join_lines_go(src, len, pos: next_pos, buf: %by)
+  | Some(val: JoinResult(joined_line, next_pos)) ->
+    // Emit the joined line followed by '\n'.
+    let %bx = bb.push_string(buf: %buf, s: joined_line)
+    let %by = bb.push_byte(buf: %bx, byte: char.ord(c: '\n'))
+    return join_lines_go(src, len, pos: next_pos, buf: %by)
+  end
+end
+
+// join_broken_lines: pass-3 entry point. Pure (no I/O).
+// Takes pass-2 output; returns output with expanded groups that fit ≤ 100 cols
+// collapsed back to single lines.
+// Loops to a fixpoint: a single pass joins one level of nesting per run; deeply
+// nested groups may need multiple passes.
+let join_broken_lines = fn (src: string) -> string do
+  let len = str.byte_length(s: src)
+  if len == 0 then return src end
+  let %buf = bb.empty()
+  let %final_buf = join_lines_go(src, len, pos: 0, buf: %buf)
+  let result = bb.to_string(buf: &final_buf)
+  bb.free(buf: %final_buf)
+  // Loop to fixpoint: joining inner groups may enable joining outer groups.
+  if result == src then return result else return join_broken_lines(src: result) end
 end
