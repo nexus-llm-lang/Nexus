@@ -1,0 +1,511 @@
+/**
+ * map: a key-generic PERSISTENT (value-semantics) hash map.
+ *
+ * Unlike `std:stringmap` / `std:hashmap` — which are linear, mutable, and key
+ * on raw bytes / i64 at the runtime boundary — this map is a pure-Nexus
+ * persistent structure with value semantics: every `insert` / `remove` returns
+ * a fresh map that shares the untouched sub-trees with its predecessor, so an
+ * old snapshot is never disturbed by a later update.
+ *
+ * Key-genericity is provided by DICTIONARY-PASSING rather than typeclasses
+ * (Nexus has none): the map record carries `hash: (k: K) -> i64` and
+ * `eq: (a: K, b: K) -> bool` function fields. The convenience constructors
+ * `string_map` / `i64_map` pre-bind the byte-string and i64 hash + equality so
+ * callers do not have to supply them.
+ *
+ * The backing structure is a HAMT (hash array mapped trie): a 32-way trie keyed
+ * on successive 5-bit slices of `hash(k)`. Each interior node is a popcount
+ * bitmap over a sparse child list, so a node holding `p` children stores only
+ * `p` slots. Operations are O(log32 n) — explicitly NOT the fixed-bucket list
+ * that is O(n) per insert. Slices are consumed five bits at a time until the
+ * 64-bit hash is exhausted (depth <= 13); thereafter, and on any hash
+ * collision, entries share a single leaf bucket disambiguated by `eq`.
+ *
+ * Scope: non-linear `K`, `V` only. A persistent map is freely copied as a
+ * value; it cannot own linear `%` resources (they cannot be duplicated).
+ */
+import { Option, Some, None } from "std:option"
+import { Pair } from "std:tuple"
+import * as list from "std:list"
+import * as str from "std:str"
+
+// 5 bits per trie level => 32-way branching.
+let bits_per_level = 5
+let level_mask = 31 // (1 << bits_per_level) - 1
+let hash_bits = 64
+
+// A single key/value binding.
+type Entry<K, V> = Entry(key: K, value: V)
+
+// HAMT node. NEmpty represents an absent child; NLeaf holds one or more
+// entries that collide on the consumed hash prefix (resolved by `eq`); NBranch
+// is a sparse 32-way node whose `bitmap` marks which slices are populated and
+// whose `kids` list holds exactly popcount(bitmap) children in slice order.
+type Node<K, V> =
+  NEmpty
+  | NLeaf(hash: i64, entries: [ Entry<K, V> ])
+  | NBranch(bitmap: i64, kids: [ Node<K, V> ])
+
+/** A persistent key-generic map. `hash`/`eq` form the dictionary that makes the
+ *  map key-generic; `count` is the live entry total; `root` is the HAMT. */
+export type Map<K, V> = Map(
+  root: Node<K, V>,
+  hash: (k: K) -> i64,
+  eq: (a: K, b: K) -> bool,
+  count: i64
+)
+
+// --- bit helpers -----------------------------------------------------------
+
+// The 5-bit slice of `h` consumed at trie depth `shift` (shift = level * 5).
+let slice_at = fn (h: i64, shift: i64) -> i64 do
+  return (h >> shift) & level_mask
+end
+
+// popcount of the low `idx` bits of `bitmap` = the sparse child position for a
+// set bit at `idx`.
+let popcount_below = fn (bitmap: i64, idx: i64) -> i64 do
+  let mask = (1 << idx) - 1
+  return popcount(x: bitmap & mask, acc: 0)
+end
+
+let popcount = fn (x: i64, acc: i64) -> i64 do
+  if x == 0 then return acc end
+  return popcount(x: x >> 1, acc: acc + (x & 1))
+end
+
+// True iff bit `idx` is set in `bitmap`.
+let bit_set = fn (bitmap: i64, idx: i64) -> bool do
+  return ((bitmap >> idx) & 1) == 1
+end
+
+// --- sparse child-list splicing (persistent) -------------------------------
+
+// Return a fresh list with `x` inserted at position `pos` (0-based).
+let list_insert_at = fn <T>(xs: [ T ], pos: i64, x: T) -> [ T ] do
+  if pos <= 0 then return x :: xs end
+  match xs do
+    | [] -> return [ x ]
+    | h :: rest -> return h :: list_insert_at(xs: rest, pos: pos - 1, x)
+  end
+end
+
+// Return a fresh list with the element at `pos` replaced by `x`.
+let list_set_at = fn <T>(xs: [ T ], pos: i64, x: T) -> [ T ] do
+  match xs do
+    | [] -> return []
+    | h :: rest -> if pos <= 0 then return x :: rest else return h :: list_set_at(
+      xs: rest,
+      pos: pos - 1,
+      x
+    ) end
+  end
+end
+
+// Return a fresh list with the element at `pos` removed.
+let list_remove_at = fn <T>(xs: [ T ], pos: i64) -> [ T ] do
+  match xs do
+    | [] -> return []
+    | h :: rest -> if pos <= 0 then return rest else return h :: list_remove_at(
+      xs: rest,
+      pos: pos - 1
+    ) end
+  end
+end
+
+let list_get_at = fn <T>(xs: [ T ], pos: i64) -> Option<T> do
+  match xs do
+    | [] -> return None
+    | h :: rest -> if pos <= 0 then return Some(val: h) else return list_get_at(
+      xs: rest,
+      pos: pos - 1
+    ) end
+  end
+end
+
+// --- leaf-bucket helpers ----------------------------------------------------
+
+// Look up `k` in a collision bucket using `eq`.
+let bucket_get = fn <K, V>(entries: [ Entry<K, V> ], k: K, eq: (a: K, b: K) -> bool) -> Option<V> do
+  match entries do
+    | [] -> return None
+    | Entry(key: ek, value: ev) :: rest ->
+      if eq(a: ek, b: k) then return Some(val: ev) end
+      return bucket_get(entries: rest, k, eq)
+  end
+end
+
+// Replace the entry for `k` if present, else append; returns (new_entries,
+// was_present) so callers can maintain `count`.
+let bucket_put = fn <K, V>(
+  entries: [ Entry<K, V> ],
+  k: K,
+  v: V,
+  eq: (a: K, b: K) -> bool
+) -> Pair<[ Entry<K, V> ], bool> do
+  match entries do
+    | [] -> return Pair(left: [ Entry(key: k, value: v) ], right: false)
+    | Entry(key: ek, value: ev) :: rest ->
+      if eq(a: ek, b: k) then
+        return Pair(left: Entry(key: k, value: v) :: rest, right: true)
+      end
+      let Pair(left: tail, right: present) = bucket_put(entries: rest, k, v, eq)
+      return Pair(left: Entry(key: ek, value: ev) :: tail, right: present)
+  end
+end
+
+// Remove the entry for `k` if present; returns (new_entries, was_present).
+let bucket_remove = fn <K, V>(
+  entries: [ Entry<K, V> ],
+  k: K,
+  eq: (a: K, b: K) -> bool
+) -> Pair<[ Entry<K, V> ], bool> do
+  match entries do
+    | [] -> return Pair(left: [], right: false)
+    | Entry(key: ek, value: ev) :: rest ->
+      if eq(a: ek, b: k) then return Pair(left: rest, right: true) end
+      let Pair(left: tail, right: present) = bucket_remove(entries: rest, k, eq)
+      return Pair(left: Entry(key: ek, value: ev) :: tail, right: present)
+  end
+end
+
+// --- node insert ------------------------------------------------------------
+
+// Insert (k -> v, with precomputed full hash `h`) into `node` at trie depth
+// `shift`. Returns (new_node, was_present).
+let node_insert = fn <K, V>(
+  node: Node<K, V>,
+  h: i64,
+  k: K,
+  v: V,
+  shift: i64,
+  eq: (a: K, b: K) -> bool
+) -> Pair<Node<K, V>, bool> do
+  match node do
+    | NEmpty ->
+      return Pair(left: NLeaf(hash: h, entries: [ Entry(key: k, value: v) ]), right: false)
+    | NLeaf(hash: lh, entries: les) ->
+      // Same hash, or hash space exhausted: keep collisions in one bucket.
+      if lh == h || shift >= hash_bits then
+        let Pair(left: new_es, right: present) = bucket_put(entries: les, k, v, eq)
+        return Pair(left: NLeaf(hash: h, entries: new_es), right: present)
+      end
+      // Hashes differ but currently share this slot: split into a branch.
+      let split = split_leaf(lh, les, shift)
+      let Pair(left: grown, right: _) = node_insert(node: split, h, k, v, shift, eq)
+      return Pair(left: grown, right: false)
+    | NBranch(bitmap, kids) ->
+      let idx = slice_at(h, shift)
+      let pos = popcount_below(bitmap, idx)
+      if bit_set(bitmap, idx) then
+        match list_get_at(xs: kids, pos) do
+          | None -> return Pair(left: NBranch(bitmap, kids), right: false)
+          | Some(val: child) ->
+            let Pair(left: new_child, right: present) = node_insert(
+              node: child,
+              h,
+              k,
+              v,
+              shift: shift + bits_per_level,
+              eq
+            )
+            return Pair(
+              left: NBranch(bitmap, kids: list_set_at(xs: kids, pos, x: new_child)),
+              right: present
+            )
+        end
+      else
+        let leaf = NLeaf(hash: h, entries: [ Entry(key: k, value: v) ])
+        let new_bitmap = bitmap | (1 << idx)
+        return Pair(
+          left: NBranch(bitmap: new_bitmap, kids: list_insert_at(xs: kids, pos, x: leaf)),
+          right: false
+        )
+      end
+  end
+end
+
+// Promote a single-hash leaf into a one-child branch at `shift`, so a differing
+// key can then be inserted alongside it deeper in the trie.
+let split_leaf = fn <K, V>(lh: i64, les: [ Entry<K, V> ], shift: i64) -> Node<K, V> do
+  let idx = slice_at(h: lh, shift)
+  return NBranch(bitmap: 1 << idx, kids: [ NLeaf(hash: lh, entries: les) ])
+end
+
+// --- node lookup ------------------------------------------------------------
+
+let node_get = fn <K, V>(
+  node: Node<K, V>,
+  h: i64,
+  k: K,
+  shift: i64,
+  eq: (a: K, b: K) -> bool
+) -> Option<V> do
+  match node do
+    | NEmpty -> return None
+    | NLeaf(hash: _, entries: les) -> return bucket_get(entries: les, k, eq)
+    | NBranch(bitmap, kids) ->
+      let idx = slice_at(h, shift)
+      if bit_set(bitmap, idx) then
+        let pos = popcount_below(bitmap, idx)
+        match list_get_at(xs: kids, pos) do
+          | None -> return None
+          | Some(val: child) -> return node_get(
+            node: child,
+            h,
+            k,
+            shift: shift + bits_per_level,
+            eq
+          )
+        end
+      else
+        return None
+      end
+  end
+end
+
+// --- node remove ------------------------------------------------------------
+
+// Remove `k` (full hash `h`) from `node`. Returns (new_node, was_present).
+let node_remove = fn <K, V>(
+  node: Node<K, V>,
+  h: i64,
+  k: K,
+  shift: i64,
+  eq: (a: K, b: K) -> bool
+) -> Pair<Node<K, V>, bool> do
+  match node do
+    | NEmpty -> return Pair(left: NEmpty, right: false)
+    | NLeaf(hash: lh, entries: les) ->
+      let Pair(left: new_es, right: present) = bucket_remove(entries: les, k, eq)
+      match new_es do
+        | [] -> return Pair(left: NEmpty, right: present)
+        | _ -> return Pair(left: NLeaf(hash: lh, entries: new_es), right: present)
+      end
+    | NBranch(bitmap, kids) ->
+      let idx = slice_at(h, shift)
+      if bit_set(
+        bitmap,
+        idx
+      ) == false then return Pair(left: NBranch(bitmap, kids), right: false) end
+      let pos = popcount_below(bitmap, idx)
+      match list_get_at(xs: kids, pos) do
+        | None -> return Pair(left: NBranch(bitmap, kids), right: false)
+        | Some(val: child) ->
+          let Pair(left: new_child, right: present) = node_remove(
+            node: child,
+            h,
+            k,
+            shift: shift + bits_per_level,
+            eq
+          )
+          match new_child do
+            | NEmpty ->
+              // Child became empty: clear its bit and drop its slot.
+              let new_bitmap = bitmap & (level_full_mask() - (1 << idx))
+              let new_kids = list_remove_at(xs: kids, pos)
+              match new_kids do
+                | [] -> return Pair(left: NEmpty, right: present)
+                | _ -> return Pair(
+                  left: NBranch(bitmap: new_bitmap, kids: new_kids),
+                  right: present
+                )
+              end
+            | _ ->
+              return Pair(
+                left: NBranch(bitmap, kids: list_set_at(xs: kids, pos, x: new_child)),
+                right: present
+              )
+          end
+      end
+  end
+end
+
+// All 32 slice bits set, used to clear a single bit without a NOT operator.
+let level_full_mask = fn () -> i64 do
+  return (1 << 32) - 1
+end
+
+// --- entry traversal --------------------------------------------------------
+
+// Collect every entry under `node` (order is unspecified) onto `acc`.
+let node_entries = fn <K, V>(node: Node<K, V>, acc: [ Entry<K, V> ]) -> [ Entry<K, V> ] do
+  match node do
+    | NEmpty -> return acc
+    | NLeaf(hash: _, entries: les) -> return append_entries(es: les, acc)
+    | NBranch(bitmap: _, kids) -> return node_entries_list(ns: kids, acc)
+  end
+end
+
+let node_entries_list = fn <K, V>(ns: [ Node<K, V> ], acc: [ Entry<K, V> ]) -> [ Entry<K, V> ] do
+  match ns do
+    | [] -> return acc
+    | n :: rest -> return node_entries_list(ns: rest, acc: node_entries(node: n, acc))
+  end
+end
+
+let append_entries = fn <K, V>(es: [ Entry<K, V> ], acc: [ Entry<K, V> ]) -> [ Entry<K, V> ] do
+  match es do
+    | [] -> return acc
+    | e :: rest -> return append_entries(es: rest, acc: e :: acc)
+  end
+end
+
+// --- public API -------------------------------------------------------------
+
+/** An empty map carrying the supplied `hash` / `eq` dictionary. Use this to
+ *  build a map over an arbitrary key type; for the common cases prefer the
+ *  `string_map` / `i64_map` constructors below. */
+export let empty = fn <K, V>(hash: (k: K) -> i64, eq: (a: K, b: K) -> bool) -> Map<K, V> do
+  return Map(root: NEmpty, hash, eq, count: 0)
+end
+
+/** Insert or update `k -> v`, returning a fresh map. The receiver is
+ *  unaffected (value semantics). */
+export let insert = fn <K, V>(m: Map<K, V>, k: K, v: V) -> Map<K, V> do
+  let Map(root, hash: h_fn, eq: eq_fn, count) = m
+  let key_hash = h_fn(k)
+  let Pair(left: new_root, right: present) = node_insert(
+    node: root,
+    h: key_hash,
+    k,
+    v,
+    shift: 0,
+    eq: eq_fn
+  )
+  let new_count = if present then count else count + 1 end
+  return Map(root: new_root, hash: h_fn, eq: eq_fn, count: new_count)
+end
+
+/** Look up `k`, returning `Some(v)` or `None`. */
+export let get = fn <K, V>(m: Map<K, V>, k: K) -> Option<V> do
+  let Map(root, hash: h_fn, eq: eq_fn, count: _) = m
+  return node_get(node: root, h: h_fn(k), k, shift: 0, eq: eq_fn)
+end
+
+/** Look up `k`, returning the bound value or `default` when absent. */
+export let get_or = fn <K, V>(m: Map<K, V>, k: K, default: V) -> V do
+  match get(m, k) do
+    | Some(val: v) -> return v
+    | None -> return default
+  end
+end
+
+/** Whether `k` has a binding. */
+export let contains = fn <K, V>(m: Map<K, V>, k: K) -> bool do
+  match get(m, k) do
+    | Some(_) -> return true
+    | None -> return false
+  end
+end
+
+/** Remove `k` if present, returning a fresh map (value semantics). Removing an
+ *  absent key returns an equivalent map. */
+export let remove = fn <K, V>(m: Map<K, V>, k: K) -> Map<K, V> do
+  let Map(root, hash: h_fn, eq: eq_fn, count) = m
+  let Pair(left: new_root, right: present) = node_remove(
+    node: root,
+    h: h_fn(k),
+    k,
+    shift: 0,
+    eq: eq_fn
+  )
+  let new_count = if present then count - 1 else count end
+  return Map(root: new_root, hash: h_fn, eq: eq_fn, count: new_count)
+end
+
+/** The number of live bindings. */
+export let size = fn <K, V>(m: Map<K, V>) -> i64 do
+  let Map(root: _, hash: _, eq: _, count) = m
+  return count
+end
+
+/** All entries `Pair(key, value)` in unspecified order. */
+export let iterate = fn <K, V>(m: Map<K, V>) -> [ Pair<K, V> ] do
+  let Map(root, hash: _, eq: _, count: _) = m
+  let es = node_entries(node: root, acc: [])
+  return entries_to_pairs(es, acc: [])
+end
+
+let entries_to_pairs = fn <K, V>(es: [ Entry<K, V> ], acc: [ Pair<K, V> ]) -> [ Pair<K, V> ] do
+  match es do
+    | [] -> return acc
+    | Entry(
+      key: k,
+      value: v
+    ) :: rest -> return entries_to_pairs(es: rest, acc: Pair(left: k, right: v) :: acc)
+  end
+end
+
+/** All keys in unspecified order. */
+export let keys = fn <K, V>(m: Map<K, V>) -> [ K ] do
+  return pairs_keys(ps: iterate(m), acc: [])
+end
+
+let pairs_keys = fn <K, V>(ps: [ Pair<K, V> ], acc: [ K ]) -> [ K ] do
+  match ps do
+    | [] -> return acc
+    | Pair(left: k, right: _) :: rest -> return pairs_keys(ps: rest, acc: k :: acc)
+  end
+end
+
+/** All values in unspecified order. */
+export let values = fn <K, V>(m: Map<K, V>) -> [ V ] do
+  return pairs_values(ps: iterate(m), acc: [])
+end
+
+let pairs_values = fn <K, V>(ps: [ Pair<K, V> ], acc: [ V ]) -> [ V ] do
+  match ps do
+    | [] -> return acc
+    | Pair(left: _, right: v) :: rest -> return pairs_values(ps: rest, acc: v :: acc)
+  end
+end
+
+/** Merge `b` into `a`: every binding of `b` is inserted into `a`, so keys
+ *  present in both take `b`'s value. Both inputs are unaffected. */
+export let merge = fn <K, V>(a: Map<K, V>, b: Map<K, V>) -> Map<K, V> do
+  return merge_pairs(acc: a, ps: iterate(m: b))
+end
+
+let merge_pairs = fn <K, V>(acc: Map<K, V>, ps: [ Pair<K, V> ]) -> Map<K, V> do
+  match ps do
+    | [] -> return acc
+    | Pair(left: k, right: v) :: rest -> return merge_pairs(acc: insert(m: acc, k, v), ps: rest)
+  end
+end
+
+// --- key dictionaries -------------------------------------------------------
+
+// djb2-style rolling hash over the UTF-8 byte values of `s`.
+let str_hash_go = fn (s: string, i: i64, n: i64, acc: i64) -> i64 do
+  if i >= n then return acc end
+  return str_hash_go(s, i: i + 1, n, acc: (acc * 33 + str.char_code(s, idx: i)))
+end
+
+let string_hash = fn (k: string) -> i64 do
+  return str_hash_go(s: k, i: 0, n: str.length(s: k), acc: 5381)
+end
+
+let string_eq = fn (a: string, b: string) -> bool do
+  return a == b
+end
+
+/** A map with `string` keys, pre-bound to a byte-string hash and `==`
+ *  equality. The common case; equivalent to `empty` with the string
+ *  dictionary supplied. */
+export let string_map = fn <V>() -> Map<string, V> do
+  return Map(root: NEmpty, hash: string_hash, eq: string_eq, count: 0)
+end
+
+let i64_hash = fn (k: i64) -> i64 do
+  return k
+end
+
+let i64_eq = fn (a: i64, b: i64) -> bool do
+  return a == b
+end
+
+/** A map with `i64` keys, pre-bound to identity hash and `==` equality. */
+export let i64_map = fn <V>() -> Map<i64, V> do
+  return Map(root: NEmpty, hash: i64_hash, eq: i64_eq, count: 0)
+end
