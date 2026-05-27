@@ -164,7 +164,7 @@ ok "Installed nexus.wasm ($(wc -c < nexus.wasm | tr -d ' ') bytes)"
 
 # ─── Stage L: build lsp.wasm ─────────────────────────────────────────────
 #
-# `src/lsp/main.nx` wires the LSP scaffold to the Nexus pipeline; running
+# `src/tools/lsp/main.nx` wires the LSP scaffold to the Nexus pipeline; running
 # it produces a standalone wasm that speaks JSON-RPC on stdio. We compile
 # it through the self-hosted `nexus.wasm` produced by Stage 1, mirroring
 # the Stage 1/2 self-host invocation. The handler-vtable record literal
@@ -174,8 +174,8 @@ ok "Installed nexus.wasm ($(wc -c < nexus.wasm | tr -d ' ') bytes)"
 
 LSP_RAW="$BUILD_DIR/lsp_raw.wasm"
 LSP_OUT="$BUILD_DIR/lsp.wasm"
-info "Stage L: wasmtime run nexus.wasm src/lsp/main.nx → $LSP_RAW"
-"$WASMTIME" run "${WASMTIME_FLAGS_CORE[@]}" nexus.wasm build src/lsp/main.nx -o "$LSP_RAW"
+info "Stage L: wasmtime run nexus.wasm src/tools/lsp/main.nx → $LSP_RAW"
+"$WASMTIME" run "${WASMTIME_FLAGS_CORE[@]}" nexus.wasm build src/tools/lsp/main.nx -o "$LSP_RAW"
 
 if wasm-tools print "$LSP_RAW" 2>/dev/null | grep -q 'import "nexus:std/'; then
   fail "lsp.wasm emitted unresolved nexus:std imports. Self-hosted compose is not wired."
