@@ -17,15 +17,19 @@
  */
 
 import { Span } from "src/syntax/token.nx"
-import { TypeExpr, TyUnit, TyLinear, TyLazy, TyBorrow, TyArrow, NamedType } from "src/syntax/ast.nx"
+import {
+  TypeExpr, TyUnit, TyLinear, TyLazy, TyBorrow, TyArrow, TyRow, TyVar,
+  TyUserDefined, NamedType
+} from "src/syntax/ast.nx"
 import { HirExpr, HirExprKind, HirCallArg } from "src/ir/hir/types.nx"
 import {
-  SubstEntry, CheckState,
+  SubstEntry, CheckState, FreshResult,
   InferExprResult, InferExprOk, InferExprErr,
   UnifyOk, UnifyErr
 }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
 import * as unify from "src/typecheck/unify.nx"
+import { Option, Some, None } from "std:option"
 import {
   InstantiateResult,
   instantiate_scheme, infer_borrow_arg_position
@@ -40,6 +44,56 @@ import {
   check_call_throw_row_admitted, check_force_require_row
 } from "src/typecheck/infer/control_flow.nx"
 import { TypeError } from "src/typecheck/errors.nx"
+
+// Result of pinning a callee throws-row into an inference-row caller variable:
+// the advanced state (fresh-var supply bumped) plus the extra substitution
+// (empty when no pinning applies).
+type CallPinResult = CallPinResult(state: CheckState, subst: [ SubstEntry ])
+
+/** T-App effect-row pinning for inference-row callers.
+ *
+ *  Mirrors the raise-site pinning (see infer_raise / pin_raised_into_row): when
+ *  the caller's active throws-row is still an unsolved inference variable — as
+ *  inside a suspended thunk body, whose collecting row is a fresh `throw_row` —
+ *  a call to a function that declares a closed throws-row must EXTEND the
+ *  caller row to include those exceptions. Otherwise the thunk's deferred
+ *  throws-row escapes unbound and a later thunk-vs-thunk unification can bind
+ *  it to a narrower declared row, dropping the exceptions the call can raise.
+ *
+ *  Only closed callee rows contribute concrete members; an open caller row
+ *  whose tail is the `__implicit` absent-annotation sentinel, and closed /
+ *  non-row caller rows, are left untouched (admission is already decided by
+ *  check_call_throw_row_admitted).
+ */
+let pin_callee_row_into_caller = fn (
+  state: CheckState, callee_row: TypeExpr, caller_row: TypeExpr
+) -> CallPinResult do
+  match callee_row do
+    | TyRow(types: callee_types, rest: None) ->
+      match caller_row do
+        | TyVar(name: rn) ->
+          if rn == "__implicit" then return CallPinResult(state, subst: subst.subst_empty()) end
+          let FreshResult(state: st1, typ: tail) = tctypes.tc_fresh_var(state)
+          let open_row = TyRow(types: callee_types, rest: Some(val: tail))
+          return CallPinResult(state: st1, subst: subst.subst_single(var: rn, typ: open_row))
+        | TyRow(types: _, rest: Some(val: tail)) ->
+          match tail do
+            | TyVar(name: "__implicit") -> return CallPinResult(state, subst: subst.subst_empty())
+            | TyVar(name: _) ->
+              let FreshResult(state: st1, typ: ftail) = tctypes.tc_fresh_var(state)
+              let open_row = TyRow(types: callee_types, rest: Some(val: ftail))
+              let tdefs = tctypes.state_typedefs(state: st1)
+              match unify.unify(t1: caller_row, t2: open_row, tdefs) do
+                | UnifyOk(subst: s) -> return CallPinResult(state: st1, subst: s)
+                | UnifyErr(_) -> return CallPinResult(state, subst: subst.subst_empty())
+              end
+            | _ -> return CallPinResult(state, subst: subst.subst_empty())
+          end
+        | _ -> return CallPinResult(state, subst: subst.subst_empty())
+      end
+    | _ -> return CallPinResult(state, subst: subst.subst_empty())
+  end
+end
 
 export let infer_call = fn (
   state: CheckState, func: string, args: [ HirCallArg ], span: Span,
@@ -125,7 +179,20 @@ export let infer_call = fn (
                     func,
                     fn_pure_set
                   ) do
-                    | RaiseOk -> return InferExprOk(state: st2, subst: s_all, typ: rt)
+                    | RaiseOk ->
+                      // T-App (inference-row pinning): if the caller's active
+                      // throws-row is still an unsolved variable (a collecting
+                      // thunk row), extend it to include the callee's declared
+                      // exceptions so they are not later unified away against a
+                      // narrower declared row.
+                      let CallPinResult(state: st3, subst: pin_s) =
+                        pin_callee_row_into_caller(state: st2, callee_row, caller_row)
+                      let s_pinned = subst.subst_compose(s1: s_all, s2: pin_s)
+                      return InferExprOk(
+                        state: st3,
+                        subst: s_pinned,
+                        typ: subst.subst_apply(subst: pin_s, typ: rt)
+                      )
                     | RaiseRejected(message: m) -> return InferExprErr(message: m, span)
                   end
               end

@@ -19,7 +19,7 @@
 import { Span } from "src/syntax/token.nx"
 import {
   TypeExpr, TyI64, TyBool, TyUnit, TyArray, TyRecord, TyLazy, TyLinear,
-  TyBorrow, TyRef, TyUserDefined, TyArrow, TyRow,
+  TyBorrow, TyRef, TyUserDefined, TyArrow, TyRow, TyVar,
   NamedType, RecordDef
 } from "src/syntax/ast.nx"
 import {
@@ -688,6 +688,59 @@ export let infer_lambda = fn (
   end
 end
 
+// Result of pinning a raised variant into an inference-row variable: the
+// advanced state (fresh-var supply bumped) plus the extra substitution that
+// records the row constraint (empty when no pinning applied).
+type PinResult = PinResult(state: CheckState, subst: [ SubstEntry ])
+
+/** T-Raise row-pinning for inference-row contexts.
+ *
+ *  When the active throws-row is still an unsolved inference variable — which
+ *  happens inside a suspended thunk body (T-LetThunk types `e` under a fresh
+ *  `throw_row` so the body's effects are collected rather than charged to the
+ *  enclosing fn) — a `throw C` must EXTEND that row to include `C`, exactly as
+ *  a declared closed row already lists its members. Otherwise the thunk's
+ *  deferred throws-row escapes as an unbound variable and a later thunk-vs-thunk
+ *  unification can bind it to a NARROWER declared row, dropping the actually
+ *  raised exception (a P5 containment hole).
+ *
+ *  Pinning is applied in two shapes and skipped otherwise (so ordinary
+ *  function bodies are untouched):
+ *   - bare `TyVar` active row (the collecting thunk row before any throw):
+ *     bind it to an OPEN row `{ C | ?r }` with a fresh tail `?r`, keeping it
+ *     extensible for further throws in the same body.
+ *   - open row `{ ... | ?t }` whose tail `?t` is a genuine inference variable
+ *     (NOT the `__implicit` absent-annotation sentinel): unify against
+ *     `{ C | ?r }` so `C` accumulates into the head while the row stays open.
+ *
+ *  Closed rows (declared `throws { ... }` / `throws {}`), the `__implicit`
+ *  open-tail sentinel, and non-row active rows are left as-is: their admission
+ *  is already decided by check_raise_admitted.
+ */
+let pin_raised_into_row = fn (state: CheckState, name: string, row: TypeExpr) -> PinResult do
+  match row do
+    | TyVar(name: rn) ->
+      if rn == "__implicit" then return PinResult(state, subst: subst.subst_empty()) end
+      let FreshResult(state: st1, typ: tail) = tctypes.tc_fresh_var(state)
+      let open_row = TyRow(types: [ TyUserDefined(name, args: []) ], rest: Some(val: tail))
+      return PinResult(state: st1, subst: subst.subst_single(var: rn, typ: open_row))
+    | TyRow(types: _, rest: Some(val: tail)) ->
+      match tail do
+        | TyVar(name: "__implicit") -> return PinResult(state, subst: subst.subst_empty())
+        | TyVar(name: _) ->
+          let FreshResult(state: st1, typ: ftail) = tctypes.tc_fresh_var(state)
+          let open_row = TyRow(types: [ TyUserDefined(name, args: []) ], rest: Some(val: ftail))
+          let tdefs = tctypes.state_typedefs(state: st1)
+          match unify.unify(t1: row, t2: open_row, tdefs) do
+            | UnifyOk(subst: s) -> return PinResult(state: st1, subst: s)
+            | UnifyErr(_) -> return PinResult(state, subst: subst.subst_empty())
+          end
+        | _ -> return PinResult(state, subst: subst.subst_empty())
+      end
+    | _ -> return PinResult(state, subst: subst.subst_empty())
+  end
+end
+
 export let infer_raise = fn (
   state: CheckState, inner: HirExpr, span: Span,
   infer_expr_fn: (
@@ -720,10 +773,20 @@ export let infer_raise = fn (
         | RaiseOk -> ()
         | RaiseRejected(message: m) -> return InferExprErr(message: m, span)
       end
+      // T-Raise (inference-row pinning): when the active throws-row is still an
+      // unsolved inference variable (the collecting row of a suspended thunk
+      // body), extend it to include the raised variant so the thunk's deferred
+      // throws-row carries the exception rather than escaping unbound and later
+      // unifying away against a narrower declared row.
+      let PinResult(state: st_pin, subst: pin_s) = match exn_name_opt do
+        | Some(val: nm) -> pin_raised_into_row(state: st1, name: nm, row)
+        | None -> PinResult(state: st1, subst: subst.subst_empty())
+      end
+      let sc2 = subst.subst_compose(s1: sc, s2: pin_s)
       // Raise diverges; the result type is unconstrained (fresh tyvar so the
       // surrounding context can pick whatever it needs).
-      let FreshResult(state: st2, typ: tv) = tctypes.tc_fresh_var(state: st1)
-      return InferExprOk(state: st2, subst: sc, typ: tv)
+      let FreshResult(state: st2, typ: tv) = tctypes.tc_fresh_var(state: st_pin)
+      return InferExprOk(state: st2, subst: sc2, typ: tv)
   end
 end
 
