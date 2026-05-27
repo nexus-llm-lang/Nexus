@@ -43,9 +43,9 @@ their own top-level dir.** A subcommand's thin driver (arg handling + calling
 into an engine) lives flat in `tools/` (e.g. `tools/lint.nx`, `tools/fmt.nx`);
 the engine it drives — reusable by other surfaces such as the LSP — lives in a
 top-level dir (`lint/`, `fmt/`, ...). Shared support is purpose-named, not a
-catch-all: `syntax/` (ast/token/source_pos), `util/` (generic data structures),
-`diagnostics/` (errors), `ir/support/` (compiler-internal helpers). Do not
-reintroduce a `common/` grab-bag.
+catch-all: `syntax/` (ast/token/source_pos), `collection/` (generic data
+structures), `diagnostics/` (errors), `ir/support/` (compiler-internal
+helpers). Do not reintroduce a `common/`/`util/` grab-bag.
 
 ## Session Completion
 1. Create issues for remaining work (`bd create`)
