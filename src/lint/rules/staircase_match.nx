@@ -1,0 +1,360 @@
+/**
+ * staircase_match: L0009 rule — a "staircase" `match` whose arm body is
+ * IMMEDIATELY another `match` on the same scrutinee (or on a variable the outer
+ * arm pattern binds, e.g. the `tail` of a `head :: tail` peel), foldable into a
+ * single nested pattern.
+ *
+ * Advisory (LintInfo) only — never trips the `--check` CI gate, mirroring
+ * L0006 / L0007 / L0100.
+ *
+ * Rationale (SKILL.md § "Collapse staircase `match`"): fusing the inner shapes
+ * into the outer pattern makes the arity/shape each arm expects visible at the
+ * surface instead of buried in a second match.  The compiler produces the same
+ * decision tree either way — this is pure legibility.
+ *
+ * Two flagged shapes:
+ *   (a) same-scrutinee re-match — an arm body is a single `match` on the SAME
+ *       scrutinee expression as the outer match (`match res do | Ok(inner) ->
+ *       match res do ...`).  Detected by structural scrutinee equality.
+ *   (b) list-tail re-match — an arm whose pattern is `head :: tail` (a `Cons`
+ *       constructor binding a tail variable) whose body is a single `match` on
+ *       that bound tail variable (`| x :: rest -> match rest do ...`).
+ *
+ * SKILL exception honoured: when the inner `match` is on a DIFFERENT list /
+ * scrutinee (zip-style lockstep), no single-arm flattening exists.  This rule
+ * only fires when the inner scrutinee is provably the outer scrutinee (a) or a
+ * variable the outer arm itself binds (b); an inner match on an unrelated
+ * expression is left alone.
+ *
+ * "Immediately" = the arm body is exactly one statement that is a bare
+ * expression / return whose value is an `ExprMatch`.  An arm doing other work
+ * before the inner match is not a staircase.
+ *
+ * Detection-only: no fix-it.  Folding the nested patterns requires
+ * reconstructing a combined pattern from source spans and is left to the
+ * author.
+ */
+
+import { Option, Some, None } from "std:option"
+import { Span } from "src/syntax/token.nx"
+import {
+  SpannedExpr, Expr, ExprMatch, ExprVariable, ExprLambda, ExprCall, ExprCallExpr,
+  ExprConstructor, ExprArray, ExprList, ExprRecord, ExprIndex, ExprFieldAccess,
+  ExprBinaryOp, ExprUnaryOp, ExprIf, ExprWhile, ExprFor, ExprRaise, ExprForce,
+  ExprHandler,
+  SpannedStmt, Stmt, StmtLet, StmtLetPattern, StmtExpr, StmtReturn,
+  StmtAssign, StmtIndexAssign, StmtTry, StmtInject,
+  MatchCase, CatchArm, HandlerArm, Function,
+  CallArg, CtorArg, NamedExpr,
+  SpannedPattern, Pattern, PatVariable, PatConstructor, PatConstructorWildcard,
+  PatRecord, PatWildcard, PatLiteral, PatOr,
+  CtorPatternField, RecordPatField, RdrName, Unqual, Qual
+} from "src/syntax/ast.nx"
+import { LintFinding, LintInfo } from "src/lint/types.nx"
+import { expr_eq } from "src/lint/rules/ast_eq.nx"
+
+// ── bound-variable collection ───────────────────────────────────────────────
+//
+// Gather every variable name a pattern binds (recursively through ctor /
+// record / or- patterns), so shape (b) can ask "is the inner scrutinee a
+// variable this arm binds?".
+
+let collect_pat_binders = fn (pat: SpannedPattern, acc: [ string ]) -> [ string ] do
+  let SpannedPattern(node, span: _) = pat
+  match node do
+    | PatVariable(name, sigil: _) -> return name :: acc
+    | PatConstructor(
+      name: _,
+      fields,
+      sigil: _
+    ) -> return collect_ctor_field_binders(fs: fields, acc)
+    | PatConstructorWildcard(name: _, sigil: _) -> return acc
+    | PatRecord(fields, has_wildcard: _) -> return collect_record_field_binders(fs: fields, acc)
+    | PatWildcard -> return acc
+    | PatLiteral(lit: _) -> return acc
+    | PatOr(alts) -> return collect_spats_binders(ps: alts, acc)
+  end
+end
+
+let collect_ctor_field_binders = fn (fs: [ CtorPatternField ], acc: [ string ]) -> [ string ] do
+  match fs do
+    | [] -> return acc
+    | CtorPatternField(name: _, pattern) :: rest ->
+      let acc2 = collect_pat_binders(pat: pattern, acc)
+      return collect_ctor_field_binders(fs: rest, acc: acc2)
+  end
+end
+
+let collect_record_field_binders = fn (fs: [ RecordPatField ], acc: [ string ]) -> [ string ] do
+  match fs do
+    | [] -> return acc
+    | RecordPatField(name: _, pattern) :: rest ->
+      let acc2 = collect_pat_binders(pat: pattern, acc)
+      return collect_record_field_binders(fs: rest, acc: acc2)
+  end
+end
+
+let collect_spats_binders = fn (ps: [ SpannedPattern ], acc: [ string ]) -> [ string ] do
+  match ps do
+    | [] -> return acc
+    | p :: rest ->
+      let acc2 = collect_pat_binders(pat: p, acc)
+      return collect_spats_binders(ps: rest, acc: acc2)
+  end
+end
+
+let name_in = fn (n: string, xs: [ string ]) -> bool do
+  match xs do
+    | [] -> return false
+    | h :: rest -> if h == n then return true end
+      return name_in(n, xs: rest)
+  end
+end
+
+// Is `e` a bare unqualified variable reference whose name the outer arm binds?
+let scrutinee_is_bound_var = fn (e: SpannedExpr, binders: [ string ]) -> bool do
+  let SpannedExpr(node, span: _) = e
+  match node do
+    | ExprVariable(name, sigil: _) ->
+      match name do
+        | Unqual(name: n) -> return name_in(n, xs: binders)
+        | Qual(alias: _, name: _) -> return false
+      end
+    | _ -> return false
+  end
+end
+
+// ── staircase detection ─────────────────────────────────────────────────────
+
+// If `body` is exactly one statement that is a bare-expr / return whose value
+// is an `ExprMatch`, return that inner match's scrutinee.
+let lone_inner_match_scrutinee = fn (body: [ SpannedStmt ]) -> Option<SpannedExpr> do
+  match body do
+    | [ SpannedStmt(node, span: _) ] ->
+      match node do
+        | StmtExpr(expr) -> return inner_match_target(e: expr)
+        | StmtReturn(value) -> return inner_match_target(e: value)
+        | _ -> return None
+      end
+    | _ -> return None
+  end
+end
+
+let inner_match_target = fn (e: SpannedExpr) -> Option<SpannedExpr> do
+  let SpannedExpr(node, span: _) = e
+  match node do
+    | ExprMatch(target, cases: _) -> return Some(val: target)
+    | _ -> return None
+  end
+end
+
+// Does any arm of `cases` re-match on the OUTER scrutinee `outer_target`, or on
+// a variable that arm's pattern binds?
+let any_arm_is_staircase = fn (outer_target: SpannedExpr, cases: [ MatchCase ]) -> bool do
+  match cases do
+    | [] -> return false
+    | MatchCase(pattern, body) :: rest ->
+      match lone_inner_match_scrutinee(body) do
+        | Some(val: inner_scrut) ->
+          // (a) inner match on the same scrutinee as the outer match.
+          if expr_eq(a: outer_target, b: inner_scrut) then return true end
+          // (b) inner match on a variable this arm's pattern binds (list tail).
+          let binders = collect_pat_binders(pat: pattern, acc: [])
+          if scrutinee_is_bound_var(e: inner_scrut, binders) then return true end
+          return any_arm_is_staircase(outer_target, cases: rest)
+        | None -> return any_arm_is_staircase(outer_target, cases: rest)
+      end
+  end
+end
+
+let l0009_message = fn () -> string do
+  return "staircase `match` — an arm immediately re-`match`es on the same"
+    ++ " scrutinee (or the bound `:: tail`); fold the inner shapes into a single"
+    ++ " nested pattern so each arm's shape is visible at the surface"
+end
+
+let make_l0009_finding = fn (sp: Span) -> LintFinding do
+  return LintFinding(
+    code: "L0009",
+    severity: LintInfo,
+    message: l0009_message(),
+    fix_it: None,
+    span: sp
+  )
+end
+
+let check_match_site = fn (
+  sp: Span,
+  target: SpannedExpr,
+  cases: [ MatchCase ],
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  if any_arm_is_staircase(outer_target: target, cases) then return make_l0009_finding(sp) :: acc end
+  return acc
+end
+
+// ── walker ──────────────────────────────────────────────────────────────────
+//
+// Hand-written (like L0007) so the finding anchors at the OUTER match node's
+// own span.  Staircase folding is position-agnostic, so both statement- and
+// expression-position outer matches are inspected.
+
+let walk_stmts = fn (ss: [ SpannedStmt ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match ss do
+    | [] -> return acc
+    | s :: rest ->
+      let acc2 = walk_spanned_stmt(s, acc)
+      return walk_stmts(ss: rest, acc: acc2)
+  end
+end
+
+let walk_spanned_stmt = fn (s: SpannedStmt, acc: [ LintFinding ]) -> [ LintFinding ] do
+  let SpannedStmt(node, span: _) = s
+  match node do
+      | StmtLet(name: _, sigil: _, typ: _, value) | StmtLetPattern(pattern: _, value) ->
+        return walk_expr(e: value, acc)
+      | StmtExpr(expr) -> return walk_expr(e: expr, acc)
+      | StmtReturn(value) | StmtAssign(target: _, value) -> return walk_expr(e: value, acc)
+      | StmtIndexAssign(target, index, value) ->
+        let a1 = walk_expr(e: target, acc)
+        let a2 = walk_expr(e: index, acc: a1)
+        return walk_expr(e: value, acc: a2)
+      | StmtTry(body, catch_arms) ->
+        let a1 = walk_stmts(ss: body, acc)
+        return walk_catch_arms(arms: catch_arms, acc: a1)
+      | StmtInject(handlers, body) ->
+        let a1 = walk_spanned_exprs(es: handlers, acc)
+        return walk_stmts(ss: body, acc: a1)
+    end
+end
+
+let walk_expr = fn (e: SpannedExpr, acc: [ LintFinding ]) -> [ LintFinding ] do
+  let SpannedExpr(node, span) = e
+  match node do
+      | ExprMatch(target, cases) ->
+        let a1 = check_match_site(sp: span, target, cases, acc)
+        let a2 = walk_expr(e: target, acc: a1)
+        return walk_match_cases(cs: cases, acc: a2)
+      | ExprIf(cond, then_branch, else_branch) ->
+        let a1 = walk_expr(e: cond, acc)
+        let a2 = walk_stmts(ss: then_branch, acc: a1)
+        return walk_stmts(ss: else_branch, acc: a2)
+      | ExprWhile(cond, body) ->
+        let a1 = walk_expr(e: cond, acc)
+        return walk_stmts(ss: body, acc: a1)
+      | ExprFor(var: _, start, end_expr, body) ->
+        let a1 = walk_expr(e: start, acc)
+        let a2 = walk_expr(e: end_expr, acc: a1)
+        return walk_stmts(ss: body, acc: a2)
+      | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
+        return walk_stmts(ss: body, acc)
+      | ExprBinaryOp(left, op: _, right) ->
+        let a1 = walk_expr(e: left, acc)
+        return walk_expr(e: right, acc: a1)
+      | ExprUnaryOp(op: _, operand) -> return walk_expr(e: operand, acc)
+      | ExprCall(func: _, args) -> return walk_call_args(args, acc)
+      | ExprCallExpr(callee, args) ->
+        let a1 = walk_expr(e: callee, acc)
+        return walk_call_args(args, acc: a1)
+      | ExprConstructor(name: _, args, sigil: _) -> return walk_ctor_args(args, acc)
+      | ExprArray(elements) | ExprList(elements) -> return walk_spanned_exprs(es: elements, acc)
+      | ExprRecord(fields) -> return walk_named_exprs(fs: fields, acc)
+      | ExprIndex(target, index) ->
+        let a1 = walk_expr(e: target, acc)
+        return walk_expr(e: index, acc: a1)
+      | ExprFieldAccess(target, field: _) -> return walk_expr(e: target, acc)
+      | ExprRaise(value) | ExprForce(value) -> return walk_expr(e: value, acc)
+      | ExprHandler(coeffect_name: _, requires: _, arms) -> return walk_handler_arms(arms, acc)
+      | _ -> return acc
+    end
+end
+
+let walk_spanned_exprs = fn (es: [ SpannedExpr ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match es do
+    | [] -> return acc
+    | e :: rest ->
+      let acc2 = walk_expr(e: e, acc)
+      return walk_spanned_exprs(es: rest, acc: acc2)
+  end
+end
+
+let walk_call_args = fn (args: [ CallArg ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match args do
+    | [] -> return acc
+    | CallArg(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_call_args(args: rest, acc: acc2)
+  end
+end
+
+let walk_ctor_args = fn (args: [ CtorArg ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match args do
+    | [] -> return acc
+    | CtorArg(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_ctor_args(args: rest, acc: acc2)
+  end
+end
+
+let walk_named_exprs = fn (fs: [ NamedExpr ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match fs do
+    | [] -> return acc
+    | NamedExpr(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_named_exprs(fs: rest, acc: acc2)
+  end
+end
+
+let walk_match_cases = fn (cs: [ MatchCase ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match cs do
+    | [] -> return acc
+    | MatchCase(pattern: _, body) :: rest ->
+      let acc2 = walk_stmts(ss: body, acc)
+      return walk_match_cases(cs: rest, acc: acc2)
+  end
+end
+
+let walk_catch_arms = fn (arms: [ CatchArm ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match arms do
+    | [] -> return acc
+    | CatchArm(pattern: _, body) :: rest ->
+      let acc2 = walk_stmts(ss: body, acc)
+      return walk_catch_arms(arms: rest, acc: acc2)
+  end
+end
+
+let walk_handler_arms = fn (arms: [ HandlerArm ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match arms do
+    | [] -> return acc
+    | HandlerArm(arm, cont_binder: _, span: _) :: rest ->
+      let Function(
+        name: _,
+        is_public: _,
+        type_params: _,
+        params: _,
+        ret_type: _,
+        requires: _,
+        throw_row: _,
+        body,
+        span: _
+      ) = arm
+      let acc2 = walk_stmts(ss: body, acc)
+        return walk_handler_arms(arms: rest, acc: acc2)
+  end
+end
+
+/** Collect L0009 findings across a function body (a list of statements). */
+export let collect_staircase_matches_in_stmts = fn (
+  ss: [ SpannedStmt ],
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  return walk_stmts(ss, acc)
+end
+
+/** Collect L0009 findings from a top-level value expression (non-lambda). */
+export let collect_staircase_matches_in_expr = fn (
+  e: SpannedExpr,
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  return walk_expr(e, acc)
+end

@@ -1,0 +1,450 @@
+/**
+ * ast_eq: span-insensitive STRUCTURAL equality over the surface AST, used by
+ * the structural lint rules L0009 (staircase: same-scrutinee inner match) and
+ * L0010 (identical-RHS arms → or-pattern).
+ *
+ * Soundness contract — CONSERVATIVE EQUALITY:
+ *   `expr_eq` / `stmts_eq` answer "are these two subtrees structurally
+ *   identical, ignoring source spans?".  The lint rules that consume the
+ *   answer turn a `true` into a *rewrite suggestion* (fuse two arms into an
+ *   or-pattern, or collapse a staircase).  A false "equal" would suggest a
+ *   semantics-changing rewrite, so the danger is entirely on the "claims equal
+ *   when not" side.  Therefore every comparator here is biased to `false`:
+ *     - two values are equal only when their constructors match AND every
+ *       child compares equal;
+ *     - any node kind whose full structure this module does not recurse into
+ *       (today: `ExprLambda`, `ExprExternal`, `ExprHandler`, and the
+ *       statement forms `StmtTry` / `StmtInject` whose nested bodies carry
+ *       type/handler shapes the rules need not fuse) compares as `false`.
+ *   A spurious `false` only costs a missed advisory note; a spurious `true`
+ *   could corrupt code, so the asymmetry is deliberate.
+ *
+ * Spans are intentionally ignored: the two arms of a match live at different
+ * source positions, so two structurally identical bodies necessarily differ in
+ * span.  Equality keyed on spans would never fire.
+ */
+
+import {
+  SpannedExpr, Expr, SpannedStmt, Stmt, SpannedPattern, Pattern,
+  Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit,
+  RdrName, Unqual, Qual, Sigil,
+  ExprLiteral, ExprVariable, ExprBorrow, ExprBinaryOp, ExprUnaryOp,
+  ExprCall, ExprCallExpr, ExprConstructor, ExprArray, ExprList, ExprRecord,
+  ExprIndex, ExprFieldAccess, ExprIf, ExprMatch, ExprWhile, ExprFor,
+  ExprRaise, ExprForce,
+  StmtLet, StmtLetPattern, StmtExpr, StmtReturn, StmtAssign, StmtIndexAssign,
+  CallArg, CtorArg, NamedExpr, MatchCase,
+  PatLiteral, PatVariable, PatConstructor, PatConstructorWildcard,
+  PatRecord, PatWildcard, PatOr, CtorPatternField, RecordPatField,
+  BinaryOp, UnaryOp
+} from "src/syntax/ast.nx"
+
+// ── leaf comparators ────────────────────────────────────────────────────────
+
+export let rdr_eq = fn (a: RdrName, b: RdrName) -> bool do
+  match a do
+    | Unqual(name: an) ->
+      match b do
+        | Unqual(name: bn) -> return an == bn
+        | Qual(alias: _, name: _) -> return false
+      end
+    | Qual(alias: aa, name: an) ->
+      match b do
+        | Unqual(name: _) -> return false
+        | Qual(alias: ba, name: bn) -> return aa == ba && an == bn
+      end
+  end
+end
+
+// Sigil is a nullary enum; compare by tag via a small int code.
+let sigil_code = fn (s: Sigil) -> i64 do
+  match s do
+    | SigilImmutable -> return 0
+    | SigilMutable -> return 1
+    | SigilLinear -> return 2
+    | SigilBorrow -> return 3
+    | SigilLazy -> return 4
+  end
+end
+
+export let sigil_eq = fn (a: Sigil, b: Sigil) -> bool do
+  return sigil_code(s: a) == sigil_code(s: b)
+end
+
+export let lit_eq = fn (a: Literal, b: Literal) -> bool do
+  match a do
+    | LitInt(val: av) ->
+      match b do | LitInt(val: bv) -> return av == bv | _ -> return false end
+    | LitFloat(val: av) ->
+      match b do | LitFloat(val: bv) -> return av == bv | _ -> return false end
+    | LitBool(val: av) ->
+      match b do | LitBool(val: bv) -> return av == bv | _ -> return false end
+    | LitChar(val: av) ->
+      match b do | LitChar(val: bv) -> return av == bv | _ -> return false end
+    | LitString(val: av) ->
+      match b do | LitString(val: bv) -> return av == bv | _ -> return false end
+    | LitUnit ->
+      match b do | LitUnit -> return true | _ -> return false end
+  end
+end
+
+// BinaryOp / UnaryOp are nullary enums; compare by an int tag code.
+let binop_code = fn (op: BinaryOp) -> i64 do
+  match op do
+    | OpAdd -> return 0  | OpSub -> return 1  | OpMul -> return 2
+    | OpDiv -> return 3  | OpMod -> return 4  | OpFAdd -> return 5
+    | OpFSub -> return 6 | OpFMul -> return 7 | OpFDiv -> return 8
+    | OpEq -> return 9   | OpNe -> return 10  | OpLt -> return 11
+    | OpLe -> return 12  | OpGt -> return 13  | OpGe -> return 14
+    | OpFEq -> return 15 | OpFNe -> return 16 | OpFLt -> return 17
+    | OpFLe -> return 18 | OpFGt -> return 19 | OpFGe -> return 20
+    | OpBitAnd -> return 21 | OpBitOr -> return 22 | OpBitXor -> return 23
+    | OpShl -> return 24 | OpShr -> return 25 | OpAnd -> return 26
+    | OpOr -> return 27  | OpConcat -> return 28
+  end
+end
+
+let binop_eq = fn (a: BinaryOp, b: BinaryOp) -> bool do
+  return binop_code(op: a) == binop_code(op: b)
+end
+
+let unop_code = fn (op: UnaryOp) -> i64 do
+  match op do
+    | OpNeg -> return 0
+    | OpFNeg -> return 1
+    | OpNot -> return 2
+  end
+end
+
+let unop_eq = fn (a: UnaryOp, b: UnaryOp) -> bool do
+  return unop_code(op: a) == unop_code(op: b)
+end
+
+// ── expression equality ─────────────────────────────────────────────────────
+
+export let expr_eq = fn (a: SpannedExpr, b: SpannedExpr) -> bool do
+  let SpannedExpr(node: an, span: _) = a
+  let SpannedExpr(node: bn, span: _) = b
+  return expr_node_eq(a: an, b: bn)
+end
+
+let expr_node_eq = fn (a: Expr, b: Expr) -> bool do
+  match a do
+    | ExprLiteral(lit: al) ->
+      match b do | ExprLiteral(lit: bl) -> return lit_eq(a: al, b: bl) | _ -> return false end
+    | ExprVariable(name: an, sigil: asg) ->
+      match b do
+        | ExprVariable(
+          name: bn,
+          sigil: bsg
+        ) -> return rdr_eq(a: an, b: bn) && sigil_eq(a: asg, b: bsg)
+        | _ -> return false
+      end
+    | ExprBorrow(name: an, sigil: asg) ->
+      match b do
+        | ExprBorrow(name: bn, sigil: bsg) -> return an == bn && sigil_eq(a: asg, b: bsg)
+        | _ -> return false
+      end
+    | ExprBinaryOp(left: al, op: ao, right: ar) ->
+      match b do
+        | ExprBinaryOp(left: bl, op: bo, right: br) ->
+          return binop_eq(a: ao, b: bo) && expr_eq(a: al, b: bl) && expr_eq(a: ar, b: br)
+        | _ -> return false
+      end
+    | ExprUnaryOp(op: ao, operand: aop) ->
+      match b do
+        | ExprUnaryOp(
+          op: bo,
+          operand: bop
+        ) -> return unop_eq(a: ao, b: bo) && expr_eq(a: aop, b: bop)
+        | _ -> return false
+      end
+    | ExprCall(func: af, args: aargs) ->
+      match b do
+        | ExprCall(
+          func: bf,
+          args: bargs
+        ) -> return rdr_eq(a: af, b: bf) && call_args_eq(a: aargs, b: bargs)
+        | _ -> return false
+      end
+    | ExprCallExpr(callee: ac, args: aargs) ->
+      match b do
+        | ExprCallExpr(callee: bc, args: bargs) ->
+          return expr_eq(a: ac, b: bc) && call_args_eq(a: aargs, b: bargs)
+        | _ -> return false
+      end
+    | ExprConstructor(name: an, args: aargs, sigil: asg) ->
+      match b do
+        | ExprConstructor(name: bn, args: bargs, sigil: bsg) ->
+          return rdr_eq(
+            a: an,
+            b: bn
+          ) && sigil_eq(a: asg, b: bsg) && ctor_args_eq(a: aargs, b: bargs)
+        | _ -> return false
+      end
+    | ExprArray(elements: ae) ->
+      match b do | ExprArray(elements: be) -> return exprs_eq(a: ae, b: be) | _ -> return false end
+    | ExprList(elements: ae) ->
+      match b do | ExprList(elements: be) -> return exprs_eq(a: ae, b: be) | _ -> return false end
+    | ExprRecord(fields: af) ->
+      match b do | ExprRecord(fields: bf) -> return named_exprs_eq(
+        a: af,
+        b: bf
+      ) | _ -> return false end
+    | ExprIndex(target: at, index: ai) ->
+      match b do
+        | ExprIndex(target: bt, index: bi) -> return expr_eq(a: at, b: bt) && expr_eq(a: ai, b: bi)
+        | _ -> return false
+      end
+    | ExprFieldAccess(target: at, field: af) ->
+      match b do
+        | ExprFieldAccess(target: bt, field: bf) -> return af == bf && expr_eq(a: at, b: bt)
+        | _ -> return false
+      end
+    | ExprIf(cond: ac, then_branch: at, else_branch: aeb) ->
+      match b do
+        | ExprIf(cond: bc, then_branch: bt, else_branch: beb) ->
+          return expr_eq(a: ac, b: bc) && stmts_eq(a: at, b: bt) && stmts_eq(a: aeb, b: beb)
+        | _ -> return false
+      end
+    | ExprMatch(target: at, cases: ac) ->
+      match b do
+        | ExprMatch(target: bt, cases: bc) -> return expr_eq(a: at, b: bt) && cases_eq(a: ac, b: bc)
+        | _ -> return false
+      end
+    | ExprWhile(cond: ac, body: ab) ->
+      match b do
+        | ExprWhile(cond: bc, body: bb) -> return expr_eq(a: ac, b: bc) && stmts_eq(a: ab, b: bb)
+        | _ -> return false
+      end
+    | ExprFor(var: av, start: ast, end_expr: aee, body: ab) ->
+      match b do
+        | ExprFor(var: bv, start: bst, end_expr: bee, body: bb) ->
+          return av == bv && expr_eq(
+            a: ast,
+            b: bst
+          ) && expr_eq(a: aee, b: bee) && stmts_eq(a: ab, b: bb)
+        | _ -> return false
+      end
+    | ExprRaise(value: av) ->
+      match b do | ExprRaise(value: bv) -> return expr_eq(a: av, b: bv) | _ -> return false end
+    | ExprForce(value: av) ->
+      match b do | ExprForce(value: bv) -> return expr_eq(a: av, b: bv) | _ -> return false end
+    // Node kinds carrying type/handler shapes are NOT compared structurally;
+    // bias to `false` so the rules never fuse them (see soundness contract).
+    | _ -> return false
+  end
+end
+
+let exprs_eq = fn (a: [ SpannedExpr ], b: [ SpannedExpr ]) -> bool do
+  match a do
+    | [] -> match b do | [] -> return true | _ -> return false end
+    | ah :: ar ->
+      match b do
+        | [] -> return false
+        | bh :: br -> if expr_eq(a: ah, b: bh) then return exprs_eq(a: ar, b: br) end
+          return false
+      end
+  end
+end
+
+let call_args_eq = fn (a: [ CallArg ], b: [ CallArg ]) -> bool do
+  match a do
+    | [] -> match b do | [] -> return true | _ -> return false end
+    | CallArg(name: an, value: av) :: ar ->
+      match b do
+        | [] -> return false
+        | CallArg(name: bn, value: bv) :: br ->
+          if an == bn && expr_eq(a: av, b: bv) then return call_args_eq(a: ar, b: br) end
+          return false
+      end
+  end
+end
+
+let ctor_args_eq = fn (a: [ CtorArg ], b: [ CtorArg ]) -> bool do
+  match a do
+    | [] -> match b do | [] -> return true | _ -> return false end
+    | CtorArg(name: an, value: av) :: ar ->
+      match b do
+        | [] -> return false
+        | CtorArg(name: bn, value: bv) :: br ->
+          if an == bn && expr_eq(a: av, b: bv) then return ctor_args_eq(a: ar, b: br) end
+          return false
+      end
+  end
+end
+
+let named_exprs_eq = fn (a: [ NamedExpr ], b: [ NamedExpr ]) -> bool do
+  match a do
+    | [] -> match b do | [] -> return true | _ -> return false end
+    | NamedExpr(name: an, value: av) :: ar ->
+      match b do
+        | [] -> return false
+        | NamedExpr(name: bn, value: bv) :: br ->
+          if an == bn && expr_eq(a: av, b: bv) then return named_exprs_eq(a: ar, b: br) end
+          return false
+      end
+  end
+end
+
+let cases_eq = fn (a: [ MatchCase ], b: [ MatchCase ]) -> bool do
+  match a do
+    | [] -> match b do | [] -> return true | _ -> return false end
+    | MatchCase(pattern: ap, body: ab) :: ar ->
+      match b do
+        | [] -> return false
+        | MatchCase(pattern: bp, body: bb) :: br ->
+          if pattern_eq(
+            a: ap,
+            b: bp
+          ) && stmts_eq(a: ab, b: bb) then return cases_eq(a: ar, b: br) end
+          return false
+      end
+  end
+end
+
+// ── statement equality ──────────────────────────────────────────────────────
+
+export let stmts_eq = fn (a: [ SpannedStmt ], b: [ SpannedStmt ]) -> bool do
+  match a do
+    | [] -> match b do | [] -> return true | _ -> return false end
+    | ah :: ar ->
+      match b do
+        | [] -> return false
+        | bh :: br -> if stmt_eq(a: ah, b: bh) then return stmts_eq(a: ar, b: br) end
+          return false
+      end
+  end
+end
+
+let stmt_eq = fn (a: SpannedStmt, b: SpannedStmt) -> bool do
+  let SpannedStmt(node: an, span: _) = a
+  let SpannedStmt(node: bn, span: _) = b
+  return stmt_node_eq(a: an, b: bn)
+end
+
+let stmt_node_eq = fn (a: Stmt, b: Stmt) -> bool do
+  match a do
+    | StmtLet(name: an, sigil: asg, typ: _, value: av) ->
+      match b do
+        // type annotation is intentionally not compared (TypeExpr is not
+        // recursed); name + sigil + value identity is the meaningful test.
+        | StmtLet(name: bn, sigil: bsg, typ: _, value: bv) ->
+          return an == bn && sigil_eq(a: asg, b: bsg) && expr_eq(a: av, b: bv)
+        | _ -> return false
+      end
+    | StmtLetPattern(pattern: ap, value: av) ->
+      match b do
+        | StmtLetPattern(
+          pattern: bp,
+          value: bv
+        ) -> return pattern_eq(a: ap, b: bp) && expr_eq(a: av, b: bv)
+        | _ -> return false
+      end
+    | StmtExpr(expr: ae) ->
+      match b do | StmtExpr(expr: be) -> return expr_eq(a: ae, b: be) | _ -> return false end
+    | StmtReturn(value: av) ->
+      match b do | StmtReturn(value: bv) -> return expr_eq(a: av, b: bv) | _ -> return false end
+    | StmtAssign(target: at, value: av) ->
+      match b do
+        | StmtAssign(target: bt, value: bv) -> return at == bt && expr_eq(a: av, b: bv)
+        | _ -> return false
+      end
+    | StmtIndexAssign(target: at, index: ai, value: av) ->
+      match b do
+        | StmtIndexAssign(target: bt, index: bi, value: bv) ->
+          return expr_eq(a: at, b: bt) && expr_eq(a: ai, b: bi) && expr_eq(a: av, b: bv)
+        | _ -> return false
+      end
+    // StmtTry / StmtInject carry nested bodies/handlers the rules need not fuse;
+    // bias to `false` (see soundness contract).
+    | _ -> return false
+  end
+end
+
+// ── pattern equality ────────────────────────────────────────────────────────
+
+export let pattern_eq = fn (a: SpannedPattern, b: SpannedPattern) -> bool do
+  let SpannedPattern(node: an, span: _) = a
+  let SpannedPattern(node: bn, span: _) = b
+  return pattern_node_eq(a: an, b: bn)
+end
+
+let pattern_node_eq = fn (a: Pattern, b: Pattern) -> bool do
+  match a do
+    | PatLiteral(lit: al) ->
+      match b do | PatLiteral(lit: bl) -> return lit_eq(a: al, b: bl) | _ -> return false end
+    | PatVariable(name: an, sigil: asg) ->
+      match b do
+        | PatVariable(name: bn, sigil: bsg) -> return an == bn && sigil_eq(a: asg, b: bsg)
+        | _ -> return false
+      end
+    | PatConstructor(name: an, fields: af, sigil: asg) ->
+      match b do
+        | PatConstructor(name: bn, fields: bf, sigil: bsg) ->
+          return rdr_eq(
+            a: an,
+            b: bn
+          ) && sigil_eq(a: asg, b: bsg) && ctor_pat_fields_eq(a: af, b: bf)
+        | _ -> return false
+      end
+    | PatConstructorWildcard(name: an, sigil: asg) ->
+      match b do
+        | PatConstructorWildcard(
+          name: bn,
+          sigil: bsg
+        ) -> return rdr_eq(a: an, b: bn) && sigil_eq(a: asg, b: bsg)
+        | _ -> return false
+      end
+    | PatRecord(fields: af, has_wildcard: aw) ->
+      match b do
+        | PatRecord(
+          fields: bf,
+          has_wildcard: bw
+        ) -> return aw == bw && record_pat_fields_eq(a: af, b: bf)
+        | _ -> return false
+      end
+    | PatWildcard ->
+      match b do | PatWildcard -> return true | _ -> return false end
+    | PatOr(alts: aa) ->
+      match b do | PatOr(alts: ba) -> return spats_eq(a: aa, b: ba) | _ -> return false end
+  end
+end
+
+let spats_eq = fn (a: [ SpannedPattern ], b: [ SpannedPattern ]) -> bool do
+  match a do
+    | [] -> match b do | [] -> return true | _ -> return false end
+    | ah :: ar ->
+      match b do
+        | [] -> return false
+        | bh :: br -> if pattern_eq(a: ah, b: bh) then return spats_eq(a: ar, b: br) end
+          return false
+      end
+  end
+end
+
+let ctor_pat_fields_eq = fn (a: [ CtorPatternField ], b: [ CtorPatternField ]) -> bool do
+  match a do
+    | [] -> match b do | [] -> return true | _ -> return false end
+    | CtorPatternField(name: an, pattern: ap) :: ar ->
+      match b do
+        | [] -> return false
+        | CtorPatternField(name: bn, pattern: bp) :: br ->
+          if an == bn && pattern_eq(a: ap, b: bp) then return ctor_pat_fields_eq(a: ar, b: br) end
+          return false
+      end
+  end
+end
+
+let record_pat_fields_eq = fn (a: [ RecordPatField ], b: [ RecordPatField ]) -> bool do
+  match a do
+    | [] -> match b do | [] -> return true | _ -> return false end
+    | RecordPatField(name: an, pattern: ap) :: ar ->
+      match b do
+        | [] -> return false
+        | RecordPatField(name: bn, pattern: bp) :: br ->
+          if an == bn && pattern_eq(a: ap, b: bp) then return record_pat_fields_eq(a: ar, b: br) end
+          return false
+      end
+  end
+end
