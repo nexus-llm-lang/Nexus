@@ -1,0 +1,286 @@
+/**
+ * single_arm_match: L0007 rule — single-arm `match` over an irrefutable
+ * binding pattern, equivalent to a `let` destructuring.
+ *
+ * Advisory (LintInfo) only — never trips the `--check` CI gate, mirroring
+ * L0006 / L0100.
+ *
+ * Because the language enforces match exhaustiveness, any single-arm match
+ * that compiles is irrefutable: its sole arm pattern binds without the
+ * possibility of failure (single-variant constructor, record, tuple-as-
+ * constructor, or a plain variable bind).  Such a match is exactly
+ * equivalent to `let <pat> = e` followed by the arm body, but adds an
+ * indentation level and a `do … end` frame for no dispatch.
+ *
+ * The rule flags `match e do | <pat> -> body end` whose sole arm pattern is
+ * an irrefutable BINDING pattern and suggests the `let` form.
+ *
+ * Excluded (NOT flagged):
+ *   - the bare wildcard arm `| _ -> body`: rewriting to `let _ = e` is
+ *     forbidden by the drop discipline (primitives auto-drop; non-primitives
+ *     need an explicit drop function), so the wildcard is left alone.
+ *   - literal patterns (`| 0 -> …`, `| "x" -> …`): refutable.
+ *   - or-patterns (`| A | B -> …`): refutable / multiple alternatives.
+ *   - the list constructors `Nil` / `Cons` and the empty-list pattern `[]`:
+ *     these are refutable against a list type, so a `let` rewrite would be
+ *     unsound (and `let [] = xs` is nonsense).
+ *   - any match with more than one arm.
+ *
+ * The finding carries a placeholder zero-length fix-it; the source-scanning
+ * enrichment that computes the real replacement span lives in the fix-mode
+ * driver (src/tools/lint.nx), the same split used by L0001 / L0002.
+ */
+
+import { Option, Some } from "std:option"
+import * as list from "std:list"
+import { Fixit } from "src/tools/fix.nx"
+import { Span } from "src/syntax/token.nx"
+import {
+  SpannedExpr, Expr, ExprMatch, ExprLambda, ExprCall, ExprConstructor,
+  ExprArray, ExprList, ExprRecord, ExprIndex, ExprFieldAccess, ExprBinaryOp,
+  ExprUnaryOp, ExprIf, ExprWhile, ExprFor, ExprRaise, ExprForce, ExprHandler,
+  SpannedStmt, Stmt, StmtLet, StmtLetPattern, StmtExpr, StmtReturn,
+  StmtAssign, StmtIndexAssign, StmtTry, StmtInject,
+  MatchCase, CatchArm, HandlerArm, Function,
+  CallArg, CtorArg, NamedExpr,
+  SpannedPattern, Pattern, PatVariable, PatConstructor, PatConstructorWildcard,
+  PatRecord, PatWildcard, PatLiteral, PatOr,
+  RdrName, Unqual, Qual
+} from "src/syntax/ast.nx"
+import { LintFinding, LintInfo } from "src/lint/types.nx"
+
+// The list-shaped constructor names whose single-arm match would be a
+// refutable (non-exhaustive) list pattern, not an irrefutable binding.
+let is_list_ctor_name = fn (rdr: RdrName) -> bool do
+  let n = match rdr do
+    | Unqual(name) -> name
+    | Qual(alias: _, name) -> name
+  end
+  return n == "Nil" || n == "Cons"
+end
+
+// Is `pat` an irrefutable BINDING pattern that L0007 should flag?
+// Plain variable binds, single-variant constructors (including tuple/record
+// constructors), constructor-wildcard binds, and record destructures qualify.
+// Wildcards, literals, or-patterns, and list constructors do not.
+let is_irrefutable_binding = fn (pat: Pattern) -> bool do
+  match pat do
+    | PatVariable(name: _, sigil: _) -> return true
+    | PatRecord(fields: _, has_wildcard: _) -> return true
+    | PatConstructor(name, fields: _, sigil: _) -> return !is_list_ctor_name(rdr: name)
+    | PatConstructorWildcard(name, sigil: _) -> return !is_list_ctor_name(rdr: name)
+    | PatWildcard -> return false
+    | PatLiteral(lit: _) -> return false
+    | PatOr(alts: _) -> return false
+  end
+end
+
+let l0007_message = fn () -> string do
+  return "single-arm `match` over an irrefutable pattern is equivalent to a"
+    ++ " `let` destructuring; rewrite `match e do | pat -> body end` as"
+    ++ " `let pat = e` then `body`"
+end
+
+// Build the L0007 finding for a single-arm match whose span is `sp` (the
+// `match` keyword location).  The fix-it is a zero-length placeholder; the
+// fix-mode driver computes the real replacement span by source scanning.
+let make_l0007_finding = fn (sp: Span) -> LintFinding do
+  return LintFinding(
+    code: "L0007",
+    severity: LintInfo,
+    message: l0007_message(),
+    fix_it: Some(val: Fixit(
+      start: 0,
+      len: 0,
+      replacement: "",
+      code: "L0007",
+      message: "replace the single-arm `match` with `let <pat> = e` then the arm body"
+    )),
+    span: sp
+  )
+end
+
+// Inspect one match site: if it has exactly one arm whose pattern is an
+// irrefutable binding, prepend an L0007 finding anchored at `sp`.
+let check_match_site = fn (
+  sp: Span,
+  cases: [ MatchCase ],
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  match cases do
+    | [ MatchCase(pattern, body: _) ] ->
+      match pattern do | SpannedPattern(node, span: _) ->
+        if is_irrefutable_binding(pat: node) then
+          return make_l0007_finding(sp) :: acc
+        end
+        return acc
+      end
+    | _ -> return acc
+  end
+end
+
+// ── walker ────────────────────────────────────────────────────────────────
+//
+// A hand-written walker (not the shared ast_fold) because the finding must be
+// anchored at the SpannedExpr span of the match node, which ast_fold's
+// on_expr visitor does not expose.
+
+let walk_stmts = fn (ss: [ SpannedStmt ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match ss do
+    | [] -> return acc
+    | s :: rest ->
+      let acc2 = walk_spanned_stmt(s, acc)
+      return walk_stmts(ss: rest, acc: acc2)
+  end
+end
+
+let walk_spanned_stmt = fn (s: SpannedStmt, acc: [ LintFinding ]) -> [ LintFinding ] do
+  match s do | SpannedStmt(node, span: _) ->
+    match node do
+      | StmtLet(name: _, sigil: _, typ: _, value) | StmtLetPattern(pattern: _, value) ->
+        return walk_expr(e: value, acc)
+      | StmtExpr(expr) -> return walk_expr(e: expr, acc)
+      | StmtReturn(value) | StmtAssign(target: _, value) -> return walk_expr(e: value, acc)
+      | StmtIndexAssign(target, index, value) ->
+        let a1 = walk_expr(e: target, acc)
+        let a2 = walk_expr(e: index, acc: a1)
+        return walk_expr(e: value, acc: a2)
+      | StmtTry(body, catch_arms) ->
+        let a1 = walk_stmts(ss: body, acc)
+        return walk_catch_arms(arms: catch_arms, acc: a1)
+      | StmtInject(handlers, body) ->
+        let a1 = walk_spanned_exprs(es: handlers, acc)
+        return walk_stmts(ss: body, acc: a1)
+    end
+  end
+end
+
+let walk_expr = fn (e: SpannedExpr, acc: [ LintFinding ]) -> [ LintFinding ] do
+  match e do | SpannedExpr(node, span) ->
+    match node do
+      | ExprMatch(target, cases) ->
+        let a1 = check_match_site(sp: span, cases, acc)
+        let a2 = walk_expr(e: target, acc: a1)
+        return walk_match_cases(cs: cases, acc: a2)
+      | ExprIf(cond, then_branch, else_branch) ->
+        let a1 = walk_expr(e: cond, acc)
+        let a2 = walk_stmts(ss: then_branch, acc: a1)
+        return walk_stmts(ss: else_branch, acc: a2)
+      | ExprWhile(cond, body) ->
+        let a1 = walk_expr(e: cond, acc)
+        return walk_stmts(ss: body, acc: a1)
+      | ExprFor(var: _, start, end_expr, body) ->
+        let a1 = walk_expr(e: start, acc)
+        let a2 = walk_expr(e: end_expr, acc: a1)
+        return walk_stmts(ss: body, acc: a2)
+      | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
+        return walk_stmts(ss: body, acc)
+      | ExprBinaryOp(left, op: _, right) ->
+        let a1 = walk_expr(e: left, acc)
+        return walk_expr(e: right, acc: a1)
+      | ExprUnaryOp(op: _, operand) -> return walk_expr(e: operand, acc)
+      | ExprCall(func: _, args) -> return walk_call_args(args, acc)
+      | ExprConstructor(name: _, args, sigil: _) -> return walk_ctor_args(args, acc)
+      | ExprArray(elements) | ExprList(elements) -> return walk_spanned_exprs(es: elements, acc)
+      | ExprRecord(fields) -> return walk_named_exprs(fs: fields, acc)
+      | ExprIndex(target, index) ->
+        let a1 = walk_expr(e: target, acc)
+        return walk_expr(e: index, acc: a1)
+      | ExprFieldAccess(target, field: _) -> return walk_expr(e: target, acc)
+      | ExprRaise(value) | ExprForce(value) -> return walk_expr(e: value, acc)
+      | ExprHandler(coeffect_name: _, requires: _, arms) -> return walk_handler_arms(arms, acc)
+      | _ -> return acc
+    end
+  end
+end
+
+let walk_spanned_exprs = fn (es: [ SpannedExpr ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match es do
+    | [] -> return acc
+    | e :: rest ->
+      let acc2 = walk_expr(e: e, acc)
+      return walk_spanned_exprs(es: rest, acc: acc2)
+  end
+end
+
+let walk_call_args = fn (args: [ CallArg ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match args do
+    | [] -> return acc
+    | CallArg(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_call_args(args: rest, acc: acc2)
+  end
+end
+
+let walk_ctor_args = fn (args: [ CtorArg ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match args do
+    | [] -> return acc
+    | CtorArg(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_ctor_args(args: rest, acc: acc2)
+  end
+end
+
+let walk_named_exprs = fn (fs: [ NamedExpr ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match fs do
+    | [] -> return acc
+    | NamedExpr(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_named_exprs(fs: rest, acc: acc2)
+  end
+end
+
+let walk_match_cases = fn (cs: [ MatchCase ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match cs do
+    | [] -> return acc
+    | MatchCase(pattern: _, body) :: rest ->
+      let acc2 = walk_stmts(ss: body, acc)
+      return walk_match_cases(cs: rest, acc: acc2)
+  end
+end
+
+let walk_catch_arms = fn (arms: [ CatchArm ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match arms do
+    | [] -> return acc
+    | CatchArm(pattern: _, body) :: rest ->
+      let acc2 = walk_stmts(ss: body, acc)
+      return walk_catch_arms(arms: rest, acc: acc2)
+  end
+end
+
+let walk_handler_arms = fn (arms: [ HandlerArm ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match arms do
+    | [] -> return acc
+    | HandlerArm(arm, cont_binder: _, span: _) :: rest ->
+      match arm do | Function(
+        name: _,
+        is_public: _,
+        type_params: _,
+        params: _,
+        ret_type: _,
+        requires: _,
+        throw_row: _,
+        body,
+        span: _
+      ) ->
+        let acc2 = walk_stmts(ss: body, acc)
+        return walk_handler_arms(arms: rest, acc: acc2)
+      end
+  end
+end
+
+/** Collect L0007 findings across a function body (a list of statements). */
+export let collect_single_arm_matches_in_stmts = fn (
+  ss: [ SpannedStmt ],
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  return walk_stmts(ss, acc)
+end
+
+/** Collect L0007 findings from a top-level value expression (non-lambda). */
+export let collect_single_arm_matches_in_expr = fn (
+  e: SpannedExpr,
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  return walk_expr(e, acc)
+end
