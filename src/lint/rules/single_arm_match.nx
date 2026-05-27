@@ -109,14 +109,24 @@ let check_match_site = fn (
 ) -> [ LintFinding ] do
   match cases do
     | [ MatchCase(pattern, body: _) ] ->
-      match pattern do | SpannedPattern(node, span: _) ->
-        if is_irrefutable_binding(pat: node) then
+      let SpannedPattern(node, span: _) = pattern
+      if is_irrefutable_binding(pat: node) then
           return make_l0007_finding(sp) :: acc
         end
         return acc
-      end
     | _ -> return acc
   end
+end
+
+// A statement-position expression: if it is a single-arm match over an
+// irrefutable binding, flag it (anchored at the match's own span).  Anything
+// else is a no-op here — `walk_expr` does the structural recursion.
+let check_stmt_position_match = fn (e: SpannedExpr, acc: [ LintFinding ]) -> [ LintFinding ] do
+  let SpannedExpr(node, span) = e
+  match node do
+      | ExprMatch(target: _, cases) -> return check_match_site(sp: span, cases, acc)
+      | _ -> return acc
+    end
 end
 
 // ── walker ────────────────────────────────────────────────────────────────
@@ -135,11 +145,20 @@ let walk_stmts = fn (ss: [ SpannedStmt ], acc: [ LintFinding ]) -> [ LintFinding
 end
 
 let walk_spanned_stmt = fn (s: SpannedStmt, acc: [ LintFinding ]) -> [ LintFinding ] do
-  match s do | SpannedStmt(node, span: _) ->
-    match node do
+  let SpannedStmt(node, span: _) = s
+  match node do
       | StmtLet(name: _, sigil: _, typ: _, value) | StmtLetPattern(pattern: _, value) ->
         return walk_expr(e: value, acc)
-      | StmtExpr(expr) -> return walk_expr(e: expr, acc)
+      | StmtExpr(expr) ->
+        // Statement position: a bare expression statement is the ONLY place a
+        // single-arm `match e do | pat -> body end` is equivalent to
+        // `let pat = e` then `body`.  Flag it here (and only here); `walk_expr`
+        // recurses without flagging, so matches reached through value-consuming
+        // positions (a `let`/`return`/assign RHS, a call argument, an operand,
+        // any sub-expression) are correctly excluded — rewriting those to a
+        // `let` statement would be invalid syntax.
+        let acc2 = check_stmt_position_match(e: expr, acc)
+        return walk_expr(e: expr, acc: acc2)
       | StmtReturn(value) | StmtAssign(target: _, value) -> return walk_expr(e: value, acc)
       | StmtIndexAssign(target, index, value) ->
         let a1 = walk_expr(e: target, acc)
@@ -152,15 +171,18 @@ let walk_spanned_stmt = fn (s: SpannedStmt, acc: [ LintFinding ]) -> [ LintFindi
         let a1 = walk_spanned_exprs(es: handlers, acc)
         return walk_stmts(ss: body, acc: a1)
     end
-  end
 end
 
 let walk_expr = fn (e: SpannedExpr, acc: [ LintFinding ]) -> [ LintFinding ] do
-  match e do | SpannedExpr(node, span) ->
-    match node do
+  let SpannedExpr(node, span) = e
+  match node do
       | ExprMatch(target, cases) ->
-        let a1 = check_match_site(sp: span, cases, acc)
-        let a2 = walk_expr(e: target, acc: a1)
+        // Do NOT flag here: a match reached via `walk_expr` is in expression
+        // position (its value is consumed), where the `let` rewrite is invalid.
+        // Statement-position matches are flagged in `walk_spanned_stmt`'s
+        // `StmtExpr` branch.  We still recurse so nested statement-position
+        // matches (inside the target sub-expressions or the arm bodies) are seen.
+        let a2 = walk_expr(e: target, acc)
         return walk_match_cases(cs: cases, acc: a2)
       | ExprIf(cond, then_branch, else_branch) ->
         let a1 = walk_expr(e: cond, acc)
@@ -191,7 +213,6 @@ let walk_expr = fn (e: SpannedExpr, acc: [ LintFinding ]) -> [ LintFinding ] do
       | ExprHandler(coeffect_name: _, requires: _, arms) -> return walk_handler_arms(arms, acc)
       | _ -> return acc
     end
-  end
 end
 
 let walk_spanned_exprs = fn (es: [ SpannedExpr ], acc: [ LintFinding ]) -> [ LintFinding ] do
@@ -252,7 +273,7 @@ let walk_handler_arms = fn (arms: [ HandlerArm ], acc: [ LintFinding ]) -> [ Lin
   match arms do
     | [] -> return acc
     | HandlerArm(arm, cont_binder: _, span: _) :: rest ->
-      match arm do | Function(
+      let Function(
         name: _,
         is_public: _,
         type_params: _,
@@ -262,10 +283,9 @@ let walk_handler_arms = fn (arms: [ HandlerArm ], acc: [ LintFinding ]) -> [ Lin
         throw_row: _,
         body,
         span: _
-      ) ->
-        let acc2 = walk_stmts(ss: body, acc)
+      ) = arm
+      let acc2 = walk_stmts(ss: body, acc)
         return walk_handler_arms(arms: rest, acc: acc2)
-      end
   end
 end
 
