@@ -14,7 +14,7 @@
  */
 import { ByteBuffer }, * as bb from "std:bytebuffer"
 import { BinaryOp, TypeExpr } from "src/syntax/ast.nx"
-import { vt_i32, vt_i64,
+import { vt_i32, vt_i64, vt_f32, vt_f64,
          op_i32_eq, op_i32_ne, op_i32_lt_s, op_i32_gt_s, op_i32_le_s, op_i32_ge_s,
          op_i32_add, op_i32_sub, op_i32_mul, op_i32_xor,
          op_i64_eq, op_i64_ne, op_i64_lt_s, op_i64_le_s, op_i64_gt_s, op_i64_ge_s,
@@ -28,7 +28,7 @@ import { vt_i32, vt_i64,
 import { TyI64 } from "src/syntax/ast.nx"
 import { SymbolNotFound, CodegenError, SkBinaryOp } from "src/backend/errors.nx"
 
-/** Unify the operand types of a `BinaryOp` to a single wasm-friendly valtype: short-circuits to `TyBool` for `OpAnd`/`OpOr`, widens mixed i32/i64 to i64 (so the emitted opcode operands match), and otherwise returns the LHS type. Callers use this to insert any needed coercions before `emit_binary`. */
+/** Unify the operand types of a `BinaryOp` to a single wasm-friendly valtype: short-circuits to `TyBool` for `OpAnd`/`OpOr`, for the float-tagged ops (`OpF*`) picks whichever operand is a float so an i64-erased operand (a type variable instantiated at a float type) gets bit-reinterpreted to the float slot the opcode needs, widens mixed i32/i64 to i64, and otherwise returns the LHS type. Callers use this to insert any needed coercions before `emit_binary`. */
 export let binary_operand_type = fn (
   op: BinaryOp,
   lhs_type: TypeExpr,
@@ -42,6 +42,21 @@ export let binary_operand_type = fn (
   end
   let lt_vt = wdefs.type_to_valtype(typ: lt)
   let rt_vt = wdefs.type_to_valtype(typ: rt)
+  // Float-tagged ops (OpFAdd..OpFGe) demand float operands. When the operand
+  // types disagree (one side is an i64-erased generic value carrying float
+  // bits, the other a concrete float), choose the float side so emit_coercion
+  // reinterprets the erased operand into the f32/f64 slot the opcode needs.
+  match op do
+    | OpFAdd | OpFSub | OpFMul | OpFDiv
+    | OpFEq | OpFNe | OpFLt | OpFLe | OpFGt | OpFGe ->
+      if lt_vt == rt_vt then return lt end
+      let l_float = lt_vt == vt_f64 || lt_vt == vt_f32
+      let r_float = rt_vt == vt_f64 || rt_vt == vt_f32
+      if l_float then return lt end
+      if r_float then return rt end
+      return lt
+    | _ -> ()
+  end
   if lt_vt == rt_vt then return lt end
   // Mixed i32/i64 widens to i64 so the wasm opcode operands match.
   if (lt_vt == vt_i32 && rt_vt == vt_i64) || (lt_vt == vt_i64 && rt_vt == vt_i32) then
@@ -63,6 +78,12 @@ export let emit_binary = fn (
   let use_f32 = match wdefs.peel_linear(typ: operand_type) do
     | TyF32 -> true | _ -> false
   end
+  // Polymorphic comparators (==,!=,<,<=,>,>=) carry their generic Op* tag even
+  // when the operands are floats. Detect float operands so those arms emit the
+  // f32/f64 compare opcode instead of an i64/i32 one against float stack values.
+  let use_float = match wdefs.peel_linear(typ: operand_type) do
+    | TyF32 | TyF64 -> true | _ -> false
+  end
   let opcode = match op do
     | OpAdd -> match use_i32 do | true -> op_i32_add | false -> op_i64_add end
     | OpSub -> match use_i32 do | true -> op_i32_sub | false -> op_i64_sub end
@@ -72,12 +93,12 @@ export let emit_binary = fn (
     | OpFSub -> match use_f32 do | true -> op_f32_sub | false -> op_f64_sub end
     | OpFMul -> match use_f32 do | true -> op_f32_mul | false -> op_f64_mul end
     | OpFDiv -> match use_f32 do | true -> op_f32_div | false -> op_f64_div end
-    | OpEq -> match use_i32 do | true -> op_i32_eq | false -> op_i64_eq end
-    | OpNe -> match use_i32 do | true -> op_i32_ne | false -> op_i64_ne end
-    | OpLt -> match use_i32 do | true -> op_i32_lt_s | false -> op_i64_lt_s end
-    | OpLe -> match use_i32 do | true -> op_i32_le_s | false -> op_i64_le_s end
-    | OpGt -> match use_i32 do | true -> op_i32_gt_s | false -> op_i64_gt_s end
-    | OpGe -> match use_i32 do | true -> op_i32_ge_s | false -> op_i64_ge_s end
+    | OpEq -> match use_float do | true -> match use_f32 do | true -> op_f32_eq | false -> op_f64_eq end | false -> match use_i32 do | true -> op_i32_eq | false -> op_i64_eq end end
+    | OpNe -> match use_float do | true -> match use_f32 do | true -> op_f32_ne | false -> op_f64_ne end | false -> match use_i32 do | true -> op_i32_ne | false -> op_i64_ne end end
+    | OpLt -> match use_float do | true -> match use_f32 do | true -> op_f32_lt | false -> op_f64_lt end | false -> match use_i32 do | true -> op_i32_lt_s | false -> op_i64_lt_s end end
+    | OpLe -> match use_float do | true -> match use_f32 do | true -> op_f32_le | false -> op_f64_le end | false -> match use_i32 do | true -> op_i32_le_s | false -> op_i64_le_s end end
+    | OpGt -> match use_float do | true -> match use_f32 do | true -> op_f32_gt | false -> op_f64_gt end | false -> match use_i32 do | true -> op_i32_gt_s | false -> op_i64_gt_s end end
+    | OpGe -> match use_float do | true -> match use_f32 do | true -> op_f32_ge | false -> op_f64_ge end | false -> match use_i32 do | true -> op_i32_ge_s | false -> op_i64_ge_s end end
     | OpFEq -> match use_f32 do | true -> op_f32_eq | false -> op_f64_eq end
     | OpFNe -> match use_f32 do | true -> op_f32_ne | false -> op_f64_ne end
     | OpFLt -> match use_f32 do | true -> op_f32_lt | false -> op_f64_lt end
