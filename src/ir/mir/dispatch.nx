@@ -1,0 +1,248 @@
+/**
+ * dispatch: runtime cap-handler dispatcher generation for MIR lowering.
+ *
+ * When the program declares two or more handler bindings for the same cap,
+ * cap calls for that cap are lowered (in mir.nx `lower_cap_call`) to a call to
+ * a generated `__dispatch_<Cap>_<method>` function instead of a direct
+ * `__handler_*` call. This module builds those dispatcher functions.
+ *
+ * Each dispatcher reads the cap's runtime handler-register slot
+ * (`__hreg_get(cap_idx)`) and forwards its arguments to the `__handler_*`
+ * method of the dynamically-active handler. A slot value of 0 (no inject active
+ * — zero-initialised memory) falls through to the program's first-declared
+ * handler for the cap, matching the static default path. `inject` saves, sets,
+ * and restores these slots (in mir.nx) so nested injects shadow correctly and a
+ * cap call reached through a helper observes the innermost active handler.
+ *
+ * Single-handler caps never reach here: they keep the cheaper direct call.
+ */
+import {
+  MirFunction,
+  MirParam,
+  MirStmt,
+  MirStmtLet,
+  MirStmtReturn,
+  MirStmtExpr,
+  MirExpr,
+  MirCall,
+  MirCallArg,
+  MirVariable,
+  MirLiteral,
+  MirBinaryOp,
+  MirIf,
+  CapEntry
+} from "src/ir/mir/types.nx"
+import { MirError } from "src/ir/mir/errors.nx"
+import {
+  cap_index,
+  handler_id,
+  cap_needs_runtime_dispatch,
+  handlers_for_cap,
+  lookup_handler_by_cap
+} from "src/ir/mir/cap.nx"
+import { HirCap, HirCapMethod, HirParam, HirHandlerBindingEntry } from "src/ir/hir/types.nx"
+import { TypeExpr, TyI64, LitInt, OpEq } from "src/syntax/ast.nx"
+import { Span } from "src/syntax/token.nx"
+import { Some, None, Option } from "std:option"
+import * as list from "std:list"
+import * as naming from "src/ir/support/naming.nx"
+
+let zero_span = Span(offset: 0, line: 0, col: 0)
+
+/** Build all runtime dispatcher functions for the program: one per method of
+ *  every cap that has two or more handler bindings. `cap_layouts` is the same
+ *  CapEntry list threaded through lowering, so dispatcher cap-indices match the
+ *  ones used at the cap-call site. */
+export let build_cap_dispatchers = fn (
+  caps: [ HirCap ],
+  bindings: [ HirHandlerBindingEntry ],
+  cap_layouts: [ CapEntry ]
+) -> [ MirFunction ] throws { MirError } do
+  return build_dispatchers_go(caps, bindings, cap_layouts, acc: [])
+end
+
+let build_dispatchers_go = fn (
+  caps: [ HirCap ],
+  bindings: [ HirHandlerBindingEntry ],
+  cap_layouts: [ CapEntry ],
+  acc: [ MirFunction ]
+) -> [ MirFunction ] throws { MirError } do
+  match caps do
+    | [] -> return list.reverse(xs: acc)
+    | HirCap(name: cname, methods: ms) :: rest ->
+      if cap_needs_runtime_dispatch(cap_name: cname, bindings) then
+        let method_fns = build_method_dispatchers(
+          cap_name: cname,
+          methods: ms,
+          bindings,
+          cap_layouts,
+          acc: []
+        )
+        return build_dispatchers_go(
+          caps: rest,
+          bindings,
+          cap_layouts,
+          acc: prepend_rev(src: method_fns, dst: acc)
+        )
+      else
+        return build_dispatchers_go(caps: rest, bindings, cap_layouts, acc)
+      end
+  end
+end
+
+let prepend_rev = fn (src: [ MirFunction ], dst: [ MirFunction ]) -> [ MirFunction ] do
+  match src do
+    | [] -> return dst
+    | x :: rest -> return prepend_rev(src: rest, dst: x :: dst)
+  end
+end
+
+let build_method_dispatchers = fn (
+  cap_name: string,
+  methods: [ HirCapMethod ],
+  bindings: [ HirHandlerBindingEntry ],
+  cap_layouts: [ CapEntry ],
+  acc: [ MirFunction ]
+) -> [ MirFunction ] throws { MirError } do
+  match methods do
+    | [] -> return list.reverse(xs: acc)
+    | HirCapMethod(
+      name: mname,
+      requires: _,
+      span: _,
+      throw_row: _,
+      typ_params: tps,
+      typ_ret: ret
+    ) :: rest ->
+      let fn_mir = build_one_dispatcher(
+        cap_name,
+        method_name: mname,
+        params: tps,
+        ret_type: ret,
+        bindings,
+        cap_layouts
+      )
+      return build_method_dispatchers(
+        cap_name,
+        methods: rest,
+        bindings,
+        cap_layouts,
+        acc: fn_mir :: acc
+      )
+  end
+end
+
+/** Build a single dispatcher function for `cap_name.method_name`. */
+let build_one_dispatcher = fn (
+  cap_name: string,
+  method_name: string,
+  params: [ HirParam ],
+  ret_type: TypeExpr,
+  bindings: [ HirHandlerBindingEntry ],
+  cap_layouts: [ CapEntry ]
+) -> MirFunction throws { MirError } do
+  let mir_params = lower_params(params, acc: [])
+  let fwd_args = forward_args(params, acc: [])
+  let cidx = cap_index(cap_name, cap_layouts)
+  let slot_name = "__hreg_slot"
+  // let __hreg_slot = __hreg_get(cap_idx)
+  let load_stmt = MirStmtLet(
+    name: slot_name,
+    typ: TyI64,
+    expr: MirCall(
+      func: "__hreg_get",
+      args: [ MirCallArg(label: "cap_idx", value: MirLiteral(lit: LitInt(val: cidx))) ],
+      ret_type: TyI64
+    )
+  )
+  // Default (slot == 0 → no active inject): forward to the program's
+  // first-declared handler for this cap (the static-default choice).
+  let default_binding = match lookup_handler_by_cap(cap_name, bindings) do
+    | Some(val: b) -> b
+    | None -> ""
+  end
+  let default_call = MirStmtReturn(expr: MirCall(
+    func: naming.handler_func_name(handler_name: default_binding, method_name),
+    args: fwd_args,
+    ret_type
+  ))
+  let handler_names = handlers_for_cap(cap_name, bindings)
+  let if_chain = build_if_chain(
+    slot_name,
+    method_name,
+    fwd_args,
+    ret_type,
+    handler_names,
+    bindings,
+    default_stmts: [ default_call ]
+  )
+  let body = load_stmt :: if_chain
+  return MirFunction(
+    name: naming.cap_dispatch_func_name(cap_name, method_name),
+    params: mir_params,
+    ret_type,
+    body,
+    span: zero_span
+  )
+end
+
+/** Construct the nested if-chain that compares the loaded slot against each
+ *  handler's id and forwards to its method, falling through to `default_stmts`. */
+let build_if_chain = fn (
+  slot_name: string,
+  method_name: string,
+  fwd_args: [ MirCallArg ],
+  ret_type: TypeExpr,
+  handler_names: [ string ],
+  bindings: [ HirHandlerBindingEntry ],
+  default_stmts: [ MirStmt ]
+) -> [ MirStmt ] throws { MirError } do
+  match handler_names do
+    | [] -> return default_stmts
+    | hname :: rest ->
+      let hid = handler_id(binding_name: hname, bindings)
+      let then_stmt = MirStmtReturn(expr: MirCall(
+        func: naming.handler_func_name(handler_name: hname, method_name),
+        args: fwd_args,
+        ret_type
+      ))
+      let else_stmts = build_if_chain(
+        slot_name,
+        method_name,
+        fwd_args,
+        ret_type,
+        handler_names: rest,
+        bindings,
+        default_stmts
+      )
+      let cond = MirBinaryOp(
+        left: MirVariable(name: slot_name),
+        op: OpEq,
+        right: MirLiteral(lit: LitInt(val: hid))
+      )
+      return [ MirStmtExpr(expr: MirIf(
+        cond,
+        then_body: [ then_stmt ],
+        else_body: Some(val: else_stmts)
+      )) ]
+  end
+end
+
+let lower_params = fn (params: [ HirParam ], acc: [ MirParam ]) -> [ MirParam ] do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | HirParam(label: l, name: n, sigil: _, typ: t) :: rest ->
+      return lower_params(params: rest, acc: MirParam(label: l, name: n, typ: t) :: acc)
+  end
+end
+
+let forward_args = fn (params: [ HirParam ], acc: [ MirCallArg ]) -> [ MirCallArg ] do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | HirParam(label: l, name: n, sigil: _, typ: _) :: rest ->
+      return forward_args(
+        params: rest,
+        acc: MirCallArg(label: l, value: MirVariable(name: n)) :: acc
+      )
+  end
+end

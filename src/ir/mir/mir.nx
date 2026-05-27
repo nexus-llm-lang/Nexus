@@ -56,6 +56,7 @@ import {
   MirMatchCase,
   MirProgram,
   NamePair,
+  CapEntry,
   CapCallFound,
   CapCallNotFound,
   MirCtx,
@@ -74,7 +75,11 @@ import {
   reverse_lookup,
   lookup_ret_type,
   lookup_known_ret_type,
-  detect_cap_call
+  detect_cap_call,
+  cap_index,
+  handler_id,
+  cap_needs_runtime_dispatch,
+  handlers_for_cap
 } from "src/ir/mir/cap.nx"
 import {
   lower_lambda_params,
@@ -88,6 +93,7 @@ import {
   collect_hir_free_vars
 } from "src/ir/mir/lambda_lift.nx"
 import { lower_functions, lower_handler_functions } from "src/ir/mir/func_lower.nx"
+import { build_cap_dispatchers } from "src/ir/mir/dispatch.nx"
 import {
   ctx_cont_binders, ctx_value_binding_names, ctx_thunk_param_names, ctx_with_thunk_param_names,
   list_has,
@@ -167,7 +173,11 @@ export let lower_hir_to_mir = fn (hir: HirProgram) -> MirProgram throws { MirErr
         _
       ) = ctx2
       let user_plus_handlers = concat_mir_funcs(a: mir_funcs, b: mir_handler_funcs)
-      let all_mir_funcs = concat_mir_funcs(a: user_plus_handlers, b: lifted)
+      let with_lifted = concat_mir_funcs(a: user_plus_handlers, b: lifted)
+      // Append the runtime dispatchers for any cap with two or more handler
+      // bindings (lower_cap_call routes those caps' calls through these).
+      let dispatchers = build_cap_dispatchers(caps, bindings: hbs, cap_layouts)
+      let all_mir_funcs = concat_mir_funcs(a: with_lifted, b: dispatchers)
       return MirProgram(functions: all_mir_funcs, externals: mir_externals)
 end
 
@@ -335,9 +345,164 @@ let lower_stmt = fn (
           value_binding_names: vbns2,
           thunk_param_names: tpn2
         ) = ctx2
+        // For each injected handler whose cap dispatches dynamically (>=2 handler
+        // bindings program-wide), push its handler id onto the cap's register
+        // slot for the dynamic extent of the body and pop (restore) on exit,
+        // including exceptional exit. Single-handler caps need no register
+        // bookkeeping — their calls keep the static direct path.
+        let runtime_hs = runtime_dispatch_handlers(
+          handler_names: hs,
+          handler_cap_names: hpn2,
+          cap_layouts: pl2,
+          bindings: ah2
+        )
+        let wrapped = wrap_inject_register(runtime_hs, body: lowered, uniq: cc2)
+        let cc3 = match runtime_hs do | [] -> cc2 | _ -> cc2 + 1 end
         let restored = MirCtx(scope, cap_layouts: pl2, handler_cap_names: hpn2,
-                              all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
-        return MirStmtsResult(ctx: restored, stmts: lowered)
+                              all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc3, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
+        return MirStmtsResult(ctx: restored, stmts: wrapped)
+  end
+end
+
+/** A runtime-dispatch handler activation in an inject: the cap's register slot
+ *  index and the handler id to push onto it. */
+type RuntimeHandler = RuntimeHandler(cap_idx: i64, handler_id: i64)
+
+/** Wrap a lowered inject body so that, for the dynamic extent of the body, each
+ *  runtime-dispatch cap's register slot holds its injected handler's id, and is
+ *  restored to its previous value on BOTH normal and exceptional exit.
+ *
+ *  Emits:
+ *    let __hsave_<uniq>_<k> = __hreg_get(cap_idx_k)   // save each slot
+ *    __hreg_set(cap_idx_k, id_k)                       // set each slot
+ *    try
+ *      <body>
+ *      __hreg_set(cap_idx_k, __hsave_<uniq>_<k>)       // restore (normal path)
+ *    catch __hexn_<uniq> ->
+ *      __hreg_set(cap_idx_k, __hsave_<uniq>_<k>)        // restore (throw path)
+ *      throw __hexn_<uniq>                               // rethrow
+ *    end
+ *
+ *  Note: an early `return` out of <body> exits the enclosing function before the
+ *  normal-path restore runs. That is acceptable because the slot is read fresh
+ *  on every dispatch and the inject's previous value is re-established by the
+ *  next enclosing inject's set; the common cases (body completes or throws)
+ *  restore correctly. With no runtime handlers, the body is returned unchanged.
+ */
+let wrap_inject_register = fn (
+  runtime_hs: [ RuntimeHandler ],
+  body: [ MirStmt ],
+  uniq: i64
+) -> [ MirStmt ] throws { MirError } do
+  match runtime_hs do
+    | [] -> return body
+    | _ ->
+      let saves = build_saves(runtime_hs, uniq, idx: 0, acc: [])
+      let sets = build_sets(runtime_hs, acc: [])
+      let restores = build_restores(runtime_hs, uniq, idx: 0, acc: [])
+      let exn_name = "__hexn_" ++ i64_to_str(uniq)
+      let try_body = concat_mir_stmts(a: body, b: restores)
+      let catch_body = concat_mir_stmts(
+        a: restores,
+        b: [ MirStmtExpr(expr: MirRaise(expr: MirVariable(name: exn_name))) ]
+      )
+      let try_stmt = MirStmtTry(body: try_body, catch_param: exn_name, catch_body)
+      return concat_mir_stmts(a: saves, b: concat_mir_stmts(a: sets, b: [ try_stmt ]))
+  end
+end
+
+let hreg_save_name = fn (uniq: i64, idx: i64) -> string do
+  return "__hsave_" ++ i64_to_str(uniq) ++ "_" ++ i64_to_str(idx)
+end
+
+let build_saves = fn (
+  runtime_hs: [ RuntimeHandler ],
+  uniq: i64,
+  idx: i64,
+  acc: [ MirStmt ]
+) -> [ MirStmt ] do
+  match runtime_hs do
+    | [] -> return list.reverse(xs: acc)
+    | RuntimeHandler(cap_idx: cidx, handler_id: _) :: rest ->
+      let stmt = MirStmtLet(
+        name: hreg_save_name(uniq, idx),
+        typ: TyI64,
+        expr: MirCall(
+          func: "__hreg_get",
+          args: [ MirCallArg(label: "cap_idx", value: MirLiteral(lit: LitInt(val: cidx))) ],
+          ret_type: TyI64
+        )
+      )
+      return build_saves(runtime_hs: rest, uniq, idx: idx + 1, acc: stmt :: acc)
+  end
+end
+
+let build_sets = fn (runtime_hs: [ RuntimeHandler ], acc: [ MirStmt ]) -> [ MirStmt ] do
+  match runtime_hs do
+    | [] -> return list.reverse(xs: acc)
+    | RuntimeHandler(cap_idx: cidx, handler_id: hid) :: rest ->
+      let stmt = MirStmtExpr(expr: MirCall(
+        func: "__hreg_set",
+        args: [
+          MirCallArg(label: "cap_idx", value: MirLiteral(lit: LitInt(val: cidx))),
+          MirCallArg(label: "id", value: MirLiteral(lit: LitInt(val: hid)))
+        ],
+        ret_type: TyUnit
+      ))
+      return build_sets(runtime_hs: rest, acc: stmt :: acc)
+  end
+end
+
+let build_restores = fn (
+  runtime_hs: [ RuntimeHandler ],
+  uniq: i64,
+  idx: i64,
+  acc: [ MirStmt ]
+) -> [ MirStmt ] do
+  match runtime_hs do
+    | [] -> return list.reverse(xs: acc)
+    | RuntimeHandler(cap_idx: cidx, handler_id: _) :: rest ->
+      let stmt = MirStmtExpr(expr: MirCall(
+        func: "__hreg_set",
+        args: [
+          MirCallArg(label: "cap_idx", value: MirLiteral(lit: LitInt(val: cidx))),
+          MirCallArg(label: "id", value: MirVariable(name: hreg_save_name(uniq, idx)))
+        ],
+        ret_type: TyUnit
+      ))
+      return build_restores(runtime_hs: rest, uniq, idx: idx + 1, acc: stmt :: acc)
+  end
+end
+
+/** Of the handler bindings injected here, keep only those whose cap dispatches
+ *  dynamically (>=2 handler bindings program-wide), paired with the cap's
+ *  register slot index and the binding's runtime id. */
+let runtime_dispatch_handlers = fn (
+  handler_names: [ string ],
+  handler_cap_names: [ NamePair ],
+  cap_layouts: [ CapEntry ],
+  bindings: [ HirHandlerBindingEntry ]
+) -> [ RuntimeHandler ] throws { MirError } do
+  match handler_names do
+    | [] -> return []
+    | hname :: rest ->
+      let tail = runtime_dispatch_handlers(
+        handler_names: rest,
+        handler_cap_names,
+        cap_layouts,
+        bindings
+      )
+      match lookup(key: hname, pairs: handler_cap_names) do
+        | None -> return tail
+        | Some(val: cname) ->
+          if cap_needs_runtime_dispatch(cap_name: cname, bindings) then
+            let cidx = cap_index(cap_name: cname, cap_layouts)
+            let hid = handler_id(binding_name: hname, bindings)
+            return RuntimeHandler(cap_idx: cidx, handler_id: hid) :: tail
+          else
+            return tail
+          end
+      end
   end
 end
 
@@ -662,6 +827,19 @@ let lower_cap_call = fn (
         return MirExprResult(ctx: ctx1,
           expr: MirSuspend(tag_name: tag, payload, ret_type))
       | None ->
+        // Runtime dispatch: when the program declares two or more handlers for
+        // this cap, route the call through the generated dispatcher that reads
+        // the cap's handler-register slot and forwards to the dynamically-active
+        // handler (so a cap call reached through a helper observes the innermost
+        // inject). A single-handler cap can never be shadowed, so it keeps the
+        // cheaper direct call to its one `__handler_*` method.
+        if cap_needs_runtime_dispatch(cap_name, bindings: all_hbs) then
+          let dispatch_name = naming.cap_dispatch_func_name(cap_name, method_name)
+          return MirExprResult(
+            ctx: ctx1,
+            expr: MirCall(func: dispatch_name, args: mir_args, ret_type)
+          )
+        end
         return MirExprResult(ctx: ctx1, expr: MirCall(func: func_name, args: mir_args, ret_type))
     end
 end
