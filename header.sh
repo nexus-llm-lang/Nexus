@@ -587,17 +587,20 @@ if [ "$RUN_MODE" = "1" ]; then
   # the only thing the user sees on success; on failure replay stderr.
   COMPILE_ELOG=$(mktemp "${TMPDIR:-/tmp}/nexus-run-compile.XXXXXX.log")
   # shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS + SB_COMPILE_FLAGS intentionally word-split.
-  if ! eval wasmtime run \
+  # Capture the real exit code without triggering set -e on failure: initialise
+  # compile_ec=0 then let the || assignment update it when wasmtime exits non-zero.
+  compile_ec=0
+  eval wasmtime run \
       -W \"\$W_FLAGS\" -S threads \
       --dir=. --dir=\"\${TMPDIR:-/tmp}\" \
       \${NEXUS_WASMTIME_ARGS:-} \
       \"\$PAYLOAD_WASM\" build \"\$RUN_INPUT\" -o \"\$RUN_WASM\" --explain-capabilities none \
       ${SB_COMPILE_FLAGS:-} \
-      >/dev/null 2>"$COMPILE_ELOG"; then
-    compile_exit=$?
+      >/dev/null 2>"$COMPILE_ELOG" || compile_ec=$?
+  if [ "$compile_ec" -ne 0 ]; then
     cat "$COMPILE_ELOG" >&2
     rm -f "$COMPILE_ELOG"
-    exit $compile_exit
+    exit "$compile_ec"
   fi
   rm -f "$COMPILE_ELOG"
 
