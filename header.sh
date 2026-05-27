@@ -37,6 +37,13 @@ MANIFEST_FILE=""
 cleanup() {
   [ -n "$TMP" ] && rm -f "$TMP"
   [ -n "$MANIFEST_FILE" ] && rm -f "$MANIFEST_FILE"
+  # Always succeed. This runs as the last command of the EXIT trap chain, so
+  # under `set -e` its return status becomes the script's final exit code. The
+  # content-addressed cache leaves both $TMP and $MANIFEST_FILE empty on the
+  # common path, making the `[ -n ... ]` tests above return 1 — without this
+  # `return 0`, a clean `exit 0` (e.g. `nexus test` with 0 failures) would
+  # surface as exit 1 and fail CI.
+  return 0
 }
 trap cleanup EXIT INT TERM HUP
 
@@ -249,8 +256,16 @@ awk -v head_bytes="$HEAD_BYTES" '
 #     `cp ./nexus /usr/local/bin/`), OR
 #   * no local sha256 tool is available (we cannot verify), OR
 #   * NEXUS_SKIP_STALE_CHECK is set non-empty (escape hatch).
+#
+# The embedded sha256 of the requested payload bytes. Recorded in the
+# manifest as `sha:<name>:<hex>` (parsed to `__sha__ <name> <hex>`). Used
+# both for the stale-launcher check below and as the key for the
+# content-addressed extraction cache further down. Empty if the launcher
+# was built without a sha tool.
+PAYLOAD_SHA=$(awk -v want="$PAYLOAD_NAME" '$1 == "__sha__" && $2 == want { print $3; exit }' "$MANIFEST_FILE")
+
 if [ -z "${NEXUS_SKIP_STALE_CHECK:-}" ]; then
-  EXPECTED_SHA=$(awk -v want="$PAYLOAD_NAME" '$1 == "__sha__" && $2 == want { print $3; exit }' "$MANIFEST_FILE")
+  EXPECTED_SHA="$PAYLOAD_SHA"
   LAUNCHER_DIR=$(dirname -- "$0")
   case "$PAYLOAD_NAME" in
     compiler) SIBLING="$LAUNCHER_DIR/nexus.wasm" ;;
@@ -290,12 +305,69 @@ fi
 SIZE=$(echo "$ENTRY" | awk '{ print $1 }')
 OFFSET=$(echo "$ENTRY" | awk '{ print $2 }')
 
-TMP=$(mktemp) || exit 1
-# Extract the payload bytes [OFFSET, OFFSET+SIZE) of $0. Read the first
-# OFFSET+SIZE bytes and keep the last SIZE: `tail` consumes all of `head`'s
-# output, so neither side closes the pipe early (a `tail … | head -c SIZE`
-# would SIGPIPE `tail`, printing a spurious "Broken pipe" on every run).
-head -c "$((OFFSET + SIZE))" "$0" | tail -c "$SIZE" > "$TMP"
+# The manifest has been fully parsed into shell variables (SIZE, OFFSET,
+# PAYLOAD_SHA); the temp manifest file is no longer needed. Free it now so
+# the run paths that `exec` (and thus never fire the EXIT trap) do not leak
+# it. Clear the variable so the trap's later `rm -f "$MANIFEST_FILE"` is a
+# harmless no-op.
+[ -n "$MANIFEST_FILE" ] && rm -f "$MANIFEST_FILE"
+MANIFEST_FILE=""
+
+# ─── Content-addressed payload cache ─────────────────────────────────────
+# Extract the requested payload to a deterministic, content-addressed path
+# keyed by the payload's embedded sha256, instead of a fresh per-run
+# `mktemp`. This is the file wasmtime loads as the module to run.
+#
+# Why a cache and not mktemp: the `nexus run`/default paths `exec` wasmtime,
+# which REPLACES this shell process — so the `cleanup` EXIT trap never fires
+# and a per-run `mktemp` extraction is leaked. Accumulated over a dev/test
+# session this exhausted the /tmp tmpfs. A content-addressed cache extracts
+# each payload version exactly once, reuses it on every subsequent run (no
+# extraction, no leak), and self-deduplicates (one file per payload sha).
+#
+# PAYLOAD_WASM is the path handed to wasmtime. When the cache is usable it
+# points at the persistent cache file (which the cleanup trap must NOT
+# delete — hence it is kept out of $TMP). When the cache is unusable (no
+# embedded sha, or an unwritable cache dir) we fall back to the old per-run
+# mktemp in $TMP, which the trap still reaps on non-exec paths.
+PAYLOAD_WASM=""
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/nexus"
+if [ -n "$PAYLOAD_SHA" ] && mkdir -p "$CACHE_DIR" 2>/dev/null; then
+  CACHE_WASM="$CACHE_DIR/nexus-$PAYLOAD_SHA.wasm"
+  # Reuse iff the cache file exists and is exactly the expected size. The
+  # size guard rejects a torn/partial file from an interrupted extraction.
+  if [ -f "$CACHE_WASM" ] && [ "$(wc -c < "$CACHE_WASM" 2>/dev/null | tr -d ' ')" = "$SIZE" ]; then
+    PAYLOAD_WASM="$CACHE_WASM"
+  else
+    # Extract to a unique temp in the same dir, then atomically rename into
+    # place. Same-directory `mv` is atomic, so concurrent launchers either
+    # see no file or the complete file — never a torn one. A lost race just
+    # re-extracts harmlessly (last writer wins; bytes are identical).
+    CACHE_TMP=$(mktemp "$CACHE_DIR/nexus-extract.XXXXXX" 2>/dev/null) || CACHE_TMP=""
+    if [ -n "$CACHE_TMP" ]; then
+      # Extract the payload bytes [OFFSET, OFFSET+SIZE) of $0. Read the first
+      # OFFSET+SIZE bytes and keep the last SIZE: `tail` consumes all of
+      # `head`'s output, so neither side closes the pipe early (a
+      # `tail … | head -c SIZE` would SIGPIPE `tail`, printing a spurious
+      # "Broken pipe" on every run).
+      if head -c "$((OFFSET + SIZE))" "$0" | tail -c "$SIZE" > "$CACHE_TMP" \
+         && mv -f "$CACHE_TMP" "$CACHE_WASM" 2>/dev/null; then
+        PAYLOAD_WASM="$CACHE_WASM"
+      else
+        rm -f "$CACHE_TMP"
+      fi
+    fi
+  fi
+fi
+
+if [ -z "$PAYLOAD_WASM" ]; then
+  # Fallback: no usable cache (no embedded sha, or cache dir/extract failed).
+  # Extract to a per-run temp reaped by the cleanup trap. Exec paths cannot
+  # fire the trap, but this branch is the degenerate no-sha case only.
+  TMP=$(mktemp) || exit 1
+  head -c "$((OFFSET + SIZE))" "$0" | tail -c "$SIZE" > "$TMP"
+  PAYLOAD_WASM="$TMP"
+fi
 
 # Compose the wasmtime feature flag set. Both payloads are self-contained
 # core WASM with preview1 imports satisfied by --dir mounts.
@@ -505,6 +577,7 @@ if [ "$RUN_MODE" = "1" ]; then
     [ -n "${RUN_WASM:-}" ] && rm -f "$RUN_WASM"
     [ -n "$TMP" ] && rm -f "$TMP"
     [ -n "$MANIFEST_FILE" ] && rm -f "$MANIFEST_FILE"
+    return 0  # see cleanup(): trap return status must not leak into exit code
   }
   trap cleanup_run EXIT INT TERM HUP
 
@@ -518,7 +591,7 @@ if [ "$RUN_MODE" = "1" ]; then
       -W \"\$W_FLAGS\" -S threads \
       --dir=. --dir=\"\${TMPDIR:-/tmp}\" \
       \${NEXUS_WASMTIME_ARGS:-} \
-      \"\$TMP\" build \"\$RUN_INPUT\" -o \"\$RUN_WASM\" --explain-capabilities none \
+      \"\$PAYLOAD_WASM\" build \"\$RUN_INPUT\" -o \"\$RUN_WASM\" --explain-capabilities none \
       ${SB_COMPILE_FLAGS:-} \
       >/dev/null 2>"$COMPILE_ELOG"; then
     compile_exit=$?
@@ -861,7 +934,7 @@ if [ "$TEST_MODE" = "1" ]; then
   if [ "$TEST_COVERAGE" = "1" ]; then
     COMPILE_EXTRA_ARGS="--coverage"
   fi
-  export TMP W_FLAGS TMPDIR_REAL RESULTS_DIR NEXUS_WASMTIME_ARGS COMPILE_EXTRA_ARGS TEST_COVERAGE UPDATE_GOLDEN
+  export PAYLOAD_WASM W_FLAGS TMPDIR_REAL RESULTS_DIR NEXUS_WASMTIME_ARGS COMPILE_EXTRA_ARGS TEST_COVERAGE UPDATE_GOLDEN
   IDX=0
   PLAN_FILE="$RESULTS_DIR/plan.tsv"
   : > "$PLAN_FILE"
@@ -927,7 +1000,7 @@ if [ "$TEST_MODE" = "1" ]; then
       elog="$RESULTS_DIR/err_$idx.log"
       if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
-          "$TMP" repl \
+          "$PAYLOAD_WASM" repl \
           < "$f" > "$actual" 2>"$elog"; then
         t1=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t1 - t0) / 1000000 ))
@@ -1027,7 +1100,7 @@ if [ "$TEST_MODE" = "1" ]; then
       if [ -n "$NEG_CODE" ]; then
         if wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
             ${NEXUS_WASMTIME_ARGS:-} \
-            "$TMP" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
+            "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
             >/dev/null 2>"$elog"; then
           t1=$(date +%s%N 2>/dev/null || date +%s000000000)
           ms=$(( (t1 - t0) / 1000000 ))
@@ -1082,7 +1155,7 @@ if [ "$TEST_MODE" = "1" ]; then
       # Compile must succeed (the negative is exclusively at run time).
       if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
-          "$TMP" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
+          "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
           >/dev/null 2>"$elog"; then
         t1=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t1 - t0) / 1000000 ))
@@ -1142,7 +1215,7 @@ if [ "$TEST_MODE" = "1" ]; then
       t0=$(date +%s%N 2>/dev/null || date +%s000000000)
       if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
-          "$TMP" build "$f" -o "$wasm" --p3-component --explain-capabilities none \
+          "$PAYLOAD_WASM" build "$f" -o "$wasm" --p3-component --explain-capabilities none \
           >/dev/null 2>"$elog"; then
         t1=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t1 - t0) / 1000000 ))
@@ -1280,7 +1353,7 @@ if [ "$TEST_MODE" = "1" ]; then
       t0=$(date +%s%N 2>/dev/null || date +%s000000000)
       if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
-          "$TMP" build "$f" -o "$wasm" --p2-component --explain-capabilities none \
+          "$PAYLOAD_WASM" build "$f" -o "$wasm" --p2-component --explain-capabilities none \
           >/dev/null 2>"$elog"; then
         t1=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t1 - t0) / 1000000 ))
@@ -1418,7 +1491,7 @@ if [ "$TEST_MODE" = "1" ]; then
     t0=$(date +%s%N 2>/dev/null || date +%s000000000)
     if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
         ${NEXUS_WASMTIME_ARGS:-} \
-        "$TMP" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
+        "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
         >/dev/null 2>"$elog"; then
       t1=$(date +%s%N 2>/dev/null || date +%s000000000)
       ms=$(( (t1 - t0) / 1000000 ))
@@ -1658,7 +1731,7 @@ if [ "$BENCH_MODE" = "1" ]; then
     # Compile via the compiler payload (same pattern as nexus test loop).
     if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
         ${NEXUS_WASMTIME_ARGS:-} \
-        "$TMP" build "$bench_file" -o "$BENCH_WASM" --explain-capabilities none \
+        "$PAYLOAD_WASM" build "$bench_file" -o "$BENCH_WASM" --explain-capabilities none \
         2>/dev/null; then
       echo "{\"name\":\"${bench_name}\",\"error\":\"compile failed\"}"
       BENCH_ANY_FAIL=1
@@ -1870,5 +1943,5 @@ exec wasmtime run \
   -S threads \
   --dir=. --dir="${TMPDIR:-/tmp}" \
   ${NEXUS_WASMTIME_ARGS:-} \
-  "$TMP" "$@"
+  "$PAYLOAD_WASM" "$@"
 #__NEXUS_PAYLOAD_MANIFEST__
