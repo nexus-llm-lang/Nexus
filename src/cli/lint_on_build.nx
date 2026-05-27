@@ -1,0 +1,195 @@
+/**
+ * cli/lint_on_build: run the lint engine at the tail of the static-check
+ * pipeline (after typecheck) so `nexus build` / `nexus typecheck` perform full
+ * static checking, not just typechecking.
+ *
+ * The lint engine here is the same AST-driven pack used by the standalone
+ * `nexus lint` subcommand (src/lint/lint.nx + src/lint/rules/design_authority.nx),
+ * run over the already-parsed AST and raw source.  Findings render through the
+ * same `[Lxxxx]` format as the standalone path (format_finding) and are written
+ * to stderr alongside the compiler's other diagnostics.
+ *
+ * Severity model on the build path:
+ *   - default              every finding is non-fatal (warning / note); the
+ *                          build proceeds.
+ *   - --lint-level=error   promote WARNING-severity findings to errors that gate
+ *                          the build.  Advisory rules (see advisory_codes) are
+ *                          NEVER promoted by this blanket switch.
+ *   - --deny=Lxxxx,Lyyyy   promote the named rule codes to gating errors.  This
+ *                          is the only way to escalate an advisory rule, and it
+ *                          requires naming the code explicitly.
+ *   - --no-lint            skip lint entirely on the build path.
+ *
+ * Note severity (LintInfo, e.g. L0100 cognitive-complexity) is never promoted
+ * by either switch — it informs only.  Inline `// lint:allow ...` suppression
+ * is honoured via apply_suppressions before any promotion is applied.
+ *
+ * `run_lint_on_build` returns the count of findings promoted to errors; the
+ * driver halts before codegen (non-zero exit) when that count is positive.
+ */
+
+import * as str from "std:str"
+import * as list from "std:list"
+import { Console } from "std:stdio"
+import { Option, Some, None } from "std:option"
+import { Program } from "src/syntax/ast.nx"
+import { LintFinding, LintSeverity, LintWarning, LintInfo, LintError } from "src/lint/types.nx"
+import { lint_program, format_finding } from "src/lint/lint.nx"
+import { apply_suppressions } from "src/lint/suppress.nx"
+import { lint_design_authority } from "src/lint/rules/design_authority.nx"
+
+/** Escalation policy for lint findings on the build path. */
+export type LintBuildPolicy = LintBuildPolicy(
+  enabled: bool,
+  level_error: bool,
+  deny_codes: [ string ]
+)
+
+/** Build a policy from the parsed global flags. `--no-lint` clears `enabled`. */
+export let make_lint_build_policy = fn (
+  no_lint: bool,
+  level_error: bool,
+  deny: Option<string>
+) -> LintBuildPolicy do
+  let deny_codes = match deny do
+    | None -> []
+    | Some(val: spec) -> split_deny_codes(spec)
+  end
+  return LintBuildPolicy(enabled: !no_lint, level_error, deny_codes)
+end
+
+/** Split a `--deny=L0002,L0007` value into trimmed, non-empty codes. */
+let split_deny_codes = fn (spec: string) -> [ string ] do
+  let parts = str.split(s: spec, sep: ",")
+  return trim_nonempty(xs: parts, acc: [])
+end
+
+let trim_nonempty = fn (xs: [ string ], acc: [ string ]) -> [ string ] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | p :: rest ->
+      let t = str.trim(s: p)
+      if str.length(s: t) == 0 then return trim_nonempty(xs: rest, acc) end
+      return trim_nonempty(xs: rest, acc: t :: acc)
+  end
+end
+
+/** Advisory rule codes: findings the blanket `--lint-level=error` switch must
+ *  not promote.  These judge intent rather than a likely bug, so escalating
+ *  them to a hard error requires naming the code via `--deny`.  L0006 flags a
+ *  design-authority comment claim without a citation.
+ */
+let advisory_codes = fn () -> [ string ] do
+  return [ "L0006" ]
+end
+
+let code_in = fn (code: string, xs: [ string ]) -> bool do
+  match xs do
+    | [] -> return false
+    | c :: rest ->
+      if c == code then return true end
+      return code_in(code, xs: rest)
+  end
+end
+
+let is_advisory = fn (code: string) -> bool do
+  return code_in(code, xs: advisory_codes())
+end
+
+/** Decide whether a finding should be promoted to a gating error under the
+ *  policy.
+ *
+ *  `--deny=<code>` is an explicit opt-in: it promotes the named code whatever
+ *  its source severity, so naming `L0006` (or any note-severity rule) escalates
+ *  it.  This is the only path that can gate an advisory rule.
+ *
+ *  `--lint-level=error` is a blanket switch: it promotes WARNING-severity
+ *  findings (the "likely bug" class) but never NOTE-severity findings, and
+ *  never advisory codes (which judge intent rather than a likely bug).
+ */
+let should_promote = fn (code: string, severity: LintSeverity, policy: LintBuildPolicy) -> bool do
+  match policy do | LintBuildPolicy(enabled: _, level_error, deny_codes) ->
+    if code_in(code, xs: deny_codes) then return true end
+    let is_warning = match severity do
+      | LintWarning -> true
+      | LintInfo -> false
+      | LintError -> true
+    end
+    if level_error && is_warning && !is_advisory(code) then return true end
+    return false
+  end
+end
+
+/** Rewrite a finding's severity to LintError. */
+let promote_finding = fn (f: LintFinding) -> LintFinding do
+  match f do | LintFinding(code, severity: _, message, fix_it, span) ->
+    return LintFinding(code, severity: LintError, message, fix_it, span)
+  end
+end
+
+/** Apply the escalation policy to every finding, returning the (possibly
+ *  promoted) findings in source order. */
+let apply_policy = fn (
+  findings: [ LintFinding ],
+  policy: LintBuildPolicy,
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  match findings do
+    | [] -> return list.reverse(xs: acc)
+    | f :: rest ->
+      let f2 = match f do | LintFinding(code, severity, message: _, fix_it: _, span: _) ->
+        if should_promote(code, severity, policy) then promote_finding(f) else f end
+      end
+      return apply_policy(findings: rest, policy, acc: f2 :: acc)
+  end
+end
+
+/** Count findings at LintError severity (the gating count). */
+let count_errors = fn (findings: [ LintFinding ]) -> i64 do
+  match findings do
+    | [] -> return 0
+    | LintFinding(code: _, severity, message: _, fix_it: _, span: _) :: rest ->
+      let this = match severity do
+        | LintWarning -> 0
+        | LintInfo -> 0
+        | LintError -> 1
+      end
+      return this + count_errors(findings: rest)
+  end
+end
+
+/** Emit each finding to stderr in the standalone-lint text format. */
+let emit_findings = fn (file: string, findings: [ LintFinding ]) -> unit require { Console } do
+  match findings do
+    | [] -> return ()
+    | f :: rest ->
+      Console.eprintln(val: format_finding(file, f))
+      return emit_findings(file, findings: rest)
+  end
+end
+
+/** Run the lint engine over an already-parsed program at the tail of the
+ *  static-check pipeline.  `src` is the raw source (needed by the
+ *  comment-scanning design-authority rule and by suppression directives).
+ *
+ *  Returns the number of findings promoted to gating errors.  When this is
+ *  positive the caller must halt the build before codegen with a non-zero exit.
+ *  When lint is disabled (`--no-lint`) this is a no-op returning 0.
+ */
+export let run_lint_on_build = fn (
+  prog: Program,
+  src: string,
+  file: string,
+  policy: LintBuildPolicy
+) -> i64 require { Console } do
+  match policy do | LintBuildPolicy(enabled, level_error: _, deny_codes: _) ->
+    if !enabled then return 0 end
+  end
+  let ast_findings = lint_program(prog)
+  let src_findings = lint_design_authority(src)
+  let raw = list.concat(xs: ast_findings, ys: src_findings)
+  let suppressed = apply_suppressions(src, findings: raw)
+  let promoted = apply_policy(findings: suppressed, policy, acc: [])
+  emit_findings(file, findings: promoted)
+  return count_errors(findings: promoted)
+end
