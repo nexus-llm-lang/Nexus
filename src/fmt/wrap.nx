@@ -1,0 +1,317 @@
+/**
+ * wrap: Pass-2 line-length wrapper for the Nexus formatter.
+ *
+ * Lines exceeding 100 columns are broken at the first comma-separated group
+ * at the outermost nesting level (first `(`, `[`, or `{` with at least one
+ * comma and a matching close on the same line).
+ *
+ * Expanded form:
+ *   prefix_up_to_and_including_opener + '\n'
+ *   (indent+2)item1,'\n'
+ *   ...
+ *   (indent+2)last_item'\n'
+ *   indent + closer + suffix + '\n'
+ *
+ * Idempotency guarantee: wrapping is skipped when the prefix line (content
+ * through the opener) already exceeds max_line_len — no infinite-wrap loop.
+ * After a single wrap, each piece is <= max_line_len (or can't be split),
+ * so a second pass sees lines within budget and emits them unchanged.
+ *
+ * Not in this pass (deferred):
+ *   - Joining already-expanded groups that fit on one line (pass-3).
+ *   - Wrapping import statements or type-parameter lists.
+ *   - Canonical re-indentation by do/end depth.
+ */
+
+import * as str from "std:str"
+import * as char from "std:char"
+import * as bb from "std:bytebuffer"
+import * as list from "std:list"
+import { Option, Some, None } from "std:option"
+import {
+  scan_block_comment,
+  scan_string,
+  scan_char,
+  scan_bracket_string,
+  find_line_end,
+  rtrim_in_s
+} from "src/fmt/scan.nx"
+
+let max_line_len = 100
+
+// GroupInfo describes the outermost wrappable group found in a single line.
+//   open_pos: byte offset of the opening delimiter within the line string.
+//   close_pos: byte offset of the closing delimiter.
+//   commas: offsets of commas at depth 1, in order.
+type GroupInfo = GroupInfo(open_pos: i64, close_pos: i64, commas: [ i64 ])
+
+// skip_balanced: advance past balanced delimiter pairs.
+// Called with depth=1 (just entered a group); returns position just past
+// the balancing close-bracket (depth=0). Skips protected regions.
+let skip_balanced = fn (s: string, len: i64, pos: i64, depth: i64) -> i64 do
+  if pos >= len then return len end
+  if depth <= 0 then return pos end
+  let b = str.byte_at(s, idx: pos)
+  if b == '/' && pos + 1 < len && str.byte_at(s, idx: pos + 1) == '*' then
+    let end_pos = scan_block_comment(src: s, pos: pos + 2, len, depth: 1)
+    return skip_balanced(s, len, pos: end_pos, depth)
+  end
+  if b == '"' then
+    let end_pos = scan_string(src: s, pos: pos + 1, len)
+    return skip_balanced(s, len, pos: end_pos, depth)
+  end
+  if b == '\'' then
+    match scan_char(src: s, pos: pos + 1, len) do
+    | Some(val: end_pos) -> return skip_balanced(s, len, pos: end_pos, depth)
+    | None -> return skip_balanced(s, len, pos: pos + 1, depth)
+    end
+  end
+  if b == '[' && pos + 1 < len && str.byte_at(s, idx: pos + 1) == '='
+     && pos + 2 < len && str.byte_at(s, idx: pos + 2) == '[' then
+    let end_pos = scan_bracket_string(src: s, pos: pos + 3, len)
+    return skip_balanced(s, len, pos: end_pos, depth)
+  end
+  if b == '(' || b == '[' || b == '{' then
+    return skip_balanced(s, len, pos: pos + 1, depth: depth + 1)
+  end
+  if b == ')' || b == ']' || b == '}' then
+    return skip_balanced(s, len, pos: pos + 1, depth: depth - 1)
+  end
+  return skip_balanced(s, len, pos: pos + 1, depth)
+end
+
+// scan_group_contents: scan inside a group (after the opening delimiter),
+// collecting comma positions at depth 1. Returns None if the group has no
+// matching close on the same line, has no commas, or the line ends in a
+// comment before the close.
+let scan_group_contents = fn (
+  s: string,
+  len: i64,
+  pos: i64,
+  open_pos: i64,
+  commas: [ i64 ]
+) -> Option<GroupInfo> do
+  if pos >= len then return None end
+  let b = str.byte_at(s, idx: pos)
+  if b == '/' && pos + 1 < len && str.byte_at(s, idx: pos + 1) == '/' then
+    return None
+  end
+  if b == '/' && pos + 1 < len && str.byte_at(s, idx: pos + 1) == '*' then
+    let end_pos = scan_block_comment(src: s, pos: pos + 2, len, depth: 1)
+    return scan_group_contents(s, len, pos: end_pos, open_pos, commas)
+  end
+  if b == '"' then
+    let end_pos = scan_string(src: s, pos: pos + 1, len)
+    return scan_group_contents(s, len, pos: end_pos, open_pos, commas)
+  end
+  if b == '\'' then
+    match scan_char(src: s, pos: pos + 1, len) do
+    | Some(val: end_pos) -> return scan_group_contents(s, len, pos: end_pos, open_pos, commas)
+    | None -> return scan_group_contents(s, len, pos: pos + 1, open_pos, commas)
+    end
+  end
+  if b == '[' && pos + 1 < len && str.byte_at(s, idx: pos + 1) == '='
+     && pos + 2 < len && str.byte_at(s, idx: pos + 2) == '[' then
+    let end_pos = scan_bracket_string(src: s, pos: pos + 3, len)
+    return scan_group_contents(s, len, pos: end_pos, open_pos, commas)
+  end
+  if b == '(' || b == '[' || b == '{' then
+    let end_pos = skip_balanced(s, len, pos: pos + 1, depth: 1)
+    return scan_group_contents(s, len, pos: end_pos, open_pos, commas)
+  end
+  if b == ',' then
+    return scan_group_contents(s, len, pos: pos + 1, open_pos, commas: pos :: commas)
+  end
+  if b == ')' || b == ']' || b == '}' then
+    if list.is_empty(xs: commas) then return None end
+    return Some(val: GroupInfo(open_pos, close_pos: pos, commas: list.reverse(xs: commas)))
+  end
+  return scan_group_contents(s, len, pos: pos + 1, open_pos, commas)
+end
+
+// find_group: find the leftmost delimiter group in a line that has at least
+// one comma and a matching close on the same line.
+let find_group = fn (s: string, len: i64, pos: i64) -> Option<GroupInfo> do
+  if pos >= len then return None end
+  let b = str.byte_at(s, idx: pos)
+  if b == '/' && pos + 1 < len && str.byte_at(s, idx: pos + 1) == '/' then
+    return None
+  end
+  if b == '/' && pos + 1 < len && str.byte_at(s, idx: pos + 1) == '*' then
+    let end_pos = scan_block_comment(src: s, pos: pos + 2, len, depth: 1)
+    return find_group(s, len, pos: end_pos)
+  end
+  if b == '"' then
+    let end_pos = scan_string(src: s, pos: pos + 1, len)
+    return find_group(s, len, pos: end_pos)
+  end
+  if b == '\'' then
+    match scan_char(src: s, pos: pos + 1, len) do
+    | Some(val: end_pos) -> return find_group(s, len, pos: end_pos)
+    | None -> return find_group(s, len, pos: pos + 1)
+    end
+  end
+  if b == '[' && pos + 1 < len && str.byte_at(s, idx: pos + 1) == '='
+     && pos + 2 < len && str.byte_at(s, idx: pos + 2) == '[' then
+    let end_pos = scan_bracket_string(src: s, pos: pos + 3, len)
+    return find_group(s, len, pos: end_pos)
+  end
+  if b == '(' || b == '[' || b == '{' then
+    let result = scan_group_contents(s, len, pos: pos + 1, open_pos: pos, commas: [])
+    match result do
+    | Some(_) -> return result
+    | None ->
+      let after = skip_balanced(s, len, pos: pos + 1, depth: 1)
+      return find_group(s, len, pos: after)
+    end
+  end
+  return find_group(s, len, pos: pos + 1)
+end
+
+// ltrim_in: first non-space position in s[pos..end_p).
+let ltrim_in = fn (s: string, pos: i64, end_p: i64) -> i64 do
+  if pos >= end_p then return end_p end
+  let b = str.byte_at(s, idx: pos)
+  if b == ' ' then return ltrim_in(s, pos: pos + 1, end_p) end
+  return pos
+end
+
+// push_n_spaces: push n ASCII space bytes to buf.
+let push_n_spaces = fn (buf: %ByteBuffer, n: i64) -> %ByteBuffer do
+  if n <= 0 then return buf end
+  let %buf2 = bb.push_byte(buf: %buf, byte: char.ord(c: ' '))
+  return push_n_spaces(buf: %buf2, n: n - 1)
+end
+
+// emit_items: recursively emit each comma-separated item on its own line.
+//   item_start: start of the current item in `line`.
+//   remaining_commas: remaining comma positions (in `line`).
+//   close_pos: position of the closing delimiter in `line`.
+//   indent_len: number of leading spaces on the original line.
+// Each non-last item is followed by a comma; the last item is not.
+// Items are trimmed of leading/trailing spaces.
+let emit_items = fn (
+  line: string,
+  item_start: i64,
+  remaining_commas: [ i64 ],
+  close_pos: i64,
+  buf: %ByteBuffer,
+  indent_len: i64
+) -> %ByteBuffer do
+  let cont = indent_len + 2
+  match remaining_commas do
+  | [] ->
+    let ls = ltrim_in(s: line, pos: item_start, end_p: close_pos)
+    let rs = rtrim_in_s(s: line, start: ls, end_p: close_pos)
+    let %b1 = push_n_spaces(buf: %buf, n: cont)
+    let item_len = if rs > ls then rs - ls else 0 end
+    let item = str.byte_substring(s: line, start: ls, len: item_len)
+    let %b2 = bb.push_string(buf: %b1, s: item)
+    return bb.push_byte(buf: %b2, byte: char.ord(c: '\n'))
+  | cp :: rest ->
+    let ls = ltrim_in(s: line, pos: item_start, end_p: cp)
+    let rs = rtrim_in_s(s: line, start: ls, end_p: cp)
+    let %b1 = push_n_spaces(buf: %buf, n: cont)
+    let item_len = if rs > ls then rs - ls else 0 end
+    let item = str.byte_substring(s: line, start: ls, len: item_len)
+    let %b2 = bb.push_string(buf: %b1, s: item)
+    let %b3 = bb.push_byte(buf: %b2, byte: char.ord(c: ','))
+    let %b4 = bb.push_byte(buf: %b3, byte: char.ord(c: '\n'))
+    return emit_items(
+      line,
+      item_start: cp + 1,
+      remaining_commas: rest,
+      close_pos,
+      buf: %b4,
+      indent_len
+    )
+  end
+end
+
+// count_leading_spaces: count leading ASCII space bytes in s starting at pos.
+// (After pass 1, there are no leading tabs in code lines.)
+let count_leading_spaces = fn (s: string, len: i64, pos: i64) -> i64 do
+  if pos >= len then return len end
+  let b = str.byte_at(s, idx: pos)
+  if b != ' ' then return pos end
+  return count_leading_spaces(s, len, pos: pos + 1)
+end
+
+// try_wrap_line: attempt to wrap one line. Returns None when the line fits
+// within max_line_len or when no wrappable group is found. Otherwise
+// returns Some(wrapped) where `wrapped` is the multi-line replacement
+// (all lines joined, each terminated by '\n').
+//
+// The idempotency guard: if the prefix (content up through the opener)
+// already exceeds max_line_len, wrapping is skipped — the line is left
+// as-is so a second pass produces identical output.
+let try_wrap_line = fn (line: string, line_len: i64) -> Option<string> do
+  if line_len <= 100 then return None end
+  let indent_len = count_leading_spaces(s: line, len: line_len, pos: 0)
+  match find_group(s: line, len: line_len, pos: 0) do
+  | None -> return None
+  | Some(val: GroupInfo(open_pos, close_pos, commas)) ->
+    let prefix_len = open_pos + 1
+    if prefix_len > 100 then return None end
+    let %buf = bb.empty()
+    let prefix = str.byte_substring(s: line, start: 0, len: prefix_len)
+    let %b1 = bb.push_string(buf: %buf, s: prefix)
+    let %b2 = bb.push_byte(buf: %b1, byte: char.ord(c: '\n'))
+    let %b3 = emit_items(
+      line,
+      item_start: open_pos + 1,
+      remaining_commas: commas,
+      close_pos,
+      buf: %b2,
+      indent_len
+    )
+    let %b4 = push_n_spaces(buf: %b3, n: indent_len)
+    let close_char = str.byte_at(s: line, idx: close_pos)
+    let %b5 = bb.push_byte(buf: %b4, byte: char.ord(c: close_char))
+    let suffix_start = close_pos + 1
+    let suffix_len_v = line_len - suffix_start
+    let %b6 = if suffix_len_v > 0 then
+      let suffix = str.byte_substring(s: line, start: suffix_start, len: suffix_len_v)
+      bb.push_string(buf: %b5, s: suffix)
+    else
+      %b5
+    end
+    let result = bb.to_string(buf: &b6)
+    bb.free(buf: %b6)
+    return Some(val: result)
+  end
+end
+
+// wrap_lines_go: process source line by line, wrapping lines that exceed
+// max_line_len.
+let wrap_lines_go = fn (src: string, len: i64, pos: i64, buf: %ByteBuffer) -> %ByteBuffer do
+  if pos >= len then return buf end
+  let line_end = find_line_end(src, len, pos)
+  let line_len = line_end - pos
+  let line = str.byte_substring(s: src, start: pos, len: line_len)
+  let %buf2 = match try_wrap_line(line, line_len) do
+    | None ->
+      let %bx = bb.push_string(buf: %buf, s: line)
+      bb.push_byte(buf: %bx, byte: char.ord(c: '\n'))
+    | Some(val: wrapped) ->
+      let %bx = bb.push_string(buf: %buf, s: wrapped)
+      bb.push_byte(buf: %bx, byte: char.ord(c: '\n'))
+  end
+  let next_pos = if line_end < len then line_end + 1 else len end
+  return wrap_lines_go(src, len, pos: next_pos, buf: %buf2)
+end
+
+// wrap_long_lines: pass-2 entry point. Pure (no I/O).
+// Takes pass-1 output; returns output with long lines wrapped.
+// Loops to fixpoint: one pass wraps the leftmost group per line; a wrapped
+// continuation line can itself still exceed the budget, so re-run until
+// stable so a single `nexus fmt` is idempotent.
+export let wrap_long_lines = fn (src: string) -> string do
+  let len = str.byte_length(s: src)
+  if len == 0 then return src end
+  let %buf = bb.empty()
+  let %final_buf = wrap_lines_go(src, len, pos: 0, buf: %buf)
+  let result = bb.to_string(buf: &final_buf)
+  bb.free(buf: %final_buf)
+  if result == src then return result else return wrap_long_lines(src: result) end
+end
