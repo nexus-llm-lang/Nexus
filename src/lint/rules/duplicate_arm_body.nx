@@ -1,0 +1,262 @@
+/**
+ * duplicate_arm_body: L0010 rule — a `match` with two or more arms whose
+ * BODIES are structurally identical, collapsible into a single or-pattern arm
+ * (`p1 | p2 -> body`).
+ *
+ * Advisory (LintInfo) only — never trips the `--check` CI gate, mirroring
+ * L0006 / L0007 / L0100.
+ *
+ * Rationale (SKILL.md § "Or-patterns to share an arm body"): duplicated arm
+ * bodies rot — when one arm's body changes the others silently drift.  Fusing
+ * the alternatives with `|` keeps the single body authoritative.
+ *
+ * Position: an or-pattern rewrite preserves the match's value, so it is valid
+ * in EVERY position the match itself appears (statement or expression).  This
+ * rule therefore fires at every `ExprMatch`, unlike the statement-only L0007.
+ *
+ * Detection-only: no fix-it.  A correct or-pattern fusion must (a) verify the
+ * fused alternatives bind the same variable set with compatible types and
+ * (b) reconstruct the combined `p1 | p2` pattern from source spans; neither is
+ * structurally guaranteed from arm-body equality alone (SKILL.md warns that
+ * bodies that *look* identical but reference different binders are genuinely
+ * different — our structural equality already excludes those, but the binder-
+ * compatibility of the FUSED PATTERNS is a separate, type-level question).  So
+ * the rule reports and leaves the rewrite to the author.
+ *
+ * Excluded (NOT flagged):
+ *   - matches with fewer than two arms (nothing to fuse);
+ *   - the case where no two bodies are structurally equal.
+ *
+ * Structural body equality (src/lint/rules/ast_eq.nx) compares the arm-body
+ * statement lists span-insensitively and is biased to `false`, so two arms are
+ * flagged only when their bodies are provably identical — `use(x)` vs `use(y)`
+ * differ (distinct `ExprVariable`), so they are NOT flagged, matching SKILL's
+ * "different binders are genuinely different bodies" carve-out.
+ */
+
+import { Option, None } from "std:option"
+import { Span } from "src/syntax/token.nx"
+import {
+  SpannedExpr, Expr, ExprMatch, ExprLambda, ExprCall, ExprCallExpr,
+  ExprConstructor, ExprArray, ExprList, ExprRecord, ExprIndex, ExprFieldAccess,
+  ExprBinaryOp, ExprUnaryOp, ExprIf, ExprWhile, ExprFor, ExprRaise, ExprForce,
+  ExprHandler,
+  SpannedStmt, Stmt, StmtLet, StmtLetPattern, StmtExpr, StmtReturn,
+  StmtAssign, StmtIndexAssign, StmtTry, StmtInject,
+  MatchCase, CatchArm, HandlerArm, Function,
+  CallArg, CtorArg, NamedExpr
+} from "src/syntax/ast.nx"
+import { LintFinding, LintInfo } from "src/lint/types.nx"
+import { stmts_eq } from "src/lint/rules/ast_eq.nx"
+
+let l0010_message = fn () -> string do
+  return "two or more `match` arms have structurally identical bodies; fuse the"
+    ++ " alternatives into a single or-pattern arm (`p1 | p2 -> body`) so the"
+    ++ " shared body stays authoritative"
+end
+
+let make_l0010_finding = fn (sp: Span) -> LintFinding do
+  return LintFinding(
+    code: "L0010",
+    severity: LintInfo,
+    message: l0010_message(),
+    fix_it: None,
+    span: sp
+  )
+end
+
+// Does the body `b` appear (structurally) anywhere in the rest list `others`?
+let body_in = fn (b: [ SpannedStmt ], others: [ MatchCase ]) -> bool do
+  match others do
+    | [] -> return false
+    | MatchCase(pattern: _, body) :: rest ->
+      if stmts_eq(a: b, b: body) then return true end
+      return body_in(b, others: rest)
+  end
+end
+
+// Are there two arms among `cases` whose bodies are structurally equal?
+let has_duplicate_body = fn (cases: [ MatchCase ]) -> bool do
+  match cases do
+    | [] -> return false
+    | MatchCase(pattern: _, body) :: rest ->
+      if body_in(b: body, others: rest) then return true end
+      return has_duplicate_body(cases: rest)
+  end
+end
+
+// Flag at the match site when >=2 arms share an identical body.
+let check_match_site = fn (
+  sp: Span,
+  cases: [ MatchCase ],
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  if has_duplicate_body(cases) then return make_l0010_finding(sp) :: acc end
+  return acc
+end
+
+// ── walker ──────────────────────────────────────────────────────────────────
+//
+// Hand-written (like L0007) so the finding anchors at the match node's own
+// SpannedExpr span.  Both statement- and expression-position matches are
+// flagged here (the or-pattern rewrite is position-agnostic).
+
+let walk_stmts = fn (ss: [ SpannedStmt ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match ss do
+    | [] -> return acc
+    | s :: rest ->
+      let acc2 = walk_spanned_stmt(s, acc)
+      return walk_stmts(ss: rest, acc: acc2)
+  end
+end
+
+let walk_spanned_stmt = fn (s: SpannedStmt, acc: [ LintFinding ]) -> [ LintFinding ] do
+  let SpannedStmt(node, span: _) = s
+  match node do
+      | StmtLet(name: _, sigil: _, typ: _, value) | StmtLetPattern(pattern: _, value) ->
+        return walk_expr(e: value, acc)
+      | StmtExpr(expr) -> return walk_expr(e: expr, acc)
+      | StmtReturn(value) | StmtAssign(target: _, value) -> return walk_expr(e: value, acc)
+      | StmtIndexAssign(target, index, value) ->
+        let a1 = walk_expr(e: target, acc)
+        let a2 = walk_expr(e: index, acc: a1)
+        return walk_expr(e: value, acc: a2)
+      | StmtTry(body, catch_arms) ->
+        let a1 = walk_stmts(ss: body, acc)
+        return walk_catch_arms(arms: catch_arms, acc: a1)
+      | StmtInject(handlers, body) ->
+        let a1 = walk_spanned_exprs(es: handlers, acc)
+        return walk_stmts(ss: body, acc: a1)
+    end
+end
+
+let walk_expr = fn (e: SpannedExpr, acc: [ LintFinding ]) -> [ LintFinding ] do
+  let SpannedExpr(node, span) = e
+  match node do
+      | ExprMatch(target, cases) ->
+        let a1 = check_match_site(sp: span, cases, acc)
+        let a2 = walk_expr(e: target, acc: a1)
+        return walk_match_cases(cs: cases, acc: a2)
+      | ExprIf(cond, then_branch, else_branch) ->
+        let a1 = walk_expr(e: cond, acc)
+        let a2 = walk_stmts(ss: then_branch, acc: a1)
+        return walk_stmts(ss: else_branch, acc: a2)
+      | ExprWhile(cond, body) ->
+        let a1 = walk_expr(e: cond, acc)
+        return walk_stmts(ss: body, acc: a1)
+      | ExprFor(var: _, start, end_expr, body) ->
+        let a1 = walk_expr(e: start, acc)
+        let a2 = walk_expr(e: end_expr, acc: a1)
+        return walk_stmts(ss: body, acc: a2)
+      | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
+        return walk_stmts(ss: body, acc)
+      | ExprBinaryOp(left, op: _, right) ->
+        let a1 = walk_expr(e: left, acc)
+        return walk_expr(e: right, acc: a1)
+      | ExprUnaryOp(op: _, operand) -> return walk_expr(e: operand, acc)
+      | ExprCall(func: _, args) -> return walk_call_args(args, acc)
+      | ExprCallExpr(callee, args) ->
+        let a1 = walk_expr(e: callee, acc)
+        return walk_call_args(args, acc: a1)
+      | ExprConstructor(name: _, args, sigil: _) -> return walk_ctor_args(args, acc)
+      | ExprArray(elements) | ExprList(elements) -> return walk_spanned_exprs(es: elements, acc)
+      | ExprRecord(fields) -> return walk_named_exprs(fs: fields, acc)
+      | ExprIndex(target, index) ->
+        let a1 = walk_expr(e: target, acc)
+        return walk_expr(e: index, acc: a1)
+      | ExprFieldAccess(target, field: _) -> return walk_expr(e: target, acc)
+      | ExprRaise(value) | ExprForce(value) -> return walk_expr(e: value, acc)
+      | ExprHandler(coeffect_name: _, requires: _, arms) -> return walk_handler_arms(arms, acc)
+      | _ -> return acc
+    end
+end
+
+let walk_spanned_exprs = fn (es: [ SpannedExpr ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match es do
+    | [] -> return acc
+    | e :: rest ->
+      let acc2 = walk_expr(e: e, acc)
+      return walk_spanned_exprs(es: rest, acc: acc2)
+  end
+end
+
+let walk_call_args = fn (args: [ CallArg ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match args do
+    | [] -> return acc
+    | CallArg(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_call_args(args: rest, acc: acc2)
+  end
+end
+
+let walk_ctor_args = fn (args: [ CtorArg ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match args do
+    | [] -> return acc
+    | CtorArg(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_ctor_args(args: rest, acc: acc2)
+  end
+end
+
+let walk_named_exprs = fn (fs: [ NamedExpr ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match fs do
+    | [] -> return acc
+    | NamedExpr(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_named_exprs(fs: rest, acc: acc2)
+  end
+end
+
+let walk_match_cases = fn (cs: [ MatchCase ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match cs do
+    | [] -> return acc
+    | MatchCase(pattern: _, body) :: rest ->
+      let acc2 = walk_stmts(ss: body, acc)
+      return walk_match_cases(cs: rest, acc: acc2)
+  end
+end
+
+let walk_catch_arms = fn (arms: [ CatchArm ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match arms do
+    | [] -> return acc
+    | CatchArm(pattern: _, body) :: rest ->
+      let acc2 = walk_stmts(ss: body, acc)
+      return walk_catch_arms(arms: rest, acc: acc2)
+  end
+end
+
+let walk_handler_arms = fn (arms: [ HandlerArm ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match arms do
+    | [] -> return acc
+    | HandlerArm(arm, cont_binder: _, span: _) :: rest ->
+      let Function(
+        name: _,
+        is_public: _,
+        type_params: _,
+        params: _,
+        ret_type: _,
+        requires: _,
+        throw_row: _,
+        body,
+        span: _
+      ) = arm
+      let acc2 = walk_stmts(ss: body, acc)
+        return walk_handler_arms(arms: rest, acc: acc2)
+  end
+end
+
+/** Collect L0010 findings across a function body (a list of statements). */
+export let collect_duplicate_arm_bodies_in_stmts = fn (
+  ss: [ SpannedStmt ],
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  return walk_stmts(ss, acc)
+end
+
+/** Collect L0010 findings from a top-level value expression (non-lambda). */
+export let collect_duplicate_arm_bodies_in_expr = fn (
+  e: SpannedExpr,
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  return walk_expr(e, acc)
+end

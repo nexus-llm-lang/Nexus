@@ -1,0 +1,302 @@
+/**
+ * ctor_wildcard_match: L0008 rule — a two-arm `match` of the shape "one
+ * constructor pattern WITH bindings + a bare wildcard fallback", rewritable as
+ * `if let PAT = EXPR then ... else ... end`.
+ *
+ * Advisory (LintInfo) only — never trips the `--check` CI gate, mirroring
+ * L0006 / L0007 / L0100.
+ *
+ * Rationale (SKILL.md § "`if let` over two-arm `match`"): `if let` surfaces the
+ * meaningful destructure as the primary control choice instead of burying it
+ * in match noise.
+ *
+ * Position: SKILL.md states "Both statement-form and expression-form are
+ * supported" for `if let`, so the rewrite is valid in EVERY position the match
+ * appears.  This rule therefore fires at every qualifying `ExprMatch` (unlike
+ * the statement-only L0007 `let` rewrite).
+ *
+ * Detection-only: no fix-it.  A faithful `if let` rewrite must reconstruct the
+ * pattern and both branch bodies from source spans (including re-emitting the
+ * arm bodies as `then` / `else` blocks); that source reconstruction is left to
+ * the author, so the rule reports only.
+ *
+ * Flagged shape (BOTH must hold):
+ *   - exactly two arms;
+ *   - one arm pattern is the bare wildcard `_` (the `else` fallback);
+ *   - the other arm pattern is a single-variant CONSTRUCTOR carrying at least
+ *     one binding field (`F(x)`, `F(a: y, ...)`), and is NOT a list
+ *     constructor (`Cons` / `Nil`).
+ *
+ * Excluded (NOT flagged), per SKILL.md "Skip the rewrite when the constructor
+ * arm has no bindings":
+ *   - a constructor arm with zero binding fields (`TkColon -> true`) — `if let`
+ *     adds syntax without payoff; this includes `PatConstructorWildcard`
+ *     (`F(_)`) and an empty-field `PatConstructor`;
+ *   - the list constructors `Cons` / `Nil` (their flattening is the staircase /
+ *     list-pattern concern, not if-let);
+ *   - record / variable / literal / or- patterns in the non-wildcard arm
+ *     (records are irrefutable → rule #1 `let`; the rest are not the if-let
+ *     shape);
+ *   - matches with anything other than exactly two arms;
+ *   - two-arm matches without a bare-wildcard arm.
+ */
+
+import { Option, None } from "std:option"
+import { Span } from "src/syntax/token.nx"
+import {
+  SpannedExpr, Expr, ExprMatch, ExprLambda, ExprCall, ExprCallExpr,
+  ExprConstructor, ExprArray, ExprList, ExprRecord, ExprIndex, ExprFieldAccess,
+  ExprBinaryOp, ExprUnaryOp, ExprIf, ExprWhile, ExprFor, ExprRaise, ExprForce,
+  ExprHandler,
+  SpannedStmt, Stmt, StmtLet, StmtLetPattern, StmtExpr, StmtReturn,
+  StmtAssign, StmtIndexAssign, StmtTry, StmtInject,
+  MatchCase, CatchArm, HandlerArm, Function,
+  CallArg, CtorArg, NamedExpr,
+  SpannedPattern, Pattern, PatVariable, PatConstructor, PatConstructorWildcard,
+  PatRecord, PatWildcard, PatLiteral, PatOr,
+  RdrName, Unqual, Qual
+} from "src/syntax/ast.nx"
+import { LintFinding, LintInfo } from "src/lint/types.nx"
+
+// The list-shaped constructor names: their two-arm-with-wildcard form is a list
+// peel (staircase / list-flattening concern), not an if-let destructure.
+let is_list_ctor_name = fn (rdr: RdrName) -> bool do
+  let n = match rdr do
+    | Unqual(name) -> name
+    | Qual(alias: _, name) -> name
+  end
+  return n == "Nil" || n == "Cons"
+end
+
+// Is `pat` a single-variant constructor carrying >=1 binding field (and not a
+// list constructor)?  This is the "meaningful destructure" if-let targets.
+let is_binding_ctor = fn (pat: Pattern) -> bool do
+  match pat do
+    | PatConstructor(name, fields, sigil: _) ->
+      if is_list_ctor_name(rdr: name) then return false end
+      // empty-field constructor carries no bindings → skip (per SKILL).
+      match fields do
+        | [] -> return false
+        | _ -> return true
+      end
+    // PatConstructorWildcard `F(_)` carries no bindings → skip.
+    | PatConstructorWildcard(name: _, sigil: _) -> return false
+    | PatVariable(name: _, sigil: _) -> return false
+    | PatRecord(fields: _, has_wildcard: _) -> return false
+    | PatWildcard -> return false
+    | PatLiteral(lit: _) -> return false
+    | PatOr(alts: _) -> return false
+  end
+end
+
+let is_wildcard = fn (pat: Pattern) -> bool do
+  match pat do
+    | PatWildcard -> return true
+    | _ -> return false
+  end
+end
+
+let l0008_message = fn () -> string do
+  return "two-arm `match` of a binding constructor plus a wildcard fallback is"
+    ++ " equivalent to `if let PAT = e then ... else ... end`; prefer `if let`"
+    ++ " to surface the destructure as the primary control choice"
+end
+
+let make_l0008_finding = fn (sp: Span) -> LintFinding do
+  return LintFinding(
+    code: "L0008",
+    severity: LintInfo,
+    message: l0008_message(),
+    fix_it: None,
+    span: sp
+  )
+end
+
+// Recognise the (binding-ctor, bare-wildcard) pair in either arm order.
+let is_if_let_shape = fn (p1: Pattern, p2: Pattern) -> bool do
+  if is_binding_ctor(pat: p1) && is_wildcard(pat: p2) then return true end
+  if is_wildcard(pat: p1) && is_binding_ctor(pat: p2) then return true end
+  return false
+end
+
+// Inspect a match site: a two-arm match matching the if-let shape is flagged.
+let check_match_site = fn (
+  sp: Span,
+  cases: [ MatchCase ],
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  match cases do
+    | [ MatchCase(pattern: pat1, body: _), MatchCase(pattern: pat2, body: _) ] ->
+      let SpannedPattern(node: n1, span: _) = pat1
+      let SpannedPattern(node: n2, span: _) = pat2
+      if is_if_let_shape(p1: n1, p2: n2) then return make_l0008_finding(sp) :: acc end
+      return acc
+    | _ -> return acc
+  end
+end
+
+// ── walker ──────────────────────────────────────────────────────────────────
+//
+// Hand-written (like L0007) so the finding anchors at the match node's own
+// span.  Both statement- and expression-position matches are flagged (the
+// `if let` rewrite is valid in either, per SKILL.md).
+
+let walk_stmts = fn (ss: [ SpannedStmt ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match ss do
+    | [] -> return acc
+    | s :: rest ->
+      let acc2 = walk_spanned_stmt(s, acc)
+      return walk_stmts(ss: rest, acc: acc2)
+  end
+end
+
+let walk_spanned_stmt = fn (s: SpannedStmt, acc: [ LintFinding ]) -> [ LintFinding ] do
+  let SpannedStmt(node, span: _) = s
+  match node do
+      | StmtLet(name: _, sigil: _, typ: _, value) | StmtLetPattern(pattern: _, value) ->
+        return walk_expr(e: value, acc)
+      | StmtExpr(expr) -> return walk_expr(e: expr, acc)
+      | StmtReturn(value) | StmtAssign(target: _, value) -> return walk_expr(e: value, acc)
+      | StmtIndexAssign(target, index, value) ->
+        let a1 = walk_expr(e: target, acc)
+        let a2 = walk_expr(e: index, acc: a1)
+        return walk_expr(e: value, acc: a2)
+      | StmtTry(body, catch_arms) ->
+        let a1 = walk_stmts(ss: body, acc)
+        return walk_catch_arms(arms: catch_arms, acc: a1)
+      | StmtInject(handlers, body) ->
+        let a1 = walk_spanned_exprs(es: handlers, acc)
+        return walk_stmts(ss: body, acc: a1)
+    end
+end
+
+let walk_expr = fn (e: SpannedExpr, acc: [ LintFinding ]) -> [ LintFinding ] do
+  let SpannedExpr(node, span) = e
+  match node do
+      | ExprMatch(target, cases) ->
+        let a1 = check_match_site(sp: span, cases, acc)
+        let a2 = walk_expr(e: target, acc: a1)
+        return walk_match_cases(cs: cases, acc: a2)
+      | ExprIf(cond, then_branch, else_branch) ->
+        let a1 = walk_expr(e: cond, acc)
+        let a2 = walk_stmts(ss: then_branch, acc: a1)
+        return walk_stmts(ss: else_branch, acc: a2)
+      | ExprWhile(cond, body) ->
+        let a1 = walk_expr(e: cond, acc)
+        return walk_stmts(ss: body, acc: a1)
+      | ExprFor(var: _, start, end_expr, body) ->
+        let a1 = walk_expr(e: start, acc)
+        let a2 = walk_expr(e: end_expr, acc: a1)
+        return walk_stmts(ss: body, acc: a2)
+      | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body) ->
+        return walk_stmts(ss: body, acc)
+      | ExprBinaryOp(left, op: _, right) ->
+        let a1 = walk_expr(e: left, acc)
+        return walk_expr(e: right, acc: a1)
+      | ExprUnaryOp(op: _, operand) -> return walk_expr(e: operand, acc)
+      | ExprCall(func: _, args) -> return walk_call_args(args, acc)
+      | ExprCallExpr(callee, args) ->
+        let a1 = walk_expr(e: callee, acc)
+        return walk_call_args(args, acc: a1)
+      | ExprConstructor(name: _, args, sigil: _) -> return walk_ctor_args(args, acc)
+      | ExprArray(elements) | ExprList(elements) -> return walk_spanned_exprs(es: elements, acc)
+      | ExprRecord(fields) -> return walk_named_exprs(fs: fields, acc)
+      | ExprIndex(target, index) ->
+        let a1 = walk_expr(e: target, acc)
+        return walk_expr(e: index, acc: a1)
+      | ExprFieldAccess(target, field: _) -> return walk_expr(e: target, acc)
+      | ExprRaise(value) | ExprForce(value) -> return walk_expr(e: value, acc)
+      | ExprHandler(coeffect_name: _, requires: _, arms) -> return walk_handler_arms(arms, acc)
+      | _ -> return acc
+    end
+end
+
+let walk_spanned_exprs = fn (es: [ SpannedExpr ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match es do
+    | [] -> return acc
+    | e :: rest ->
+      let acc2 = walk_expr(e: e, acc)
+      return walk_spanned_exprs(es: rest, acc: acc2)
+  end
+end
+
+let walk_call_args = fn (args: [ CallArg ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match args do
+    | [] -> return acc
+    | CallArg(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_call_args(args: rest, acc: acc2)
+  end
+end
+
+let walk_ctor_args = fn (args: [ CtorArg ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match args do
+    | [] -> return acc
+    | CtorArg(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_ctor_args(args: rest, acc: acc2)
+  end
+end
+
+let walk_named_exprs = fn (fs: [ NamedExpr ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match fs do
+    | [] -> return acc
+    | NamedExpr(name: _, value) :: rest ->
+      let acc2 = walk_expr(e: value, acc)
+      return walk_named_exprs(fs: rest, acc: acc2)
+  end
+end
+
+let walk_match_cases = fn (cs: [ MatchCase ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match cs do
+    | [] -> return acc
+    | MatchCase(pattern: _, body) :: rest ->
+      let acc2 = walk_stmts(ss: body, acc)
+      return walk_match_cases(cs: rest, acc: acc2)
+  end
+end
+
+let walk_catch_arms = fn (arms: [ CatchArm ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match arms do
+    | [] -> return acc
+    | CatchArm(pattern: _, body) :: rest ->
+      let acc2 = walk_stmts(ss: body, acc)
+      return walk_catch_arms(arms: rest, acc: acc2)
+  end
+end
+
+let walk_handler_arms = fn (arms: [ HandlerArm ], acc: [ LintFinding ]) -> [ LintFinding ] do
+  match arms do
+    | [] -> return acc
+    | HandlerArm(arm, cont_binder: _, span: _) :: rest ->
+      let Function(
+        name: _,
+        is_public: _,
+        type_params: _,
+        params: _,
+        ret_type: _,
+        requires: _,
+        throw_row: _,
+        body,
+        span: _
+      ) = arm
+      let acc2 = walk_stmts(ss: body, acc)
+        return walk_handler_arms(arms: rest, acc: acc2)
+  end
+end
+
+/** Collect L0008 findings across a function body (a list of statements). */
+export let collect_ctor_wildcard_matches_in_stmts = fn (
+  ss: [ SpannedStmt ],
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  return walk_stmts(ss, acc)
+end
+
+/** Collect L0008 findings from a top-level value expression (non-lambda). */
+export let collect_ctor_wildcard_matches_in_expr = fn (
+  e: SpannedExpr,
+  acc: [ LintFinding ]
+) -> [ LintFinding ] do
+  return walk_expr(e, acc)
+end

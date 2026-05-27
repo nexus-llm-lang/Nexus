@@ -1,0 +1,219 @@
+// L0009 — staircase `match`: an arm body immediately re-`match`es on the same
+// scrutinee (or the bound `:: tail`), foldable into a nested pattern.
+//
+// Exercises `lint_program` directly on a parsed AST (Proc.exec is -1 under
+// WASI preview1, same pattern as lint_l0007_test).
+//
+// POSITIVE (L0009 fires): an arm whose sole body statement re-matches on the
+//   SAME scrutinee, and the list-tail variant (`x :: rest -> match rest do`).
+// NEGATIVE (L0009 silent): an inner match on a DIFFERENT scrutinee (the
+//   zip-style exception), an arm that does other work before the inner match
+//   (not "immediately"), and a flat single-level match.
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as stdio from "std:stdio"
+import { Console } from "std:stdio"
+import * as lexer from "src/frontend/lexer.nx"
+import { ParseDiagnostics }, * as parser from "src/frontend/parser.nx"
+import { LintFinding, lint_program } from "src/lint/lint.nx"
+import { LintSeverity, LintWarning, LintInfo, LintError } from "src/lint/types.nx"
+
+let lint_source = fn (src: string) -> [ LintFinding ] do
+  let tokens = lexer.tokenize(src: src)
+  let ParseDiagnostics(prog, diags: _) = parser.parse_collect(tokens: tokens, file: "fixture.nx")
+  return lint_program(prog: prog)
+end
+
+let codes_of = fn (fs: [ LintFinding ]) -> [ string ] do
+  return codes_of_loop(fs, acc: [])
+end
+
+let codes_of_loop = fn (fs: [ LintFinding ], acc: [ string ]) -> [ string ] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | LintFinding(code, severity: _, message: _, fix_it: _, span: _) :: rest ->
+      return codes_of_loop(fs: rest, acc: code :: acc)
+  end
+end
+
+let has_code = fn (xs: [ string ], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | h :: rest ->
+      if h == s then return true end
+      return has_code(xs: rest, s)
+  end
+end
+
+// ── POSITIVE: same-scrutinee re-match ───────────────────────────────────────
+
+let test_l0009_same_scrutinee_fires = fn () -> unit throws { Exn } do
+  // Outer matches on `x`; one arm body is a lone `match x do ...` — same
+  // scrutinee, so the arms can be folded.
+  let src = "type T = A | B | C\n"
+    ++ "let f = fn (x: T) -> i64 do\n"
+    ++ "  match x do\n"
+    ++ "    | A ->\n"
+    ++ "      match x do\n"
+    ++ "        | B -> return 1\n"
+    ++ "        | _ -> return 2\n"
+    ++ "      end\n"
+    ++ "    | _ -> return 0\n"
+    ++ "  end\n"
+    ++ "end\n"
+  let codes = codes_of(fs: lint_source(src))
+  test_assert.assert(cond: has_code(xs: codes, s: "L0009"),
+    label: "L0009 fires on a same-scrutinee staircase match")
+  return ()
+end
+
+// ── POSITIVE: list-tail re-match (`x :: rest -> match rest do`) ─────────────
+
+let test_l0009_list_tail_fires = fn () -> unit throws { Exn } do
+  let src = "let f = fn (xs: [ i64 ]) -> i64 do\n"
+    ++ "  match xs do\n"
+    ++ "    | [] -> return 0\n"
+    ++ "    | x :: rest ->\n"
+    ++ "      match rest do\n"
+    ++ "        | [] -> return x\n"
+    ++ "        | y :: ys -> return x + y\n"
+    ++ "      end\n"
+    ++ "  end\n"
+    ++ "end\n"
+  let codes = codes_of(fs: lint_source(src))
+  test_assert.assert(cond: has_code(xs: codes, s: "L0009"),
+    label: "L0009 fires on a list-tail staircase match")
+  return ()
+end
+
+// ── NEGATIVE: inner match on a DIFFERENT scrutinee (zip-style exception) ────
+
+let test_l0009_different_scrutinee_silent = fn () -> unit throws { Exn } do
+  // Outer matches `xs`, arm binds its tail `rest`, but the inner match is on a
+  // SECOND, unrelated list `ys` (lockstep traversal).  No single-arm
+  // flattening exists, so L0009 must stay silent.
+  let src = "let f = fn (xs: [ i64 ], ys: [ i64 ]) -> i64 do\n"
+    ++ "  match xs do\n"
+    ++ "    | [] -> return 0\n"
+    ++ "    | x :: rest ->\n"
+    ++ "      match ys do\n"
+    ++ "        | [] -> return x\n"
+    ++ "        | y :: yt -> return x + y\n"
+    ++ "      end\n"
+    ++ "  end\n"
+    ++ "end\n"
+  let codes = codes_of(fs: lint_source(src))
+  test_assert.assert(cond: !has_code(xs: codes, s: "L0009"),
+    label: "L0009 silent when the inner match is on a different scrutinee")
+  return ()
+end
+
+// ── NEGATIVE: arm does other work before the inner match (not "immediately") ─
+
+let test_l0009_work_before_silent = fn () -> unit throws { Exn } do
+  // The arm binds `let n = ...` before the inner match, so the inner match is
+  // not the sole/immediate body statement.
+  let src = "type T = A | B | C\n"
+    ++ "let f = fn (x: T) -> i64 do\n"
+    ++ "  match x do\n"
+    ++ "    | A ->\n"
+    ++ "      let n = 5\n"
+    ++ "      match x do\n"
+    ++ "        | B -> return n\n"
+    ++ "        | _ -> return n + 1\n"
+    ++ "      end\n"
+    ++ "    | _ -> return 0\n"
+    ++ "  end\n"
+    ++ "end\n"
+  let codes = codes_of(fs: lint_source(src))
+  test_assert.assert(cond: !has_code(xs: codes, s: "L0009"),
+    label: "L0009 silent when the arm does other work before the inner match")
+  return ()
+end
+
+// ── NEGATIVE: flat single-level match ───────────────────────────────────────
+
+let test_l0009_flat_silent = fn () -> unit throws { Exn } do
+  let src = "type T = A | B | C\n"
+    ++ "let f = fn (x: T) -> i64 do\n"
+    ++ "  match x do\n"
+    ++ "    | A -> return 1\n"
+    ++ "    | B -> return 2\n"
+    ++ "    | _ -> return 0\n"
+    ++ "  end\n"
+    ++ "end\n"
+  let codes = codes_of(fs: lint_source(src))
+  test_assert.assert(cond: !has_code(xs: codes, s: "L0009"),
+    label: "L0009 silent on a flat single-level match")
+  return ()
+end
+
+// ── Severity: advisory note (never a warning) ───────────────────────────────
+
+let test_l0009_is_note_severity = fn () -> unit throws { Exn } do
+  let src = "type T = A | B | C\n"
+    ++ "let f = fn (x: T) -> i64 do\n"
+    ++ "  match x do\n"
+    ++ "    | A ->\n"
+    ++ "      match x do\n"
+    ++ "        | B -> return 1\n"
+    ++ "        | _ -> return 2\n"
+    ++ "      end\n"
+    ++ "    | _ -> return 0\n"
+    ++ "  end\n"
+    ++ "end\n"
+  let findings = lint_source(src)
+  let is_note = check_l0009_note(fs: findings)
+  test_assert.assert(cond: is_note, label: "L0009 emitted at note (advisory) severity")
+  return ()
+end
+
+let check_l0009_note = fn (fs: [ LintFinding ]) -> bool do
+  match fs do
+    | [] -> return false
+    | LintFinding(code, severity, message: _, fix_it: _, span: _) :: rest ->
+      if code == "L0009" then
+        return severity_is_note(s: severity)
+      end
+      return check_l0009_note(fs: rest)
+  end
+end
+
+let severity_is_note = fn (s: LintSeverity) -> bool do
+  match s do
+    | LintInfo -> return true
+    | LintWarning -> return false
+    | LintError -> return false
+  end
+end
+
+// ── Runner ──────────────────────────────────────────────────────────────────
+
+let body = fn () -> unit throws { Exn } do
+  test_l0009_same_scrutinee_fires()
+  test_l0009_list_tail_fires()
+  test_l0009_different_scrutinee_silent()
+  test_l0009_work_before_silent()
+  test_l0009_flat_silent()
+  test_l0009_is_note_severity()
+  return ()
+end
+
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    1 / ok
+    return ()
+  end
+end
