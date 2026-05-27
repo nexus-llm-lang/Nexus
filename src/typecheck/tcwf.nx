@@ -61,6 +61,7 @@ import {
   TypeError,
   UnknownCapability,
   UnknownThrowVariant,
+  MalformedRowTail,
   RefEscapes,
   RefInnerLinear,
   ReservedDeclarationName,
@@ -256,17 +257,59 @@ let check_throw_entries = fn (
   end
 end
 
+/** wfThrow tail check: the pipe-tail of a throws row `{ ... | T }` must be a
+ *  ROW VARIABLE — the open-row form opens over a polymorphic row variable
+ *  (a bound `<R>` quantifier). At an introduction site the row is still in
+ *  pre-conversion form, so a bound quantifier `R` appears as the surface name
+ *  `TyUserDefined("R", [])`; only names in `type_params` qualify. A concrete
+ *  exception or an undeclared name in tail position is malformed: it would
+ *  otherwise be treated as a fully-open row downstream, silently dropping the
+ *  tail member from containment. The `__implicit` absent-annotation sentinel
+ *  and genuine inference/row variables are always accepted. The inclusive
+ *  closed multi-member form is the comma list `{ E, F }`.
+ */
+let check_throw_tail = fn (
+  rest: Option<TypeExpr>, type_params: [ string ], span: Span
+) -> unit throws { TypeError } do
+  match rest do
+    | None -> return ()
+    | Some(val: tail) ->
+      match tail do
+        // Already a row variable (e.g. an inference var, or a quantifier that
+        // was converted by convert_ud_to_var before reaching this check).
+        | TyVar(name: _) -> return ()
+        // Surface-name tail: legitimate only when it names a bound `<R>`
+        // quantifier (kindOf will further constrain R to Row).
+        | TyUserDefined(name: n, args: []) ->
+          if str_list_has(names: type_params, s: n) then return () end
+          throw MalformedRowTail(name: n, span)
+        // Any other shape after '|' is not a row variable.
+        | TyUserDefined(name: n, args: _) -> throw MalformedRowTail(name: n, span)
+        | _ -> throw MalformedRowTail(name: "<non-row-variable pipe-tail>", span)
+      end
+  end
+end
+
 /** wfThrow(ρ_e): every named entry in the throws row must be either the
  *  universal `Exn` sentinel, a constructor (variant) of `Exn`, or a
- *  declared exception group. Tail vars are unconstrained (same rationale
- *  as wfCap).
+ *  declared exception group. The pipe-tail must be a row variable — a bound
+ *  `<R>` quantifier (open-row form) — and is validated by `check_throw_tail`;
+ *  a concrete exception / undeclared name after `|` is rejected (use the
+ *  comma form `{ E, F }` for an inclusive closed list).
+ *
+ *  `type_params` are the quantifiers in scope at the introduction site, used
+ *  to recognise a legitimate row-variable tail. Sites without quantifiers in
+ *  scope (cap methods, handler arms) pass `[]`.
  */
 export let wf_throw = fn (
   row: TypeExpr, vidx_: VariantIndex,
-  groups: [ ExceptionGroupEntry ], span: Span
+  groups: [ ExceptionGroupEntry ], span: Span,
+  type_params: [ string ]
 ) -> unit throws { TypeError } do
   match row do
-    | TyRow(types: ts, rest: _) -> return check_throw_entries(entries: ts, vidx_, groups, span)
+    | TyRow(types: ts, rest: r) ->
+      check_throw_entries(entries: ts, vidx_, groups, span)
+      return check_throw_tail(rest: r, type_params, span)
     | _ -> return ()
   end
 end
@@ -416,7 +459,7 @@ let walk_funcs = fn (
     | [] -> return ()
     | HirFunction(
       name: fn_name,
-      type_params: _,
+      type_params: tps,
       params: fn_params,
       ret_type: ret,
       throw_row: tw,
@@ -426,7 +469,7 @@ let walk_funcs = fn (
       requires: req
     ) :: rest ->
       wf_cap(row: req, caps, span: sp)
-      wf_throw(row: tw, vidx_, groups, span: sp)
+      wf_throw(row: tw, vidx_, groups, span: sp, type_params: tps)
       // Gravity rule: ¬escapesRef(τ_r) on the declared return type.
       // Pre-DCE so even unused functions with `ref(T)` return types are rejected.
       enforce_no_escapes_ref(typ: ret, context: "return type of '" ++ fn_name ++ "'", span: sp)
@@ -461,7 +504,7 @@ let walk_handler_arms = fn (
     | HirHandlerArm(
       arm: HirFunction(
         name: _,
-        type_params: _,
+        type_params: arm_tps,
         params: arm_ps,
         ret_type: _,
         throw_row: tw,
@@ -473,7 +516,7 @@ let walk_handler_arms = fn (
       cont_binder: _
     ) :: rest ->
       wf_cap(row: req, caps, span: sp)
-      wf_throw(row: tw, vidx_, groups, span: sp)
+      wf_throw(row: tw, vidx_, groups, span: sp, type_params: arm_tps)
       // wfRef on handler arm parameter types.
       let arm_param_nts = hir_params_to_named_types_tcwf(params: arm_ps)
       enforce_wf_ref_params(params: arm_param_nts, span: sp, tdefs)
@@ -508,7 +551,9 @@ let walk_cap_methods = fn (
       typ_ret: _
     ) :: rest ->
       wf_cap(row: req, caps, span: sp)
-      wf_throw(row: tw, vidx_, groups, span: sp)
+      // Cap methods declare no generic row quantifiers, so a pipe-tail here can
+      // never be a legitimate row variable: pass the empty quantifier list.
+      wf_throw(row: tw, vidx_, groups, span: sp, type_params: [])
       return walk_cap_methods(methods: rest, caps, vidx_, groups)
   end
 end
