@@ -647,13 +647,29 @@ export let infer_lambda = fn (
   tcwf.enforce_wf_ref_params(params: param_types, span, tdefs: tctypes.state_record_defs(state))
   let outer_env = tctypes.state_env(state)
   let body_env = add_params_to_env(env: outer_env, params)
-  let st1 = tctypes.state_with_env(state, env: body_env)
+  // T-Lambda: a lambda is a NEW function — its body's raises / calls / forces
+  // must be charged against the LAMBDA's own throws-row, not the enclosing
+  // fn's active row.  Type the body under a fresh COLLECTING throw-row var so
+  // that raise (T-Raise), call (T-App) and force (T-Force) pin their surfaced
+  // exceptions into it (the unified inference-row pinning), then reconcile the
+  // collected row with the lambda's declared row below.  Without this an
+  // unannotated lambda body's `throw E` was admitted via the enclosing fn's
+  // (possibly open) row and the arrow's `__implicit` row absorbed the narrower
+  // declared slot at a later unify — laundering a wider-throwing body into a
+  // narrower declared arrow row (a P5 containment hole, the lambda-return
+  // residual of the unbound-throws-row class).  The enclosing fn's row is
+  // restored after the body so the lambda's effects are NOT charged to it.
+  let outer_throw = tctypes.state_throw_row(state)
+  let FreshResult(state: st_thr, typ: tv_thr) = tctypes.tc_fresh_var(state)
+  let body_env_state = tctypes.state_with_env(st_thr, env: body_env)
+  let st1 = tctypes.state_with_throw_row(state: body_env_state, throw_row: tv_thr)
   match infer_stmts_fn(state: st1, stmts: body, ret_type) do
     | InferExprErr(
       message: m,
       span: espan
     ) -> return InferExprErr(message: "lambda body: " ++ m, span: espan)
-    | InferExprOk(state: st2, subst: s1, typ: body_typ) ->
+    | InferExprOk(state: st2pre, subst: s1, typ: body_typ) ->
+      let st2 = tctypes.state_with_throw_row(state: st2pre, throw_row: outer_throw)
       // T-Lambda: τ_r ≠ unit ⟹ tail(s†) = ⊥.
       // The body must supply the return value by one of two means:
       //   (a) the last statement is a non-unit expression whose type provides
@@ -681,10 +697,65 @@ export let infer_lambda = fn (
             span: rsp
           )
         | capture.CaptureScan(linear: lin, ref_hit: None) ->
-          let arrow = TyArrow(params: param_types, ret: ret_type, requires, throw_row)
-          let wrapped = if lin then TyLinear(inner: arrow) else arrow end
-          return InferExprOk(state: st2, subst: s1, typ: subst.subst_apply(subst: s1, typ: wrapped))
+          // Reconcile the body's COLLECTED throws-row with the lambda's
+          // declared row.  An unannotated lambda's declared row is the
+          // `__implicit` open sentinel: adopt the collected row as the arrow's
+          // throws-row so the actual throws are reflected (and reject later if
+          // narrowed at a deferred slot).  A lambda that DECLARES a closed
+          // throws row must have its body's collected throws admitted by that
+          // row (T-Lambda: the body may raise no more than the declared row);
+          // the declared row stays as the arrow's row.
+          let collected = subst.subst_apply(subst: s1, typ: tv_thr)
+          match reconcile_lambda_throw_row(state: st2, collected, declared: throw_row, span) do
+            | InferExprErr(message: m, span: esp) -> return InferExprErr(message: m, span: esp)
+            | InferExprOk(state: st3, subst: s_recon, typ: effective_thr) ->
+              let s_all = subst.subst_compose(s1, s2: s_recon)
+              let arrow = TyArrow(
+                params: param_types,
+                ret: ret_type,
+                requires,
+                throw_row: effective_thr
+              )
+              let wrapped = if lin then TyLinear(inner: arrow) else arrow end
+              return InferExprOk(
+                state: st3,
+                subst: s_all,
+                typ: subst.subst_apply(subst: s_all, typ: wrapped)
+              )
+          end
       end
+  end
+end
+
+/** T-Lambda throws-row reconciliation.  Given the body's COLLECTED throws-row
+ *  (pinned by raise / call / force during body inference) and the lambda's
+ *  declared row, returns the effective arrow throws-row (in `typ`):
+ *   - declared `__implicit` open (unannotated lambda): adopt `collected`, so a
+ *     later unify at a narrower deferred slot rejects the surplus exceptions.
+ *   - declared closed row: the collected throws must be admitted by it
+ *     (otherwise the body raises more than the annotation permits); the
+ *     declared row is kept.
+ *   - any other declared shape (a genuine effect-variable etc.): keep declared. */
+let reconcile_lambda_throw_row = fn (
+  state: CheckState, collected: TypeExpr, declared: TypeExpr, span: Span
+) -> InferExprResult throws { TypeError } do
+  match declared do
+    | TyRow(types: _, rest: Some(val: TyVar(name: "__implicit"))) ->
+      return InferExprOk(state, subst: subst.subst_empty(), typ: collected)
+    | TyRow(types: _, rest: None) ->
+      let groups = tctypes.state_exception_groups(state)
+      let fn_pure_set = tctypes.state_fn_pure_set(state)
+      match check_call_throw_row_admitted(
+        callee_row: collected,
+        caller_row: declared,
+        groups,
+        func: "lambda body",
+        fn_pure_set
+      ) do
+        | RaiseRejected(message: m) -> return InferExprErr(message: "lambda body: " ++ m, span)
+        | RaiseOk -> return InferExprOk(state, subst: subst.subst_empty(), typ: declared)
+      end
+    | _ -> return InferExprOk(state, subst: subst.subst_empty(), typ: declared)
   end
 end
 
@@ -732,6 +803,119 @@ let pin_raised_into_row = fn (state: CheckState, name: string, row: TypeExpr) ->
           let open_row = TyRow(types: [ TyUserDefined(name, args: []) ], rest: Some(val: ftail))
           let tdefs = tctypes.state_typedefs(state: st1)
           match unify.unify(t1: row, t2: open_row, tdefs) do
+            | UnifyOk(subst: s) -> return PinResult(state: st1, subst: s)
+            | UnifyErr(_) -> return PinResult(state, subst: subst.subst_empty())
+          end
+        | _ -> return PinResult(state, subst: subst.subst_empty())
+      end
+    | _ -> return PinResult(state, subst: subst.subst_empty())
+  end
+end
+
+/** Collect the concrete `TyUserDefined` members of a (possibly open) surfaced
+ *  throws row.  Tail variables and non-row shapes contribute nothing — only
+ *  the literal exception names a forced thunk can raise are pinnable. */
+let surfaced_row_members = fn (row: TypeExpr) -> [ TypeExpr ] do
+  match row do
+    | TyRow(types: ts, rest: _) -> return only_user_defined(ts)
+    | _ -> return []
+  end
+end
+
+let only_user_defined = fn (ts: [ TypeExpr ]) -> [ TypeExpr ] do
+  match ts do
+    | [] -> return []
+    | t :: rest ->
+      match t do
+        | TyUserDefined(name: _, args: _) -> return t :: only_user_defined(ts: rest)
+        | _ -> return only_user_defined(ts: rest)
+      end
+  end
+end
+
+/** Pin a forced thunk's surfaced throws (T-Force) into the active throws-row
+ *  the same way infer_raise (T-Raise) and infer_call (T-App) pin raised /
+ *  callee exceptions.  When the active row is the still-unsolved collecting
+ *  row of a suspended thunk body or an unannotated lambda body, the surfaced
+ *  variants must EXTEND it; otherwise the collecting row escapes unbound and a
+ *  later thunk-vs-thunk (or arrow-vs-arrow) unification can bind it to a
+ *  narrower declared row, dropping the exceptions the force can surface (a P5
+ *  containment hole — the force-path residual of the unbound-throws-row class).
+ *
+ *  Mirrors pin_callee_row_into_caller: only a collecting var or an open caller
+ *  row whose tail is a genuine inference variable (not the `__implicit`
+ *  absent-annotation sentinel) is extended; closed / non-row caller rows are
+ *  left as-is (admission already decided by check_call_throw_row_admitted). */
+let pin_surfaced_throws_into_row = fn (
+  state: CheckState, surfaced_row: TypeExpr, active_row: TypeExpr
+) -> PinResult do
+  let members = surfaced_row_members(row: surfaced_row)
+  if list.is_empty(xs: members) then return PinResult(state, subst: subst.subst_empty()) end
+  match active_row do
+    | TyVar(name: rn) ->
+      if rn == "__implicit" then return PinResult(state, subst: subst.subst_empty()) end
+      let FreshResult(state: st1, typ: tail) = tctypes.tc_fresh_var(state)
+      let open_row = TyRow(types: members, rest: Some(val: tail))
+      return PinResult(state: st1, subst: subst.subst_single(var: rn, typ: open_row))
+    | TyRow(types: _, rest: Some(val: tail)) ->
+      match tail do
+        | TyVar(name: "__implicit") -> return PinResult(state, subst: subst.subst_empty())
+        | TyVar(name: _) ->
+          let FreshResult(state: st1, typ: ftail) = tctypes.tc_fresh_var(state)
+          let open_row = TyRow(types: members, rest: Some(val: ftail))
+          let tdefs = tctypes.state_typedefs(state: st1)
+          match unify.unify(t1: active_row, t2: open_row, tdefs) do
+            | UnifyOk(subst: s) -> return PinResult(state: st1, subst: s)
+            | UnifyErr(_) -> return PinResult(state, subst: subst.subst_empty())
+          end
+        | _ -> return PinResult(state, subst: subst.subst_empty())
+      end
+    | _ -> return PinResult(state, subst: subst.subst_empty())
+  end
+end
+
+/** Decide whether the active require row is a still-unsolved COLLECTING row
+ *  (the fresh require var of a suspended thunk body / unannotated lambda body)
+ *  rather than a fn's declared concrete require row.  When collecting, a force
+ *  of a thunk that requires extra capabilities must DEFER those into the
+ *  collecting row (extend it), not discharge them eagerly against the
+ *  constructing fn's ambient — otherwise a valid thunk-of-a-thunk whose outer
+ *  require row legitimately defers the inner's capabilities is wrongly rejected
+ *  (the require-row dual of the throws hole, an over-rejection in the SAFE
+ *  direction).  Mirrors the throws-collecting var: a bare TyVar or an open row
+ *  with a genuine inference-variable tail. */
+let require_row_is_collecting = fn (row: TypeExpr) -> bool do
+  match row do
+    | TyVar(name: rn) -> return rn != "__implicit"
+    | TyRow(types: _, rest: Some(val: tail)) ->
+      match tail do
+        | TyVar(name: "__implicit") -> return false
+        | TyVar(name: _) -> return true
+        | _ -> return false
+      end
+    | _ -> return false
+  end
+end
+
+/** Pin a forced thunk's surfaced require capabilities into the active
+ *  collecting require row (the dual of pin_surfaced_throws_into_row). */
+let pin_surfaced_require_into_row = fn (
+  state: CheckState, surfaced_row: TypeExpr, active_row: TypeExpr
+) -> PinResult do
+  let members = surfaced_row_members(row: surfaced_row)
+  if list.is_empty(xs: members) then return PinResult(state, subst: subst.subst_empty()) end
+  match active_row do
+    | TyVar(name: rn) ->
+      let FreshResult(state: st1, typ: tail) = tctypes.tc_fresh_var(state)
+      let open_row = TyRow(types: members, rest: Some(val: tail))
+      return PinResult(state: st1, subst: subst.subst_single(var: rn, typ: open_row))
+    | TyRow(types: _, rest: Some(val: tail)) ->
+      match tail do
+        | TyVar(name: _) ->
+          let FreshResult(state: st1, typ: ftail) = tctypes.tc_fresh_var(state)
+          let open_row = TyRow(types: members, rest: Some(val: ftail))
+          let tdefs = tctypes.state_typedefs(state: st1)
+          match unify.unify(t1: active_row, t2: open_row, tdefs) do
             | UnifyOk(subst: s) -> return PinResult(state: st1, subst: s)
             | UnifyErr(_) -> return PinResult(state, subst: subst.subst_empty())
           end
@@ -818,11 +1002,12 @@ export let infer_force = fn (
           // T-Force: discharge the thunk's deferred throw_row against the
           // caller's active throw_row.  A `throws {}` caller (closed empty row)
           // must not force a thunk whose throw_row is non-empty.
+          let surfaced_thr = subst.subst_apply(subst: s1, typ: thr)
           let caller_row = subst.subst_apply(subst: s1, typ: tctypes.state_throw_row(state: st1))
           let groups = tctypes.state_exception_groups(state: st1)
           let fn_pure_set = tctypes.state_fn_pure_set(state: st1)
           match check_call_throw_row_admitted(
-            callee_row: subst.subst_apply(subst: s1, typ: thr),
+            callee_row: surfaced_thr,
             caller_row,
             groups,
             func: "force",
@@ -830,14 +1015,48 @@ export let infer_force = fn (
           ) do
             | RaiseRejected(message: m2) -> return InferExprErr(message: m2, span)
             | RaiseOk ->
+              // T-Force (inference-row pinning): when the active throws-row is
+              // still an unsolved collecting var (a suspended thunk body or an
+              // unannotated lambda body), extend it to include the forced
+              // thunk's surfaced exceptions so they are not later unified away
+              // against a narrower declared row at the deferred-narrowing slot.
+              let PinResult(state: st_pt, subst: pin_t) =
+                pin_surfaced_throws_into_row(
+                  state: st1,
+                  surfaced_row: surfaced_thr,
+                  active_row: caller_row
+                )
+              let s_pt = subst.subst_compose(s1, s2: pin_t)
               // T-Force spec §T-Force: discharge thunk's require_row against the
               // ambient require_row.  Every capability needed by the thunk at
               // force time must already be in the forcing context's ambient row.
               let ambient_rq = subst.subst_apply(
-                subst: s1,
-                typ: tctypes.state_require_row(state: st1)
+                subst: s_pt,
+                typ: tctypes.state_require_row(state: st_pt)
               )
-              let resolved_rq = subst.subst_apply(subst: s1, typ: rq)
+              let resolved_rq = subst.subst_apply(subst: s_pt, typ: rq)
+              // Require-row dual: when the ambient require row is a still-
+              // unsolved COLLECTING var (a suspended thunk / unannotated lambda
+              // body), the forced thunk's required capabilities are DEFERRED
+              // into that collecting row rather than discharged eagerly against
+              // the constructing fn's declared ambient (which would wrongly
+              // reject a valid thunk-of-a-thunk that legitimately defers the
+              // inner's capabilities).  Discharge eagerly only against a
+              // concrete declared ambient row.
+              if require_row_is_collecting(row: ambient_rq) then
+                let PinResult(state: st_pr, subst: pin_r) =
+                  pin_surfaced_require_into_row(
+                    state: st_pt,
+                    surfaced_row: resolved_rq,
+                    active_row: ambient_rq
+                  )
+                let s_pr = subst.subst_compose(s1: s_pt, s2: pin_r)
+                return InferExprOk(
+                  state: st_pr,
+                  subst: s_pr,
+                  typ: subst.subst_apply(subst: s_pr, typ: u)
+                )
+              end
               match check_force_require_row(
                 thunk_require_row: resolved_rq,
                 ambient_require_row: ambient_rq
@@ -848,7 +1067,11 @@ export let infer_force = fn (
                       ++ "' which is not in the ambient require row (T-Force: ρ_q' ⊆ ρ_q)",
                     span
                   )
-                | None -> return InferExprOk(state: st1, subst: s1, typ: u)
+                | None -> return InferExprOk(
+                  state: st_pt,
+                  subst: s_pt,
+                  typ: subst.subst_apply(subst: s_pt, typ: u)
+                )
               end
           end
         | _ ->
@@ -886,12 +1109,36 @@ export let infer_force = fn (
               ) do
                 | RaiseRejected(message: m2) -> return InferExprErr(message: m2, span)
                 | RaiseOk ->
+                  // T-Force (inference-row pinning): mirror the TyLazy arm —
+                  // pin the surfaced throws into a collecting active row.
+                  let PinResult(state: st_pt, subst: pin_t) =
+                    pin_surfaced_throws_into_row(
+                      state: st4,
+                      surfaced_row: resolved_thr,
+                      active_row: caller_row
+                    )
+                  let sc_pt = subst.subst_compose(s1: sc, s2: pin_t)
                   // T-Force spec §T-Force: discharge thunk's require_row.
                   let ambient_rq = subst.subst_apply(
-                    subst: sc,
-                    typ: tctypes.state_require_row(state: st4)
+                    subst: sc_pt,
+                    typ: tctypes.state_require_row(state: st_pt)
                   )
-                  let resolved_rq = subst.subst_apply(subst: sc, typ: tv_rq)
+                  let resolved_rq = subst.subst_apply(subst: sc_pt, typ: tv_rq)
+                  // Require-row dual: defer into a collecting ambient.
+                  if require_row_is_collecting(row: ambient_rq) then
+                    let PinResult(state: st_pr, subst: pin_r) =
+                      pin_surfaced_require_into_row(
+                        state: st_pt,
+                        surfaced_row: resolved_rq,
+                        active_row: ambient_rq
+                      )
+                    let sc_pr = subst.subst_compose(s1: sc_pt, s2: pin_r)
+                    return InferExprOk(
+                      state: st_pr,
+                      subst: sc_pr,
+                      typ: subst.subst_apply(subst: sc_pr, typ: tv)
+                    )
+                  end
                   match check_force_require_row(
                     thunk_require_row: resolved_rq,
                     ambient_require_row: ambient_rq
@@ -904,9 +1151,9 @@ export let infer_force = fn (
                       )
                     | None ->
                       return InferExprOk(
-                        state: st4,
-                        subst: sc,
-                        typ: subst.subst_apply(subst: sc, typ: tv)
+                        state: st_pt,
+                        subst: sc_pt,
+                        typ: subst.subst_apply(subst: sc_pt, typ: tv)
                       )
                   end
               end
