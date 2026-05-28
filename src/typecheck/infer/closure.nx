@@ -14,13 +14,52 @@
  */
 
 import { HirParam } from "src/ir/hir/types.nx"
-import { NamedType } from "src/syntax/ast.nx"
+import {
+  NamedType, TypeExpr, TyLinear, TyLazy, TyBorrow, TyRef, TyRow,
+  Sigil, SigilLinear, SigilLazy, SigilBorrow, SigilMutable, SigilImmutable
+} from "src/syntax/ast.nx"
 import { EnvEntry }, * as tctypes from "src/typecheck/types.nx"
 import { TypeError } from "src/typecheck/errors.nx"
+import { None } from "std:option"
 import * as list from "std:list"
 
-/** Flatten a HirParam list into a NamedType list, dropping sigil information.
- *  Used by infer_lambda and infer_let to build the TyArrow param vector. */
+/** Wrap a parameter type in the constructor implied by its binding sigil.
+ *  Mirrors the T-Let-wrapSigil pass in stmt_eval so that parameters carry the
+ *  same modality on their Arrow position and in the body env scope.  Skips the
+ *  wrap when the inferred type is already wrapped in the matching modality so
+ *  that idempotent `%(%T)` collapses to a single `TyLinear`.  `SigilMutable` is
+ *  treated as `~`, matching `wrap_ref`; `SigilImmutable` is the passthrough.
+ */
+let wrap_sigil = fn (sigil: Sigil, typ: TypeExpr) -> TypeExpr do
+  match sigil do
+    | SigilLinear ->
+      if let TyLinear(_) = typ then return typ
+      else return TyLinear(inner: typ)
+      end
+    | SigilLazy ->
+      if let TyLazy(_, _, _) = typ then return typ
+      else return TyLazy(
+          inner: typ,
+          require_row: TyRow(types: [], rest: None),
+          throw_row: TyRow(types: [], rest: None)
+        )
+      end
+    | SigilBorrow ->
+      if let TyBorrow(_) = typ then return typ
+      else return TyBorrow(inner: typ)
+      end
+    | SigilMutable ->
+      match typ do
+        | TyRef(_) | TyLinear(_) | TyLazy(_, _, _) | TyBorrow(_) -> return typ
+        | _ -> return TyRef(inner: typ)
+      end
+    | SigilImmutable -> return typ
+  end
+end
+
+/** Flatten a HirParam list into a NamedType list, reflecting the binding
+ *  sigil into the Arrow parameter type via `wrap_sigil`.  Used by
+ *  infer_lambda and infer_let to build the TyArrow param vector. */
 export let build_param_named_types = fn (params: [ HirParam ]) -> [ NamedType ] throws { TypeError } do
   return build_param_named_types_go(params, acc: [])
 end
@@ -31,21 +70,32 @@ let build_param_named_types_go = fn (
 ) -> [ NamedType ] throws { TypeError } do
   match params do
     | [] -> return list.reverse(xs: acc)
-    | HirParam(label: _, name: n, sigil: _, typ: t) :: rest ->
-      return build_param_named_types_go(params: rest, acc: NamedType(name: n, typ: t) :: acc)
+    | HirParam(label: _, name: n, sigil: sig, typ: t) :: rest ->
+      return build_param_named_types_go(
+        params: rest,
+        acc: NamedType(name: n, typ: wrap_sigil(sigil: sig, typ: t)) :: acc
+      )
   end
 end
 
-/** Extend an env with lambda-parameter bindings (one monomorphic scheme per param). */
+/** Extend an env with lambda-parameter bindings (one monomorphic scheme per
+ *  param).  The binding sigil is reflected into the env type via `wrap_sigil`
+ *  so that the body of the function sees `%T` / `@T` / `&T` and the linearity
+ *  / lazy / borrow checks fire as if the param were declared with the
+ *  corresponding `let` form. */
 export let add_params_to_env = fn (
   env: [ EnvEntry ],
   params: [ HirParam ]
 ) -> [ EnvEntry ] throws { TypeError } do
   match params do
     | [] -> return env
-    | HirParam(label: _, name: n, sigil: _, typ: t) :: rest ->
+    | HirParam(label: _, name: n, sigil: sig, typ: t) :: rest ->
       return add_params_to_env(
-        env: tctypes.env_insert(env, name: n, scheme: tctypes.mono(typ: t)),
+        env: tctypes.env_insert(
+          env,
+          name: n,
+          scheme: tctypes.mono(typ: wrap_sigil(sigil: sig, typ: t))
+        ),
         params: rest
       )
   end
