@@ -56,6 +56,22 @@ these directly unless writing compiler internals or runtime tests.
 - `nxlib/stdlib/test/` — test framework modules (`assert`).  Imported as
   `std:test/<name>`.
 
+## Common signatures (exact labels)
+
+Labels are part of the call — these are the highest-frequency ones, verified
+against source. The integer→string conversion is `val`, not `n`:
+
+| Call | Signature |
+|------|-----------|
+| `Console.println(val: s)` / `Console.eprintln(val: s)` | `(val: string) -> unit` |
+| `str.from_i64(val: n)` | `(val: i64) -> string` |
+| `str.length(s: x)` | `(s: string) -> i64` |
+| `list.nth(xs: l, n: i)` | `<T>(xs: [T], n: i64) -> T throws { ListError }` |
+| `list.length(xs: l)` | `<T>(xs: [T]) -> i64` |
+
+When a label is not listed here, confirm it from source (`nexus grep 'let <fn>'`)
+rather than guessing from the parameter's role.
+
 ## Capability Permissions
 
 Stdlib caps require permissions on `main`:

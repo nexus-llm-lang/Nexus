@@ -1,6 +1,6 @@
 ---
 name: nexus-lang
-description: "Write Nexus (.nx) programs — an LLM-friendly language with linear types, coeffects (ports/handlers), and WASM compilation. Use when writing, reviewing, or explaining Nexus code."
+description: "Write Nexus (.nx) programs — an LLM-friendly language with linear types, coeffects (caps/handlers), and WASM compilation. Use when writing, reviewing, or explaining Nexus code."
 ---
 
 # Nexus Language
@@ -15,7 +15,7 @@ Nexus is a programming language designed for LLM-friendly code generation. Its p
 - Reviewing or debugging Nexus code
 - Explaining Nexus language features
 - Porting algorithms to Nexus
-- Working with Nexus's type system, ports/handlers, or linear types
+- Working with Nexus's type system, caps/handlers, or linear types
 
 ## When NOT to Use This Skill
 
@@ -115,13 +115,30 @@ end
 
 ### 4. Sigils: `%` (linear), `&` (borrow), `~` (mutable ref)
 ```nexus
-let %arr = [| 1, 2, 3 |]       // linear — must be consumed exactly once
-let view = &%arr                 // borrow — immutable view, does not consume
-view[0] <- 42                   // mutation via borrow
+let %arr = [| 1, 2, 3 |]        // linear — must be consumed exactly once
 let ~x = 10                     // mutable ref, stack-confined
 ~x <- 20                        // reassignment
 let v = ~x                      // dereference
 ```
+
+**Borrows are valid only in argument position** — you cannot bind one to a `let`
+(`let view = &%arr` is rejected: `T-Borrow` requires the target be non-linear).
+Pass `&%arr` directly as a call argument; the callee reads/mutates through the
+borrow without consuming, and `T-App` discharges the borrow on return:
+```nexus
+let set_elem = fn (a: &[| i64 |], i: i64, v: i64) -> unit do
+  a[i] <- v                     // mutate element through a borrow parameter
+  return ()
+end
+let get_elem = fn (a: &[| i64 |], i: i64) -> i64 do
+  return a[i]                   // read element through a borrow parameter
+end
+// caller: set_elem(a: &%arr, i: 0, v: 42)  — &%arr only as an argument
+```
+`[| T |]` is a low-level linear primitive: there is **no `std:array` module**, and
+element access is only via `&[| T |]` borrow parameters as shown. For ordinary code
+prefer the immutable `[T]` list (recursion / `std:list`). Reach for `[| T |]` only
+when you genuinely need in-place mutation.
 
 ### 5. Lazy evaluation with `@`
 ```nexus
@@ -202,6 +219,11 @@ Points where the in-tree implementation matches user expectation but the
 canonical `type-system-formal.md` spec is incomplete. Code behaves as
 documented here; the spec is being tightened separately.
 
+> Note: the formal spec writes the throw-term as `raise e`; the **surface
+> keyword you actually type is `throw`** (see Error Handling above). Spec rule
+> names below quote the spec's `raise` spelling, but any code you write uses
+> `throw`.
+
 ### Expression statements (T-ExprStmt) — nexus-ka1m
 
 The term grammar `s ::= ... | e` admits a bare expression as a statement,
@@ -226,7 +248,7 @@ types as `unit` rather than ⊥, and `T-Match`'s divergent-arm carve-out
 does not fire — HIR desugars the form to
 `match (raise e) do | p -> end` (`src/ir/hir/hir.nx`, `StmtLetPattern`
 case), and the trailing `infer_stmts([])` yields `TyUnit`. Workaround
-when you want the arm classified as divergent: write `raise e` as an
+when you want the arm classified as divergent: write `throw e` as an
 expression-statement (or precede with `return`) instead of binding it.
 The pending spec fix extends the ⊥ clause to `let p = raise e'` so both
 binding shapes behave uniformly.
@@ -234,6 +256,34 @@ binding shapes behave uniformly.
 ## Effect System (Caps & Handlers)
 
 Nexus uses coeffects for dependency injection, NOT algebraic effects. See https://nexus-llm-lang.github.io/latest/spec/effects for details.
+
+Minimal self-contained `cap` / `handler` / `inject` (compiles as-is):
+```nexus
+import { Console }, * as stdio from "std:stdio"
+
+cap Logger do                              // declare the capability (interface)
+  fn log(msg: string) -> unit
+end
+
+let console_logger = handler Logger require { PermConsole } do   // implement it
+  fn log(msg: string) -> unit do
+    Console.println(val: "[LOG] " ++ msg)
+    return ()
+  end
+end
+
+let greet = fn (name: string) -> unit require { Logger } do      // depend on the cap
+  Logger.log(msg: "Hello, " ++ name)
+  return ()
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler, console_logger do                // supply handler(s)
+    greet(name: "World")
+  end
+  return ()
+end
+```
 
 Working example: [handler_basic.nx](../../examples/feature/handler_basic.nx) (define a `cap`, implement a `handler`, inject with `inject h do ... end`).
 
@@ -272,9 +322,15 @@ let main = fn () -> unit require { PermConsole } do
 end
 ```
 
+`main` is the runtime entry-point hook — declare it as a plain `let main` and
+**never `export` it** (`export let main` is rejected with E2018).
+
 ### Error Handling
 
-Working example: [try_catch.nx](../../examples/feature/try_catch.nx) (raise, selective catch arms, bare catch).
+**The keyword is `throw`** (not `raise`): `throw SomeException(field: ...)` raises an
+exception; the function's `throws { ... }` row must list it. Catch with `try ... catch`.
+
+Working example: [try_catch.nx](../../examples/feature/try_catch.nx) (throw, selective catch arms, bare catch).
 
 **When to use which form:**
 - **Bare `catch <ident> -> body end`** — one identifier binds the whole exception value. Use when the handler treats every escaping exception uniformly (log, rethrow, return a default). `catch _ -> ...` is the same shape with the value discarded.
@@ -333,7 +389,7 @@ Skip the rewrite when the constructor arm has **no bindings** (e.g. `TkColon -> 
 if let TkString(val: s) = peek_token(toks: toks) then
   return ParsedIdent(name: s, rest: skip(toks: toks))
 else
-  raise UnexpectedToken(expected: "string literal", ...)
+  throw UnexpectedToken(expected: "string literal", ...)
 end
 
 // Expression form
@@ -342,7 +398,7 @@ let arr_elem = if let TyArray(elem: e) = arr_t then e else TyI64 end
 // AVOID — two-arm match on a single binding constructor
 match peek_token(toks: toks) do
   | TkString(val: s) -> return ParsedIdent(name: s, rest: skip(toks: toks))
-  | _ -> raise UnexpectedToken(expected: "string literal", ...)
+  | _ -> throw UnexpectedToken(expected: "string literal", ...)
 end
 ```
 
@@ -503,7 +559,7 @@ For everything else, name the specific exceptions or an already-declared `except
 ```nexus
 // PREFER — row enumerates exactly what escapes
 let parse_top = fn (toks: [Token]) -> Decl throws { ParseError } do
-  raise UnexpectedToken(span: ...)
+  throw UnexpectedToken(span: ...)
 end
 
 let load_config = fn (path: string) -> Config require { Fs } throws { FileNotFound, ParseError } do
@@ -512,7 +568,7 @@ end
 
 // AVOID — Exn admits any exception, including ones the caller can't reasonably catch
 let parse_top = fn (toks: [Token]) -> Decl throws { Exn } do
-  raise UnexpectedToken(span: ...)
+  throw UnexpectedToken(span: ...)
 end
 ```
 
@@ -526,12 +582,16 @@ let lower_to_hir = fn (...) -> HirProgram throws { HirError } do ...
 
 Partial functions (operations defined only on a subset of inputs — `head`, `tail`, `unwrap`, `to_i64`) **must raise a domain-specific exception**, not `RuntimeError(val: "...")`. Catch-all error strings discard the structured information callers need to recover. Declare a real `exception` per failure mode:
 
+Exception names are **unit-global** (they share one namespace across all modules,
+imported or not), so don't reuse a name the stdlib already exports — e.g. `EmptyList`
+is taken by `std:list` and redeclaring it is E2029. Pick a distinct name:
+
 ```nexus
 // PREFER
-exception EmptyList(op: string)
-let head = fn <T>(xs: [T]) -> T throws { EmptyList } do
+exception EmptyInput(op: string)
+let head = fn <T>(xs: [T]) -> T throws { EmptyInput } do
   match xs do
-    | [] -> raise EmptyList(op: "head")
+    | [] -> throw EmptyInput(op: "head")
     | v :: _ -> return v
   end
 end
@@ -539,7 +599,7 @@ end
 // AVOID — RuntimeError is the dumping ground; callers can't pattern-match on intent
 let head = fn <T>(xs: [T]) -> T throws { Exn } do
   match xs do
-    | [] -> raise RuntimeError(val: "head: empty list")
+    | [] -> throw RuntimeError(val: "head: empty list")
     | v :: _ -> return v
   end
 end
@@ -560,7 +620,7 @@ end
 | `throws { Exn }` for a function with a known exception set | List the actual exceptions or an `exception group` (see rule #7) |
 | Multiple match arms with identical RHS: `p1 -> e \| p2 -> e \| p3 -> e` | Fuse with: `p1 \| p2 \| p3 -> e` (see rule #4) |
 | List arm that re-matches its tail: `\| x :: rest -> match rest do ...` | Peel heads on the surface: `\| [x] -> ...` and `\| x :: y :: ys -> ...` (see rule #3 list variant) |
-| `raise RuntimeError(val: "...")` from a partial function | Declare a domain-specific `exception` and raise that |
+| `throw RuntimeError(val: "...")` from a partial function | Declare a domain-specific `exception` and `throw` that |
 | `let r = ...; let r2 = ...; let r3 = ...` when intermediates are dead | Shadow: reuse `r` (see rule #6) |
 
 ## Reference Files

@@ -147,7 +147,7 @@ end
 // ADT: use match (the value carries variants/payloads)
 match res do
   | Ok(val: c)  -> return c
-  | Err(err: m) -> raise ConfigError(msg: m)
+  | Err(err: m) -> throw ConfigError(msg: m)
 end
 ```
 
@@ -271,8 +271,9 @@ end
 - The body sees the enclosing scope, so mutate state via an outer `let ~x = ...`
   (the loop binder itself is immutable).
 
-For traversing a list or array, use `match`/recursion or `list.fold_left` /
-`array.fold_left` instead — there is no `for x in xs` syntax.
+For traversing a list, use `match`/recursion or `list.fold_left` — there is no
+`for x in xs` syntax. For an array, index it inside an integer-range `for` loop
+(`for i = 0 to n do ... a[i] ... end`) through a `&[| T |]` borrow parameter.
 
 ## Linear Resource Management
 
@@ -286,28 +287,40 @@ Nexus linear types (`%`) enforce exactly-once consumption at compile time.
 
 ## Array Patterns
 
-Arrays are linear (`%`). Borrow (`&`) for reads/writes, consume when done.
+Arrays `[| T |]` are a low-level **linear** primitive. There is **no `std:array`
+module** — element access happens only through `&[| T |]` **borrow parameters**
+(borrows are valid solely in argument position; you cannot `let view = &%arr`).
+Inside such a parameter, index with `a[i]` (read) and `a[i] <- v` (write), and
+walk it with an integer-range `for` loop.
 
 ```nexus
-// Create (linear) and borrow (view)
-let %arr = [| 0, 0, 0 |]
-let view = &%arr
-view[0] <- 10
-view[1] <- 20
-view[2] <- 30
+// Read/write through borrow parameters — &%arr is only ever passed as an argument.
+let fill = fn (a: &[| i64 |], n: i64) -> unit do
+  for i = 0 to n do          // exclusive upper bound: i ∈ [0, n)
+    a[i] <- i * 10
+  end
+  return ()
+end
 
-// Read
-let first = view[0]
-let len = array.length(arr: &%arr)
+let sum = fn (a: &[| i64 |], n: i64) -> i64 do
+  let ~total = 0
+  for i = 0 to n do
+    ~total <- ~total + a[i]
+  end
+  return ~total
+end
 
-// Iterate via borrow — fold_left is the borrow-side iterator
-let _ = array.fold_left(arr: &%arr, init: (), f: fn (acc: unit, val: i64) -> unit do
-  Console.println(val: str.from_i64(val: val))
-end)
-
-// Consume (f receives each element as linear)
-array.consume(arr: %arr, f: fn (val: %i64) -> unit do end)
+// caller:
+//   let %arr = [| 0, 0, 0 |]
+//   fill(a: &%arr, n: 3)
+//   let s = sum(a: &%arr, n: 3)
 ```
+
+Consumption caveat: a `%[| T |]` is linear and must be consumed exactly once, but
+arrays have no element-wise destructure and the language ships no array-free /
+`consume` intrinsic — so for most code prefer the immutable `[T]` list
+(recursion / `std:list`) and reach for `[| T |]` only when in-place mutation is
+genuinely required.
 
 ## Pattern shorthands
 
