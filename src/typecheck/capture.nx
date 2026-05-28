@@ -248,3 +248,174 @@ let pat_recfield_binders = fn (fields: [ HirRecordPatField ], acc: [ string ]) -
       return pat_recfield_binders(fields: rest, acc: acc2)
   end
 end
+
+// ── Linear-capture name collection ────────────────────────────────────────────
+//
+// Parallel walk to scan_lambda_captures / scan_stmts, but accumulates the
+// *names* of linear outer bindings captured rather than a bool flag.  Used by
+// effects.nx to enforce the T-Handler cross-arm uniqueness premise:
+//   ∀ y ∈ dom(Γ_cap). |{ j ∈ J | y ∈ fv(e_j) }| = 1
+//
+// Only TyLinear / TyLazy / TyArray outer bindings are collected; ref and
+// plain types are ignored.  Duplicate names are suppressed (only the first
+// occurrence is recorded).
+
+let visit_var_linear = fn (
+  name: string,
+  outer_env: [ EnvEntry ], bound: [ string ], acc: [ string ]
+) -> [ string ] do
+  if str_member(xs: bound, target: name) then return acc end
+  if str_member(xs: acc, target: name) then return acc end
+  match env_lookup(env: outer_env, name) do
+    | None -> return acc
+    | Some(val: Scheme(vars: _, typ: t)) ->
+      match t do
+        | TyLinear(_) | TyLazy(_) | TyArray(_) -> return name :: acc
+        | _ -> return acc
+      end
+  end
+end
+
+let scan_stmts_linear = fn (
+  stmts: [ HirStmt ], outer_env: [ EnvEntry ], bound: [ string ], acc: [ string ]
+) -> [ string ] do
+  match stmts do
+    | [] -> return acc
+    | HirStmt(node: nd, span: _) :: rest ->
+      match nd do
+        | Let(name: n, sigil: _, typ: _, value: v) ->
+          let acc1 = scan_expr_linear(expr: v, outer_env, bound, acc)
+          return scan_stmts_linear(stmts: rest, outer_env, bound: n :: bound, acc: acc1)
+        | Expr(expr: e) | Return(expr: e) ->
+          let acc1 = scan_expr_linear(expr: e, outer_env, bound, acc)
+          return scan_stmts_linear(stmts: rest, outer_env, bound, acc: acc1)
+        | Assign(target: t, value: v) ->
+          let acc1 = scan_expr_linear(expr: t, outer_env, bound, acc)
+          let acc2 = scan_expr_linear(expr: v, outer_env, bound, acc: acc1)
+          return scan_stmts_linear(stmts: rest, outer_env, bound, acc: acc2)
+        | Try(body: b, catch_param: cp, catch_body: cb) ->
+          let acc1 = scan_stmts_linear(stmts: b, outer_env, bound, acc)
+          let acc2 = scan_stmts_linear(stmts: cb, outer_env, bound: cp :: bound, acc: acc1)
+          return scan_stmts_linear(stmts: rest, outer_env, bound, acc: acc2)
+        | Inject(handlers: _, body: b) ->
+          let acc1 = scan_stmts_linear(stmts: b, outer_env, bound, acc)
+          return scan_stmts_linear(stmts: rest, outer_env, bound, acc: acc1)
+      end
+  end
+end
+
+let scan_expr_linear = fn (
+  expr: HirExpr, outer_env: [ EnvEntry ], bound: [ string ], acc: [ string ]
+) -> [ string ] do
+  let HirExpr(node: nd, span: _) = expr
+  match nd do
+    | Literal(_) -> return acc
+    | Variable(name: n, sigil: _) | Borrow(name: n, sigil: _) ->
+      return visit_var_linear(name: n, outer_env, bound, acc)
+    | BinOp(left: l, op: _, right: r) ->
+      let acc1 = scan_expr_linear(expr: l, outer_env, bound, acc)
+      return scan_expr_linear(expr: r, outer_env, bound, acc: acc1)
+    | UnOp(op: _, operand: o) ->
+      return scan_expr_linear(expr: o, outer_env, bound, acc)
+    | Call(func: f, args) ->
+      let acc1 = visit_var_linear(name: f, outer_env, bound, acc)
+      return scan_call_args_linear(args, outer_env, bound, acc: acc1)
+    | CallExpr(callee: c, args) ->
+      let acc1 = scan_expr_linear(expr: c, outer_env, bound, acc)
+      return scan_call_args_linear(args, outer_env, bound, acc: acc1)
+    | Ctor(variant: _, args, labels: _, sigil: _) ->
+      return scan_exprs_linear(exprs: args, outer_env, bound, acc)
+    | Record(fields: fs) ->
+      return scan_named_exprs_linear(exprs: fs, outer_env, bound, acc)
+    | Array(elems: es) ->
+      return scan_exprs_linear(exprs: es, outer_env, bound, acc)
+    | Index(target: t, index: i) ->
+      let acc1 = scan_expr_linear(expr: t, outer_env, bound, acc)
+      return scan_expr_linear(expr: i, outer_env, bound, acc: acc1)
+    | FieldAccess(target: t, field: _) ->
+      return scan_expr_linear(expr: t, outer_env, bound, acc)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      let acc1 = scan_expr_linear(expr: c, outer_env, bound, acc)
+      let acc2 = scan_stmts_linear(stmts: tb, outer_env, bound, acc: acc1)
+      match eb do
+        | Some(val: stmts) -> return scan_stmts_linear(stmts, outer_env, bound, acc: acc2)
+        | None -> return acc2
+      end
+    | Match(target: t, cases: cs) ->
+      let acc1 = scan_expr_linear(expr: t, outer_env, bound, acc)
+      return scan_match_cases_linear(cases: cs, outer_env, bound, acc: acc1)
+    | While(cond: c, body: b) ->
+      let acc1 = scan_expr_linear(expr: c, outer_env, bound, acc)
+      return scan_stmts_linear(stmts: b, outer_env, bound, acc: acc1)
+    | For(var: v, start: s, end_expr: e, body: b) ->
+      let acc1 = scan_expr_linear(expr: s, outer_env, bound, acc)
+      let acc2 = scan_expr_linear(expr: e, outer_env, bound, acc: acc1)
+      return scan_stmts_linear(stmts: b, outer_env, bound: v :: bound, acc: acc2)
+    | Lambda(type_params: _, params: ps, ret_type: _, requires: _, throw_row: _, body: b) ->
+      let inner_bound = collect_param_names(params: ps, acc: bound)
+      return scan_stmts_linear(stmts: b, outer_env, bound: inner_bound, acc)
+    | Raise(expr: e) | Force(expr: e) ->
+      return scan_expr_linear(expr: e, outer_env, bound, acc)
+    | Thunk(body: b) ->
+      return scan_expr_linear(expr: b, outer_env, bound, acc)
+    | ExternalRef(_) | Handler(_) -> return acc
+  end
+end
+
+let scan_exprs_linear = fn (
+  exprs: [ HirExpr ], outer_env: [ EnvEntry ], bound: [ string ], acc: [ string ]
+) -> [ string ] do
+  match exprs do
+    | [] -> return acc
+    | e :: rest ->
+      let acc1 = scan_expr_linear(expr: e, outer_env, bound, acc)
+      return scan_exprs_linear(exprs: rest, outer_env, bound, acc: acc1)
+  end
+end
+
+let scan_call_args_linear = fn (
+  args: [ HirCallArg ], outer_env: [ EnvEntry ], bound: [ string ], acc: [ string ]
+) -> [ string ] do
+  match args do
+    | [] -> return acc
+    | HirCallArg(label: _, value: v) :: rest ->
+      let acc1 = scan_expr_linear(expr: v, outer_env, bound, acc)
+      return scan_call_args_linear(args: rest, outer_env, bound, acc: acc1)
+  end
+end
+
+let scan_named_exprs_linear = fn (
+  exprs: [ HirNamedExpr ], outer_env: [ EnvEntry ], bound: [ string ], acc: [ string ]
+) -> [ string ] do
+  match exprs do
+    | [] -> return acc
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      let acc1 = scan_expr_linear(expr: v, outer_env, bound, acc)
+      return scan_named_exprs_linear(exprs: rest, outer_env, bound, acc: acc1)
+  end
+end
+
+let scan_match_cases_linear = fn (
+  cases: [ HirMatchCase ], outer_env: [ EnvEntry ], bound: [ string ], acc: [ string ]
+) -> [ string ] do
+  match cases do
+    | [] -> return acc
+    | HirMatchCase(pattern: p, body: b) :: rest ->
+      let case_bound = pat_binders(pat: p, acc: bound)
+      let acc1 = scan_stmts_linear(stmts: b, outer_env, bound: case_bound, acc)
+      return scan_match_cases_linear(cases: rest, outer_env, bound, acc: acc1)
+  end
+end
+
+/** Collect the names of linear outer bindings (TyLinear / TyLazy / TyArray)
+ *  that a lambda body captures from `outer_env`.  Each name appears at most
+ *  once in the result.  Used to enforce per-arm linear-capture uniqueness in
+ *  T-Handler. */
+export let collect_linear_capture_names = fn (
+  body: [ HirStmt ],
+  outer_env: [ EnvEntry ],
+  params: [ HirParam ]
+) -> [ string ] do
+  let bound = collect_param_names(params, acc: [])
+  return scan_stmts_linear(stmts: body, outer_env, bound, acc: [])
+end
