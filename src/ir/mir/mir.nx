@@ -370,24 +370,30 @@ type RuntimeHandler = RuntimeHandler(cap_idx: i64, handler_id: i64)
 
 /** Wrap a lowered inject body so that, for the dynamic extent of the body, each
  *  runtime-dispatch cap's register slot holds its injected handler's id, and is
- *  restored to its previous value on BOTH normal and exceptional exit.
+ *  restored to its previous value on EVERY exit path: normal completion,
+ *  exception, AND early `return` out of the inject body.
  *
  *  Emits:
  *    let __hsave_<uniq>_<k> = __hreg_get(cap_idx_k)   // save each slot
  *    __hreg_set(cap_idx_k, id_k)                       // set each slot
  *    try
- *      <body>
+ *      <body'>                                         // body with returns rewritten
  *      __hreg_set(cap_idx_k, __hsave_<uniq>_<k>)       // restore (normal path)
  *    catch __hexn_<uniq> ->
  *      __hreg_set(cap_idx_k, __hsave_<uniq>_<k>)        // restore (throw path)
  *      throw __hexn_<uniq>                               // rethrow
  *    end
  *
- *  Note: an early `return` out of <body> exits the enclosing function before the
- *  normal-path restore runs. That is acceptable because the slot is read fresh
- *  on every dispatch and the inject's previous value is re-established by the
- *  next enclosing inject's set; the common cases (body completes or throws)
- *  restore correctly. With no runtime handlers, the body is returned unchanged.
+ *  <body'> is the original body with every `return e` rewritten to
+ *    `let __hret_<uniq> = e; <restores>; return __hret_<uniq>`
+ *  so the register slot is discharged on the return path too. Without this
+ *  rewrite an early return out of the inject body would leak the inner
+ *  handler's id into the enclosing dynamic scope, causing subsequent same-cap
+ *  calls to dispatch to the wrong handler. Nested injects compose naturally
+ *  because their own wrap already produced inner-restore-then-return tails;
+ *  the outer rewrite then layers its restore before each such return.
+ *
+ *  With no runtime handlers, the body is returned unchanged.
  */
 let wrap_inject_register = fn (
   runtime_hs: [ RuntimeHandler ],
@@ -401,13 +407,116 @@ let wrap_inject_register = fn (
       let sets = build_sets(runtime_hs, acc: [])
       let restores = build_restores(runtime_hs, uniq, idx: 0, acc: [])
       let exn_name = "__hexn_" ++ i64_to_str(uniq)
-      let try_body = concat_mir_stmts(a: body, b: restores)
+      let ret_tmp = "__hret_" ++ i64_to_str(uniq)
+      let body_rw = rewrite_returns_in_stmts(stmts: body, restores, ret_tmp)
+      let try_body = concat_mir_stmts(a: body_rw, b: restores)
       let catch_body = concat_mir_stmts(
         a: restores,
         b: [ MirStmtExpr(expr: MirRaise(expr: MirVariable(name: exn_name))) ]
       )
       let try_stmt = MirStmtTry(body: try_body, catch_param: exn_name, catch_body)
       return concat_mir_stmts(a: saves, b: concat_mir_stmts(a: sets, b: [ try_stmt ]))
+  end
+end
+
+/** Rewrite every `MirStmtReturn(e)` inside `stmts` to a sequence that runs the
+ *  inject's restores BEFORE the return: `let <ret_tmp> = e; <restores>; return <ret_tmp>`.
+ *  Recurses through control-flow stmts (Try, If/While/Match/Block in expression
+ *  position via MirStmtExpr) but does NOT cross MirMakeClosure boundaries —
+ *  returns inside a nested lambda body belong to that lambda's separately-lifted
+ *  MirFunction, not the current inject's enclosing function. */
+let rewrite_returns_in_stmts = fn (
+  stmts: [ MirStmt ],
+  restores: [ MirStmt ],
+  ret_tmp: string
+) -> [ MirStmt ] throws { MirError } do
+  match stmts do
+    | [] -> return []
+    | s :: rest ->
+      let s2 = rewrite_returns_in_stmt(stmt: s, restores, ret_tmp)
+      let rest2 = rewrite_returns_in_stmts(stmts: rest, restores, ret_tmp)
+      return concat_mir_stmts(a: s2, b: rest2)
+  end
+end
+
+let rewrite_returns_in_stmt = fn (
+  stmt: MirStmt,
+  restores: [ MirStmt ],
+  ret_tmp: string
+) -> [ MirStmt ] throws { MirError } do
+  match stmt do
+    | MirStmtReturn(expr: e) ->
+      // The return expression itself does not produce a nested return, so we
+      // do not recurse into it. Hoist e into ret_tmp, run restores, then return.
+      let let_stmt = MirStmtLet(name: ret_tmp, typ: TyI64, expr: e)
+      let tail = [ MirStmtReturn(expr: MirVariable(name: ret_tmp)) ]
+      return concat_mir_stmts(a: [ let_stmt ], b: concat_mir_stmts(a: restores, b: tail))
+    | MirStmtTry(body: b, catch_param: cp, catch_body: cb) ->
+      // Nested try: rewrite returns in both arms. The cp binding does not
+      // shadow anything we touch (ret_tmp is __hret_<uniq>, exn names use a
+      // disjoint __hexn_<uniq> namespace).
+      let b2 = rewrite_returns_in_stmts(stmts: b, restores, ret_tmp)
+      let cb2 = rewrite_returns_in_stmts(stmts: cb, restores, ret_tmp)
+      return [ MirStmtTry(body: b2, catch_param: cp, catch_body: cb2) ]
+    | MirStmtExpr(expr: e) ->
+      let e2 = rewrite_returns_in_expr(expr: e, restores, ret_tmp)
+      return [ MirStmtExpr(expr: e2) ]
+    | MirStmtLet(name: n, typ: t, expr: e) ->
+      let e2 = rewrite_returns_in_expr(expr: e, restores, ret_tmp)
+      return [ MirStmtLet(name: n, typ: t, expr: e2) ]
+    | MirStmtAssign(target: tgt, value: v) ->
+      // No returns can appear inside target/value expression trees in the
+      // surface language; pass through.
+      return [ MirStmtAssign(target: tgt, value: v) ]
+    | MirStmtInjectResume(body_fn: _, handler_arm_fns: _, handler_arm_tags: _) ->
+      // body_fn is a separately-lifted MirFunction; its returns are not ours.
+      return [ stmt ]
+  end
+end
+
+/** Recurse into expressions that carry nested stmt lists (If/While/Match/Block
+ *  in expression position). Other expression shapes are pass-through. We do NOT
+ *  descend into MirMakeClosure / nested closures — those bind their own returns
+ *  via their lifted MirFunction body. */
+let rewrite_returns_in_expr = fn (
+  expr: MirExpr,
+  restores: [ MirStmt ],
+  ret_tmp: string
+) -> MirExpr throws { MirError } do
+  match expr do
+    | MirIf(cond: c, then_body: tb, else_body: eb) ->
+      let tb2 = rewrite_returns_in_stmts(stmts: tb, restores, ret_tmp)
+      let eb2 = match eb do
+        | Some(val: ebs) -> Some(val: rewrite_returns_in_stmts(stmts: ebs, restores, ret_tmp))
+        | None -> None
+      end
+      return MirIf(cond: c, then_body: tb2, else_body: eb2)
+    | MirMatch(target: t, cases: cs) ->
+      let cs2 = rewrite_returns_in_cases(cases: cs, restores, ret_tmp)
+      return MirMatch(target: t, cases: cs2)
+    | MirWhile(cond: c, body: b) ->
+      let b2 = rewrite_returns_in_stmts(stmts: b, restores, ret_tmp)
+      return MirWhile(cond: c, body: b2)
+    | MirBlock(stmts: ss) ->
+      let ss2 = rewrite_returns_in_stmts(stmts: ss, restores, ret_tmp)
+      return MirBlock(stmts: ss2)
+    | _ -> return expr
+  end
+end
+
+let rewrite_returns_in_cases = fn (
+  cases: [ MirMatchCase ],
+  restores: [ MirStmt ],
+  ret_tmp: string
+) -> [ MirMatchCase ] throws { MirError } do
+  match cases do
+    | [] -> return []
+    | MirMatchCase(pattern: p, body: b) :: rest ->
+      let b2 = rewrite_returns_in_stmts(stmts: b, restores, ret_tmp)
+      return MirMatchCase(
+        pattern: p,
+        body: b2
+      ) :: rewrite_returns_in_cases(cases: rest, restores, ret_tmp)
   end
 end
 
