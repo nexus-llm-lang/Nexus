@@ -11,7 +11,9 @@
 
 import { Span } from "src/syntax/token.nx"
 import {
-  TypeExpr, TyLinear,
+  TypeExpr, TyLinear, TyVar, TyUserDefined, TyArrow, TyRef, TyLazy, TyBorrow,
+  TyArray, TyList, TyRecord, TyRow,
+  NamedType,
   RecordDef, EnumDef, VariantField,
   Sigil, SigilImmutable, SigilLinear, SigilLazy
 } from "src/syntax/ast.nx"
@@ -89,10 +91,35 @@ let let_binds_linear = fn (
       end
       let HirExpr(node: vnode, span: _) = value
       match vnode do
-        | Call(func: f, args: _) ->
+        | Call(func: f, args: cargs) ->
           match sig_lookup(sigs, name: f) do
-            | Some(val: SigEntry(name: _, param_types: _, ret_type: rt, throw_row: _)) ->
-              return is_linear_binding_type(t: rt, tdefs, enum_defs)
+            | Some(val: SigEntry(name: _, type_params: tps, param_labels: pls, param_types: pts, ret_type: rt, throw_row: _)) ->
+              // (a) Callee return type is itself linear (e.g. `bb.empty() -> %ByteBuffer`).
+              if is_linear_binding_type(t: rt, tdefs, enum_defs) then return true end
+              // (b) Param→result-slot flow: for any call arg paired (by
+              //     label) to a parameter whose type mentions a callee
+              //     type-parameter that also occurs in `rt`, if the runtime
+              //     arg itself binds linear, the call's result carries the
+              //     linear payload through that type-variable slot. The
+              //     `type_params` gate restricts the check to true generics
+              //     and avoids conflating concrete nominal names (e.g. `Bb`)
+              //     with type-variable references — the linearity pass runs
+              //     BEFORE typecheck's `convert_ud_to_var`, so both `TyVar`
+              //     and `TyUserDefined(α, [])` are TyVar candidates in the
+              //     raw HIR. Targeted check that avoids over-tracking calls
+              //     like `take_bb(b: %x) -> i64` where the linear is
+              //     consumed by the callee (no type-param flow into rt).
+              return any_call_arg_propagates_linear(
+                args: cargs,
+                type_params: tps,
+                param_labels: pls,
+                param_types: pts,
+                ret_type: rt,
+                sigs,
+                tdefs,
+                enum_defs,
+                pre_st
+              )
             | None -> return false
           end
         | CallExpr(callee: _, args: _) ->
@@ -160,6 +187,205 @@ let any_record_field_linear = fn (
         pre_st
       ) then return true end
       return any_record_field_linear(fields: rest, sigs, tdefs, enum_defs, pre_st)
+  end
+end
+
+/** Lookup a parameter type by label; param labels and types are positionally
+ *  parallel. Returns None if the label is not declared (no match — the
+ *  caller treats this as "skip this arg"). */
+let lookup_param_type_by_label = fn (
+  labels: [ string ], types: [ TypeExpr ], target: string
+) -> Option<TypeExpr> do
+  match labels do
+    | [] -> return None
+    | l :: lrest ->
+      match types do
+        | [] -> return None
+        | t :: trest ->
+          if l == target then return Some(val: t) end
+          return lookup_param_type_by_label(labels: lrest, types: trest, target)
+      end
+  end
+end
+
+/** True if `α` occurs anywhere inside `t` as a type-variable reference.
+ *  Linearity runs BEFORE typecheck, so type-parameter references in the
+ *  raw HIR appear as either `TyVar(α)` (already-converted in fixtures) OR
+ *  `TyUserDefined(α, [])` (the parser's lossy encoding of a bare name).
+ *  Both forms denote the same abstract slot and we treat them
+ *  interchangeably here. Walks the type structurally. */
+let tyvar_occurs_in_type = fn (a: string, t: TypeExpr) -> bool do
+  match t do
+    | TyVar(name: n) -> return n == a
+    | TyUserDefined(name: n, args: []) -> return n == a
+    | TyUserDefined(name: _, args: ts) -> return tyvar_occurs_in_types(a, ts)
+    | TyArrow(params: ps, ret: r, requires: _, throw_row: _) ->
+      if tyvar_occurs_in_named_types(a, nts: ps) then return true end
+      return tyvar_occurs_in_type(a, t: r)
+    | TyRef(inner: i) -> return tyvar_occurs_in_type(a, t: i)
+    | TyLinear(inner: i) -> return tyvar_occurs_in_type(a, t: i)
+    | TyLazy(inner: i, require_row: _, throw_row: _) -> return tyvar_occurs_in_type(a, t: i)
+    | TyBorrow(inner: i) -> return tyvar_occurs_in_type(a, t: i)
+    | TyArray(elem: e) -> return tyvar_occurs_in_type(a, t: e)
+    | TyList(elem: e) -> return tyvar_occurs_in_type(a, t: e)
+    | TyRecord(fields: fs) -> return tyvar_occurs_in_named_types(a, nts: fs)
+    | TyRow(types: ts, rest: _) -> return tyvar_occurs_in_types(a, ts)
+    | _ -> return false
+  end
+end
+
+let tyvar_occurs_in_types = fn (a: string, ts: [ TypeExpr ]) -> bool do
+  match ts do
+    | [] -> return false
+    | t :: rest ->
+      if tyvar_occurs_in_type(a, t) then return true end
+      return tyvar_occurs_in_types(a, ts: rest)
+  end
+end
+
+let tyvar_occurs_in_named_types = fn (a: string, nts: [ NamedType ]) -> bool do
+  match nts do
+    | [] -> return false
+    | NamedType(name: _, typ: t) :: rest ->
+      if tyvar_occurs_in_type(a, t) then return true end
+      return tyvar_occurs_in_named_types(a, nts: rest)
+  end
+end
+
+/** Collect all type-variable names occurring anywhere inside `t` as a flat
+ *  list (with possible duplicates; callers test membership). Treats both
+ *  `TyVar(α)` and the raw-HIR-pre-typecheck shape `TyUserDefined(α, [])` as
+ *  type-variable references — see [[tyvar_occurs_in_type]] for the rationale. */
+let collect_tyvars = fn (t: TypeExpr, acc: [ string ]) -> [ string ] do
+  match t do
+    | TyVar(name: n) -> return n :: acc
+    | TyUserDefined(name: n, args: []) -> return n :: acc
+    | TyUserDefined(name: _, args: ts) -> return collect_tyvars_list(ts, acc)
+    | TyArrow(params: ps, ret: r, requires: _, throw_row: _) ->
+      let acc1 = collect_tyvars_named(nts: ps, acc)
+      return collect_tyvars(t: r, acc: acc1)
+    | TyRef(inner: i) -> return collect_tyvars(t: i, acc)
+    | TyLinear(inner: i) -> return collect_tyvars(t: i, acc)
+    | TyLazy(inner: i, require_row: _, throw_row: _) -> return collect_tyvars(t: i, acc)
+    | TyBorrow(inner: i) -> return collect_tyvars(t: i, acc)
+    | TyArray(elem: e) -> return collect_tyvars(t: e, acc)
+    | TyList(elem: e) -> return collect_tyvars(t: e, acc)
+    | TyRecord(fields: fs) -> return collect_tyvars_named(nts: fs, acc)
+    | TyRow(types: ts, rest: _) -> return collect_tyvars_list(ts, acc)
+    | _ -> return acc
+  end
+end
+
+let collect_tyvars_list = fn (ts: [ TypeExpr ], acc: [ string ]) -> [ string ] do
+  match ts do
+    | [] -> return acc
+    | t :: rest ->
+      let acc1 = collect_tyvars(t, acc)
+      return collect_tyvars_list(ts: rest, acc: acc1)
+  end
+end
+
+let collect_tyvars_named = fn (nts: [ NamedType ], acc: [ string ]) -> [ string ] do
+  match nts do
+    | [] -> return acc
+    | NamedType(name: _, typ: t) :: rest ->
+      let acc1 = collect_tyvars(t, acc)
+      return collect_tyvars_named(nts: rest, acc: acc1)
+  end
+end
+
+/** True if any declared type-parameter `α ∈ type_params` occurs inside
+ *  `pt` AND also occurs inside `rt`. Used as the "param→result-slot flow"
+ *  predicate: a linear arg flowing into this parameter slot propagates
+ *  into the result wherever `α` survives in `rt`. The `type_params` gate
+ *  restricts the check to true generics — without it, a concrete nominal
+ *  type like `Bb` in `wrap_id(b: %Bb) -> Bb` would spuriously self-match.
+ *  Returns false when `pt` has no TyVar slots OR when `pt`'s TyVars don't
+ *  reach `rt` (e.g. `take_bb(b: %Bb) -> i64`). */
+let pt_shares_tyvar_with_rt = fn (pt: TypeExpr, rt: TypeExpr, type_params: [ string ]) -> bool do
+  let pt_tyvars = collect_tyvars(t: pt, acc: [])
+  let pt_in_tps = filter_in(xs: pt_tyvars, keep: type_params, acc: [])
+  return any_tyvar_in_rt(tyvars: pt_in_tps, rt)
+end
+
+let any_tyvar_in_rt = fn (tyvars: [ string ], rt: TypeExpr) -> bool do
+  match tyvars do
+    | [] -> return false
+    | a :: rest ->
+      if tyvar_occurs_in_type(a, t: rt) then return true end
+      return any_tyvar_in_rt(tyvars: rest, rt)
+  end
+end
+
+/** Param→result-slot linear propagation check for a Call. For each call arg
+ *  paired (by label) to its declared parameter type `pt`:
+ *    - If `pt` shares any callee-declared `type_params` slot with `rt` AND
+ *      the arg expression itself binds linear (recursive
+ *      `let_binds_linear`), the call result carries the linear payload
+ *      through that TyVar slot — the outer let must track it.
+ *  Avoids over-tracking calls like `take_bb(b: %x) -> i64` (rt has no
+ *  callee-tyvar flow) or `bb.free(buf: %x) -> bool` (rt has no tyvars). */
+let any_call_arg_propagates_linear = fn (
+  args: [ HirCallArg ],
+  type_params: [ string ],
+  param_labels: [ string ],
+  param_types: [ TypeExpr ],
+  ret_type: TypeExpr,
+  sigs: [ SigEntry ],
+  tdefs: [ RecordDef ],
+  enum_defs: [ EnumDef ],
+  pre_st: LinState
+) -> bool do
+  // Fast path: no declared type parameters → no flow possible.
+  match type_params do
+    | [] -> return false
+    | _ -> ()
+  end
+  return any_call_arg_propagates_linear_go(
+    args, type_params, param_labels, param_types, ret_type, sigs, tdefs, enum_defs, pre_st
+  )
+end
+
+let any_call_arg_propagates_linear_go = fn (
+  args: [ HirCallArg ],
+  type_params: [ string ],
+  param_labels: [ string ],
+  param_types: [ TypeExpr ],
+  ret_type: TypeExpr,
+  sigs: [ SigEntry ],
+  tdefs: [ RecordDef ],
+  enum_defs: [ EnumDef ],
+  pre_st: LinState
+) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: l, value: v) :: rest ->
+      match lookup_param_type_by_label(labels: param_labels, types: param_types, target: l) do
+        | Some(val: pt) ->
+          if pt_shares_tyvar_with_rt(pt, rt: ret_type, type_params) then
+            if let_binds_linear(
+              sigil: SigilImmutable,
+              ann: None,
+              value: v,
+              sigs,
+              tdefs,
+              enum_defs,
+              pre_st
+            ) then return true end
+          end
+        | None -> ()
+      end
+      return any_call_arg_propagates_linear_go(
+        args: rest,
+        type_params,
+        param_labels,
+        param_types,
+        ret_type,
+        sigs,
+        tdefs,
+        enum_defs,
+        pre_st
+      )
   end
 end
 
@@ -908,7 +1134,7 @@ let check_throwable_leak = fn (
 ) -> unit throws { TypeError } do
   match sig_lookup(sigs, name: func) do
     | None -> return ()
-    | Some(val: SigEntry(name: _, param_types: _, ret_type: _, throw_row: tw)) ->
+    | Some(val: SigEntry(name: _, param_labels: _, param_types: _, ret_type: _, throw_row: tw)) ->
       if !row_is_throwable(eff_row: tw) then return () end
       let leaked = uncovered_linears(st)
       match leaked do
