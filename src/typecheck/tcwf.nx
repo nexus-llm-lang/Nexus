@@ -55,7 +55,15 @@ import {
   HirHandlerArm,
   HirHandlerBindingEntry,
   HirHandlerBinding,
-  HirParam
+  HirParam,
+  HirStmt,
+  HirStmtKind,
+  HirExpr,
+  HirExprKind,
+  HirCallArg,
+  HirNamedExpr,
+  HirMatchCase,
+  HirBody
 } from "src/ir/hir/types.nx"
 import {
   TypeError,
@@ -64,6 +72,7 @@ import {
   MalformedRowTail,
   RefEscapes,
   RefInnerLinear,
+  LinearTypeInGenericArg,
   ReservedDeclarationName,
   DuplicateDeclaration,
   InvalidGroupMember
@@ -387,6 +396,347 @@ export let enforce_no_escapes_ref = fn (
   end
 end
 
+// ── Generic-instantiation-at-linear well-formedness (spec §Linearity) ─────
+//
+// Persistent generic containers (`Pair`, `Map`, `Option`, ...) deliver their
+// payload by alias on every read: `map.get` returns a fresh copy of the
+// stored value, two unpacks of `let Pair(left: x, right: y) = p` are distinct
+// uses of the same underlying slot, etc. If the slot holds a LINEAR value,
+// each read duplicates that single-use resource — a `bb.empty()` placed in
+// `Map<string, %ByteBuffer>` is observable as two `%ByteBuffer` aliases and
+// freeing both is a double-free.
+//
+// Spec §Linearity states the predicate `linear` recurses into the type
+// arguments of a named type (worked example `linear(Pair<%i64,i64>) = true`).
+// At the IMPL level the 4j5l1 close left the variant-field path
+// deliberately shallow (so PbField → PbValue → %ByteBuffer wouldn't
+// retroactively mark every `[PbField]` linear and break protobuf code that
+// doesn't clean up on throw paths). The shallow tradeoff is preserved here;
+// instead we enforce the rule at TYPE-FORMATION: a generic type parameter
+// cannot be instantiated with a linear type. Equivalently, a
+// `TyUserDefined(name, args)` is well-formed only when no `args[i]` is
+// structurally linear. The rule fires at every type-introduction site
+// (params, return, fields, variant fields), close to the source line that
+// wrote the bad type expression.
+//
+// Concrete (no-args) user types like `PbField` itself do NOT trigger the
+// rule because `args = []`; this is the carve-out that keeps protobuf
+// compiling. Type-parameter occurrences `TyUserDefined("T", [])` are also
+// args-less and so do not trigger; instantiation at a linear actual happens
+// when the caller writes the explicit `<%X>`, which IS caught here.
+
+/** True iff `args` contains a structurally-linear type at any position.
+ *  Returns the 1-based position of the FIRST offending arg (or 0 if none).
+ *  Linear means: TyLinear, TyLazy, TyArray, or a TyUserDefined whose own
+ *  args (recursively) include one — see `is_linear_binding_type`.
+ */
+let first_linear_arg_position = fn (
+  args: [ TypeExpr ],
+  idx: i64,
+  tdefs: [ RecordDef ],
+  enum_defs: [ EnumDef ]
+) -> i64 do
+  match args do
+    | [] -> return 0
+    | a :: rest ->
+      if is_linear_binding_type(t: a, tdefs, enum_defs) then return idx end
+      return first_linear_arg_position(args: rest, idx: idx + 1, tdefs, enum_defs)
+  end
+end
+
+/** Walk a type structurally and reject every `TyUserDefined(name, args)`
+ *  node whose `args` contain a linear type (spec §Linearity: persistent
+ *  generic container cannot hold a linear payload). `context` is a short
+ *  description of the introduction site, used in the diagnostic.
+ *  Recurses into wrappers and into the args themselves so that
+ *  `Box<Pair<%bb, i64>>` is caught at the inner Pair as well as the outer
+ *  Box (whichever fires first reports the inner-most precise location).
+ *  Arrow types are NOT recursed into here: a `fn () -> Map<string, %bb>`
+ *  *type* in an outer return position is caught at the outer site, and the
+ *  arrow's own ret-type is screened when that lambda is registered.
+ */
+export let enforce_no_linear_type_args = fn (
+  typ: TypeExpr,
+  context: string,
+  span: Span,
+  tdefs: [ RecordDef ],
+  enum_defs: [ EnumDef ]
+) -> unit throws { TypeError } do
+  match typ do
+    // Wrappers: peel and recurse. The wrappers themselves carry no args
+    // we'd reject; the inner type may.
+    | TyLinear(inner: i) | TyLazy(
+      inner: i,
+      require_row: _,
+      throw_row: _
+    ) | TyBorrow(inner: i) | TyRef(inner: i) ->
+      return enforce_no_linear_type_args(typ: i, context, span, tdefs, enum_defs)
+    | TyArray(elem: e) | TyList(elem: e) ->
+      return enforce_no_linear_type_args(typ: e, context, span, tdefs, enum_defs)
+    | TyRecord(fields: fs) ->
+      return enforce_no_linear_named_types(fields: fs, context, span, tdefs, enum_defs)
+    | TyUserDefined(name: n, args: type_args) ->
+      // Recurse into args FIRST so the innermost `Pair<%bb, _>` in
+      // `Box<Pair<%bb, _>>` is reported (more precise) before the outer
+      // Box-of-linear. After the recursion, check this level.
+      enforce_no_linear_args_each(args: type_args, context, span, tdefs, enum_defs)
+      let pos = first_linear_arg_position(args: type_args, idx: 1, tdefs, enum_defs)
+      if pos > 0 then
+        throw LinearTypeInGenericArg(context, outer_type: n, position: pos, span)
+      end
+      return ()
+    | _ -> return ()
+  end
+end
+
+let enforce_no_linear_args_each = fn (
+  args: [ TypeExpr ],
+  context: string,
+  span: Span,
+  tdefs: [ RecordDef ],
+  enum_defs: [ EnumDef ]
+) -> unit throws { TypeError } do
+  match args do
+    | [] -> return ()
+    | a :: rest ->
+      enforce_no_linear_type_args(typ: a, context, span, tdefs, enum_defs)
+      return enforce_no_linear_args_each(args: rest, context, span, tdefs, enum_defs)
+  end
+end
+
+let enforce_no_linear_named_types = fn (
+  fields: [ NamedType ],
+  context: string,
+  span: Span,
+  tdefs: [ RecordDef ],
+  enum_defs: [ EnumDef ]
+) -> unit throws { TypeError } do
+  match fields do
+    | [] -> return ()
+    | NamedType(name: _, typ: t) :: rest ->
+      enforce_no_linear_type_args(typ: t, context, span, tdefs, enum_defs)
+      return enforce_no_linear_named_types(fields: rest, context, span, tdefs, enum_defs)
+  end
+end
+
+/** Apply `enforce_no_linear_type_args` to each named-typed slot (e.g. a list
+ *  of function parameters or D-Cap method parameters). `param_label_fmt` is
+ *  used to format the per-param context string.
+ */
+let enforce_no_linear_args_in_params = fn (
+  params: [ NamedType ],
+  context_prefix: string,
+  span: Span,
+  tdefs: [ RecordDef ],
+  enum_defs: [ EnumDef ]
+) -> unit throws { TypeError } do
+  match params do
+    | [] -> return ()
+    | NamedType(name: n, typ: t) :: rest ->
+      enforce_no_linear_type_args(
+        typ: t,
+        context: "parameter '" ++ n ++ "' of " ++ context_prefix,
+        span,
+        tdefs,
+        enum_defs
+      )
+      return enforce_no_linear_args_in_params(params: rest, context_prefix, span, tdefs, enum_defs)
+  end
+end
+
+// ── Function-body let-annotation walk ──────────────────────────────────────
+//
+// `let x: Map<string, %bb> = ...` is the second of the four spec-listed
+// reject sites and slips through the param/return walks above. The body
+// walker visits every `Let` statement in an EagerBody (the form normal
+// lambdas are converted into), and runs the type-formation check against
+// the user-written annotation when present (the Option<TypeExpr>). It
+// recurses through block-bearing statement / expression kinds so that
+// annotations inside nested If/Match/While/For/Try/Inject/Lambda branches
+// are also covered. LazyBody (rare; only top-level non-lambda lets pre
+// `iterative_resolve`) is skipped — those convert to a single value
+// binding whose own annotation is captured elsewhere if at all.
+
+let walk_body_let_annots = fn (
+  body: HirBody,
+  fn_name: string,
+  tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  match body do
+    | EagerBody(stmts) -> return walk_stmts_let_annots(stmts, fn_name, tdefs)
+    | LazyBody(ast_expr: _, entries: _) -> return ()
+  end
+end
+
+let walk_stmts_let_annots = fn (
+  stmts: [ HirStmt ],
+  fn_name: string,
+  tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  match stmts do
+    | [] -> return ()
+    | HirStmt(node: kind, span: sp) :: rest ->
+      walk_stmt_kind_let_annots(kind, span: sp, fn_name, tdefs)
+      return walk_stmts_let_annots(stmts: rest, fn_name, tdefs)
+  end
+end
+
+let walk_stmt_kind_let_annots = fn (
+  kind: HirStmtKind,
+  span: Span,
+  fn_name: string,
+  tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  match kind do
+    | Let(name: ln, sigil: _, typ: ann, value: v) ->
+      match ann do
+        | Some(val: t) ->
+          enforce_no_linear_type_args(
+            typ: t,
+            context: "let binding '" ++ ln ++ "' in '" ++ fn_name ++ "'",
+            span,
+            tdefs,
+            enum_defs: []
+          )
+        | None -> ()
+      end
+      return walk_expr_let_annots(expr: v, fn_name, tdefs)
+    | Expr(expr: e) -> return walk_expr_let_annots(expr: e, fn_name, tdefs)
+    | Return(expr: e) -> return walk_expr_let_annots(expr: e, fn_name, tdefs)
+    | Assign(target: tgt, value: v) ->
+      walk_expr_let_annots(expr: tgt, fn_name, tdefs)
+      return walk_expr_let_annots(expr: v, fn_name, tdefs)
+    | Try(body: tb, catch_param: _, catch_body: cb) ->
+      walk_stmts_let_annots(stmts: tb, fn_name, tdefs)
+      return walk_stmts_let_annots(stmts: cb, fn_name, tdefs)
+    | Inject(handlers: _, body: ib) ->
+      return walk_stmts_let_annots(stmts: ib, fn_name, tdefs)
+  end
+end
+
+let walk_expr_let_annots = fn (
+  expr: HirExpr,
+  fn_name: string,
+  tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  let HirExpr(node: kind, span: _) = expr
+  match kind do
+    | Literal(lit: _) -> return ()
+    | Variable(name: _, sigil: _) -> return ()
+    | Borrow(name: _, sigil: _) -> return ()
+    | BinOp(left: l, op: _, right: r) ->
+      walk_expr_let_annots(expr: l, fn_name, tdefs)
+      return walk_expr_let_annots(expr: r, fn_name, tdefs)
+    | UnOp(op: _, operand: o) -> return walk_expr_let_annots(expr: o, fn_name, tdefs)
+    | Call(func: _, args: as_) -> return walk_call_args_let_annots(args: as_, fn_name, tdefs)
+    | CallExpr(callee: c, args: as_) ->
+      walk_expr_let_annots(expr: c, fn_name, tdefs)
+      return walk_call_args_let_annots(args: as_, fn_name, tdefs)
+    | Ctor(variant: _, args: as_, labels: _, sigil: _) ->
+      return walk_exprs_let_annots(exprs: as_, fn_name, tdefs)
+    | Record(fields: fs) -> return walk_named_exprs_let_annots(fields: fs, fn_name, tdefs)
+    | Array(elems: es) -> return walk_exprs_let_annots(exprs: es, fn_name, tdefs)
+    | Index(target: t, index: i) ->
+      walk_expr_let_annots(expr: t, fn_name, tdefs)
+      return walk_expr_let_annots(expr: i, fn_name, tdefs)
+    | FieldAccess(target: t, field: _) -> return walk_expr_let_annots(expr: t, fn_name, tdefs)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      walk_expr_let_annots(expr: c, fn_name, tdefs)
+      walk_stmts_let_annots(stmts: tb, fn_name, tdefs)
+      match eb do
+        | Some(val: es) -> return walk_stmts_let_annots(stmts: es, fn_name, tdefs)
+        | None -> return ()
+      end
+    | Match(target: t, cases: cs) ->
+      walk_expr_let_annots(expr: t, fn_name, tdefs)
+      return walk_match_cases_let_annots(cases: cs, fn_name, tdefs)
+    | While(cond: c, body: wb) ->
+      walk_expr_let_annots(expr: c, fn_name, tdefs)
+      return walk_stmts_let_annots(stmts: wb, fn_name, tdefs)
+    | For(var: _, start: s, end_expr: e, body: fb) ->
+      walk_expr_let_annots(expr: s, fn_name, tdefs)
+      walk_expr_let_annots(expr: e, fn_name, tdefs)
+      return walk_stmts_let_annots(stmts: fb, fn_name, tdefs)
+    | Lambda(
+        type_params: _,
+        params: _,
+        ret_type: _,
+        requires: _,
+        throw_row: _,
+        body: lb
+      ) ->
+      // Nested lambda: walk its body too. Its own params/ret are checked by
+      // walk_funcs when it surfaces as a top-level HirFunction (after lambda
+      // lifting) or here (anonymous, lifted later). To be safe also include
+      // them now — but conservatively only the body since the lambda's params
+      // are checked at the parent level once the lambda is lifted.
+      return walk_stmts_let_annots(stmts: lb, fn_name, tdefs)
+    | Raise(expr: e) -> return walk_expr_let_annots(expr: e, fn_name, tdefs)
+    | Force(expr: e) -> return walk_expr_let_annots(expr: e, fn_name, tdefs)
+    | Thunk(body: e) -> return walk_expr_let_annots(expr: e, fn_name, tdefs)
+    | ExternalRef(symbol: _, type_params: _, arg_names: _, typ: _) -> return ()
+    | Handler(cap_name: _, requires: _, arms: _) ->
+      // Handler arms are themselves HirFunctions in handler_bindings; their
+      // let-annotations get walked when walk_handler_bindings invokes us on
+      // each arm's body. Anonymous Handler-expr arms are not currently lifted
+      // into handler_bindings; conservatively skip — annotation checks at
+      // params/return are still applied at the lambda surface.
+      return ()
+  end
+end
+
+let walk_call_args_let_annots = fn (
+  args: [ HirCallArg ],
+  fn_name: string,
+  tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  match args do
+    | [] -> return ()
+    | HirCallArg(label: _, value: v) :: rest ->
+      walk_expr_let_annots(expr: v, fn_name, tdefs)
+      return walk_call_args_let_annots(args: rest, fn_name, tdefs)
+  end
+end
+
+let walk_exprs_let_annots = fn (
+  exprs: [ HirExpr ],
+  fn_name: string,
+  tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  match exprs do
+    | [] -> return ()
+    | e :: rest ->
+      walk_expr_let_annots(expr: e, fn_name, tdefs)
+      return walk_exprs_let_annots(exprs: rest, fn_name, tdefs)
+  end
+end
+
+let walk_named_exprs_let_annots = fn (
+  fields: [ HirNamedExpr ],
+  fn_name: string,
+  tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  match fields do
+    | [] -> return ()
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      walk_expr_let_annots(expr: v, fn_name, tdefs)
+      return walk_named_exprs_let_annots(fields: rest, fn_name, tdefs)
+  end
+end
+
+let walk_match_cases_let_annots = fn (
+  cases: [ HirMatchCase ],
+  fn_name: string,
+  tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  match cases do
+    | [] -> return ()
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      walk_stmts_let_annots(stmts: b, fn_name, tdefs)
+      return walk_match_cases_let_annots(cases: rest, fn_name, tdefs)
+  end
+end
+
 // wfRef (spec §wfRef): wfRef(~σ) ⟺ ¬linear(σ).
 // A ref cell's inner type must not be linear — each deref (~x) would
 // otherwise produce a fresh copy of the linear payload, duplicating the
@@ -489,6 +839,27 @@ let walk_funcs = fn (
       // wfRef on parameter types: pre-DCE so even unused functions with ref(%T) params are rejected.
       let fn_param_nts = hir_params_to_named_types_tcwf(params: fn_params)
       enforce_wf_ref_params(params: fn_param_nts, span: sp, tdefs)
+      // Spec §Linearity (type-formation): no generic instantiation at a linear
+      // type argument. Checked on declared return type and every parameter type.
+      enforce_no_linear_type_args(
+        typ: ret,
+        context: "return type of '" ++ fn_name ++ "'",
+        span: sp,
+        tdefs,
+        enum_defs: []
+      )
+      enforce_no_linear_args_in_params(
+        params: fn_param_nts,
+        context_prefix: "'" ++ fn_name ++ "'",
+        span: sp,
+        tdefs,
+        enum_defs: []
+      )
+      // NOTE: body let-annotation walking is intentionally NOT done here:
+      // `check_program_wf_rows` runs on pre-resolve HirProgram where all
+      // top-level lambda bodies are still LazyBody. Body walking happens in
+      // `check_program_wf_let_annots` after `iterative_resolve` has flipped
+      // bodies to EagerBody.
       return walk_funcs(funcs: rest, caps, vidx_, groups, tdefs)
   end
 end
@@ -533,6 +904,15 @@ let walk_handler_arms = fn (
       // wfRef on handler arm parameter types.
       let arm_param_nts = hir_params_to_named_types_tcwf(params: arm_ps)
       enforce_wf_ref_params(params: arm_param_nts, span: sp, tdefs)
+      // Spec §Linearity (type-formation): no generic-of-linear in handler arm params.
+      enforce_no_linear_args_in_params(
+        params: arm_param_nts,
+        context_prefix: "handler arm",
+        span: sp,
+        tdefs,
+        enum_defs: []
+      )
+      // NOTE: body let-annotation walking is deferred to `check_program_wf_let_annots`.
       return walk_handler_arms(arms: rest, caps, vidx_, groups, tdefs)
   end
 end
@@ -604,6 +984,21 @@ let walk_cap_methods_wf_ref = fn (
       // wfRef on D-Cap method parameter types (spec §wfRef table, D-Cap).
       let method_param_nts = hir_params_to_named_types_tcwf(params: mparams)
       enforce_wf_ref_params(params: method_param_nts, span: sp, tdefs)
+      // Spec §Linearity (type-formation): no generic-of-linear in cap method params/return.
+      enforce_no_linear_type_args(
+        typ: mret,
+        context: "return type of cap method '" ++ mname ++ "'",
+        span: sp,
+        tdefs,
+        enum_defs: []
+      )
+      enforce_no_linear_args_in_params(
+        params: method_param_nts,
+        context_prefix: "cap method '" ++ mname ++ "'",
+        span: sp,
+        tdefs,
+        enum_defs: []
+      )
       return walk_cap_methods_wf_ref(methods: rest, vidx_, groups, tdefs)
   end
 end
@@ -643,6 +1038,19 @@ let walk_variant_fields = fn (
       end
       // escapesRef: reject ref(σ) at any structurally reachable position.
       enforce_no_escapes_ref(typ: t, context: ctx, span: Span(offset: 0, line: 0, col: 0))
+      // Spec §Linearity (type-formation): a variant field that names a generic
+      // type instantiated at a linear type-arg (e.g. `Pair<%bb, _>`) violates
+      // the persistent-container rule. Concrete user enums whose body
+      // transitively reaches a linear (PbField->PbValue->%ByteBuffer) are NOT
+      // touched here (the protobuf carve-out): only the direct `<%T>`
+      // type-arg position is rejected.
+      enforce_no_linear_type_args(
+        typ: t,
+        context: ctx,
+        span: Span(offset: 0, line: 0, col: 0),
+        tdefs,
+        enum_defs: []
+      )
       return walk_variant_fields(
         fields: rest,
         idx: idx + 1,
@@ -699,6 +1107,14 @@ let walk_record_fields = fn (
       end
       // escapesRef: reject ref(σ) at any structurally reachable position.
       enforce_no_escapes_ref(typ: t, context: ctx, span: Span(offset: 0, line: 0, col: 0))
+      // Spec §Linearity (type-formation): no generic-of-linear in record-typedef fields.
+      enforce_no_linear_type_args(
+        typ: t,
+        context: ctx,
+        span: Span(offset: 0, line: 0, col: 0),
+        tdefs,
+        enum_defs: []
+      )
       return walk_record_fields(fields: rest, type_name, tdefs, enum_defs)
   end
 end
@@ -889,4 +1305,94 @@ export let check_program_wf_rows = fn (prog: HirProgram) -> unit throws { TypeEr
   walk_enum_defs(defs: edefs, tdefs, enum_defs: edefs)
   // D-Type-Record: wfRef + escapesRef on record fields.
   return walk_type_defs(defs: tdefs, tdefs, enum_defs: edefs)
+end
+
+// ── Post-resolve let-annotation walk ──────────────────────────────────────
+//
+// `check_program_wf_rows` walks the pre-resolve HIR where top-level lambda
+// bodies are still `LazyBody`; nested `let x: T = e` annotations inside
+// those bodies aren't visible there. This pass runs after
+// `iterative_resolve` (or `resolve_all_lazy_no_filter`) has converted
+// reachable bodies to `EagerBody`, and applies the type-formation rule to
+// every let-annotation found in function bodies.
+
+let walk_funcs_let_annots = fn (
+  funcs: [ HirFunction ], tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  match funcs do
+    | [] -> return ()
+    | HirFunction(
+      name: fn_name,
+      type_params: _,
+      params: _,
+      ret_type: _,
+      throw_row: _,
+      body: fn_body,
+      span: _,
+      file: _,
+      requires: _
+    ) :: rest ->
+      walk_body_let_annots(body: fn_body, fn_name, tdefs)
+      return walk_funcs_let_annots(funcs: rest, tdefs)
+  end
+end
+
+let walk_handler_bindings_let_annots = fn (
+  hbs: [ HirHandlerBindingEntry ], tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  match hbs do
+    | [] -> return ()
+    | HirHandlerBindingEntry(
+      name: _,
+      binding: HirHandlerBinding(cap_name: _, requires: _, arms)
+    ) :: rest ->
+      walk_handler_arms_let_annots(arms, tdefs)
+      return walk_handler_bindings_let_annots(hbs: rest, tdefs)
+  end
+end
+
+let walk_handler_arms_let_annots = fn (
+  arms: [ HirHandlerArm ], tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  match arms do
+    | [] -> return ()
+    | HirHandlerArm(
+      arm: HirFunction(
+        name: arm_name,
+        type_params: _,
+        params: _,
+        ret_type: _,
+        throw_row: _,
+        body: arm_body,
+        span: _,
+        file: _,
+        requires: _
+      ),
+      cont_binder: _
+    ) :: rest ->
+      walk_body_let_annots(body: arm_body, fn_name: arm_name, tdefs)
+      return walk_handler_arms_let_annots(arms: rest, tdefs)
+  end
+end
+
+/** Spec §Linearity (type-formation) for let-annotations: walk every
+ *  function body and handler-arm body in the program and reject any
+ *  `let x: T = e` whose annotation T instantiates a generic at a linear
+ *  type-arg (`Map<string, %bb>`, `Pair<%bb, _>`, …). Must run on the
+ *  post-resolve HirProgram (bodies converted from LazyBody to EagerBody).
+ */
+export let check_program_wf_let_annots = fn (prog: HirProgram) -> unit throws { TypeError } do
+  let HirProgram(
+    caps: _,
+    functions: funcs,
+    externals: _,
+    handler_bindings: hbs,
+    enum_defs: _,
+    exception_groups: _,
+    value_binding_names: _,
+    type_defs: tdefs,
+    visible_enum_names: _
+  ) = prog
+  walk_funcs_let_annots(funcs, tdefs)
+  return walk_handler_bindings_let_annots(hbs, tdefs)
 end
