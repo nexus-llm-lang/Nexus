@@ -59,7 +59,7 @@ tag.
 
 | File | What it shows |
 | ---- | --- |
-| [`feature/try_catch.nx`](./feature/try_catch.nx) | `raise` + `try / catch | Pattern -> ...` + `throws { ... }` row |
+| [`feature/try_catch.nx`](./feature/try_catch.nx) | `throw` + `try / catch | Pattern -> ...` + `throws { ... }` row |
 | [`feature/exception_group.nx`](./feature/exception_group.nx) | `exception group G = A | B` closed sums |
 
 ### Effects (caps + handlers)

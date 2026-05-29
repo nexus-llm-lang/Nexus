@@ -57,7 +57,7 @@ end
 
 - The parser accepts a comma-separated list of handler expressions in one
   `inject` (see `parse_inject_stmt` / `parse_inject_handlers` in
-  `src/frontend/parser.nx`); order is not significant between independent
+  `src/frontend/parser/core.nx`); order is not significant between independent
   handlers.
 - The comma form keeps `BODY`'s indentation flat. Nested `inject` walls add an
   indentation level per handler with no extra meaning.
@@ -105,8 +105,8 @@ end
   exposes it under a fixed implicit name; the explicit form lets you choose
   the name (`k`, `kont`, `cc`, etc.) and is required if the arm body
   contains a nested closure that wants to capture the continuation.
-- Parsed by `src/frontend/parser.nx::parse_optional_with_kont`; carried as
-  `cont_binder: Option<string>` on `HandlerArm` in `src/common/ast.nx`.
+- Parsed by `src/frontend/parse_args.nx::parse_optional_with_kont`; carried as
+  `cont_binder: Option<string>` on `HandlerArm` in `src/syntax/ast.nx` (line 155).
 
 ## Error Handling Patterns
 
@@ -417,7 +417,7 @@ let w = (a | b) + c     // OK — paren'd
 if (flags | MASK) != 0 then ... end   // OK — if-cond is unambiguous
 ```
 
-The disambiguation logic lives in `src/frontend/parser.nx::parse_prec_loop`
+The disambiguation logic lives in `src/frontend/parser/core.nx::parse_prec_loop`
 via `pcore.pipe_starts_arm` (depth-tracking lookahead scan, 64-token fuel
 cap).
 

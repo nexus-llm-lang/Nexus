@@ -181,7 +181,7 @@ import * as list from "std:list"
 import { Result, Ok, Err } from "std:result"
 
 // Local files — bare relative paths (no colon)
-import { MyType } from "src/common/foo.nx"
+import { HandlerArm } from "src/syntax/ast.nx"
 
 // FFI binding — declares the host module for subsequent `external` decls
 import external "std:str"
