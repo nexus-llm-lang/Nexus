@@ -36,11 +36,12 @@
 
 import { Span } from "src/types/span.nx"
 import { BinaryOp, UnaryOp, OpNeg, OpFNeg, OpNot } from "src/types/vocab.nx"
-import { TypeExpr, TyUnit, TyBool, TyHandler } from "src/types/type_expr.nx"
-import { HirExprKind, HirExpr, HirStmtKind, HirStmt } from "src/ir/hir/types.nx"
+import { TypeExpr, TyUnit, TyBool, TyHandler, TyLazy, TyRow } from "src/types/type_expr.nx"
+import { HirExprKind, HirExpr, HirStmtKind, HirStmt, HirHandlerArm, HirFunction, EagerBody, HirParam } from "src/ir/hir/types.nx"
+import { convert_ud_to_var } from "src/typecheck/check/occurs.nx"
 import { validate_inline_handler_arm_set } from "src/typecheck/check/registration.nx"
 import {
-  CheckState,
+  CheckState, EnvEntry,
   InferExprResult, InferExprOk, InferExprErr,
   UnifyOk, UnifyErr
 }, * as tctypes from "src/typecheck/types.nx"
@@ -51,7 +52,7 @@ import * as tcwf from "src/typecheck/tcwf.nx"
 import { infer_literal, infer_variable, infer_borrow } from "src/typecheck/infer/literals.nx"
 import * as operators from "src/typecheck/infer/operators.nx"
 import { infer_constructor } from "src/typecheck/infer/constructor.nx"
-import { stmt_diverges } from "src/typecheck/infer/control_flow.nx"
+import { stmt_diverges, infer_stmts_tail_diverges } from "src/typecheck/infer/control_flow.nx"
 import { scan_handler_arms_for_ref_capture, scan_handler_arms_for_linear_cross } from "src/typecheck/infer/effects.nx"
 import { infer_call } from "src/typecheck/infer/call.nx"
 import {
@@ -62,7 +63,7 @@ import {
   infer_call_expr
 } from "src/typecheck/infer/exprs.nx"
 import { infer_stmt_impl } from "src/typecheck/infer/stmt_eval.nx"
-import { TypeError, UnreachableCode, HandlerLinearCrossArm } from "src/typecheck/errors.nx"
+import { TypeError, TypeMismatch, UnreachableCode, HandlerLinearCrossArm } from "src/typecheck/errors.nx"
 import { Option, Some, None } from "std:option"
 
 /** Infer the type of a HIR expression in `state`. `ret_type` is the enclosing function's return type (used to type-check `return`). Threads a substitution and updated state through the result. */
@@ -217,6 +218,11 @@ export let infer_expr = fn (
           match scan_handler_arms_for_linear_cross(arms: hms, outer_env: tctypes.state_env(state)) do
             | Some(val: dup_name) -> throw HandlerLinearCrossArm(name: dup_name, span: sp)
             | None ->
+              // T-Continuation: for `with @k` arms, every control path must
+              // terminate divergently. Check each such arm body here for the
+              // inline handler path (top-level handlers are checked in
+              // check_arm_body after synthesize_handler).
+              check_inline_kont_arm_tails(state, arms: hms)
               return InferExprOk(
                 state,
                 subst: subst.subst_empty(),
@@ -224,6 +230,84 @@ export let infer_expr = fn (
               )
           end
       end
+  end
+end
+
+// check_inline_kont_arm_tails: enforce T-Continuation tail(s̄) = ⊥ for each
+// `with @k` arm in an inline handler expression. Mirrors check_arm_body in
+// check.nx (which covers the top-level let-bound handler path). For each arm
+// with a continuation binder, sets up the body environment with @k bound,
+// runs infer_stmts to determine body_typ, then rejects with TypeMismatch when
+// the arm declares a non-unit return but the body falls through with unit type
+// and no tail-diverging control path.
+let check_inline_kont_arm_tails = fn (
+  state: CheckState,
+  arms: [ HirHandlerArm ]
+) -> unit throws { TypeError } do
+  match arms do
+    | [] -> return ()
+    | HirHandlerArm(arm: func, cont_binder: None) :: rest ->
+      return check_inline_kont_arm_tails(state, arms: rest)
+    | HirHandlerArm(
+      arm: HirFunction(
+        name,
+        type_params: tps,
+        params,
+        ret_type: ret,
+        throw_row: tw,
+        body: hir_body,
+        span: fn_span,
+        _
+      ),
+      cont_binder: Some(val: k)
+    ) :: rest ->
+      let body = match hir_body do | EagerBody(stmts: s) -> s | _ -> [] end
+      let conv_ret = convert_ud_to_var(typ: ret, vars: tps)
+      let ret_is_unit = if let TyUnit = conv_ret then true else false end
+      if !ret_is_unit then
+        // Bind params in env so infer_stmts can resolve parameter references.
+        let param_env = add_inline_arm_params(env: tctypes.state_env(state), params)
+        // Bind k as @ret_type so that forcing @k type-checks correctly.
+        let kont_env = tctypes.env_insert(
+          env: param_env,
+          name: k,
+          scheme: tctypes.mono(typ: TyLazy(
+            inner: conv_ret,
+            require_row: TyRow(types: [], rest: None),
+            throw_row: TyRow(types: [], rest: None)
+          ))
+        )
+        let arm_state = tctypes.state_with_env(state, env: kont_env)
+        let conv_tw = convert_ud_to_var(typ: tw, vars: tps)
+        let arm_state2 = tctypes.state_with_throw_row(state: arm_state, throw_row: conv_tw)
+        match infer_stmts(state: arm_state2, stmts: body, ret_type: conv_ret) do
+          | InferExprErr(message: m, span: err_span) ->
+            throw TypeMismatch(func_name: name, detail: m, span: err_span)
+          | InferExprOk(state: _, subst: _, typ: body_typ) ->
+            let body_is_unit = if let TyUnit = body_typ then true else false end
+            if body_is_unit && !infer_stmts_tail_diverges(stmts: body, depth: 64) then
+              throw TypeMismatch(
+                func_name: name,
+                detail: "return type is non-unit but body does not end with a `return` or `throw` on all paths (spec T-Lambda: τ_r ≠ unit ⟹ tail(s†) = ⊥)",
+                span: fn_span
+              )
+            end
+        end
+      end
+      return check_inline_kont_arm_tails(state, arms: rest)
+  end
+end
+
+// add_inline_arm_params: bind arm parameter names into the environment so that
+// infer_stmts on the arm body can resolve parameter references.
+let add_inline_arm_params = fn (env: [ EnvEntry ], params: [ HirParam ]) -> [ EnvEntry ] do
+  match params do
+    | [] -> return env
+    | HirParam(label: _, name: n, sigil: _, typ: t) :: rest ->
+      return add_inline_arm_params(
+        env: tctypes.env_insert(env, name: n, scheme: tctypes.mono(typ: t)),
+        params: rest
+      )
   end
 end
 
