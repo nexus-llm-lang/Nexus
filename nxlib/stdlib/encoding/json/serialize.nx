@@ -1,0 +1,248 @@
+/**
+ * json/serialize: RFC 8259 JSON serializer — emit compact JSON.
+ *
+ * Builds an output string by recursive descent. Strings escape per RFC 8259:
+ * the required-escape set is " \ and U+0000..U+001F. Forward slashes and
+ * non-ASCII code points are emitted as-is (the spec permits this for any
+ * UTF-8 producer).
+ */
+
+import * as str from "std:str"
+import * as char from "std:char"
+import * as bb from "std:bytebuffer"
+import { JsonError, JsonThrow, JsonField, JsonValue,
+         JsonNull, JsonBool, JsonInt, JsonFloat, JsonString,
+         JsonArray, JsonObject } from "std:encoding/json/types"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Internal helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+let ch_dquote = '"'
+let ch_backslash = '\\'
+
+let len_of = fn (s: string) -> i64 do
+  return str.byte_length(s)
+end
+
+// Flush the byte range [start, end) onto a bytebuffer accumulator without
+// re-encoding — this is the only way to preserve raw UTF-8 sequences from
+// the source string (a char-by-char loop would mis-handle 4-byte forms).
+// Pushing into a ByteBuffer keeps each step amortized O(|chunk|); the
+// previous string-acc form copied the growing accumulator on every escape
+// boundary, producing the O(N^2) cliff captured by the xcp6 regression.
+let flush_range_into = fn (
+  buf: %bb.ByteBuffer,
+  s: string,
+  start: i64,
+  end_pos: i64
+) -> %bb.ByteBuffer do
+  if end_pos <= start then return buf end
+  return bb.push_string(%buf, s: str.byte_substring(s, start, len: end_pos - start))
+end
+
+let hex_digit = fn (n: i64) -> string do
+  if n < 10 then
+    return str.from_char_code(code: n + 48)  // '0'
+  end
+  return str.from_char_code(code: n + 87)  // 'a' - 10
+end
+
+let unicode_escape = fn (code: i64) -> string do
+  let d3 = code / 4096
+  let d2 = (code / 256) - d3 * 16
+  let d1 = (code / 16) - (code / 256) * 16
+  let d0 = code - (code / 16) * 16
+  return "\\u" ++ hex_digit(n: d3) ++ hex_digit(n: d2) ++ hex_digit(n: d1) ++ hex_digit(n: d0)
+end
+
+// Emit string payload between quotes. Walks bytes; escapes the seven named
+// forms plus \uXXXX for U+0000..U+001F. Non-control bytes flow through
+// untouched, preserving multi-byte UTF-8 sequences.
+//
+// Threads a ByteBuffer accumulator instead of a string acc so the per-step
+// cost stays amortized O(|chunk|); the previous form copied a growing
+// string on every escape boundary, producing the O(N^2) cliff captured by
+// the xcp6 regression.
+let escape_string_into = fn (
+  buf: %bb.ByteBuffer,
+  s: string,
+  p: i64,
+  run_start: i64
+) -> %bb.ByteBuffer do
+  let n = len_of(s)
+  if p >= n then
+    return flush_range_into(%buf, s, start: run_start, end_pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  let code = char.ord(c)
+  if c == ch_dquote then
+    let %buf1 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    let %buf2 = bb.push_string(%buf1, s: "\\\"")
+    return escape_string_into(buf: %buf2, s, p: p + 1, run_start: p + 1)
+  end
+  if c == ch_backslash then
+    let %buf1 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    let %buf2 = bb.push_string(%buf1, s: "\\\\")
+    return escape_string_into(buf: %buf2, s, p: p + 1, run_start: p + 1)
+  end
+  if code >= 0 && code < 32 then
+    let %buf1 = flush_range_into(%buf, s, start: run_start, end_pos: p)
+    let esc =
+      if code == 8 then
+        "\\b"
+      else if code == 9 then
+        "\\t"
+      else if code == 10 then
+        "\\n"
+      else if code == 12 then
+        "\\f"
+      else if code == 13 then
+        "\\r"
+      else
+        unicode_escape(code)
+      end
+    let %buf2 = bb.push_string(%buf1, s: esc)
+    return escape_string_into(buf: %buf2, s, p: p + 1, run_start: p + 1)
+  end
+  return escape_string_into(%buf, s, p: p + 1, run_start)
+end
+
+let serialize_string = fn (s: string) -> string do
+  let buf = bb.empty()
+  let %buf1 = bb.push_string(%buf, s: "\"")
+  let %buf2 = escape_string_into(buf: %buf1, s, p: 0, run_start: 0)
+  let %buf3 = bb.push_string(%buf2, s: "\"")
+  let result = bb.to_string(&buf3)
+  bb.free(%buf3)
+  return result
+end
+
+// Ensure a finite f64 round-trips through the JSON grammar. Rust's
+// `f64::to_string` returns "NaN" / "inf" / "-inf" for non-finite values —
+// these are rejected upstream by `is_valid_f64` (see std:str), but checking
+// the rendered text again here keeps the contract explicit.
+let serialize_float = fn (val: f64) -> string throws { JsonThrow } do
+  // NaN is the only value that compares unequal to itself (IEEE-754).
+  if val !=. val then
+    throw JsonError(msg: "JSON does not permit NaN", pos: -1)
+  end
+  let rendered = str.from_float(val)
+  if rendered == "inf" || rendered == "-inf" then
+    throw JsonError(msg: "JSON does not permit Infinity", pos: -1)
+  end
+  // Rust's Display omits a trailing ".0" for whole f64s ("1" not "1.0"). The
+  // JSON grammar accepts either form, but consumers that distinguish int from
+  // float by syntax (e.g. JS Number vs BigInt heuristics) will be happier
+  // with an explicit decimal point.
+  if str.contains(
+    s: rendered,
+    sub: "."
+  ) || str.contains(s: rendered, sub: "e") || str.contains(s: rendered, sub: "E") then
+    return rendered
+  end
+  return rendered ++ ".0"
+end
+
+// Accumulate array items into a bytebuffer instead of building up a string
+// via repeated `acc ++ sep ++ chunk`. The original O(N^2) variant copied the
+// growing accumulator on every step; ByteBuffer.push_string is amortized
+// O(|chunk|) and bypasses the cfy4 string-concat cliff. Each call site
+// allocates one buffer and frees it after `to_string` — nested arrays/objects
+// recurse via `serialize_value`, which gets a fresh sub-buffer.
+
+// Tail of an array: prepend "," then push the next item, recurse.
+let serialize_array_items_tail = fn (
+  buf: %bb.ByteBuffer,
+  items: [ JsonValue ]
+) -> %bb.ByteBuffer throws { JsonThrow } do
+  match items do
+    | [] -> return buf
+    | v :: rest ->
+      let %buf1 = bb.push_string(%buf, s: ",")
+      let chunk = serialize_value(v)
+      let %buf2 = bb.push_string(%buf1, s: chunk)
+      return serialize_array_items_tail(buf: %buf2, items: rest)
+  end
+end
+
+// First element (no separator) followed by the tail.
+let serialize_array_items_into = fn (
+  buf: %bb.ByteBuffer,
+  items: [ JsonValue ]
+) -> %bb.ByteBuffer throws { JsonThrow } do
+  match items do
+    | [] -> return buf
+    | v :: rest ->
+      let chunk = serialize_value(v)
+      let %buf1 = bb.push_string(%buf, s: chunk)
+      return serialize_array_items_tail(buf: %buf1, items: rest)
+  end
+end
+
+let serialize_array_items = fn (items: [ JsonValue ]) -> string throws { JsonThrow } do
+  let buf = bb.empty()
+  let %buf2 = serialize_array_items_into(%buf, items)
+  let result = bb.to_string(&buf2)
+  bb.free(%buf2)
+  return result
+end
+
+let serialize_object_fields_tail = fn (
+  buf: %bb.ByteBuffer,
+  fields: [ JsonField ]
+) -> %bb.ByteBuffer throws { JsonThrow } do
+  match fields do
+    | [] -> return buf
+    | JsonField(key: k, value: v) :: rest ->
+      let %buf1 = bb.push_string(%buf, s: ",")
+      let %buf2 = bb.push_string(%buf1, s: serialize_string(s: k))
+      let %buf3 = bb.push_string(%buf2, s: ":")
+      let chunk = serialize_value(v)
+      let %buf4 = bb.push_string(%buf3, s: chunk)
+      return serialize_object_fields_tail(buf: %buf4, fields: rest)
+  end
+end
+
+let serialize_object_fields_into = fn (
+  buf: %bb.ByteBuffer,
+  fields: [ JsonField ]
+) -> %bb.ByteBuffer throws { JsonThrow } do
+  match fields do
+    | [] -> return buf
+    | JsonField(key: k, value: v) :: rest ->
+      let %buf1 = bb.push_string(%buf, s: serialize_string(s: k))
+      let %buf2 = bb.push_string(%buf1, s: ":")
+      let chunk = serialize_value(v)
+      let %buf3 = bb.push_string(%buf2, s: chunk)
+      return serialize_object_fields_tail(buf: %buf3, fields: rest)
+  end
+end
+
+let serialize_object_fields = fn (fields: [ JsonField ]) -> string throws { JsonThrow } do
+  let buf = bb.empty()
+  let %buf2 = serialize_object_fields_into(%buf, fields)
+  let result = bb.to_string(&buf2)
+  bb.free(%buf2)
+  return result
+end
+
+let serialize_value = fn (v: JsonValue) -> string throws { JsonThrow } do
+  match v do
+    | JsonNull -> return "null"
+    | JsonBool(val: b) -> return str.from_bool(val: b)
+    | JsonInt(val: i) -> return str.from_i64(val: i)
+    | JsonFloat(val: f) -> return serialize_float(val: f)
+    | JsonString(val: s) -> return serialize_string(s)
+    | JsonArray(items: xs) -> return "[" ++ serialize_array_items(items: xs) ++ "]"
+    | JsonObject(fields: fs) -> return "{" ++ serialize_object_fields(fields: fs) ++ "}"
+  end
+end
+
+/**
+Serializes a JSON value into a compact, parser-acceptable string. Raises
+JsonError if any contained f64 is NaN or ±Infinity.
+*/
+export let serialize = fn (v: JsonValue) -> string throws { JsonThrow } do
+  return serialize_value(v)
+end
