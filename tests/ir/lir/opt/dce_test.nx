@@ -1,0 +1,171 @@
+// Unit tests for src/ir/lir/opt/dce.nx::opt_dce_stmts /
+// opt_dce_stmts_eff.
+//
+// Pinned correctness-critical edges:
+//   1. opt_dce_stmts: pure unused binding is dropped.
+//   2. opt_dce_stmts: used binding is kept.
+//   3. opt_dce_stmts: impure unused binding (LirExprRaise) is kept (side effect preserved).
+//   4. opt_dce_stmts: div/mod unused binding is kept (trap is an observable effect).
+//   5. opt_dce_stmts_eff: unused call to a callee marked pure in EffectMap is dropped.
+//   6. opt_dce_stmts_eff: unused call to a callee NOT in EffectMap is kept (fail-closed).
+//   7. opt_dce_stmts_eff: external-name call is kept even if EffectMap reports it pure
+//      (host-capability gate).
+import * as test_assert from "std:test/assert"
+import * as smap from "std:stringmap"
+import { LirStmt, LirExpr, LirAtom, LirExternal, LirParam } from "src/ir/lir/types.nx"
+import { opt_dce_stmts, opt_dce_stmts_eff } from "src/ir/lir/opt/dce.nx"
+import { make_effect_map, free_effect_map, pack_summary,
+         EffectEntry, EffectSummary } from "src/ir/shared/effect_map.nx"
+import { TyI64, TyUnit } from "src/types/type_expr.nx"
+import { OpDiv, OpAdd } from "src/types/vocab.nx"
+import * as list from "std:list"
+
+let count_stmts = fn (stmts: [ LirStmt ]) -> i64 do
+  match stmts do
+    | [] -> 0
+    | _ :: rest -> 1 + count_stmts(stmts: rest)
+  end
+end
+
+// Build an empty EffectMap (no summaries).
+let empty_effect_map = fn () -> %EffectMap do
+  let %lk = smap.empty()
+  return make_effect_map(entries: [], lookup: %lk)
+end
+
+// Build an EffectMap with a single entry: `name` is pure.
+let pure_effect_map = fn (name: string) -> %EffectMap do
+  let %lk = smap.empty()
+  let %lk2 = smap.put(map: %lk, key: name, value: pack_summary(can_throw: false, is_pure: true))
+  let entry = EffectEntry(name,
+    summary: EffectSummary(capabilities_used: [], can_throw: false, is_pure: true))
+  return make_effect_map(entries: [ entry ], lookup: %lk2)
+end
+
+let body = fn () -> unit throws { Exn } do
+  // ── case 1: pure unused binding is dropped ──
+  // let dead = 42   (pure atom, dead name not in used set)
+  let dead_stmt = LirStmtLet(
+    name: "dead",
+    typ: TyI64,
+    expr: LirExprAtom(atom: LirAtomInt(val: 42))
+  )
+  let out1 = opt_dce_stmts(stmts: [ dead_stmt ], used: [])
+  test_assert.assert_eq_i64(
+    actual: count_stmts(stmts: out1),
+    expected: 0,
+    label: "dce: pure unused binding dropped"
+  )
+
+  // ── case 2: used binding is kept ──
+  let used_stmt = LirStmtLet(
+    name: "live",
+    typ: TyI64,
+    expr: LirExprAtom(atom: LirAtomInt(val: 7))
+  )
+  let out2 = opt_dce_stmts(stmts: [ used_stmt ], used: [ "live" ])
+  test_assert.assert_eq_i64(
+    actual: count_stmts(stmts: out2),
+    expected: 1,
+    label: "dce: used binding kept"
+  )
+
+  // ── case 3: impure unused binding (LirExprRaise) is kept ──
+  // raise is side-effecting; DCE must not drop it even if result unused.
+  let raise_stmt = LirStmtLet(
+    name: "effect",
+    typ: TyUnit,
+    expr: LirExprRaise(value: LirAtomInt(val: 0), typ: TyUnit)
+  )
+  let out3 = opt_dce_stmts(stmts: [ raise_stmt ], used: [])
+  test_assert.assert_eq_i64(
+    actual: count_stmts(stmts: out3),
+    expected: 1,
+    label: "dce: impure unused binding (raise) kept"
+  )
+
+  // ── case 4: div unused binding is kept (trap is observable) ──
+  // opt_is_pure returns false for OpDiv; so even if result is unused
+  // the binding must survive (divide-by-zero could trap).
+  let div_stmt = LirStmtLet(
+    name: "quotient",
+    typ: TyI64,
+    expr: LirExprBinary(
+      op: OpDiv,
+      lhs: LirAtomInt(val: 10),
+      rhs: LirAtomInt(val: 2),
+      typ: TyI64
+    )
+  )
+  let out4 = opt_dce_stmts(stmts: [ div_stmt ], used: [])
+  test_assert.assert_eq_i64(
+    actual: count_stmts(stmts: out4),
+    expected: 1,
+    label: "dce: div unused binding kept (trap is observable side effect)"
+  )
+
+  // ── case 5: opt_dce_stmts_eff: unused call to pure callee → dropped ──
+  // Build an EffectMap that marks "pure_fn" as is_pure=true.
+  // The unused-result let binding for a LirExprCall to "pure_fn" must be dropped.
+  let %em5 = pure_effect_map(name: "pure_fn")
+  let call_stmt = LirStmtLet(
+    name: "unused_call_result",
+    typ: TyI64,
+    expr: LirExprCall(func: "pure_fn", args: [], typ: TyI64)
+  )
+  let out5 = opt_dce_stmts_eff(stmts: [ call_stmt ], used: [], effects: &em5, exts: [])
+  free_effect_map(em: %em5)
+  test_assert.assert_eq_i64(
+    actual: count_stmts(stmts: out5),
+    expected: 0,
+    label: "dce_eff: unused call to pure callee dropped"
+  )
+
+  // ── case 6: unused call to callee NOT in EffectMap → kept (fail-closed) ──
+  // "unknown_fn" has no entry → lookup_bits returns None → kept.
+  let %em6 = empty_effect_map()
+  let unknown_call = LirStmtLet(
+    name: "unknown_result",
+    typ: TyI64,
+    expr: LirExprCall(func: "unknown_fn", args: [], typ: TyI64)
+  )
+  let out6 = opt_dce_stmts_eff(stmts: [ unknown_call ], used: [], effects: &em6, exts: [])
+  free_effect_map(em: %em6)
+  test_assert.assert_eq_i64(
+    actual: count_stmts(stmts: out6),
+    expected: 1,
+    label: "dce_eff: unknown callee kept (fail-closed: no summary = conservative)"
+  )
+
+  // ── case 7: external-name call is kept even if EffectMap marks it pure ──
+  // Build an EffectMap with "ext_fn" marked pure, but also put "ext_fn" in
+  // the exts list. The external gate must block the drop.
+  let %em7 = pure_effect_map(name: "ext_fn")
+  let ext = LirExternal(
+    name: "ext_fn",
+    wasm_module: "env",
+    wasm_name: "ext_fn",
+    params: [],
+    ret_type: TyI64,
+    throw_row: TyUnit
+  )
+  let ext_call = LirStmtLet(
+    name: "ext_result",
+    typ: TyI64,
+    expr: LirExprCall(func: "ext_fn", args: [], typ: TyI64)
+  )
+  let out7 = opt_dce_stmts_eff(stmts: [ ext_call ], used: [], effects: &em7, exts: [ ext ])
+  free_effect_map(em: %em7)
+  test_assert.assert_eq_i64(
+    actual: count_stmts(stmts: out7),
+    expected: 1,
+    label: "dce_eff: external call kept even when EffectMap says pure"
+  )
+
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end
