@@ -279,23 +279,35 @@ end
  *  The scan tracks paren/bracket/brace/array nesting. No fuel cap — the
  *  bounded termination comes from TkEof and the expression-only abort set,
  *  both of which are reached in any finite token stream.
+ *
+ *  Tightened heuristic for bitwise-or vs arm-separator at a depth-0 `|`:
+ *  when the segment since the previous depth-0 `|` (or scan start) was
+ *  "flat" (no paren/bracket/brace group was opened, so `had_transition` is
+ *  false) AND the two tokens immediately following the inner `|` are `_`
+ *  and `->`, the inner `|` is the real next-arm separator and the OUTER `|`
+ *  (the one `pipe_starts_arm` was asked about) was bitwise-or.  This avoids
+ *  misreading `return 1 | 2 | _ ->` as `return 1` (arm ends) followed by
+ *  an or-pattern `2 | _`.  Or-patterns whose alternatives include a
+ *  constructor-with-fields (e.g. `| Ctor(f: _) | _ ->`) are preserved
+ *  because the `(...)` marks `had_transition = true`, disabling the abort.
  */
 export let pipe_starts_arm = fn (toks: [ SpannedToken ]) -> bool do
-  pipe_scan(toks, depth: 0)
+  pipe_scan(toks, depth: 0, had_transition: false)
 end
 
-let pipe_scan = fn (toks: [ SpannedToken ], depth: i64) -> bool do
+let pipe_scan = fn (toks: [ SpannedToken ], depth: i64, had_transition: bool) -> bool do
   match peek_token(toks) do
     | TkArrow ->
       if depth <= 0 then return true end
-      return pipe_scan(toks: skip(toks), depth)
+      return pipe_scan(toks: skip(toks), depth, had_transition)
     | TkLParen | TkLBracket | TkLBrace | TkLArray -> return pipe_scan(
       toks: skip(toks),
-      depth: depth + 1
+      depth: depth + 1,
+      had_transition: true
     )
     | TkRParen | TkRBracket | TkRBrace | TkRArray ->
       if depth <= 0 then return false end
-      return pipe_scan(toks: skip(toks), depth: depth - 1)
+      return pipe_scan(toks: skip(toks), depth: depth - 1, had_transition)
     // TkEof aborts the scan; the remaining tokens cannot appear in a pattern
     // at depth 0 — must be expression continuation, so the `|` was bitwise-or,
     // not an arm separator. `!` only appears as unary prefix in expressions,
@@ -316,8 +328,36 @@ let pipe_scan = fn (toks: [ SpannedToken ], depth: i64) -> bool do
     | TkImport | TkFrom | TkAs | TkExternal | TkPub | TkOpaque
     | TkType | TkCap | TkHandler | TkInject | TkTry | TkCatch
     | TkThrow | TkRequire | TkThrows | TkException | TkRef | TkWith -> return false
-    // Pattern-friendly tokens (literals, identifiers, ::, |, ., :, comma, @, _)
-    | _ -> return pipe_scan(toks: skip(toks), depth)
+    | TkPipe ->
+      // A depth-0 `|` separates or-pattern alternatives or marks a real next arm.
+      // Tightened check: if the preceding segment was flat (had_transition=false) AND
+      // the next two tokens are `_ ->`, this inner `|` is the real arm separator —
+      // the outer `|` was bitwise-or.
+      if depth <= 0 then
+        if had_transition then
+          // Segment had paren/bracket groups — likely a complex or-pattern alt.
+          // Continue scanning; reset had_transition for the next segment.
+          return pipe_scan(toks: skip(toks), depth, had_transition: false)
+        end
+        // Flat segment: peek the two tokens immediately following this `|`.
+        let next1 = peek_token(toks: skip(toks))
+        let next2 = peek_token(toks: skip(toks: skip(toks)))
+        if let TkIdent(name: n) = next1 then
+          if n == "_" then
+            if let TkArrow = next2 then
+              // `| _ ->` immediately follows — this is the real next-arm separator.
+              // The outer `|` was bitwise-or, not an arm separator.
+              return false
+            end
+          end
+        end
+        // No `| _ ->` pattern — treat as or-pattern separator and continue.
+        return pipe_scan(toks: skip(toks), depth, had_transition: false)
+      end
+      // depth > 0: pipe inside a nested group, not a separator — continue.
+      return pipe_scan(toks: skip(toks), depth, had_transition)
+    // Pattern-friendly tokens (literals, identifiers, ::, ., :, comma, @, _)
+    | _ -> return pipe_scan(toks: skip(toks), depth, had_transition)
   end
 end
 
