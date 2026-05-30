@@ -1,0 +1,816 @@
+/**
+ * hcl/parse: HCL2 native-syntax structural decoder.
+ *
+ * Supported grammar subset:
+ *   - Blocks:      IDENT "label" "label2" { ... }
+ *   - Attributes:  name = <value>
+ *   - Values:      quoted strings, numbers, true/false/null,
+ *                  list literals [...], object expressions { key = value, ... }
+ *   - Heredocs:    <<EOF / <<-EOF (indent-strip variant)
+ *   - Comments:    hash (#), double-slash (//), and block (slash-star ... star-slash)
+ *   - Escape sequences in strings: \n \r \t \\ \" \uXXXX \UXXXXXXXX
+ *
+ * NOT supported (parse-error on encounter):
+ *   - ${...} interpolation is captured as HTemplate (no evaluation)
+ *   - function calls, arithmetic, conditionals, for-expressions
+ */
+
+import * as str from "std:str"
+import * as list from "std:list"
+import * as char from "std:char"
+import * as bb from "std:bytebuffer"
+import { Option, Some, None } from "std:option"
+import { HclError, HclThrow, HclAttr, HclItem, HclBody, HclValue,
+         HString, HNumber, HBool, HNull, HList, HObject, HTemplate,
+         Attribute, Block } from "std:encoding/hcl/types"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Internal helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+let ch_eof       = '\0'
+let ch_dquote    = '"'
+let ch_lbracket  = '['
+let ch_rbracket  = ']'
+let ch_lbrace    = '{'
+let ch_rbrace    = '}'
+let ch_comma     = ','
+let ch_eq        = '='
+let ch_hash      = '#'
+let ch_minus     = '-'
+let ch_plus      = '+'
+let ch_nl        = '\n'
+let ch_cr        = '\r'
+let ch_slash     = '/'
+let ch_star      = '*'
+let ch_backslash = '\\'
+let ch_dot       = '.'
+let ch_lt        = '<'
+
+let slen = fn (s: string) -> i64 do return str.byte_length(s) end
+
+let peek = fn (s: string, p: i64) -> char do
+  if p >= slen(s) then return ch_eof end
+  return str.byte_at(s, idx: p)
+end
+
+let starts_with_at = fn (s: string, p: i64, lit: string) -> bool do
+  let n = slen(s: lit)
+  if p + n > slen(s) then return false end
+  return str.byte_substring(s, start: p, len: n) == lit
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Whitespace and comment skipping
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Skip a # or // line comment; position stops at \n or EOF (not consumed).
+let skip_line_comment = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_nl || c == ch_cr then return p end
+  return skip_line_comment(s, p: p + 1)
+end
+
+// Skip a block comment (slash-star ... star-slash); position advances past the closer.
+let skip_block_comment = fn (s: string, p: i64) -> i64 throws { HclThrow } do
+  if p + 1 >= slen(s) then
+    throw HclError(msg: "unterminated block comment", pos: p)
+  end
+  if starts_with_at(s, p, lit: "*/") then return p + 2 end
+  return skip_block_comment(s, p: p + 1)
+end
+
+// Skip any whitespace, newlines, and comments.  Returns position of next
+// non-whitespace, non-comment byte.
+let skip_ws = fn (s: string, p: i64) -> i64 throws { HclThrow } do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ' ' || c == '\t' || c == ch_nl || c == ch_cr then
+    return skip_ws(s, p: p + 1)
+  end
+  // # comment
+  if c == ch_hash then
+    let p2 = skip_line_comment(s, p: p + 1)
+    return skip_ws(s, p: p2)
+  end
+  // // comment
+  if c == ch_slash && starts_with_at(s, p, lit: "//") then
+    let p2 = skip_line_comment(s, p: p + 2)
+    return skip_ws(s, p: p2)
+  end
+  // block comment (slash-star ... star-slash)
+  if c == ch_slash && starts_with_at(s, p, lit: "/*") then
+    let p2 = skip_block_comment(s, p: p + 2)
+    return skip_ws(s, p: p2)
+  end
+  return p
+end
+
+// Skip inline whitespace only (spaces and tabs, no newlines).
+let skip_inline_ws = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ' ' || c == '\t' then return skip_inline_ws(s, p: p + 1) end
+  return p
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Identifier / bare-word scanning
+// ═══════════════════════════════════════════════════════════════════════════
+
+let is_ident_start = fn (c: char) -> bool do
+  if c >= 'A' && c <= 'Z' then return true end
+  if c >= 'a' && c <= 'z' then return true end
+  if c == '_' then return true end
+  if c == '-' then return true end
+  return false
+end
+
+let is_ident_cont = fn (c: char) -> bool do
+  if c >= 'A' && c <= 'Z' then return true end
+  if c >= 'a' && c <= 'z' then return true end
+  if c >= '0' && c <= '9' then return true end
+  if c == '_' then return true end
+  if c == '-' then return true end
+  return false
+end
+
+// Scan to end of identifier; returns position one past last ident char.
+let scan_ident_end = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  if is_ident_cont(c: str.byte_at(s, idx: p)) then
+    return scan_ident_end(s, p: p + 1)
+  end
+  return p
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Step types (internal)
+// ═══════════════════════════════════════════════════════════════════════════
+
+type ValStep  = ValStep(value: HclValue, pos: i64)
+type StrStep  = StrStep(value: string, pos: i64)
+type BodyStep = BodyStep(body: HclBody, pos: i64)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Unicode helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+let hex_digit_val = fn (c: char) -> i64 do
+  return char.hex_digit_value(c)
+end
+
+let utf8_bytes_of = fn (code: i64) -> [ i64 ] do
+  if code < 128 then return [code] end
+  if code < 2048 then
+    let b1 = 192 + (code / 64)
+    let b2 = 128 + (code - (code / 64) * 64)
+    return [b1, b2]
+  end
+  if code < 65536 then
+    let b1 = 224 + (code / 4096)
+    let mid = code / 64
+    let b2 = 128 + (mid - (mid / 64) * 64)
+    let b3 = 128 + (code - mid * 64)
+    return [b1, b2, b3]
+  end
+  if code < 1114112 then
+    let b1 = 240 + (code / 262144)
+    let mid_hi = code / 4096
+    let b2 = 128 + (mid_hi - (mid_hi / 64) * 64)
+    let mid_lo = code / 64
+    let b3 = 128 + (mid_lo - (mid_lo / 64) * 64)
+    let b4 = 128 + (code - mid_lo * 64)
+    return [b1, b2, b3, b4]
+  end
+  return []
+end
+
+let codepoint_to_utf8 = fn (code: i64) -> string do
+  if code < 0 then return "" end
+  let bytes = utf8_bytes_of(code)
+  match bytes do
+    | [] -> return ""
+    | _ :: _ ->
+      let %buf = bb.empty()
+      let %buf2 = bb.push_bytes(%buf, bytes)
+      let result = bb.to_string(&buf2)
+      bb.free(%buf2)
+      return result
+  end
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// String parsing
+// ═══════════════════════════════════════════════════════════════════════════
+
+let flush_range = fn (
+  buf: %bb.ByteBuffer, s: string, start: i64, end_pos: i64
+) -> %bb.ByteBuffer do
+  if end_pos <= start then return buf end
+  return bb.push_string(%buf, s: str.byte_substring(s, start, len: end_pos - start))
+end
+
+// Parse \uXXXX  (4 hex digits).  `p` is just after the 'u'.
+let parse_unicode4 = fn (
+  s: string, p: i64, buf: %bb.ByteBuffer
+) -> StrStep throws { HclThrow } do
+  if p + 4 > slen(s) then
+    bb.free(%buf)
+    throw HclError(msg: "\\uXXXX escape needs 4 hex digits", pos: p)
+  end
+  let h1 = hex_digit_val(c: str.byte_at(s, idx: p))
+  let h2 = hex_digit_val(c: str.byte_at(s, idx: p + 1))
+  let h3 = hex_digit_val(c: str.byte_at(s, idx: p + 2))
+  let h4 = hex_digit_val(c: str.byte_at(s, idx: p + 3))
+  if h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0 then
+    bb.free(%buf)
+    throw HclError(msg: "invalid hex digit in \\uXXXX", pos: p)
+  end
+  let code = h1 * 4096 + h2 * 256 + h3 * 16 + h4
+  let encoded = codepoint_to_utf8(code)
+  let %buf2 = bb.push_string(%buf, s: encoded)
+  return parse_quoted_body(s, p: p + 4, run_start: p + 4, %buf2)
+end
+
+// Parse \UXXXXXXXX  (8 hex digits).  `p` is just after the 'U'.
+let parse_unicode8 = fn (
+  s: string, p: i64, buf: %bb.ByteBuffer
+) -> StrStep throws { HclThrow } do
+  if p + 8 > slen(s) then
+    bb.free(%buf)
+    throw HclError(msg: "\\UXXXXXXXX escape needs 8 hex digits", pos: p)
+  end
+  let h1 = hex_digit_val(c: str.byte_at(s, idx: p))
+  let h2 = hex_digit_val(c: str.byte_at(s, idx: p + 1))
+  let h3 = hex_digit_val(c: str.byte_at(s, idx: p + 2))
+  let h4 = hex_digit_val(c: str.byte_at(s, idx: p + 3))
+  let h5 = hex_digit_val(c: str.byte_at(s, idx: p + 4))
+  let h6 = hex_digit_val(c: str.byte_at(s, idx: p + 5))
+  let h7 = hex_digit_val(c: str.byte_at(s, idx: p + 6))
+  let h8 = hex_digit_val(c: str.byte_at(s, idx: p + 7))
+  if h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0 || h5 < 0 || h6 < 0 || h7 < 0 || h8 < 0 then
+    bb.free(%buf)
+    throw HclError(msg: "invalid hex digit in \\UXXXXXXXX", pos: p)
+  end
+  let code = h1 * 268435456 + h2 * 16777216 + h3 * 1048576 + h4 * 65536 +
+             h5 * 4096 + h6 * 256 + h7 * 16 + h8
+  let encoded = codepoint_to_utf8(code)
+  let %buf2 = bb.push_string(%buf, s: encoded)
+  return parse_quoted_body(s, p: p + 8, run_start: p + 8, %buf2)
+end
+
+// Dispatch escape sequence.  `p` is just after the backslash.
+let parse_escape = fn (
+  s: string, p: i64, buf: %bb.ByteBuffer
+) -> StrStep throws { HclThrow } do
+  if p >= slen(s) then
+    bb.free(%buf)
+    throw HclError(msg: "unterminated escape sequence", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_dquote then
+    let %buf2 = bb.push_string(%buf, s: "\"")
+    return parse_quoted_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == ch_backslash then
+    let %buf2 = bb.push_string(%buf, s: "\\")
+    return parse_quoted_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'n' then
+    let %buf2 = bb.push_string(%buf, s: "\n")
+    return parse_quoted_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'r' then
+    let %buf2 = bb.push_string(%buf, s: "\r")
+    return parse_quoted_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 't' then
+    let %buf2 = bb.push_string(%buf, s: "\t")
+    return parse_quoted_body(s, p: p + 1, run_start: p + 1, %buf2)
+  end
+  if c == 'u' then
+    return parse_unicode4(s, p: p + 1, %buf)
+  end
+  if c == 'U' then
+    return parse_unicode8(s, p: p + 1, %buf)
+  end
+  bb.free(%buf)
+  throw HclError(msg: "invalid escape sequence", pos: p - 1)
+end
+
+// Parse the body of a quoted string from position `p` (just after opening ").
+// Stops at closing " (not consumed by this fn; caller advances past it).
+// Returns a StrStep with position AFTER the closing ".
+let parse_quoted_body = fn (
+  s: string, p: i64, run_start: i64, buf: %bb.ByteBuffer
+) -> StrStep throws { HclThrow } do
+  if p >= slen(s) then
+    bb.free(%buf)
+    throw HclError(msg: "unterminated quoted string", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_dquote then
+    let %buf2 = flush_range(%buf, s, start: run_start, end_pos: p)
+    let result = bb.to_string(&buf2)
+    bb.free(%buf2)
+    return StrStep(value: result, pos: p + 1)
+  end
+  // ${...} interpolation: capture raw text as-is up through the matching }.
+  if c == '$' && starts_with_at(s, p, lit: "${") then
+    let %buf2 = flush_range(%buf, s, start: run_start, end_pos: p)
+    let p2 = p + 2
+    let p3 = scan_to_close_brace(s, p: p2)
+    let raw = str.byte_substring(s, start: p, len: p3 - p)
+    let %buf3 = bb.push_string(%buf2, s: raw)
+    return parse_quoted_body(s, p: p3, run_start: p3, %buf3)
+  end
+  if c == ch_backslash then
+    let %buf2 = flush_range(%buf, s, start: run_start, end_pos: p)
+    return parse_escape(s, p: p + 1, buf: %buf2)
+  end
+  if c == ch_nl || c == ch_cr then
+    bb.free(%buf)
+    throw HclError(msg: "newline inside quoted string", pos: p)
+  end
+  return parse_quoted_body(s, p: p + 1, run_start, %buf)
+end
+
+// Scan past a matched closing `}` (for interpolation capture).
+// Handles nested braces.
+let scan_to_close_brace = fn (s: string, p: i64) -> i64 throws { HclThrow } do
+  return scan_to_close_brace_go(s, p, depth: 1)
+end
+
+let scan_to_close_brace_go = fn (s: string, p: i64, depth: i64) -> i64 throws { HclThrow } do
+  if p >= slen(s) then
+    throw HclError(msg: "unterminated interpolation ${...}", pos: p)
+  end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_lbrace then
+    return scan_to_close_brace_go(s, p: p + 1, depth: depth + 1)
+  end
+  if c == ch_rbrace then
+    if depth == 1 then return p + 1 end
+    return scan_to_close_brace_go(s, p: p + 1, depth: depth - 1)
+  end
+  return scan_to_close_brace_go(s, p: p + 1, depth)
+end
+
+// Parse a top-level quoted string value.  `p` is at the opening ".
+// Returns HString if no interpolation, HTemplate if ${} present.
+let parse_quoted_string = fn (s: string, p: i64) -> ValStep throws { HclThrow } do
+  let %buf = bb.empty()
+  let StrStep(value: sv, pos: p2) = parse_quoted_body(s, p: p + 1, run_start: p + 1, %buf)
+  // Detect whether any ${} markers survived into the decoded string.
+  if str.contains(sv, sub: "${") then
+    return ValStep(value: HTemplate(raw: sv), pos: p2)
+  end
+  return ValStep(value: HString(val: sv), pos: p2)
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Heredoc parsing
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Called when we have seen `<<` at position p.  `p` is just past `<<`.
+let parse_heredoc = fn (s: string, p: i64) -> ValStep throws { HclThrow } do
+  // Check for indent-strip variant `<<-`
+  let p1 = p
+  let strip_indent =
+    if peek(s, p: p1) == ch_minus then
+      true
+    else
+      false
+    end
+  let p2 =
+    if strip_indent then
+      p1 + 1
+    else
+      p1
+    end
+  // Scan the marker (must be an identifier).
+  if !is_ident_start(c: peek(s, p: p2)) then
+    throw HclError(msg: "expected heredoc marker after <<", pos: p2)
+  end
+  let marker_end = scan_ident_end(s, p: p2 + 1)
+  let marker = str.byte_substring(s, start: p2, len: marker_end - p2)
+  // Skip past end of the `<<MARKER` line (to the newline).
+  let p3 = skip_inline_ws(s, p: marker_end)
+  if p3 >= slen(s) then
+    throw HclError(msg: "heredoc: expected newline after marker", pos: p3)
+  end
+  // Consume the newline after the marker line.
+  let p4 =
+    if peek(s, p: p3) == ch_cr && peek(s, p: p3 + 1) == ch_nl then
+      p3 + 2
+    else if peek(s, p: p3) == ch_nl then
+      p3 + 1
+    else
+      throw HclError(msg: "heredoc: expected newline after marker", pos: p3)
+    end
+  // Collect lines until we find the marker on its own line.
+  let StrStep(value: content, pos: p5) = collect_heredoc_lines(s, p: p4, marker, strip_indent, acc: "")
+  if str.contains(content, sub: "${") then
+    return ValStep(value: HTemplate(raw: content), pos: p5)
+  end
+  return ValStep(value: HString(val: content), pos: p5)
+end
+
+// Accumulate heredoc content lines.  Returns accumulated string + position
+// just after the closing marker line.
+let collect_heredoc_lines = fn (
+  s: string, p: i64, marker: string, strip_indent: bool, acc: string
+) -> StrStep throws { HclThrow } do
+  if p >= slen(s) then
+    throw HclError(msg: "unterminated heredoc (missing closing marker)", pos: p)
+  end
+  // Check if this line is the closing marker.
+  let line_start =
+    if strip_indent then
+      skip_inline_ws(s, p)
+    else
+      p
+    end
+  if starts_with_at(s, p: line_start, lit: marker) then
+    let after_marker = line_start + slen(s: marker)
+    let after_marker2 = skip_inline_ws(s, p: after_marker)
+    // Closing marker must be followed by newline or EOF.
+    let p_after =
+      if after_marker2 >= slen(s) then
+        after_marker2
+      else if peek(s, p: after_marker2) == ch_cr && peek(s, p: after_marker2 + 1) == ch_nl then
+        after_marker2 + 2
+      else if peek(s, p: after_marker2) == ch_nl then
+        after_marker2 + 1
+      else
+        // Not the end of the line — not the closing marker; fall through.
+        -1
+      end
+    if p_after >= 0 then
+      return StrStep(value: acc, pos: p_after)
+    end
+  end
+  // Scan to end of this line, collecting characters.
+  let line_end = scan_line_end(s, p)
+  let line = str.byte_substring(s, start: p, len: line_end - p)
+  let new_acc = acc ++ line ++ "\n"
+  // Advance past the newline.
+  let p_next =
+    if line_end >= slen(s) then
+      line_end
+    else if peek(s, p: line_end) == ch_cr && peek(s, p: line_end + 1) == ch_nl then
+      line_end + 2
+    else
+      line_end + 1
+    end
+  return collect_heredoc_lines(s, p: p_next, marker, strip_indent, acc: new_acc)
+end
+
+// Scan to the end of the current line (stops at \n, \r, or EOF; does not consume newline).
+let scan_line_end = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_nl || c == ch_cr then return p end
+  return scan_line_end(s, p: p + 1)
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Number parsing
+// ═══════════════════════════════════════════════════════════════════════════
+
+let is_digit = fn (c: char) -> bool do
+  return c >= '0' && c <= '9'
+end
+
+// Scan a numeric literal (integer or float, optionally signed).
+// Returns end position.
+let scan_number_end = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if is_digit(c) then return scan_number_end(s, p: p + 1) end
+  if c == ch_dot then return scan_number_end(s, p: p + 1) end
+  if c == 'e' || c == 'E' then return scan_exp_end(s, p: p + 1) end
+  return p
+end
+
+let scan_exp_end = fn (s: string, p: i64) -> i64 do
+  if p >= slen(s) then return p end
+  let c = str.byte_at(s, idx: p)
+  if c == ch_plus || c == ch_minus then return scan_number_end(s, p: p + 1) end
+  if is_digit(c) then return scan_number_end(s, p: p + 1) end
+  return p
+end
+
+let parse_number = fn (s: string, p: i64) -> ValStep throws { HclThrow } do
+  let sign_pos = p
+  let p1 =
+    if peek(s, p) == ch_minus || peek(s, p) == ch_plus then
+      p + 1
+    else
+      p
+    end
+  let end_pos = scan_number_end(s, p: p1)
+  if end_pos == p1 then
+    throw HclError(msg: "expected numeric digit", pos: p)
+  end
+  let lit = str.byte_substring(s, start: p, len: end_pos - p)
+  match str.parse_f64_checked(s: lit) do
+    | Some(val: f) -> return ValStep(value: HNumber(val: f), pos: end_pos)
+    | None -> throw HclError(msg: "malformed number: " ++ lit, pos: p)
+  end
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Value parsing
+// ═══════════════════════════════════════════════════════════════════════════
+
+let parse_value = fn (s: string, p: i64) -> ValStep throws { HclThrow } do
+  let p1 = skip_ws(s, p)
+  if p1 >= slen(s) then
+    throw HclError(msg: "unexpected end of input in value position", pos: p1)
+  end
+  let c = str.byte_at(s, idx: p1)
+
+  // Quoted string.
+  if c == ch_dquote then
+    return parse_quoted_string(s, p: p1)
+  end
+
+  // Heredoc <<EOF / <<-EOF.
+  if starts_with_at(s, p: p1, lit: "<<") then
+    return parse_heredoc(s, p: p1 + 2)
+  end
+
+  // List [...].
+  if c == ch_lbracket then
+    return parse_list(s, p: p1)
+  end
+
+  // Object expression { key = value, ... }.
+  if c == ch_lbrace then
+    return parse_object_expr(s, p: p1)
+  end
+
+  // Boolean keywords.
+  if starts_with_at(s, p: p1, lit: "true") then
+    let after = p1 + 4
+    if after >= slen(s) || !is_ident_cont(c: str.byte_at(s, idx: after)) then
+      return ValStep(value: HBool(val: true), pos: after)
+    end
+  end
+  if starts_with_at(s, p: p1, lit: "false") then
+    let after = p1 + 5
+    if after >= slen(s) || !is_ident_cont(c: str.byte_at(s, idx: after)) then
+      return ValStep(value: HBool(val: false), pos: after)
+    end
+  end
+
+  // Null keyword.
+  if starts_with_at(s, p: p1, lit: "null") then
+    let after = p1 + 4
+    if after >= slen(s) || !is_ident_cont(c: str.byte_at(s, idx: after)) then
+      return ValStep(value: HNull, pos: after)
+    end
+  end
+
+  // Numeric literal (integer or float, optionally signed).
+  if is_digit(c) || ((c == ch_minus || c == ch_plus) && is_digit(c: peek(s, p: p1 + 1))) then
+    return parse_number(s, p: p1)
+  end
+
+  throw HclError(msg: "unexpected token in value position", pos: p1)
+end
+
+// ─── List [v, v, ...] ────────────────────────────────────────────────────────
+
+let parse_list_items = fn (s: string, p: i64, acc: [ HclValue ]) -> ValStep throws { HclThrow } do
+  let p1 = skip_ws(s, p)
+  if p1 >= slen(s) then
+    throw HclError(msg: "unterminated list (missing ']')", pos: p1)
+  end
+  if peek(s, p: p1) == ch_rbracket then
+    return ValStep(value: HList(items: list.reverse(xs: acc)), pos: p1 + 1)
+  end
+  let ValStep(value: v, pos: p2) = parse_value(s, p: p1)
+  let p3 = skip_ws(s, p: p2)
+  let nc = peek(s, p: p3)
+  if nc == ch_comma then
+    return parse_list_items(s, p: p3 + 1, acc: v :: acc)
+  end
+  if nc == ch_rbracket then
+    return ValStep(value: HList(items: list.reverse(xs: v :: acc)), pos: p3 + 1)
+  end
+  throw HclError(msg: "expected ',' or ']' in list", pos: p3)
+end
+
+let parse_list = fn (s: string, p: i64) -> ValStep throws { HclThrow } do
+  return parse_list_items(s, p: p + 1, acc: [])
+end
+
+// ─── Object expression { key = value, ... } ──────────────────────────────────
+
+let parse_object_fields = fn (
+  s: string, p: i64, acc: [ HclAttr ]
+) -> ValStep throws { HclThrow } do
+  let p1 = skip_ws(s, p)
+  if p1 >= slen(s) then
+    throw HclError(msg: "unterminated object expression (missing '}')", pos: p1)
+  end
+  if peek(s, p: p1) == ch_rbrace then
+    return ValStep(value: HObject(fields: list.reverse(xs: acc)), pos: p1 + 1)
+  end
+  // Key: identifier or quoted string.
+  let StrStep(value: key, pos: p2) = parse_attr_key(s, p: p1)
+  let p3 = skip_ws(s, p: p2)
+  if peek(s, p: p3) != ch_eq then
+    throw HclError(msg: "expected '=' in object field", pos: p3)
+  end
+  let p4 = p3 + 1
+  let ValStep(value: v, pos: p5) = parse_value(s, p: p4)
+  let new_acc = HclAttr(name: key, value: v) :: acc
+  let p6 = skip_ws(s, p: p5)
+  let nc = peek(s, p: p6)
+  if nc == ch_comma then
+    return parse_object_fields(s, p: p6 + 1, acc: new_acc)
+  end
+  if nc == ch_rbrace then
+    return ValStep(value: HObject(fields: list.reverse(xs: new_acc)), pos: p6 + 1)
+  end
+  // No comma required in HCL object expressions (newlines serve as separators).
+  return parse_object_fields(s, p: p6, acc: new_acc)
+end
+
+let parse_object_expr = fn (s: string, p: i64) -> ValStep throws { HclThrow } do
+  let p1 = skip_ws(s, p: p + 1)
+  if peek(s, p: p1) == ch_rbrace then
+    return ValStep(value: HObject(fields: []), pos: p1 + 1)
+  end
+  return parse_object_fields(s, p: p + 1, acc: [])
+end
+
+// ─── Key for attribute or object field (ident or quoted string) ──────────────
+
+let parse_attr_key = fn (s: string, p: i64) -> StrStep throws { HclThrow } do
+  let c = peek(s, p)
+  if c == ch_dquote then
+    let %buf = bb.empty()
+    let StrStep(value: k, pos: p2) = parse_quoted_body(s, p: p + 1, run_start: p + 1, %buf)
+    return StrStep(value: k, pos: p2)
+  end
+  if is_ident_start(c) then
+    let end_pos = scan_ident_end(s, p: p + 1)
+    let ident = str.byte_substring(s, start: p, len: end_pos - p)
+    return StrStep(value: ident, pos: end_pos)
+  end
+  throw HclError(msg: "expected attribute name (identifier or quoted string)", pos: p)
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Body parsing (sequence of items inside { ... } or at top level)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Parse one item (attribute or block) starting at position p.
+// Returns updated item list and new position.
+//
+// Grammar:
+//   item = IDENT "label"* { body }     -- block
+//        | IDENT "label"* = value      -- attribute (with optional labels before =, unusual but allowed)
+//        | IDENT = value               -- plain attribute (most common)
+
+let parse_item = fn (s: string, p: i64, acc: [ HclItem ]) -> BodyStep throws { HclThrow } do
+  let p1 = skip_ws(s, p)
+  if p1 >= slen(s) then
+    return BodyStep(body: HclBody(items: list.reverse(xs: acc)), pos: p1)
+  end
+  let c = str.byte_at(s, idx: p1)
+  // End of block body.
+  if c == ch_rbrace then
+    return BodyStep(body: HclBody(items: list.reverse(xs: acc)), pos: p1)
+  end
+  // Items must start with an identifier or quoted key.
+  let StrStep(value: first_ident, pos: p2) = parse_attr_key(s, p: p1)
+  // Now peek: could be `=` (attribute), a string label, or `{` (block).
+  let p3 = skip_inline_ws(s, p: p2)
+  let c3 = peek(s, p: p3)
+
+  // Attribute: IDENT = value
+  if c3 == ch_eq then
+    let p4 = skip_inline_ws(s, p: p3 + 1)
+    let ValStep(value: v, pos: p5) = parse_value(s, p: p4)
+    let item = Attribute(attr: HclAttr(name: first_ident, value: v))
+    return parse_item(s, p: p5, acc: item :: acc)
+  end
+
+  // Block: IDENT "label"* { ... }   or IDENT { ... }
+  // Collect optional labels (quoted strings or identifiers, up to the opening {).
+  let BodyStep(body: labels_body, pos: p_labels) =
+    collect_block_labels(s, p: p3, acc_items: [])
+  // p_labels should be at `{`.
+  let pc = peek(s, p: p_labels)
+  if pc != ch_lbrace then
+    throw HclError(msg: "expected '{' to open block body or '=' for attribute", pos: p_labels)
+  end
+  // Parse the block body inside { ... }.
+  let BodyStep(body: inner_body, pos: p_after_body) = parse_body(s, p: p_labels + 1)
+  // After parse_body returns we expect '}'.
+  let p_close = skip_ws(s, p: p_after_body)
+  if peek(s, p: p_close) != ch_rbrace then
+    throw HclError(msg: "expected '}' to close block body", pos: p_close)
+  end
+  // Extract label strings from the label-collector body items.
+  let label_list = extract_labels(body: labels_body)
+  let block_item = Block(block_type: first_ident, labels: label_list, body: inner_body)
+  return parse_item(s, p: p_close + 1, acc: block_item :: acc)
+end
+
+// Collect zero or more block labels (quoted strings or bare identifiers)
+// up to (but not including) the opening `{`.  Each label is stored as an
+// Attribute item with name="" and value=HString so we can reuse BodyStep.
+let collect_block_labels = fn (
+  s: string, p: i64, acc_items: [ string ]
+) -> BodyStep throws { HclThrow } do
+  let p1 = skip_inline_ws(s, p)
+  let c = peek(s, p: p1)
+  // `{` — done collecting labels.
+  if c == ch_lbrace then
+    let label_items = labels_to_items(acc: list.reverse(xs: acc_items))
+    return BodyStep(body: HclBody(items: label_items), pos: p1)
+  end
+  // Quoted string label.
+  if c == ch_dquote then
+    let %buf = bb.empty()
+    let StrStep(value: label, pos: p2) = parse_quoted_body(s, p: p1 + 1, run_start: p1 + 1, %buf)
+    return collect_block_labels(s, p: p2, acc_items: label :: acc_items)
+  end
+  // Bare identifier label.
+  if is_ident_start(c) then
+    let end_pos = scan_ident_end(s, p: p1 + 1)
+    let label = str.byte_substring(s, start: p1, len: end_pos - p1)
+    return collect_block_labels(s, p: end_pos, acc_items: label :: acc_items)
+  end
+  throw HclError(msg: "expected block label (string or identifier) or '{'", pos: p1)
+end
+
+// Convert a list of label strings into a list of HclItems (Attribute with
+// name="__label__" — not exposed; extract_labels reads them back).
+let labels_to_items = fn (acc: [ string ]) -> [ HclItem ] do
+  match acc do
+    | [] -> return []
+    | lbl :: rest ->
+      return Attribute(attr: HclAttr(name: "__label__", value: HString(val: lbl))) :: labels_to_items(acc: rest)
+  end
+end
+
+// Extract label strings back from the internal label-collector body.
+let extract_labels = fn (body: HclBody) -> [ string ] do
+  let HclBody(items: xs) = body
+  return extract_labels_go(xs)
+end
+
+let extract_labels_go = fn (items: [ HclItem ]) -> [ string ] do
+  match items do
+    | [] -> return []
+    | Attribute(attr: HclAttr(name: _, value: HString(val: lbl))) :: rest ->
+      return lbl :: extract_labels_go(items: rest)
+    | _ :: rest ->
+      return extract_labels_go(items: rest)
+  end
+end
+
+// Parse a block body: zero or more items until `}` or EOF.
+// Does NOT consume the closing `}`.
+let parse_body = fn (s: string, p: i64) -> BodyStep throws { HclThrow } do
+  return parse_item(s, p, acc: [])
+end
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Public entry point
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+Parse a complete HCL document (native syntax).
+Returns an HclBody containing the top-level items.
+Throws HclError on any syntax error.
+
+Supported subset:
+  - Blocks: `block_type "label" { ... }` (zero or more string labels)
+  - Attributes: `name = value`
+  - Values: quoted strings, heredocs <<EOF, numbers, true/false/null,
+            lists [...], object expressions { key = value, ... }
+  - Comments: hash (#), double-slash (//), and block (slash-star ... star-slash)
+  - ${...} interpolations captured verbatim as HTemplate
+
+NOT supported (parse error):
+  - Function calls, arithmetic, conditionals, for-expressions outside ${...}
+*/
+export let parse = fn (s: string) -> HclBody throws { HclThrow } do
+  let p1 = skip_ws(s, p: 0)
+  let BodyStep(body: b, pos: p2) = parse_body(s, p: p1)
+  let p3 = skip_ws(s, p: p2)
+  if p3 < slen(s) then
+    throw HclError(msg: "unexpected token after end of document", pos: p3)
+  end
+  return b
+end
