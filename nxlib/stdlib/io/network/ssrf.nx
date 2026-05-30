@@ -51,9 +51,11 @@ type IpSegList = IpSegList(
   valid: bool
 )
 
-// Parse a decimal unsigned integer at position pos in s.
-// Returns (value, end_pos) encoded as value * 100000 + end_pos, or -1 on failure.
-// Values are bounded to [0, 65535] to cover both IPv4 octets and IPv6 segments.
+// Parse an octet value at position pos in s, interpreting leading-zero
+// multi-digit sequences as octal (matching inet_aton/getaddrinfo resolver
+// semantics so that `0177` = decimal 127).  Single-digit `0` stays zero.
+// Returns (value, end_pos) encoded as value * 100000 + end_pos, or -1 on
+// failure.  Values are bounded to [0, max_val].
 let ssrf_parse_uint = fn (s: string, pos: i64, max_val: i64) -> i64 do
   let slen = str_length(s)
   if pos >= slen then
@@ -63,8 +65,14 @@ let ssrf_parse_uint = fn (s: string, pos: i64, max_val: i64) -> i64 do
     if end_pos == pos then
       return -1
     else
-      let token = substring(s, start: pos, len: end_pos - pos)
-      let val = to_i64_raw(s: token)
+      let digit_len = end_pos - pos
+      // If the first digit is '0' and there are more digits, parse as octal.
+      let first_ch = char_code_at(s, pos)
+      let val = if first_ch == 48 && digit_len > 1 then
+        parse_octal_str(s, start: pos, end_pos)
+      else
+        to_i64_raw(s: substring(s, start: pos, len: digit_len))
+      end
       if val < 0 then
         return -1
       else if val > max_val then
@@ -74,6 +82,26 @@ let ssrf_parse_uint = fn (s: string, pos: i64, max_val: i64) -> i64 do
       end
     end
   end
+end
+
+// Parse an octal integer from s[start..end_pos).  Returns -1 on invalid chars.
+let parse_octal_str = fn (s: string, start: i64, end_pos: i64) -> i64 do
+  let ~val = 0
+  let ~i = start
+  let ~ok = 1
+  while ~i < end_pos && ~ok > 0 do
+    let ch = char_code_at(s, pos: ~i)
+    if ch >= 48 && ch <= 55 then
+      // '0'..'7' are valid octal digits
+      ~val <- ~val * 8 + (ch - 48)
+      ~i <- ~i + 1
+    else
+      // '8','9' or non-digit — treat the whole octet as invalid to fail-closed
+      ~ok <- 0
+      ~val <- -1
+    end
+  end
+  return ~val
 end
 
 // Scan digits from pos; returns end_pos (may equal pos if no digits).
@@ -204,7 +232,10 @@ let parse_ipv4 = fn (s: string) -> Ip4Parsed do
                     else
                       let d = r3 / 100000
                       let p4 = r3 - d * 100000
-                      if p4 != slen then
+                      // Accept a single trailing '.' (absolute FQDN form) as
+                      // equivalent to no trailing dot — they resolve identically.
+                      let effective_end = if p4 < slen && char_code_at(s, pos: p4) == 46 then p4 + 1 else p4 end
+                      if effective_end != slen then
                         return Ip4Parsed(a: 0, b: 0, c: 0, d: 0, valid: false)
                       else
                         return Ip4Parsed(a, b, c, d, valid: true)
@@ -916,25 +947,44 @@ let ipv6_is_blocked = fn (ip: Ip6Parsed) -> bool do
 end
 
 // Check if a hostname string (already lowercased) is a blocked well-known name.
+// A trailing '.' (absolute FQDN root label) is stripped before matching since
+// it resolves identically to the same name without the trailing dot.
 let blocked_hostname = fn (lower_host: string) -> bool do
-  if lower_host == "localhost" then return true
-  else if lower_host == "ip6-localhost" then return true
-  else if lower_host == "ip6-loopback" then return true
-  else if lower_host == "metadata.google.internal" then return true
-  else if lower_host == "metadata.goog" then return true
-  else if ends_with(s: lower_host, suffix: ".localhost") then return true
-  else if ends_with(s: lower_host, suffix: ".local") then return true
+  let hlen = str_length(s: lower_host)
+  let h = if hlen > 0 && char_code_at(s: lower_host, pos: hlen - 1) == 46 then
+    substring(s: lower_host, start: 0, len: hlen - 1)
+  else
+    lower_host
+  end
+  if h == "localhost" then return true
+  else if h == "ip6-localhost" then return true
+  else if h == "ip6-loopback" then return true
+  else if h == "metadata.google.internal" then return true
+  else if h == "metadata.goog" then return true
+  else if ends_with(s: h, suffix: ".localhost") then return true
+  else if ends_with(s: h, suffix: ".local") then return true
   else return false
   end
 end
 
 // Extract the host from a URL string: strips scheme (if any), then returns
 // the authority (host[:port]) portion. Then further strips port and brackets.
+// Also handles scheme-relative URLs starting with "//" (no scheme prefix).
 let extract_host = fn (url: string) -> string do
   let slen = str_length(s: url)
-  // skip scheme: find "://" and advance past it
+  // skip scheme: find "://" and advance past it.
+  // For scheme-relative URLs like "//host/path", treat "//" as the authority
+  // start instead of falling back to position 0 (which would leave "//host"
+  // as the authority, yielding an empty host after stripping at the first "/").
   let scheme_end = index_of(s: url, sub: "://")
-  let auth_start = if scheme_end < 0 then 0 else scheme_end + 3 end
+  let auth_start = if scheme_end >= 0 then
+    scheme_end + 3
+  else if slen >= 2 && char_code_at(s: url, pos: 0) == 47 && char_code_at(s: url, pos: 1) == 47 then
+    // "//" at the very start — this is a scheme-relative URL
+    2
+  else
+    0
+  end
   let after_scheme = substring(s: url, start: auth_start, len: slen - auth_start)
   // strip path/query/fragment: find first '/' or '?' or '#'
   let slash_pos = index_of(s: after_scheme, sub: "/")
