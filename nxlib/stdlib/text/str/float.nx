@@ -506,6 +506,47 @@ let digits_to_int_go = fn (digs: i64, k: i64, i: i64, acc: i64) -> i64 do
 end
 
 /**
+Safety clamp for the 17-digit fallback path: if the nd-digit string at `digs`
+with decimal exponent `e_after` reconstructs (via i64_to_float * pow10) to a
+value strictly greater than `mag`, decrement the last non-zero digit and retry.
+This handles the case where accumulated pow10 rounding error inflates `m` and
+pushes the 17th digit one (or two) too high -- ensuring `from_float(finite x)`
+never formats to a string that reparses to +inf or to a larger value.
+Returns the adjusted exponent (may increase by 1 if clamp triggers a carry-off,
+but in practice the carry cannot push a finite value to a larger exponent here).
+*/
+let clamp_digits_to_mag = fn (digs: i64, nd: i64, e_after: i64, mag: float) -> i64 do
+  // Reconstruct the value: digits_to_int(digs, nd) * 10^(e_after - (nd-1))
+  let m_int = digits_to_int(digs, k: nd)
+  let recon = i64_to_float(val: m_int) *. pow10(n: e_after - (nd - 1))
+  // If reconstruction is <= mag, digits are fine (common case).
+  if !(recon >. mag) then return e_after end
+  // Reconstruction exceeds mag: decrement the last non-zero digit.
+  // Walk from the rightmost digit backwards to find the first non-'0'.
+  return clamp_decrement(digs, nd, e_after, mag, i: nd - 1)
+end
+let clamp_decrement = fn (digs: i64, nd: i64, e_after: i64, mag: float, i: i64) -> i64 do
+  if i < 0 then
+    // All digits are '0' after decrement -- shouldn't happen for a finite mag > 0.
+    return e_after
+  end
+  let v = mem.load_u8(addr: digs + i)
+  if v == 48 then
+    // This digit is '0'; skip it and try the next one left.
+    return clamp_decrement(digs, nd, e_after, mag, i: i - 1)
+  end
+  if v == 49 then
+    // Decrement '1' -> '0': zero out this digit, trim nd by 1 (the last 0 will
+    // be dropped by last_nonzero later), and recurse to re-check.
+    mem.store_u8(addr: digs + i, val: 48)
+    return clamp_digits_to_mag(digs, nd: i, e_after, mag)
+  end
+  // Decrement safely: v in '2'..'9' -> v-1.
+  mem.store_u8(addr: digs + i, val: v - 1)
+  return clamp_digits_to_mag(digs, nd, e_after, mag)
+end
+
+/**
 Find the fewest leading digits (1..maxk, maxk <= 15) whose value, rounded
 at the next digit, reconstructs `mag` bit-exactly (using the same
 i64_to_float * pow10 recipe `assemble_f64` uses for parsing). Writes the
@@ -604,7 +645,11 @@ export let string_from_float = fn (a_val: float) -> i64 do
     return render_sci(digs: chosen, nd, e: e_after, neg)
   end
   let next_digit = mem.load_u8(addr: raw + 17)
-  let e_after = round_digits(dst: raw, nd: 17, next_digit, exp: e)
+  let e_after0 = round_digits(dst: raw, nd: 17, next_digit, exp: e)
+  // Safety clamp: if pow10 accumulated rounding error inflated the 17th digit
+  // so that the formatted value would exceed `mag` (e.g. f64::MAX → "...159e308"
+  // which reparses to +inf), decrement the last digit until recon <= mag.
+  let e_after = clamp_digits_to_mag(digs: raw, nd: 17, e_after: e_after0, mag)
   let lnz = last_nonzero(dst: raw, n: 17, i: 16)
   let nd = if lnz < 0 then 1 else lnz + 1 end
   if e_after >= 0 - 4 && e_after < 17 then return render_fixed(digs: raw, nd, e: e_after, neg) end

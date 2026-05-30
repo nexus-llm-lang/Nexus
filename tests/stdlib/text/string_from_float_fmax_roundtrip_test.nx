@@ -1,0 +1,102 @@
+// Regression: string_from_float must never format a finite f64 to a string
+// that reparses to +inf. Specifically, f64::MAX (1.7976931348623157e308) was
+// formatted as "1.7976931348623159e308" before this fix, and
+// "1.7976931348623159e308" reparses to +inf -- a finite value formatting to
+// an infinity-denoting string (nexus-rxnv5, Bug B).
+//
+// Root cause: pow10_pos(308) accumulates rounding error via repeated 1e18
+// multiplication, underestimating 10^308. Dividing f64::MAX by this
+// underestimate inflates the normalised mantissa m, producing digit[16]=9
+// instead of 7. The fix: after the 17-digit fallback, verify
+// i64_to_float(digits) * pow10(e - (nd-1)) <= mag; if not, decrement the
+// last digit until it is.
+import * as test_assert from "std:test/assert"
+import { from_float, to_f64 } from "std:str"
+import { i64_to_float } from "std:math"
+import * as mem from "std:runtime/mem"
+import * as arena from "std:runtime/arena"
+
+let reinterpret_bits_to_f64 = fn (bits: i64) -> float do
+  let p = arena.alloc_raw(size: 8)
+  mem.store_i64(addr: p, val: bits)
+  return mem.load_f64(addr: p)
+end
+
+let reinterpret_f64_to_bits = fn (x: float) -> i64 do
+  let p = arena.alloc_raw(size: 8)
+  mem.store_f64(addr: p, val: x)
+  return mem.load_i64(addr: p)
+end
+
+let check_roundtrip = fn (x: float, label: string) -> unit throws { Exn } do
+  let bits_in = reinterpret_f64_to_bits(x)
+  let s = from_float(val: x)
+  let y = to_f64(s: s)
+  let bits_out = reinterpret_f64_to_bits(x: y)
+  test_assert.assert_eq_i64(actual: bits_out, expected: bits_in, label: label ++ " round-trip")
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  // f64::MAX = 0x7fefffffffffffff = 1.7976931348623157e308
+  let fmax = reinterpret_bits_to_f64(bits: 9218868437227405311)
+
+  // Core regression: the formatted string must be the correct value.
+  test_assert.assert_eq_string(
+    actual: from_float(val: fmax),
+    expected: "1.7976931348623157e308",
+    label: "f64::MAX formats correctly"
+  )
+
+  // Corollary: parsing the formatted string must give back the same bits
+  // (in particular, must NOT give +inf).
+  check_roundtrip(x: fmax, label: "f64::MAX")
+
+  // --- Spot-checks: known-good values must still format correctly ---
+  // -0.0 (sign bit preserved)
+  let neg_zero = reinterpret_bits_to_f64(bits: -9223372036854775808)
+  test_assert.assert_eq_string(actual: from_float(val: neg_zero), expected: "-0", label: "-0.0")
+
+  // 0.5
+  let half = i64_to_float(val: 1) /. i64_to_float(val: 2)
+  test_assert.assert_eq_string(actual: from_float(val: half), expected: "0.5", label: "0.5")
+  check_roundtrip(x: half, label: "0.5")
+
+  // 100.5
+  let v1005 = i64_to_float(val: 1005) /. i64_to_float(val: 10)
+  test_assert.assert_eq_string(actual: from_float(val: v1005), expected: "100.5", label: "100.5")
+  check_roundtrip(x: v1005, label: "100.5")
+
+  // 1e15 (exact integer, integer fast path)
+  let v1e15 = i64_to_float(val: 1000000000000000)
+  test_assert.assert_eq_string(actual: from_float(val: v1e15), expected: "1000000000000000", label: "1e15")
+  check_roundtrip(x: v1e15, label: "1e15")
+
+  // 2^53 (boundary of integer fast path; from nexus-1ylu9 regression)
+  let v_2_53 = i64_to_float(val: 9007199254740992)
+  test_assert.assert_eq_string(actual: from_float(val: v_2_53), expected: "9007199254740992", label: "2^53")
+  check_roundtrip(x: v_2_53, label: "2^53")
+
+  // 2^53 + 2 (next representable above 2^53)
+  let v_2_53p2 = i64_to_float(val: 9007199254740994)
+  test_assert.assert_eq_string(actual: from_float(val: v_2_53p2), expected: "9007199254740994", label: "2^53+2")
+  check_roundtrip(x: v_2_53p2, label: "2^53+2")
+
+  // -2^53 (negative large exact integer)
+  let neg_large = i64_to_float(val: 0) -. i64_to_float(val: 9007199254740992)
+  test_assert.assert_eq_string(actual: from_float(val: neg_large), expected: "-9007199254740992", label: "-2^53")
+
+  // 1e300 (large non-integer; round-trip must be exact)
+  let v1e300 = reinterpret_bits_to_f64(bits: 9094988921128908188)
+  check_roundtrip(x: v1e300, label: "1e300")
+
+  // 1e-300 (small non-integer)
+  let v1em300 = reinterpret_bits_to_f64(bits: 118622047889322841)
+  check_roundtrip(x: v1em300, label: "1e-300")
+
+  // 2/3 (irrational; round-trip must reconstruct the same f64)
+  let two_thirds = i64_to_float(val: 2) /. i64_to_float(val: 3)
+  check_roundtrip(x: two_thirds, label: "2/3")
+
+  return ()
+end
