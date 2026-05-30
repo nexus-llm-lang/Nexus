@@ -1300,6 +1300,10 @@ if [ "$TEST_MODE" = "1" ]; then
           next
         }
         /^[[:space:]]*\$/ { next }
+        /^[[:space:]]*\/\/[[:space:]]*p2c-allow-nonzero/ {
+          print \"allow-nonzero\\t1\"
+          next
+        }
         /^[[:space:]]*\\/\\// { next }
         { exit }
       " "$f")
@@ -1309,6 +1313,7 @@ if [ "$TEST_MODE" = "1" ]; then
       P2C_HTTP_SERVER_PID=""
       P2C_TCP_SERVE_PID=""
       P2C_TCP_SERVE_PORT=""
+      P2C_ALLOW_NONZERO=""
 
       IFS_BAK2=$IFS; IFS="
 "
@@ -1351,6 +1356,9 @@ if [ "$TEST_MODE" = "1" ]; then
         fi
       fi
       P2C_EXPECT_MSGS=$(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^msg\t/ { print \$2 }")
+      if printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^allow-nonzero\t/" | grep -q .; then
+        P2C_ALLOW_NONZERO="1"
+      fi
       IFS=$IFS_BAK2
 
       t0=$(date +%s%N 2>/dev/null || date +%s000000000)
@@ -1444,11 +1452,13 @@ if [ "$TEST_MODE" = "1" ]; then
         exit 0
       fi
       # shellcheck disable=SC2086
-      if ! wasmtime run -W component-model=y,exceptions=y \
+      _p2c_run_rc=0
+      wasmtime run -W component-model=y,exceptions=y \
           --dir=. --dir="$scratch::/tmp" ${NEXUS_WASMTIME_ARGS:-} \
           $P2C_HTTP_FLAGS $P2C_ENV_FLAGS $P2C_DIR_FLAGS \
           "$wasm" \
-          >"$p2c_out" 2>"$elog"; then
+          >"$p2c_out" 2>"$elog" || _p2c_run_rc=$?
+      if [ "$_p2c_run_rc" -ne 0 ] && { [ -z "$P2C_ALLOW_NONZERO" ] || grep -q "wasm trap\|invalid expected discriminant\|trap: " "$elog" 2>/dev/null; }; then
         t2=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t2 - t1) / 1000000 ))
         tail_txt="$(tail -16 "$elog" 2>/dev/null)"
