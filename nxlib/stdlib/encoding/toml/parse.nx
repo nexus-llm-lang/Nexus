@@ -163,6 +163,132 @@ let parse_dotted_key = fn (s: string, p: i64) -> KeyStep throws { TomlThrow } do
   return KeyStep(key: first ++ "." ++ rest, pos: p4)
 end
 
+// Split a dotted-key string (as returned by parse_dotted_key) into individual
+// segments.  The segments are guaranteed non-empty because parse_key_seg always
+// produces at least one character.
+let split_key_segs = fn (key: string) -> [string] do
+  return str.split(s: key, sep: ".")
+end
+
+// Insert a value at the dotted path given by `segs` into an existing field
+// list.  Intermediate tables are created or merged as required by TOML 1.0.
+// Throws on: duplicate scalar key, or attempt to extend a non-table key.
+let insert_dotted = fn (fields: [TomlField], segs: [string], value: TomlValue, pos: i64) -> [TomlField] throws { TomlThrow } do
+  match segs do
+    | [] -> throw TomlError(msg: "empty key path", pos)
+    | seg :: [] ->
+      // Leaf: plain key insertion (no duplicates allowed).
+      if find_field(fields, key: seg) then
+        throw TomlError(msg: "duplicate key: " ++ seg, pos)
+      end
+      return list.reverse(xs: TomlField(key: seg, value) :: list.reverse(xs: fields))
+    | seg :: rest ->
+      // Intermediate: navigate into (or create) a sub-table for `seg`.
+      match lookup_table(fields, key: seg) do
+        | TableFound(sub, rest: remaining) ->
+          // Merge into the existing sub-table.
+          let new_sub = insert_dotted(fields: sub, segs: rest, value, pos)
+          let updated = TomlField(key: seg, value: TomlTable(fields: new_sub))
+          return list.reverse(xs: updated :: list.reverse(xs: remaining))
+        | TableNotFound ->
+          // No sub-table yet: check whether a non-table key with this name
+          // already exists (that would be a redefinition error).
+          if find_field(fields, key: seg) then
+            throw TomlError(msg: "cannot extend non-table key: " ++ seg, pos)
+          end
+          // Create fresh sub-table.
+          let new_sub = insert_dotted(fields: [], segs: rest, value, pos)
+          let new_field = TomlField(key: seg, value: TomlTable(fields: new_sub))
+          return list.reverse(xs: new_field :: list.reverse(xs: fields))
+      end
+  end
+end
+
+// Navigate into the nested table addressed by `segs` (creating intermediate
+// tables as needed), merge the section body (`sec_fields`) at the leaf, and
+// return the updated top-level fields.
+let insert_section = fn (fields: [TomlField], segs: [string], sec_fields: [TomlField], pos: i64) -> [TomlField] throws { TomlThrow } do
+  match segs do
+    | [] -> throw TomlError(msg: "empty section key", pos)
+    | seg :: [] ->
+      // Leaf: the section itself goes here.  We allow an existing implicit
+      // table (created by a dotted key like `a.b = 1` before `[a]`) to be
+      // filled in.
+      match lookup_table(fields, key: seg) do
+        | TableFound(sub: existing_sub, rest: remaining) ->
+          // Merge sec_fields into the existing sub-table.
+          let merged = merge_fields(dst: existing_sub, src: sec_fields, pos)
+          let updated = TomlField(key: seg, value: TomlTable(fields: merged))
+          return list.reverse(xs: updated :: list.reverse(xs: remaining))
+        | TableNotFound ->
+          if find_field(fields, key: seg) then
+            throw TomlError(msg: "duplicate section: " ++ seg, pos)
+          end
+          let new_field = TomlField(key: seg, value: TomlTable(fields: sec_fields))
+          return list.reverse(xs: new_field :: list.reverse(xs: fields))
+      end
+    | seg :: rest ->
+      // Intermediate: navigate into or create a sub-table.
+      match lookup_table(fields, key: seg) do
+        | TableFound(sub, rest: remaining) ->
+          let new_sub = insert_section(fields: sub, segs: rest, sec_fields, pos)
+          let updated = TomlField(key: seg, value: TomlTable(fields: new_sub))
+          return list.reverse(xs: updated :: list.reverse(xs: remaining))
+        | TableNotFound ->
+          let new_sub = insert_section(fields: [], segs: rest, sec_fields, pos)
+          let new_field = TomlField(key: seg, value: TomlTable(fields: new_sub))
+          return list.reverse(xs: new_field :: list.reverse(xs: fields))
+      end
+  end
+end
+
+// Merge fields from `src` into `dst`, throwing on duplicate keys.
+let merge_fields = fn (dst: [TomlField], src: [TomlField], pos: i64) -> [TomlField] throws { TomlThrow } do
+  match src do
+    | [] -> return dst
+    | TomlField(key: k, value: v) :: rest ->
+      if find_field(dst, key: k) then
+        throw TomlError(msg: "duplicate key in section: " ++ k, pos)
+      end
+      let new_dst = list.reverse(xs: TomlField(key: k, value: v) :: list.reverse(xs: dst))
+      return merge_fields(dst: new_dst, src: rest, pos)
+  end
+end
+
+// Insert an array-of-tables entry at the leaf of a dotted path.
+let insert_aot = fn (fields: [TomlField], segs: [string], table_val: TomlValue, pos: i64) -> [TomlField] throws { TomlThrow } do
+  match segs do
+    | [] -> throw TomlError(msg: "empty aot key", pos)
+    | seg :: [] ->
+      // Leaf: append table_val to the array for `seg`.
+      match fields do
+        | [] -> return [TomlField(key: seg, value: TomlArray(items: [table_val]))]
+        | TomlField(key: k, value: v) :: rest ->
+          if k == seg then
+            match v do
+              | TomlArray(items: existing) ->
+                return TomlField(key: k, value: TomlArray(items: list.reverse(xs: table_val :: list.reverse(xs: existing)))) :: rest
+              | _ ->
+                return TomlField(key: k, value: TomlArray(items: [table_val])) :: rest
+            end
+          end
+          return TomlField(key: k, value: v) :: insert_aot(fields: rest, segs, table_val, pos)
+      end
+    | seg :: rest ->
+      // Intermediate: navigate into or create a sub-table.
+      match lookup_table(fields, key: seg) do
+        | TableFound(sub, rest: remaining) ->
+          let new_sub = insert_aot(fields: sub, segs: rest, table_val, pos)
+          let updated = TomlField(key: seg, value: TomlTable(fields: new_sub))
+          return list.reverse(xs: updated :: list.reverse(xs: remaining))
+        | TableNotFound ->
+          let new_sub = insert_aot(fields: [], segs: rest, table_val, pos)
+          let new_field = TomlField(key: seg, value: TomlTable(fields: new_sub))
+          return list.reverse(xs: new_field :: list.reverse(xs: fields))
+      end
+  end
+end
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Number parsing
 // ═══════════════════════════════════════════════════════════════════════════
@@ -236,11 +362,24 @@ let scan_hex_digits = fn (s: string, p: i64) -> i64 do
   return p
 end
 
-let parse_hex_str = fn (s: string, p: i64, acc: i64) -> i64 do
+// i64 max = 0x7FFFFFFFFFFFFFFF = 9223372036854775807
+// For hex: if acc > 0x7FFFFFFFFFFFFFFF / 16 before the next shift, or
+// shifting would overflow, throw.
+let i64_max_div16 = 576460752303423487  // 0x7FFFFFFFFFFFFFFF / 16
+
+let parse_hex_str = fn (s: string, p: i64, acc: i64) -> i64 throws { TomlThrow } do
   if p >= slen(s) then return acc end
   let c = str.byte_at(s, idx: p)
   let d = hex_digit_val(c)
-  return parse_hex_str(s, p: p + 1, acc: acc * 16 + d)
+  if acc > i64_max_div16 then
+    throw TomlError(msg: "hex integer out of i64 range", pos: -1)
+  end
+  let next = acc * 16 + d
+  // Additional check: if next is negative, overflow occurred.
+  if next < 0 then
+    throw TomlError(msg: "hex integer out of i64 range", pos: -1)
+  end
+  return parse_hex_str(s, p: p + 1, acc: next)
 end
 
 // Parse octal integer (after "0o").
@@ -268,11 +407,21 @@ let scan_oct_digits = fn (s: string, p: i64) -> i64 do
   return p
 end
 
-let parse_oct_str = fn (s: string, p: i64, acc: i64) -> i64 do
+// i64 max / 8 = 1152921504606846975 = 0xFFFFFFFFFFFFFFF
+let i64_max_div8 = 1152921504606846975
+
+let parse_oct_str = fn (s: string, p: i64, acc: i64) -> i64 throws { TomlThrow } do
   if p >= slen(s) then return acc end
   let c = str.byte_at(s, idx: p)
   let d = char.ord(c) - 48
-  return parse_oct_str(s, p: p + 1, acc: acc * 8 + d)
+  if acc > i64_max_div8 then
+    throw TomlError(msg: "octal integer out of i64 range", pos: -1)
+  end
+  let next = acc * 8 + d
+  if next < 0 then
+    throw TomlError(msg: "octal integer out of i64 range", pos: -1)
+  end
+  return parse_oct_str(s, p: p + 1, acc: next)
 end
 
 // Parse binary integer (after "0b").
@@ -300,11 +449,21 @@ let scan_bin_digits = fn (s: string, p: i64) -> i64 do
   return p
 end
 
-let parse_bin_str = fn (s: string, p: i64, acc: i64) -> i64 do
+// i64 max / 2 = 4611686018427387903 = 0x3FFFFFFFFFFFFFFF
+let i64_max_div2 = 4611686018427387903
+
+let parse_bin_str = fn (s: string, p: i64, acc: i64) -> i64 throws { TomlThrow } do
   if p >= slen(s) then return acc end
   let c = str.byte_at(s, idx: p)
   let d = char.ord(c) - 48
-  return parse_bin_str(s, p: p + 1, acc: acc * 2 + d)
+  if acc > i64_max_div2 then
+    throw TomlError(msg: "binary integer out of i64 range", pos: -1)
+  end
+  let next = acc * 2 + d
+  if next < 0 then
+    throw TomlError(msg: "binary integer out of i64 range", pos: -1)
+  end
+  return parse_bin_str(s, p: p + 1, acc: next)
 end
 
 // Check whether the decimal literal contains float indicators.
@@ -499,18 +658,27 @@ end
 let parse_inline_fields = fn (s: string, p: i64, acc: [TomlField]) -> ParseStep throws { TomlThrow } do
   let p1 = skip_inline_ws(s, p)
   if peek(s, p: p1) == ch_rbrace then
-    return ParseStep(value: TomlTable(fields: list.reverse(xs: acc)), pos: p1 + 1)
+    return ParseStep(value: TomlTable(fields: acc), pos: p1 + 1)
   end
-  let FieldStep(field: f, pos: p2) = parse_keyval(s, p: p1)
+  // Parse key (possibly dotted) and value.
+  let KeyStep(key: raw_key, pos: p2) = parse_dotted_key(s, p: p1)
   let p3 = skip_inline_ws(s, p: p2)
-  let nc = peek(s, p: p3)
+  if peek(s, p: p3) != ch_eq then
+    throw TomlError(msg: "expected '=' after key", pos: p3)
+  end
+  let p4 = skip_inline_ws(s, p: p3 + 1)
+  let ParseStep(value: v, pos: p5) = parse_value(s, p: p4)
+  let segs = split_key_segs(key: raw_key)
+  let new_acc = insert_dotted(fields: acc, segs, value: v, pos: p1)
+  let p6 = skip_inline_ws(s, p: p5)
+  let nc = peek(s, p: p6)
   if nc == ch_comma then
-    return parse_inline_fields(s, p: p3 + 1, acc: f :: acc)
+    return parse_inline_fields(s, p: p6 + 1, acc: new_acc)
   end
   if nc == ch_rbrace then
-    return ParseStep(value: TomlTable(fields: list.reverse(xs: f :: acc)), pos: p3 + 1)
+    return ParseStep(value: TomlTable(fields: new_acc), pos: p6 + 1)
   end
-  throw TomlError(msg: "expected ',' or '}' in inline table", pos: p3)
+  throw TomlError(msg: "expected ',' or '}' in inline table", pos: p6)
 end
 
 let parse_inline_table = fn (s: string, p: i64) -> ParseStep throws { TomlThrow } do
@@ -523,6 +691,7 @@ end
 
 // ─── Key-value pair ──────────────────────────────────────────────────────────
 
+// Parse a raw key/value pair (dotted key kept as flat string; nesting done by callers).
 let parse_keyval = fn (s: string, p: i64) -> FieldStep throws { TomlThrow } do
   let KeyStep(key: k, pos: p1) = parse_dotted_key(s, p)
   let p2 = skip_inline_ws(s, p: p1)
@@ -538,8 +707,7 @@ end
 // Top-level document parser
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Merge a key/value into an existing field list.
-// TOML forbids duplicate keys (at the same level); we enforce it here.
+// Check whether a key exists at the top level of a field list.
 let find_field = fn (fields: [TomlField], key: string) -> bool do
   match fields do
     | [] -> return false
@@ -547,15 +715,6 @@ let find_field = fn (fields: [TomlField], key: string) -> bool do
       if k == key then return true end
       return find_field(fields: rest, key)
   end
-end
-
-// Insert a field at the end.
-let append_field = fn (fields: [TomlField], f: TomlField) -> [TomlField] throws { TomlThrow } do
-  let TomlField(key: k, value: vv) = f
-  if find_field(fields, key: k) then
-    throw TomlError(msg: "duplicate key: " ++ k, pos: -1)
-  end
-  return list.reverse(xs: f :: list.reverse(xs: fields))
 end
 
 // Get (or create) a sub-table by key, returning (sub_fields, remaining_fields).
@@ -592,12 +751,36 @@ let parse_doc = fn (s: string, p: i64, fields: [TomlField]) -> [TomlField] throw
       return parse_table_header(s, p: p1, fields)
     end
   end
-  // Key-value line.
-  let FieldStep(field: f, pos: p2) = parse_keyval(s, p: p1)
-  let p3 = skip_line_tail(s, p: p2)
-  let p4 = consume_newline(s, p: p3)
-  let new_fields = append_field(fields, f)
-  return parse_doc(s, p: p4, fields: new_fields)
+  // Key-value line (possibly dotted key).
+  let KeyStep(key: raw_key, pos: p2) = parse_dotted_key(s, p: p1)
+  let p3 = skip_inline_ws(s, p: p2)
+  if peek(s, p: p3) != ch_eq then
+    throw TomlError(msg: "expected '=' after key", pos: p3)
+  end
+  let p4 = skip_inline_ws(s, p: p3 + 1)
+  let ParseStep(value: v, pos: p5) = parse_value(s, p: p4)
+  let p6 = skip_line_tail(s, p: p5)
+  let p7 = consume_newline(s, p: p6)
+  let segs = split_key_segs(key: raw_key)
+  let new_fields = insert_dotted(fields, segs, value: v, pos: p1)
+  return parse_doc(s, p: p7, fields: new_fields)
+end
+
+// Expand a list of flat-keyed fields (from collect_section_fields) into a
+// properly nested structure by applying insert_dotted for each field.
+let expand_body_fields = fn (fields: [TomlField]) -> [TomlField] throws { TomlThrow } do
+  let expanded = expand_body_go(fields, acc: [])
+  return expanded
+end
+
+let expand_body_go = fn (fields: [TomlField], acc: [TomlField]) -> [TomlField] throws { TomlThrow } do
+  match fields do
+    | [] -> return acc
+    | TomlField(key: k, value: v) :: rest ->
+      let segs = split_key_segs(key: k)
+      let new_acc = insert_dotted(fields: acc, segs, value: v, pos: -1)
+      return expand_body_go(fields: rest, acc: new_acc)
+  end
 end
 
 // Parse table header [section.key].
@@ -611,20 +794,23 @@ let parse_table_header = fn (s: string, p: i64, outer_fields: [TomlField]) -> [T
   end
   let p4 = skip_line_tail(s, p: p3 + 1)
   let p5 = consume_newline(s, p: p4)
-  // Collect key-vals for this section.
-  let section_fields = collect_section_fields(s, p: p5, acc: [])
-  let SectionResult(fields: sec_body, next_pos) = section_fields
-  // Build a TomlField(key: section_key, value: TomlTable(sec_body)) and append.
-  let table_val = TomlTable(fields: sec_body)
-  let f = TomlField(key: section_key, value: table_val)
-  // Check for duplicate section (allow re-opening via dotted key merging; simple check here).
-  let new_outer = list.reverse(xs: f :: list.reverse(xs: outer_fields))
+  // Collect key-vals for this section (flat keys).
+  let SectionResult(fields: raw_body, next_pos) = collect_section_fields(s, p: p5, acc: [])
+  // Expand dotted keys in the section body.
+  let sec_body = expand_body_fields(fields: raw_body)
+  // Build nested table structure for dotted section header (e.g. [a.b] → a contains b).
+  let segs = split_key_segs(key: section_key)
+  let new_outer = insert_section(fields: outer_fields, segs, sec_fields: sec_body, pos: p)
   return parse_doc(s, p: next_pos, fields: new_outer)
 end
 
 type SectionResult = SectionResult(fields: [TomlField], next_pos: i64)
 
 // Collect key-val lines until the next '[' header or EOF.
+// Returns accumulated fields. Dotted-key nesting is applied by the caller
+// (insert_section / parse_table_header) after this call returns.
+// Each raw key/value pair is accumulated as-is; the caller uses insert_dotted
+// to build the nested table structure.
 let collect_section_fields = fn (s: string, p: i64, acc: [TomlField]) -> SectionResult throws { TomlThrow } do
   let p1 = skip_empty_lines(s, p)
   if p1 >= slen(s) then
@@ -651,28 +837,14 @@ let parse_aot_header = fn (s: string, p: i64, outer_fields: [TomlField]) -> [Tom
   end
   let p4 = skip_line_tail(s, p: p3 + 2)
   let p5 = consume_newline(s, p: p4)
-  let SectionResult(fields: sec_body, next_pos) = collect_section_fields(s, p: p5, acc: [])
+  let SectionResult(fields: raw_body, next_pos) = collect_section_fields(s, p: p5, acc: [])
+  // Expand dotted keys in the aot entry body.
+  let sec_body = expand_body_fields(fields: raw_body)
   let new_table = TomlTable(fields: sec_body)
-  // Find existing array for this key and append, or start a new array.
-  let new_outer = aot_append(fields: outer_fields, key: section_key, table_val: new_table)
+  // Find existing array for this key (possibly dotted) and append.
+  let segs = split_key_segs(key: section_key)
+  let new_outer = insert_aot(fields: outer_fields, segs, table_val: new_table, pos: p)
   return parse_doc(s, p: next_pos, fields: new_outer)
-end
-
-// Append a new table to the named array-of-tables field.
-let aot_append = fn (fields: [TomlField], key: string, table_val: TomlValue) -> [TomlField] do
-  match fields do
-    | [] -> return [TomlField(key, value: TomlArray(items: [table_val]))]
-    | TomlField(key: k, value: v) :: rest ->
-      if k == key then
-        match v do
-          | TomlArray(items: existing) ->
-            return TomlField(key: k, value: TomlArray(items: list.reverse(xs: table_val :: list.reverse(xs: existing)))) :: rest
-          | _ ->
-            return TomlField(key: k, value: TomlArray(items: [table_val])) :: rest
-        end
-      end
-      return TomlField(key: k, value: v) :: aot_append(fields: rest, key, table_val)
-  end
 end
 
 /**
