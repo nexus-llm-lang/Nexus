@@ -4,32 +4,49 @@
  * Advisory (LintInfo) only — never trips the `--check` CI gate.
  *
  * Flags comments that assert an authority position ("sanctioned",
- * "the only way", "must be", "counts as", "canonical", "intended",
- * "by design", "正規", "意図的", "仕様") without an accompanying
- * citation (a "see ", "docs/", "spec/", RFC reference, issue link,
- * or "(designer)" marker).  Pure source-text scan; does not require
- * the parsed AST.
+ * "the only way", "counts as", "canonical", "by design", "正規",
+ * "意図的", "仕様") without an accompanying citation (a "see ",
+ * "docs/", "spec/", RFC reference, issue link, or "(designer)"
+ * marker).  Pure source-text scan; does not require the parsed AST.
+ *
+ * Precision notes:
+ *   - Phrases match on word/token boundaries only (alphanumeric or '_'
+ *     adjacent to the phrase suppresses the match).
+ *   - "must be" and "intended" are NOT in the list: they are ordinary
+ *     precondition/behavioural prose, not authority claims.
+ *   - The comment scanner is string-literal-aware: slashes-star inside
+ *     a string/char literal is not treated as a comment opener.
+ *   - Block-comment findings report the span of the matched line, not
+ *     the opening delimiter line.
  */
 
-import { Option, None } from "std:option"
+import { Option, Some, None } from "std:option"
 import * as str from "std:str"
+import * as char from "std:char"
 import * as list from "std:list"
 import { Span } from "src/types/span.nx"
 import { LintFinding, LintInfo } from "src/lint/types.nx"
+import {
+  scan_string,
+  scan_char,
+  scan_bracket_string,
+  scan_block_comment,
+  find_line_end
+} from "src/fmt/scan.nx"
 
 // ─── authority phrases ────────────────────────────────────────────────────────
 
 // Returns the list of authority phrases to scan for (lower-cased).
-// Intentionally narrow: only strong-claim tokens, not ordinary prose.
+// Intentionally narrow: only genuine authority-claim tokens.
+// "must be" and "intended" are excluded — they are ordinary precondition
+// or behavioural prose, not design-authority claims.
 let authority_phrases = fn () -> [ string ] do
   return [
     "sanctioned",
     "the only way",
-    "must be",
     "counts as",
     "canonical",
     "by design",
-    "intended",
     "正規",
     "意図的",
     "仕様"
@@ -41,164 +58,263 @@ let citation_markers = fn () -> [ string ] do
   return [ "see ", "docs/", "spec/", "rfc", "issue", "http://", "https://", "(designer)" ]
 end
 
-// Does `text` (already lower-cased) contain any authority phrase?
-let has_authority_phrase = fn (text: string) -> bool do
-  return any_phrase_in(text, phrases: authority_phrases())
+// ─── word-boundary helpers ────────────────────────────────────────────────────
+
+// Returns true if byte `b` is a word character (alphanumeric, '_', or '-').
+// The hyphen is included so that hyphenated compounds like "non-canonical"
+// do not match the sub-word "canonical".
+let is_word_byte = fn (b: char) -> bool do
+  if b >= 'a' && b <= 'z' then return true end
+  if b >= 'A' && b <= 'Z' then return true end
+  if b >= '0' && b <= '9' then return true end
+  if b == '_' then return true end
+  if b == '-' then return true end
+  return false
 end
 
-let any_phrase_in = fn (text: string, phrases: [ string ]) -> bool do
+// Returns true iff the occurrence of `phrase` at position `idx` in `text`
+// is on a word boundary (i.e. the byte immediately before the phrase and
+// the byte immediately after the phrase are both non-word characters or the
+// phrase sits at the start/end of the text).
+let at_word_boundary = fn (text: string, idx: i64, phrase_len: i64) -> bool do
+  let text_len = str.byte_length(s: text)
+  // Check the byte before the phrase.
+  if idx > 0 then
+    let before = str.byte_at(s: text, idx: idx - 1)
+    if is_word_byte(b: before) then return false end
+  end
+  // Check the byte after the phrase.
+  let after_idx = idx + phrase_len
+  if after_idx < text_len then
+    let after = str.byte_at(s: text, idx: after_idx)
+    if is_word_byte(b: after) then return false end
+  end
+  return true
+end
+
+// Search for `phrase` in `text` (already lower-cased) with word-boundary
+// checking.  Returns true if a whole-word match is found.
+//
+// Strategy: search in successively shorter suffixes of `text` (starting at
+// `search_from`).  `str.index_of` returns an offset into the suffix, so we
+// add `search_from` to recover the absolute position in `text`.
+let phrase_matches_in = fn (text: string, phrase: string) -> bool do
+  return phrase_matches_in_go(text, phrase, search_from: 0, phrase_len: str.byte_length(s: phrase), text_len: str.byte_length(s: text))
+end
+
+let phrase_matches_in_go = fn (text: string, phrase: string, search_from: i64, phrase_len: i64, text_len: i64) -> bool do
+  if search_from >= text_len then return false end
+  let tail_len = text_len - search_from
+  let tail = str.byte_substring(s: text, start: search_from, len: tail_len)
+  let rel_idx = str.index_of(s: tail, sub: phrase)
+  if rel_idx < 0 then return false end
+  let idx = search_from + rel_idx
+  if at_word_boundary(text, idx, phrase_len) then return true end
+  // Advance past this (non-boundary) occurrence and keep searching.
+  return phrase_matches_in_go(text, phrase, search_from: idx + 1, phrase_len, text_len)
+end
+
+// Does `text` (already lower-cased) contain any authority phrase at word boundary?
+let has_authority_phrase = fn (text: string) -> bool do
+  return any_phrase_matches(text, phrases: authority_phrases())
+end
+
+let any_phrase_matches = fn (text: string, phrases: [ string ]) -> bool do
   match phrases do
     | [] -> return false
     | p :: rest ->
-      if str.contains(s: text, sub: p) then return true end
-      return any_phrase_in(text, phrases: rest)
+      if phrase_matches_in(text, phrase: p) then return true end
+      return any_phrase_matches(text, phrases: rest)
   end
 end
 
 // Does `text` (already lower-cased) contain any citation marker?
+// Citations use plain substring match (they are not authority phrases that
+// need word-boundary protection).
 let has_citation = fn (text: string) -> bool do
-  return any_phrase_in(text, phrases: citation_markers())
+  return any_plain_phrase_in(text, phrases: citation_markers())
+end
+
+let any_plain_phrase_in = fn (text: string, phrases: [ string ]) -> bool do
+  match phrases do
+    | [] -> return false
+    | p :: rest ->
+      if str.contains(s: text, sub: p) then return true end
+      return any_plain_phrase_in(text, phrases: rest)
+  end
+end
+
+// ─── string-literal-aware comment finder ─────────────────────────────────────
+
+// A result from `find_comment_start`: either we found a comment at a position,
+// or the line has no comment.
+type CommentPos = NoComment | LineComment(at: i64) | BlockComment(at: i64)
+
+// Scan src[pos..end_pos) at the code level (skipping over string/char/bracket
+// literals) and return the first `//` or `/*` opener found.
+let find_comment_start_in_line = fn (src: string, pos: i64, end_pos: i64) -> CommentPos do
+  if pos >= end_pos then return NoComment end
+  let b = str.byte_at(s: src, idx: pos)
+  // `//` line comment opener
+  if b == '/' && pos + 1 < end_pos && str.byte_at(s: src, idx: pos + 1) == '/' then
+    return LineComment(at: pos)
+  end
+  // `/*` block comment opener
+  if b == '/' && pos + 1 < end_pos && str.byte_at(s: src, idx: pos + 1) == '*' then
+    return BlockComment(at: pos)
+  end
+  // string literal: skip over it
+  if b == '"' then
+    let after = scan_string(src, pos: pos + 1, len: end_pos)
+    return find_comment_start_in_line(src, pos: after, end_pos)
+  end
+  // char literal: skip
+  if b == '\'' then
+    match scan_char(src, pos: pos + 1, len: end_pos) do
+    | Some(val: after) ->
+      return find_comment_start_in_line(src, pos: after, end_pos)
+    | None ->
+      return find_comment_start_in_line(src, pos: pos + 1, end_pos)
+    end
+  end
+  // bracket string: skip
+  if b == '[' && pos + 1 < end_pos && str.byte_at(s: src, idx: pos + 1) == '='
+     && pos + 2 < end_pos && str.byte_at(s: src, idx: pos + 2) == '[' then
+    let after = scan_bracket_string(src, pos: pos + 3, len: end_pos)
+    return find_comment_start_in_line(src, pos: after, end_pos)
+  end
+  return find_comment_start_in_line(src, pos: pos + 1, end_pos)
 end
 
 // ─── comment extraction ───────────────────────────────────────────────────────
 
-// A collected comment block: text and the 1-based start line.
-type CommentBlock = CommentBlock(text: string, start_line: i64)
+// A collected comment line: 1-based line number and the comment text for that line.
+type CommentLine = CommentLine(line_no: i64, text: string)
 
-// Scanner state: current line number, inside a block comment, accumulated
-// block-comment text and start line, and the output list (reversed).
+// A collected comment block: one or more comment lines.
+type CommentBlock = CommentBlock(lines: [ CommentLine ])
+
+// Scanner state.
 type ScanState = ScanState(
   line_no: i64,
   in_block: bool,
-  block_text: string,
-  block_start: i64,
+  block_lines: [ CommentLine ],
   blocks: [ CommentBlock ]
 )
 
 let init_scan_state = fn () -> ScanState do
-  return ScanState(line_no: 1, in_block: false, block_text: "", block_start: 1, blocks: [])
+  return ScanState(line_no: 1, in_block: false, block_lines: [], blocks: [])
 end
 
 // Extract comment blocks from the source text.
 // Line comments produce single-line blocks.
 // Block comments accumulate lines until `*/` appears.
 let extract_comment_blocks = fn (src: string) -> [ CommentBlock ] do
-  let lines = str.split(s: src, sep: "\n")
+  let len = str.byte_length(s: src)
   let st = init_scan_state()
-  let st2 = process_lines(lines, st)
+  let st2 = process_all_lines(src, len, pos: 0, st)
   // If still in a block comment at EOF, flush it.
   let st3 = match st2 do
-    | ScanState(line_no: _, in_block, block_text: _, block_start: _, blocks: _) ->
+    | ScanState(line_no: _, in_block, block_lines: _, blocks: _) ->
       if in_block then flush_block(st: st2) else st2 end
   end
   return match st3 do
-    | ScanState(line_no: _, in_block: _, block_text: _, block_start: _, blocks) ->
+    | ScanState(line_no: _, in_block: _, block_lines: _, blocks) ->
       list.reverse(xs: blocks)
   end
 end
 
-let process_lines = fn (lines: [ string ], st: ScanState) -> ScanState do
-  match lines do
-    | [] -> return st
-    | ln :: rest ->
-      let st2 = process_line_da(line: ln, st)
-      return process_lines(lines: rest, st: st2)
-  end
+let process_all_lines = fn (src: string, len: i64, pos: i64, st: ScanState) -> ScanState do
+  if pos >= len then return st end
+  let line_end = find_line_end(src, len, pos)
+  let line_len = line_end - pos
+  let line = str.byte_substring(s: src, start: pos, len: line_len)
+  let st2 = process_line_da(line, st)
+  let next_pos = if line_end < len then line_end + 1 else len end
+  return process_all_lines(src, len, pos: next_pos, st: st2)
 end
 
 let flush_block = fn (st: ScanState) -> ScanState do
-  let ScanState(line_no, in_block: _, block_text, block_start, blocks) = st
-  let b = CommentBlock(text: block_text, start_line: block_start)
-    return ScanState(line_no, in_block: false, block_text: "", block_start: 1, blocks: b :: blocks)
+  let ScanState(line_no, in_block: _, block_lines, blocks) = st
+  let b = CommentBlock(lines: list.reverse(xs: block_lines))
+  return ScanState(line_no, in_block: false, block_lines: [], blocks: b :: blocks)
 end
 
 // Process one source line when we are inside a block comment.
 let process_line_in_block = fn (
   line: string,
   line_no: i64,
-  block_text: string,
-  block_start: i64,
+  block_lines: [ CommentLine ],
   blocks: [ CommentBlock ]
 ) -> ScanState do
   let close_idx = str.index_of(s: line, sub: "*/")
   if close_idx >= 0 then
     // Block comment closes on this line.
     let extra = str.byte_substring(s: line, start: 0, len: close_idx)
-    let merged = block_text ++ " " ++ extra
-    let b = CommentBlock(text: merged, start_line: block_start)
+    let cl = CommentLine(line_no, text: extra)
+    let all_lines = list.reverse(xs: cl :: block_lines)
+    let b = CommentBlock(lines: all_lines)
     return ScanState(
       line_no: line_no + 1,
       in_block: false,
-      block_text: "",
-      block_start: 1,
+      block_lines: [],
       blocks: b :: blocks
     )
   end
   // Whole line is inside block comment.
-  let merged = block_text ++ " " ++ line
-  return ScanState(line_no: line_no + 1, in_block: true, block_text: merged, block_start, blocks)
+  let cl = CommentLine(line_no, text: line)
+  return ScanState(line_no: line_no + 1, in_block: true, block_lines: cl :: block_lines, blocks)
 end
 
-// Process one source line when we are NOT inside a block comment and a
-// block-comment open `/*` was found at `block_open_idx`.
-let process_line_block_open = fn (
-  line: string,
-  line_no: i64,
-  block_open_idx: i64,
-  blocks: [ CommentBlock ]
-) -> ScanState do
-  let after_open = block_open_idx + 2
-  let rest_len = str.byte_length(s: line) - after_open
-  let rest_text = str.byte_substring(s: line, start: after_open, len: rest_len)
-  // Check if it also closes on the same line.
-  let close_idx = str.index_of(s: rest_text, sub: "*/")
-  if close_idx >= 0 then
-    let inner = str.byte_substring(s: rest_text, start: 0, len: close_idx)
-    let b = CommentBlock(text: inner, start_line: line_no)
+// Process one source line when NOT inside a block comment.
+let process_line_da = fn (line: string, st: ScanState) -> ScanState do
+  let ScanState(line_no, in_block, block_lines, blocks) = st
+  if in_block then
+    return process_line_in_block(line, line_no, block_lines, blocks)
+  end
+  // Not in a block comment: scan at code level for comment openers.
+  let line_len = str.byte_length(s: line)
+  match find_comment_start_in_line(src: line, pos: 0, end_pos: line_len) do
+  | NoComment ->
+    return ScanState(line_no: line_no + 1, in_block: false, block_lines: [], blocks)
+  | LineComment(at: line_comment_idx) ->
+    // Extract from `//` to end of line.
+    let tail_len = line_len - line_comment_idx
+    let comment_text = str.byte_substring(s: line, start: line_comment_idx, len: tail_len)
+    let cl = CommentLine(line_no, text: comment_text)
+    let b = CommentBlock(lines: [ cl ])
     return ScanState(
       line_no: line_no + 1,
       in_block: false,
-      block_text: "",
-      block_start: 1,
+      block_lines: [],
       blocks: b :: blocks
     )
-  end
-  return ScanState(
-    line_no: line_no + 1,
-    in_block: true,
-    block_text: rest_text,
-    block_start: line_no,
-    blocks
-  )
-end
-
-// Process one source line in the scanner.
-let process_line_da = fn (line: string, st: ScanState) -> ScanState do
-  let ScanState(line_no, in_block, block_text, block_start, blocks) = st
-  if in_block then
-      return process_line_in_block(line, line_no, block_text, block_start, blocks)
-    end
-    // Not in a block comment.
-    let line_comment_idx = str.index_of(s: line, sub: "//")
-    let block_open_idx = str.index_of(s: line, sub: "/*")
-    if line_comment_idx >= 0 && (block_open_idx < 0 || line_comment_idx < block_open_idx) then
-      // Line comment: extract from `//` to end of line.
-      let tail_len = str.byte_length(s: line) - line_comment_idx
-      let comment_text = str.byte_substring(s: line, start: line_comment_idx, len: tail_len)
-      let b = CommentBlock(text: comment_text, start_line: line_no)
+  | BlockComment(at: block_open_idx) ->
+    // Start of a block comment.
+    let after_open = block_open_idx + 2
+    let rest_len = line_len - after_open
+    let rest_text = str.byte_substring(s: line, start: after_open, len: rest_len)
+    // Check if it also closes on the same line.
+    let close_idx = str.index_of(s: rest_text, sub: "*/")
+    if close_idx >= 0 then
+      let inner = str.byte_substring(s: rest_text, start: 0, len: close_idx)
+      let cl = CommentLine(line_no, text: inner)
+      let b = CommentBlock(lines: [ cl ])
       return ScanState(
         line_no: line_no + 1,
         in_block: false,
-        block_text: "",
-        block_start: 1,
+        block_lines: [],
         blocks: b :: blocks
       )
     end
-    if block_open_idx >= 0 then
-      return process_line_block_open(line, line_no, block_open_idx, blocks)
-    end
-    // No comment on this line.
-    return ScanState(line_no: line_no + 1, in_block, block_text, block_start, blocks)
+    let cl = CommentLine(line_no, text: rest_text)
+    return ScanState(
+      line_no: line_no + 1,
+      in_block: true,
+      block_lines: [ cl ],
+      blocks
+    )
+  end
 end
 
 // ─── rule check ───────────────────────────────────────────────────────────────
@@ -208,20 +324,52 @@ let l0006_message = fn () -> string do
     ++ " — review and confirm or rewrite as a behaviour description"
 end
 
+// Find the first CommentLine whose lower-cased text has an authority phrase
+// but no citation. Returns None if all lines are clean.
+let find_flagged_line = fn (lines: [ CommentLine ]) -> Option<CommentLine> do
+  match lines do
+    | [] -> return None
+    | cl :: rest ->
+      let CommentLine(line_no: _, text) = cl
+      let lower = str.to_lower(s: text)
+      if has_authority_phrase(text: lower) && !has_citation(text: lower) then
+        return Some(val: cl)
+      end
+      return find_flagged_line(lines: rest)
+  end
+end
+
+// Check whether any line in the block carries the whole-block citation
+// (citation on any line excuses the whole block).
+let block_has_citation = fn (lines: [ CommentLine ]) -> bool do
+  match lines do
+    | [] -> return false
+    | CommentLine(line_no: _, text) :: rest ->
+      let lower = str.to_lower(s: text)
+      if has_citation(text: lower) then return true end
+      return block_has_citation(lines: rest)
+  end
+end
+
 // Check a single CommentBlock for L0006.
+// The span is anchored to the line where the matched phrase occurs.
 let check_block = fn (b: CommentBlock, acc: [ LintFinding ]) -> [ LintFinding ] do
-  let CommentBlock(text, start_line) = b
-  let lower = str.to_lower(s: text)
-    if !has_authority_phrase(text: lower) then return acc end
-    if has_citation(text: lower) then return acc end
+  let CommentBlock(lines) = b
+  // If any line carries a citation, the whole block is excused.
+  if block_has_citation(lines) then return acc end
+  // Find the first line with an authority phrase.
+  match find_flagged_line(lines) do
+  | None -> return acc
+  | Some(val: CommentLine(line_no, text: _)) ->
     let finding = LintFinding(
       code: "L0006",
       severity: LintInfo,
       message: l0006_message(),
       fix_it: None,
-      span: Span(offset: 0, line: start_line, col: 1)
+      span: Span(offset: 0, line: line_no, col: 1)
     )
     return finding :: acc
+  end
 end
 
 let check_blocks = fn (blocks: [ CommentBlock ], acc: [ LintFinding ]) -> [ LintFinding ] do
