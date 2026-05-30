@@ -76,7 +76,8 @@ import {
   ReservedDeclarationName,
   DuplicateDeclaration,
   InvalidGroupMember,
-  DuplicateCapMethod
+  DuplicateCapMethod,
+  ReservedBuiltinConstructor
 } from "src/typecheck/errors.nx"
 import { VariantIndex, VariantInfo }, * as vidx from "src/ir/support/variant_index.nx"
 import { Option, Some, None } from "std:option"
@@ -1272,6 +1273,78 @@ let check_cap_decl_names = fn (caps: [ HirCap ], seen: [ string ]) -> unit throw
   end
 end
 
+// ── Built-in constructor reservation: detect user type decls that shadow ────
+// built-in constructor names (Nil/Cons from List, None/Some from Option,
+// Ok/Err from Result). The variant index uses first-defined-wins semantics,
+// so a user-defined Cons would be silently dropped from the index while the
+// env carries the user's type — causing confusing "field 'rest'" phantom errors
+// at call sites rather than a clear diagnostic at the declaration.
+
+/** True when `name` is a constructor that belongs to one of the three built-in
+ *  generic types (List, Option, Result). Returns the owning built-in type name
+ *  so the diagnostic can name it, or the empty string when the name is not reserved.
+ */
+let builtin_type_for_ctor = fn (name: string) -> string do
+  if name == "Nil" then return "List" end
+  if name == "Cons" then return "List" end
+  if name == "None" then return "Option" end
+  if name == "Some" then return "Option" end
+  if name == "Ok" then return "Result" end
+  if name == "Err" then return "Result" end
+  return ""
+end
+
+// Walk all user-defined enum defs and reject any variant whose name collides
+// with a built-in constructor, UNLESS the enum itself IS the canonical
+// built-in type (i.e. the stdlib re-declares `type Option<T> = Some | None`
+// or `type Result<T,E> = Ok | Err` — those are the authoritative definitions
+// and must pass). Similarly skip "Exn" (exception accumulator) and "List"
+// (which lives in the built-in prelude, not in a source file seen here, but
+// guard it for symmetry).
+let check_user_enum_ctor_names = fn (defs: [ EnumDef ]) -> unit throws { TypeError } do
+  match defs do
+    | [] -> return ()
+    | EnumDef(name: n, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      // Skip the exception accumulator and the canonical built-in type names.
+      // The stdlib defines Option<T> and Result<T,E> as user enums with the
+      // same ctor names; they must be allowed. Any OTHER enum declaring these
+      // ctors is the user shadowing bug we want to reject.
+      if n == "Exn" then
+        return check_user_enum_ctor_names(defs: rest)
+      end
+      if n == "Option" then
+        return check_user_enum_ctor_names(defs: rest)
+      end
+      if n == "Result" then
+        return check_user_enum_ctor_names(defs: rest)
+      end
+      if n == "List" then
+        return check_user_enum_ctor_names(defs: rest)
+      end
+      check_enum_variant_names(enum_name: n, variants: vs)
+      return check_user_enum_ctor_names(defs: rest)
+  end
+end
+
+let check_enum_variant_names = fn (
+  enum_name: string,
+  variants: [ VariantDef ]
+) -> unit throws { TypeError } do
+  match variants do
+    | [] -> return ()
+    | VariantDef(name: vn, fields: _) :: rest ->
+      let bt = builtin_type_for_ctor(name: vn)
+      if str.length(s: bt) > 0 then
+        throw ReservedBuiltinConstructor(
+          ctor_name: vn,
+          builtin_type: bt,
+          span: Span(offset: 0, line: 0, col: 0)
+        )
+      end
+      return check_enum_variant_names(enum_name, variants: rest)
+  end
+end
+
 // ── D-ExceptionGroup: validate each group's members ────────────────────────
 
 let check_group_decls = fn (
@@ -1318,6 +1391,7 @@ end
  *    D-Exception: C ∉ {Exn} ∪ SysCaps ∧ C ∉ variants(Exn) (no reserved/duplicate)
  *    D-Cap: X ∉ {Exn} ∪ SysCaps ∧ X ∉ dom(caps) (no reserved/duplicate)
  *    D-ExceptionGroup: ∀i. C_i ∈ variants(Exn) ∧ distinct(C_1..C_n)
+ *    D-Type-Sum: user constructor ∉ {Nil,Cons,None,Some,Ok,Err} (no built-in shadow)
  */
 export let check_program_wf_rows = fn (prog: HirProgram) -> unit throws { TypeError } do
   let HirProgram(
@@ -1335,6 +1409,12 @@ export let check_program_wf_rows = fn (prog: HirProgram) -> unit throws { TypeEr
   // D-Exception / D-Cap / D-ExceptionGroup name-binding validation.
   check_exn_decl_names(defs: edefs)
   check_cap_decl_names(caps, seen: [])
+  // D-Type-Sum built-in constructor reservation: reject user type declarations
+  // whose constructor names collide with built-in List/Option/Result ctors.
+  // The variant index is built with first-defined-wins semantics; without this
+  // check, a user 'type T = Nil | Cons(head,tail)' silently drops 'Cons' from
+  // the index and produces a phantom 'rest' field error at use sites.
+  check_user_enum_ctor_names(defs: edefs)
   check_group_decls(groups: egs, vidx_: vi)
   walk_caps(caps, all_caps: caps, vidx_: vi, groups: egs)
   // Gravity rule (¬escapesRef) + wfRef on D-Cap method signatures.
