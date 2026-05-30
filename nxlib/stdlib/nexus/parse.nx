@@ -1,0 +1,288 @@
+/*
+ * nexus/parse: Nexus source-code parser — public entry point.
+ *
+ * Expose the Nexus lexer + recursive-descent parser as a stdlib library.
+ * Programs can import this module to parse Nexus source text into a surface AST.
+ *
+ * Primary entry points:
+ *
+ *   parse_source(src: string) -> Program throws { NxParseError }
+ *     Tokenize + parse; stops at the first error.  Populates Program.module_doc
+ *     from a leading doc block comment when present.
+ *
+ *   parse_source_collect(src: string, file: string) -> NxParseResult
+ *     Tokenize + parse with error recovery: accumulates all parse errors in one
+ *     pass instead of stopping at the first one.  Returns the partial Program
+ *     alongside a list of NxDiagnostic records.  An empty diag list means the
+ *     parse was clean.  Pass an empty string for `file` when no filename is
+ *     available (unit tests, REPL).
+ *
+ * Lower-level entry points (for callers that already have a token list):
+ *
+ *   parse(tokens: [SpannedToken]) -> Program throws { NxParseError }
+ *   parse_collect(tokens: [SpannedToken], file: string) -> NxParseResult
+ *
+ * Types re-exported for convenience:
+ *   Program, SpannedTopLevel, TopLevel, GlobalLet, ...  — from std:nexus/ast
+ *   Span                                                — from std:nexus/span
+ *   NxUnexpectedToken, NxUnexpectedEof, NxParseError    — from std:nexus/error
+ *   NxDiagnostic                                        — from std:nexus/error
+ *
+ * Nexus has no re-export syntax; import the sub-modules directly for the full
+ * type vocabulary (std:nexus/ast, std:nexus/span, std:nexus/vocab, etc.).
+ */
+
+import { Span } from "std:nexus/span"
+import { SpannedToken } from "std:nexus/token"
+import { SpannedTopLevel, GlobalLet, Program } from "std:nexus/ast"
+import { extract_module_doc, tokenize } from "std:nexus/lexer"
+import {
+  NxUnexpectedToken,
+  NxParseError,
+  NxDiagnostic
+} from "std:nexus/error"
+import { ParsedType, ParsedExpr, ParsedTopLevel }, * as pcore from "std:nexus/parse_core"
+import * as ptype from "std:nexus/parse_type"
+import { parse_expr } from "std:nexus/parser_core"
+import {
+  parse_import,
+  parse_type_def,
+  parse_exception_def,
+  parse_cap_def,
+  parse_external_def
+} from "std:nexus/parse_topdef"
+import * as list from "std:list"
+import * as str from "std:str"
+
+let parse_global_let_typed = fn (
+  n: string,
+  is_pub: bool,
+  r2: [ SpannedToken ],
+  sp: Span
+) -> ParsedTopLevel throws { NxParseError } do
+  let ParsedType(typ: t, rest: r4) = ptype.parse_type(toks: pcore.skip(toks: r2))
+  let ParsedExpr(expr: v, rest: r6) = parse_expr(toks: pcore.expect(toks: r4, expected: "="))
+  ParsedTopLevel(
+    item: SpannedTopLevel(
+      node: TLLet(def: GlobalLet(name: n, is_public: is_pub, typ: Some(val: t), value: v)),
+      span: sp
+    ),
+    rest: r6
+  )
+end
+
+let parse_global_let_untyped = fn (
+  n: string,
+  is_pub: bool,
+  r2: [ SpannedToken ],
+  sp: Span
+) -> ParsedTopLevel throws { NxParseError } do
+  let ParsedExpr(expr: v, rest: r4) = parse_expr(toks: pcore.expect(toks: r2, expected: "="))
+  ParsedTopLevel(
+    item: SpannedTopLevel(
+      node: TLLet(def: GlobalLet(name: n, is_public: is_pub, typ: None, value: v)),
+      span: sp
+    ),
+    rest: r4
+  )
+end
+
+let parse_global_let = fn (
+  toks: [ SpannedToken ],
+  is_pub: bool
+) -> ParsedTopLevel throws { NxParseError } do
+  let sp = pcore.peek_span(toks)
+  let ParsedIdent(name: n, rest: r2) = pcore.expect_ident(toks: pcore.expect(toks, expected: "let"))
+  return if pcore.is_tok(toks: r2, expected: ":") then
+    parse_global_let_typed(n, is_pub, r2, sp)
+  else
+    parse_global_let_untyped(n, is_pub, r2, sp)
+  end
+end
+
+let parse_top_level = fn (toks: [ SpannedToken ]) -> ParsedTopLevel throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkImport -> return parse_import(toks)
+    | TkPub ->
+      let r = pcore.skip(toks)
+      match pcore.peek_token(toks: r) do
+        | TkType | TkOpaque -> return parse_type_def(toks: r, is_pub: true)
+        | TkLet -> return parse_global_let(toks: r, is_pub: true)
+        | TkException -> return parse_exception_def(toks: r, is_pub: true)
+        | TkCap -> return parse_cap_def(toks: r, is_pub: true)
+        | TkExternal -> return parse_external_def(toks: r, is_pub: true)
+        | _ ->
+          throw NxUnexpectedToken(
+            expected: "definition after 'export'",
+            got: pcore.token_tag(tok: pcore.peek_token(toks: r)),
+            span: pcore.peek_span(toks: r)
+          )
+      end
+    | TkType | TkOpaque -> return parse_type_def(toks, is_pub: false)
+    | TkLet -> return parse_global_let(toks, is_pub: false)
+    | TkException -> return parse_exception_def(toks, is_pub: false)
+    | TkCap -> return parse_cap_def(toks, is_pub: false)
+    | TkExternal -> return parse_external_def(toks, is_pub: false)
+    | _ ->
+      throw NxUnexpectedToken(
+        expected: "top-level definition",
+        got: pcore.token_tag(tok: pcore.peek_token(toks)),
+        span: pcore.peek_span(toks)
+      )
+  end
+end
+
+let parse_program_loop = fn (
+  toks: [ SpannedToken ],
+  acc: [ SpannedTopLevel ]
+) -> Program throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkEof -> return Program(definitions: list.reverse(xs: acc), module_doc: None)
+    | _ ->
+      let ParsedTopLevel(item, rest: r) = parse_top_level(toks)
+      return parse_program_loop(toks: r, acc: item :: acc)
+  end
+end
+
+/** Parse a token list into a Program AST. Module-level doc (`module_doc`) is
+ *  left as `None`; callers with the original source text should use
+ *  `parse_source` instead so the field reflects a leading doc-block comment
+ *  when present.
+ */
+export let parse = fn (tokens: [ SpannedToken ]) -> Program throws { NxParseError } do
+  return parse_program_loop(toks: tokens, acc: [])
+end
+
+/** Parse source text directly: tokenize + parse, and populate
+ *  `Program.module_doc` from the file's leading doc-block comment (if any).
+ */
+export let parse_source = fn (src: string) -> Program throws { NxParseError } do
+  let tokens = tokenize(src)
+  let prog = parse_program_loop(toks: tokens, acc: [])
+  let doc = extract_module_doc(src)
+  let Program(definitions: defs, module_doc: _) = prog
+  return Program(definitions: defs, module_doc: doc)
+end
+
+//
+// Error-recovery variant: accumulate all parse errors in one pass.
+//
+// Recovery cap: at `max_diags` accumulated errors the loop aborts with a
+// final "too many parse errors" diagnostic.
+
+/** Result of parse_source_collect: the partial Program plus structured diagnostics.
+ *  An empty `diags` list means the parse was clean.
+ */
+export type NxParseResult = NxParseResult(prog: Program, diags: [ NxDiagnostic ])
+
+let max_parse_diags = 50
+
+let cap_diagnostic = fn (file: string) -> NxDiagnostic do
+  return NxDiagnostic(
+    code: "E1003",
+    severity: "error",
+    file,
+    line: 0,
+    column: 0,
+    message: "parse error: too many parse errors (cap = " ++ str.from_i64(val: max_parse_diags) ++ "); aborting recovery"
+  )
+end
+
+let exn_to_diagnostic = fn (err: Exn, file: string) -> NxDiagnostic do
+  match err do
+    | NxUnexpectedToken(expected: e, got: g, span: Span(offset: _, line: ln, col: c)) ->
+      NxDiagnostic(
+        code: "E1001",
+        severity: "error",
+        file,
+        line: ln,
+        column: c,
+        message: "parse error: expected " ++ e ++ ", got '" ++ g ++ "'"
+      )
+    | NxUnexpectedEof(expected: e, span: Span(offset: _, line: ln, col: c)) ->
+      NxDiagnostic(
+        code: "E1002",
+        severity: "error",
+        file,
+        line: ln,
+        column: c,
+        message: "parse error: expected " ++ e ++ ", got end of input"
+      )
+    | NxParseErrorsCollected(count: n) ->
+      NxDiagnostic(
+        code: "E1004",
+        severity: "error",
+        file,
+        line: 0,
+        column: 0,
+        message: "parse failed: " ++ str.from_i64(val: n) ++ " errors"
+      )
+    | NxDuplicateParamLabel(name: n, span: Span(offset: _, line: ln, col: c)) ->
+      NxDiagnostic(
+        code: "E1005",
+        severity: "error",
+        file,
+        line: ln,
+        column: c,
+        message: "parse error: duplicate parameter label '" ++ n ++ "'"
+      )
+    | _ ->
+      NxDiagnostic(
+        code: "E1000",
+        severity: "error",
+        file,
+        line: 0,
+        column: 0,
+        message: "parse error (unknown)"
+      )
+  end
+end
+
+let parse_collect_loop = fn (
+  toks: [ SpannedToken ],
+  acc: [ SpannedTopLevel ],
+  diags: [ NxDiagnostic ],
+  n_diags: i64,
+  file: string
+) -> NxParseResult do
+  match pcore.peek_token(toks) do
+    | TkEof -> return NxParseResult(
+      prog: Program(definitions: list.reverse(xs: acc), module_doc: None),
+      diags: list.reverse(xs: diags)
+    )
+    | _ -> ()
+  end
+  if n_diags >= max_parse_diags then
+    return NxParseResult(
+      prog: Program(definitions: list.reverse(xs: acc), module_doc: None),
+      diags: list.reverse(xs: cap_diagnostic(file) :: diags)
+    )
+  end
+  try
+    let ParsedTopLevel(item, rest: r) = parse_top_level(toks)
+    return parse_collect_loop(toks: r, acc: item :: acc, diags, n_diags, file)
+  catch e ->
+    let diag = exn_to_diagnostic(err: e, file)
+    let r2 = pcore.recover_to_top_level(toks, started: false)
+    return parse_collect_loop(toks: r2, acc, diags: diag :: diags, n_diags: n_diags + 1, file)
+  end
+end
+
+/** Parse with error recovery: returns the partial Program plus a list of
+ *  NxDiagnostic records. Empty diag list means the parse was clean.
+ *  Pass `file: ""` when no filename is available.
+ */
+export let parse_collect = fn (tokens: [ SpannedToken ], file: string) -> NxParseResult do
+  return parse_collect_loop(toks: tokens, acc: [], diags: [], n_diags: 0, file)
+end
+
+/** Source-text variant of `parse_collect`. Populates `Program.module_doc`
+ *  exactly like `parse_source`.
+ */
+export let parse_source_collect = fn (src: string, file: string) -> NxParseResult do
+  let tokens = tokenize(src)
+  let NxParseResult(prog, diags) = parse_collect(tokens, file)
+  let doc = extract_module_doc(src)
+  let Program(definitions: defs, module_doc: _) = prog
+  return NxParseResult(prog: Program(definitions: defs, module_doc: doc), diags)
+end

@@ -1,0 +1,367 @@
+/**
+ * nexus/parse_core: Parser utility types and helper functions.
+ *
+ * Contains result/parsed types, token helpers, binop tables, and arrow type lookahead.
+ */
+
+import { Span } from "std:nexus/span"
+import { Token, SpannedToken } from "std:nexus/token"
+import { Sigil, BinaryOp } from "std:nexus/vocab"
+import { TypeExpr, NamedType, VariantField, VariantDef } from "std:nexus/type_expr"
+import {
+  SpannedExpr,
+  SpannedStmt,
+  SpannedPattern,
+  SpannedTopLevel,
+  Param,
+  HandlerArm,
+  MatchCase,
+  CatchArm,
+  CallArg,
+  CtorArg,
+  NamedExpr,
+  CtorPatternField,
+  RecordPatField,
+  FunctionSig,
+  ImportItem
+} from "std:nexus/ast"
+import {
+  NxUnexpectedToken, NxParseError
+} from "std:nexus/error"
+
+//
+// Each Parsed* record bundles a parsed AST fragment with the unconsumed token
+// tail (`rest`). The parser is a no-backtracking recursive-descent over a
+// token list, so every helper returns its product paired with `rest`, and
+// callers thread `rest` into the next helper without mutable state.
+
+/** Parse result: a single type expression plus the unconsumed token tail. */
+export type ParsedType = ParsedType(typ: TypeExpr, rest: [ SpannedToken ])
+/** Parse result: a single expression plus the unconsumed token tail. */
+export type ParsedExpr = ParsedExpr(expr: SpannedExpr, rest: [ SpannedToken ])
+/** Parse result: a single statement plus the unconsumed token tail. */
+export type ParsedStmt = ParsedStmt(stmt: SpannedStmt, rest: [ SpannedToken ])
+/** Parse result: a single pattern plus the unconsumed token tail. */
+export type ParsedPat = ParsedPat(pat: SpannedPattern, rest: [ SpannedToken ])
+/** Parse result: an identifier (possibly dotted/joined) plus the unconsumed token tail. */
+export type ParsedIdent = ParsedIdent(name: string, rest: [ SpannedToken ])
+/** Parse result: a sigil (`~`/`%`/`&`/`@`/none) plus the unconsumed token tail. */
+export type ParsedSigil = ParsedSigil(sigil: Sigil, rest: [ SpannedToken ])
+/** Parse result: a statement sequence plus the unconsumed token tail. */
+export type ParsedStmts = ParsedStmts(stmts: [ SpannedStmt ], rest: [ SpannedToken ])
+/** Parse result: a call-site argument list (named + positional) plus the unconsumed token tail. */
+export type ParsedCallArgs = ParsedCallArgs(args: [ CallArg ], rest: [ SpannedToken ])
+/** Parse result: a constructor-application argument list plus the unconsumed token tail. */
+export type ParsedCtorArgs = ParsedCtorArgs(args: [ CtorArg ], rest: [ SpannedToken ])
+/** Parse result: a function-definition parameter list plus the unconsumed token tail. */
+export type ParsedParams = ParsedParams(params: [ Param ], rest: [ SpannedToken ])
+/** Parse result: a `match` arm list plus the unconsumed token tail. */
+export type ParsedMatchCases = ParsedMatchCases(cases: [ MatchCase ], rest: [ SpannedToken ])
+/** Parse result: a list of `name: Type` fields (record / arrow params) plus the unconsumed token tail. */
+export type ParsedNamedTypes = ParsedNamedTypes(fields: [ NamedType ], rest: [ SpannedToken ])
+/** Parse result: a positional type list plus the unconsumed token tail. */
+export type ParsedTypes = ParsedTypes(types: [ TypeExpr ], rest: [ SpannedToken ])
+/** Parse result: an enum's variant list plus the unconsumed token tail. */
+export type ParsedVariants = ParsedVariants(variants: [ VariantDef ], rest: [ SpannedToken ])
+/** Parse result: a single variant's field list plus the unconsumed token tail. */
+export type ParsedVariantFields = ParsedVariantFields(
+  fields: [ VariantField ],
+  rest: [ SpannedToken ]
+)
+/** Parse result: a handler's arm list plus the unconsumed token tail. */
+export type ParsedHandlerArms = ParsedHandlerArms(arms: [ HandlerArm ], rest: [ SpannedToken ])
+/** Parse result: a cap's function-signature list plus the unconsumed token tail. */
+export type ParsedFunctionSigs = ParsedFunctionSigs(sigs: [ FunctionSig ], rest: [ SpannedToken ])
+/** Parse result: a positional expression list plus the unconsumed token tail. */
+export type ParsedExprs = ParsedExprs(exprs: [ SpannedExpr ], rest: [ SpannedToken ])
+/** Parse result: a list of `name: expr` record-construction fields plus the unconsumed token tail. */
+export type ParsedNamedExprs = ParsedNamedExprs(fields: [ NamedExpr ], rest: [ SpannedToken ])
+/** Parse result: a constructor-pattern field list plus the unconsumed token tail. */
+export type ParsedCtorPatFields = ParsedCtorPatFields(
+  fields: [ CtorPatternField ],
+  rest: [ SpannedToken ]
+)
+/** Parse result: a record-pattern field list plus a `has_wildcard` flag plus the unconsumed token tail. */
+export type ParsedRecordPatFields = ParsedRecordPatFields(
+  fields: [ RecordPatField ],
+  has_wildcard: bool,
+  rest: [ SpannedToken ]
+)
+/** Parse result: a string list (e.g. type-parameter names, group members) plus the unconsumed token tail. */
+export type ParsedStrings = ParsedStrings(items: [ string ], rest: [ SpannedToken ])
+/** Parse result: an `import { ... }` item list plus the unconsumed token tail. */
+export type ParsedImportItems = ParsedImportItems(items: [ ImportItem ], rest: [ SpannedToken ])
+/** Parse result: a `catch` arm list plus the unconsumed token tail. */
+export type ParsedCatchArms = ParsedCatchArms(arms: [ CatchArm ], rest: [ SpannedToken ])
+/** Parse result: a single top-level definition plus the unconsumed token tail. */
+export type ParsedTopLevel = ParsedTopLevel(item: SpannedTopLevel, rest: [ SpannedToken ])
+
+/** Return the head token of `toks`, or `TkEof` on the empty list. */
+export let peek_token = fn (toks: [ SpannedToken ]) -> Token do
+  match toks do
+    | SpannedToken(token: tk, span: _) :: _ -> tk
+    | [] -> TkEof
+  end
+end
+
+/** Return the span of the head token of `toks`, or a zero span on the empty list. */
+export let peek_span = fn (toks: [ SpannedToken ]) -> Span do
+  match toks do
+    | SpannedToken(token: _, span: sp) :: _ -> sp
+    | [] -> Span(offset: 0, line: 0, col: 0) // EOF sentinel — intentional zero span
+  end
+end
+
+/** Drop the head token of `toks`, or return the list unchanged when empty. */
+export let skip = fn (toks: [ SpannedToken ]) -> [ SpannedToken ] do
+  match toks do
+    | _ :: r -> r
+    | [] -> toks
+  end
+end
+
+/** Recognise tokens that may start a top-level declaration. */
+export let is_top_level_start_token = fn (tok: Token) -> bool do
+  match tok do
+    | TkImport | TkPub | TkType | TkOpaque | TkLet
+    | TkException | TkCap | TkExternal -> return true
+    | _ -> return false
+  end
+end
+
+/** Advance `toks` until the head is a top-level-start token at column 1
+ *  or until EOF. Used by the parser's multi-error recovery loop.
+ */
+export let recover_to_top_level = fn (toks: [ SpannedToken ], started: bool) -> [ SpannedToken ] do
+  match toks do
+    | [] -> return toks
+    | SpannedToken(token: tk, span: Span(offset: _, line: _, col: c)) :: rest ->
+      match tk do
+        | TkEof -> return toks
+        | _ ->
+          if started && c == 1 && is_top_level_start_token(tok: tk) then
+            return toks
+          end
+          return recover_to_top_level(toks: rest, started: true)
+      end
+  end
+end
+
+/** Render a token as its canonical surface-syntax tag. */
+export let token_tag = fn (tok: Token) -> string do
+  match tok do
+    | TkLet -> "let" | TkFn -> "fn" | TkDo -> "do" | TkEnd -> "end"
+    | TkIf -> "if" | TkThen -> "then" | TkElse -> "else"
+    | TkMatch -> "match"
+    | TkWhile -> "while" | TkFor -> "for" | TkTo -> "to"
+    | TkReturn -> "return" | TkImport -> "import" | TkFrom -> "from"
+    | TkAs -> "as" | TkExternal -> "external" | TkPub -> "export"
+    | TkOpaque -> "opaque" | TkType -> "type" | TkCap -> "cap"
+    | TkHandler -> "handler" | TkInject -> "inject"
+    | TkTry -> "try" | TkCatch -> "catch" | TkThrow -> "throw"
+    | TkRequire -> "require" | TkThrows -> "throws"
+    | TkException -> "exception" | TkRef -> "ref" | TkWith -> "with"
+    | TkPlus -> "+" | TkMinus -> "-" | TkStar -> "*" | TkSlash -> "/"
+    | TkPlusPlus -> "++" | TkPlusDot -> "+." | TkMinusDot -> "-."
+    | TkStarDot -> "*." | TkSlashDot -> "/."
+    | TkEqEq -> "==" | TkBangEq -> "!=" | TkLt -> "<" | TkGt -> ">"
+    | TkLe -> "<=" | TkGe -> ">="
+    | TkEqEqDot -> "==." | TkBangEqDot -> "!=." | TkLtDot -> "<."
+    | TkGtDot -> ">." | TkLeDot -> "<=." | TkGeDot -> ">=."
+    | TkAndAnd -> "&&" | TkPipePipe -> "||" | TkShl -> "<<" | TkShr -> ">>"
+    | TkArrow -> "->" | TkLArrow -> "<-" | TkEq -> "=" | TkPipe -> "|" | TkBang -> "!"
+    | TkLParen -> "(" | TkRParen -> ")" | TkLBrace -> "{" | TkRBrace -> "}"
+    | TkLBracket -> "[" | TkRBracket -> "]" | TkLArray -> "[|" | TkRArray -> "|]"
+    | TkComma -> "," | TkDot -> "." | TkColon -> ":" | TkColonColon -> "::"
+    | TkTilde -> "~" | TkPercent -> "%" | TkAmpersand -> "&" | TkAt -> "@" | TkCaret -> "^"
+    | TkTrue -> "true" | TkFalse -> "false" | TkUnit -> "()"
+    | TkInt(_) -> "int" | TkFloat(_) -> "float" | TkChar(_) -> "char"
+    | TkString(_) -> "string_lit" | TkIdent(_) -> "ident"
+    | TkUident(_) -> "uident" | TkImportPath(_) -> "import_path"
+    | TkError(msg: m) -> m
+    | TkEof -> "eof"
+  end
+end
+
+/** Non-throwing check: does the head token's `token_tag` match `expected`? */
+export let is_tok = fn (toks: [ SpannedToken ], expected: string) -> bool do
+  return token_tag(tok: peek_token(toks)) == expected
+end
+
+/** Consume the head token if its `token_tag` matches `expected`; otherwise throw `NxUnexpectedToken`. */
+export let expect = fn (
+  toks: [ SpannedToken ],
+  expected: string
+) -> [ SpannedToken ] throws { NxParseError } do
+  if token_tag(tok: peek_token(toks)) == expected then return skip(toks)
+  else
+    throw NxUnexpectedToken(expected, got: token_tag(tok: peek_token(toks)), span: peek_span(toks))
+  end
+end
+
+/** Consume the head token as a `TkIdent` or throw `NxUnexpectedToken`. */
+export let expect_ident = fn (toks: [ SpannedToken ]) -> ParsedIdent throws { NxParseError } do
+  if let TkIdent(name: n) = peek_token(toks) then
+    return ParsedIdent(name: n, rest: skip(toks))
+  else
+    throw NxUnexpectedToken(
+      expected: "identifier",
+      got: token_tag(tok: peek_token(toks)),
+      span: peek_span(toks)
+    )
+  end
+end
+
+/** Consume the head token as a `TkUident` or throw `NxUnexpectedToken`. */
+export let expect_uident = fn (toks: [ SpannedToken ]) -> ParsedIdent throws { NxParseError } do
+  if let TkUident(name: n) = peek_token(toks) then
+    return ParsedIdent(name: n, rest: skip(toks))
+  else
+    throw NxUnexpectedToken(
+      expected: "uppercase identifier",
+      got: token_tag(tok: peek_token(toks)),
+      span: peek_span(toks)
+    )
+  end
+end
+
+/** Consume an optional leading sigil or return `SigilImmutable` without consuming. */
+export let parse_sigil = fn (toks: [ SpannedToken ]) -> ParsedSigil do
+  match peek_token(toks) do
+    | TkTilde -> return ParsedSigil(sigil: SigilMutable, rest: skip(toks))
+    | TkPercent -> return ParsedSigil(sigil: SigilLinear, rest: skip(toks))
+    | TkAmpersand -> return ParsedSigil(sigil: SigilBorrow, rest: skip(toks))
+    | TkAt -> return ParsedSigil(sigil: SigilLazy, rest: skip(toks))
+    | _ -> return ParsedSigil(sigil: SigilImmutable, rest: toks)
+  end
+end
+
+/** Check if the next two tokens form a labeled field pattern: `ident : ...` */
+export let is_labeled_field = fn (toks: [ SpannedToken ]) -> bool do
+  match peek_token(toks) do
+    | TkIdent(_) ->
+      match peek_token(toks: skip(toks)) do
+        | TkColon -> true
+        | _ -> false
+      end
+    | _ -> false
+  end
+end
+
+/** True when `tok` is a block-closer that should stop statement/expression-sequence parsing. */
+export let is_block_end = fn (tok: Token) -> bool do
+  match tok do
+    | TkEnd | TkElse | TkCatch | TkEof | TkPipe -> true
+    | _ -> false
+  end
+end
+
+/** Disambiguate a leading `|` (TkPipe) at expression infix position. */
+export let pipe_starts_arm = fn (toks: [ SpannedToken ]) -> bool do
+  pipe_scan(toks, depth: 0, had_transition: false)
+end
+
+let pipe_scan = fn (toks: [ SpannedToken ], depth: i64, had_transition: bool) -> bool do
+  match peek_token(toks) do
+    | TkArrow ->
+      if depth <= 0 then return true end
+      return pipe_scan(toks: skip(toks), depth, had_transition)
+    | TkLParen | TkLBracket | TkLBrace | TkLArray -> return pipe_scan(
+      toks: skip(toks),
+      depth: depth + 1,
+      had_transition: true
+    )
+    | TkRParen | TkRBracket | TkRBrace | TkRArray ->
+      if depth <= 0 then return false end
+      return pipe_scan(toks: skip(toks), depth: depth - 1, had_transition)
+    | TkEof
+    | TkPlus | TkStar | TkSlash | TkPercent | TkPlusPlus
+    | TkPlusDot | TkMinusDot | TkStarDot | TkSlashDot
+    | TkAmpersand | TkCaret | TkShl | TkShr
+    | TkEqEq | TkBangEq | TkLt | TkGt | TkLe | TkGe
+    | TkEqEqDot | TkBangEqDot | TkLtDot | TkGtDot | TkLeDot | TkGeDot
+    | TkAndAnd | TkPipePipe | TkBang
+    | TkLArrow | TkEq
+    | TkLet | TkFn | TkDo | TkEnd | TkIf | TkThen | TkElse
+    | TkMatch | TkWhile | TkFor | TkTo | TkReturn
+    | TkImport | TkFrom | TkAs | TkExternal | TkPub | TkOpaque
+    | TkType | TkCap | TkHandler | TkInject | TkTry | TkCatch
+    | TkThrow | TkRequire | TkThrows | TkException | TkRef | TkWith -> return false
+    | TkPipe ->
+      if depth <= 0 then
+        if had_transition then
+          return pipe_scan(toks: skip(toks), depth, had_transition: false)
+        end
+        let next1 = peek_token(toks: skip(toks))
+        let next2 = peek_token(toks: skip(toks: skip(toks)))
+        if let TkIdent(name: n) = next1 then
+          if n == "_" then
+            if let TkArrow = next2 then
+              return false
+            end
+          end
+        end
+        return pipe_scan(toks: skip(toks), depth, had_transition: false)
+      end
+      return pipe_scan(toks: skip(toks), depth, had_transition)
+    | _ -> return pipe_scan(toks: skip(toks), depth, had_transition)
+  end
+end
+
+/** Disambiguate arrow types from parenthesized types using 2-token lookahead. */
+export let is_arrow_start = fn (toks: [ SpannedToken ]) -> bool do
+  let inner = skip(toks)
+  match peek_token(toks: inner) do
+    | TkRParen ->
+      match peek_token(toks: skip(toks: inner)) do
+        | TkArrow -> true
+        | _ -> false
+      end
+    | TkIdent(_) ->
+      match peek_token(toks: skip(toks: inner)) do
+        | TkColon -> true
+        | _ -> false
+      end
+    | _ -> false
+  end
+end
+
+/** Pratt-parser precedence for the binary operator denoted by `tok`, or `-1`. */
+export let get_binop_prec = fn (tok: Token) -> i64 do
+  match tok do
+    | TkPipePipe -> return 1
+    | TkAndAnd -> return 2
+    | TkEqEq | TkBangEq | TkLt | TkGt | TkLe | TkGe
+    | TkEqEqDot | TkBangEqDot | TkLtDot | TkGtDot | TkLeDot | TkGeDot -> return 3
+    | TkPlus | TkMinus | TkPlusPlus | TkPlusDot | TkMinusDot
+    | TkPipe | TkCaret -> return 4
+    | TkStar | TkSlash | TkPercent | TkStarDot | TkSlashDot | TkAmpersand -> return 5
+    | TkShl | TkShr -> return 6
+    | _ -> return -1
+  end
+end
+
+/** Map a Token to its `BinaryOp` AST node, or `None`. */
+export let token_to_binop = fn (tok: Token) -> Option<BinaryOp> do
+  match tok do
+    | TkPlus -> return Some(val: OpAdd) | TkMinus -> return Some(val: OpSub)
+    | TkStar -> return Some(val: OpMul) | TkSlash -> return Some(val: OpDiv)
+    | TkPercent -> return Some(val: OpMod)
+    | TkPlusDot -> return Some(val: OpFAdd) | TkMinusDot -> return Some(val: OpFSub)
+    | TkStarDot -> return Some(val: OpFMul) | TkSlashDot -> return Some(val: OpFDiv)
+    | TkEqEq -> return Some(val: OpEq) | TkBangEq -> return Some(val: OpNe)
+    | TkLt -> return Some(val: OpLt) | TkGt -> return Some(val: OpGt)
+    | TkLe -> return Some(val: OpLe) | TkGe -> return Some(val: OpGe)
+    | TkEqEqDot -> return Some(val: OpFEq) | TkBangEqDot -> return Some(val: OpFNe)
+    | TkLtDot -> return Some(val: OpFLt) | TkGtDot -> return Some(val: OpFGt)
+    | TkLeDot -> return Some(val: OpFLe) | TkGeDot -> return Some(val: OpFGe)
+    | TkPlusPlus -> return Some(val: OpConcat)
+    | TkAndAnd -> return Some(val: OpAnd) | TkPipePipe -> return Some(val: OpOr)
+    | TkAmpersand -> return Some(val: OpBitAnd)
+    | TkPipe -> return Some(val: OpBitOr)
+    | TkCaret -> return Some(val: OpBitXor)
+    | TkShl -> return Some(val: OpShl)
+    | TkShr -> return Some(val: OpShr)
+    | _ -> return None
+  end
+end

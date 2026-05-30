@@ -1,0 +1,556 @@
+/**
+ * nexus/parse_pattern: Pattern parsing for the Nexus parser.
+ *
+ * Handles variable, constructor, literal, record, and wildcard patterns.
+ * Supports :: (cons) infix pattern desugared to lhs :: rhs.
+ */
+
+import { Span } from "std:nexus/span"
+import { SpannedToken } from "std:nexus/token"
+import { Unqual } from "std:nexus/vocab"
+import { SpannedPattern, CtorPatternField, RecordPatField, PatOr } from "std:nexus/ast"
+import * as rdr from "std:nexus/rdrname"
+import { NxUnexpectedToken, NxParseError } from "std:nexus/error"
+import {
+  ParsedPat,
+  ParsedIdent,
+  ParsedCtorPatFields,
+  ParsedRecordPatFields
+}, * as pcore from "std:nexus/parse_core"
+import * as list from "std:list"
+
+type ParsedListPats = ParsedListPats(pats: [ SpannedPattern ], rest: [ SpannedToken ])
+
+let parse_list_pats = fn (
+  toks: [ SpannedToken ],
+  acc: [ SpannedPattern ]
+) -> ParsedListPats throws { NxParseError } do
+  let ParsedPat(pat: p, rest: r) = parse_pattern(toks)
+  let new_acc = p :: acc
+  if pcore.is_tok(toks: r, expected: ",") then
+    let r2 = pcore.skip(toks: r)
+    if pcore.is_tok(toks: r2, expected: "]") then
+      return ParsedListPats(pats: list.reverse(xs: new_acc), rest: r2)
+    end
+    return parse_list_pats(toks: r2, acc: new_acc)
+  end
+  return ParsedListPats(pats: list.reverse(xs: new_acc), rest: r)
+end
+
+let desugar_list_pat = fn (pats: [ SpannedPattern ], sp: Span) -> SpannedPattern do
+  match pats do
+    | [] -> return SpannedPattern(
+      node: PatConstructor(name: Unqual(name: "Nil"), fields: [], sigil: SigilImmutable),
+      span: sp
+    )
+    | p :: rest ->
+      let tail = desugar_list_pat(pats: rest, sp)
+      let fields = [ CtorPatternField(name: "v", pattern: p),
+        CtorPatternField(name: "rest", pattern: tail) ]
+      return SpannedPattern(
+        node: PatConstructor(name: Unqual(name: "Cons"), fields, sigil: SigilImmutable),
+        span: sp
+      )
+  end
+end
+
+let parse_atom_pattern = fn (toks: [ SpannedToken ]) -> ParsedPat throws { NxParseError } do
+  let sp = pcore.peek_span(toks)
+  match pcore.peek_token(toks) do
+    | TkIdent(name: n) ->
+      if n == "_" then
+        return ParsedPat(pat: SpannedPattern(node: PatWildcard, span: sp), rest: pcore.skip(toks))
+      end
+      let r_id = pcore.skip(toks)
+      return try_qualified_ctor_pat(
+        toks: r_id,
+        sp,
+        prefix: n,
+        fallback_is_var: true,
+        sigil: SigilImmutable
+      )
+    | TkUident(name: n) ->
+      let r = pcore.skip(toks)
+      return try_qualified_ctor_pat(
+        toks: r,
+        sp,
+        prefix: n,
+        fallback_is_var: false,
+        sigil: SigilImmutable
+      )
+    | TkTilde ->
+      let r = pcore.skip(toks)
+      if let TkUident(name: cn) = pcore.peek_token(toks: r) then
+        let r2 = pcore.skip(toks: r)
+        return try_qualified_ctor_pat(
+          toks: r2,
+          sp,
+          prefix: cn,
+          fallback_is_var: false,
+          sigil: SigilMutable
+        )
+      end
+      let ParsedIdent(name: n, rest: r2) = pcore.expect_ident(toks: r)
+      return ParsedPat(
+        pat: SpannedPattern(node: PatVariable(name: n, sigil: SigilMutable), span: sp),
+        rest: r2
+      )
+    | TkPercent ->
+      let r = pcore.skip(toks)
+      if let TkUident(name: cn) = pcore.peek_token(toks: r) then
+        let r2 = pcore.skip(toks: r)
+        return try_qualified_ctor_pat(
+          toks: r2,
+          sp,
+          prefix: cn,
+          fallback_is_var: false,
+          sigil: SigilLinear
+        )
+      end
+      let ParsedIdent(name: n, rest: r2) = pcore.expect_ident(toks: r)
+      return ParsedPat(
+        pat: SpannedPattern(node: PatVariable(name: n, sigil: SigilLinear), span: sp),
+        rest: r2
+      )
+    | TkAt ->
+      let r = pcore.skip(toks)
+      if let TkUident(name: cn) = pcore.peek_token(toks: r) then
+        let r2 = pcore.skip(toks: r)
+        return try_qualified_ctor_pat(
+          toks: r2,
+          sp,
+          prefix: cn,
+          fallback_is_var: false,
+          sigil: SigilLazy
+        )
+      end
+      let ParsedIdent(name: n, rest: r2) = pcore.expect_ident(toks: r)
+      return ParsedPat(
+        pat: SpannedPattern(node: PatVariable(name: n, sigil: SigilLazy), span: sp),
+        rest: r2
+      )
+    | TkAmpersand ->
+      let r = pcore.skip(toks)
+      if let TkUident(name: cn) = pcore.peek_token(toks: r) then
+        let r2 = pcore.skip(toks: r)
+        return try_qualified_ctor_pat(
+          toks: r2,
+          sp,
+          prefix: cn,
+          fallback_is_var: false,
+          sigil: SigilBorrow
+        )
+      end
+      let ParsedIdent(name: n, rest: r2) = pcore.expect_ident(toks: r)
+      return ParsedPat(
+        pat: SpannedPattern(node: PatVariable(name: n, sigil: SigilBorrow), span: sp),
+        rest: r2
+      )
+    | TkInt(val: v) ->
+      return ParsedPat(
+        pat: SpannedPattern(node: PatLiteral(lit: LitInt(val: v)), span: sp),
+        rest: pcore.skip(toks)
+      )
+    | TkFloat(val: v) ->
+      return ParsedPat(
+        pat: SpannedPattern(node: PatLiteral(lit: LitFloat(val: v)), span: sp),
+        rest: pcore.skip(toks)
+      )
+    | TkMinus ->
+      let r = pcore.skip(toks)
+      match pcore.peek_token(toks: r) do
+        | TkInt(val: v) ->
+          return ParsedPat(
+            pat: SpannedPattern(node: PatLiteral(lit: LitInt(val: -v)), span: sp),
+            rest: pcore.skip(toks: r)
+          )
+        | TkFloat(val: v) ->
+          return ParsedPat(
+            pat: SpannedPattern(node: PatLiteral(lit: LitFloat(val: "-" ++ v)), span: sp),
+            rest: pcore.skip(toks: r)
+          )
+        | TkError(msg: m) ->
+          // `-9223372036854775808` is i64::MIN; the lexer rejects the bare magnitude.
+          if m == "integer literal out of range: 9223372036854775808" then
+            let i64_min = 0 - 9223372036854775807 - 1
+            return ParsedPat(
+              pat: SpannedPattern(node: PatLiteral(lit: LitInt(val: i64_min)), span: sp),
+              rest: pcore.skip(toks: r)
+            )
+          end
+          throw NxUnexpectedToken(
+            expected: "integer or float literal after '-'",
+            got: pcore.token_tag(tok: pcore.peek_token(toks: r)),
+            span: sp
+          )
+        | _ ->
+          throw NxUnexpectedToken(
+            expected: "integer or float literal after '-'",
+            got: pcore.token_tag(tok: pcore.peek_token(toks: r)),
+            span: sp
+          )
+      end
+    | TkString(val: v) ->
+      return ParsedPat(
+        pat: SpannedPattern(node: PatLiteral(lit: LitString(val: v)), span: sp),
+        rest: pcore.skip(toks)
+      )
+    | TkTrue ->
+      return ParsedPat(
+        pat: SpannedPattern(node: PatLiteral(lit: LitBool(val: true)), span: sp),
+        rest: pcore.skip(toks)
+      )
+    | TkFalse ->
+      return ParsedPat(
+        pat: SpannedPattern(node: PatLiteral(lit: LitBool(val: false)), span: sp),
+        rest: pcore.skip(toks)
+      )
+    | TkChar(val: v) ->
+      return ParsedPat(
+        pat: SpannedPattern(node: PatLiteral(lit: LitChar(val: v)), span: sp),
+        rest: pcore.skip(toks)
+      )
+    | TkLBracket ->
+      let r = pcore.skip(toks)
+      if pcore.is_tok(toks: r, expected: "]") then
+        return ParsedPat(
+          pat: SpannedPattern(
+            node: PatConstructor(name: Unqual(name: "Nil"), fields: [], sigil: SigilImmutable),
+            span: sp
+          ),
+          rest: pcore.skip(toks: r)
+        )
+      end
+      let ParsedListPats(pats, rest: r2) = parse_list_pats(toks: r, acc: [])
+      let r3 = pcore.expect(toks: r2, expected: "]")
+      return ParsedPat(pat: desugar_list_pat(pats, sp), rest: r3)
+    | TkLBrace ->
+      let ParsedRecordPatFields(
+        fields: fs,
+        has_wildcard: hw,
+        rest: r2
+      ) = parse_record_pat_fields(toks: pcore.skip(toks), acc: [])
+      let r3 = pcore.expect(toks: r2, expected: "}")
+      return ParsedPat(
+        pat: SpannedPattern(node: PatRecord(fields: fs, has_wildcard: hw), span: sp),
+        rest: r3
+      )
+    | _ ->
+      throw NxUnexpectedToken(
+        expected: "pattern",
+        got: pcore.token_tag(tok: pcore.peek_token(toks)),
+        span: sp
+      )
+  end
+end
+
+let try_qualified_ctor_pat = fn (
+  toks: [ SpannedToken ],
+  sp: Span,
+  prefix: string,
+  fallback_is_var: bool,
+  sigil: Sigil
+) -> ParsedPat throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkDot ->
+      let r_dot = pcore.skip(toks)
+      match pcore.peek_token(toks: r_dot) do
+        | TkUident(name: seg) ->
+          let qname = prefix ++ "." ++ seg
+          let r_seg = pcore.skip(toks: r_dot)
+          return try_qualified_ctor_pat(
+            toks: r_seg,
+            sp,
+            prefix: qname,
+            fallback_is_var: false,
+            sigil
+          )
+        | TkIdent(name: seg) ->
+          let qname = prefix ++ "." ++ seg
+          let r_seg = pcore.skip(toks: r_dot)
+          return try_qualified_ctor_pat(
+            toks: r_seg,
+            sp,
+            prefix: qname,
+            fallback_is_var: false,
+            sigil
+          )
+        | _ ->
+          return pat_fallback(toks, sp, name: prefix, is_var: fallback_is_var, sigil)
+      end
+    | _ ->
+      return pat_fallback(toks, sp, name: prefix, is_var: fallback_is_var, sigil)
+  end
+end
+
+let pat_fallback = fn (
+  toks: [ SpannedToken ],
+  sp: Span,
+  name: string,
+  is_var: bool,
+  sigil: Sigil
+) -> ParsedPat throws { NxParseError } do
+  if is_var then
+    return ParsedPat(pat: SpannedPattern(node: PatVariable(name, sigil), span: sp), rest: toks)
+  else
+    return parse_ctor_pattern_with_name(toks, sp, name, sigil)
+  end
+end
+
+let is_ctor_wildcard_all = fn (toks: [ SpannedToken ]) -> bool do
+  if let TkIdent(name: n) = pcore.peek_token(toks) then
+    if n == "_" then
+      match pcore.peek_token(toks: pcore.skip(toks)) do
+        | TkRParen -> return true
+        | _ -> return false
+      end
+    else
+      return false
+    end
+  else
+    return false
+  end
+end
+
+let parse_ctor_pattern_with_name = fn (
+  toks: [ SpannedToken ],
+  sp: Span,
+  name: string,
+  sigil: Sigil
+) -> ParsedPat throws { NxParseError } do
+  let rdr_name = rdr.rdr_last_from_dotted(s: name)
+  match pcore.peek_token(toks) do
+    | TkUnit ->
+      return ParsedPat(
+        pat: SpannedPattern(node: PatConstructor(name: rdr_name, fields: [], sigil), span: sp),
+        rest: pcore.skip(toks)
+      )
+    | TkLParen ->
+      let r2 = pcore.skip(toks)
+      if is_ctor_wildcard_all(toks: r2) then
+        let r3 = pcore.skip(toks: r2)
+        let r4 = pcore.expect(toks: r3, expected: ")")
+        return ParsedPat(
+          pat: SpannedPattern(node: PatConstructorWildcard(name: rdr_name, sigil), span: sp),
+          rest: r4
+        )
+      end
+      let ParsedCtorPatFields(fields: fs, rest: r3) = parse_ctor_pat_fields(toks: r2, acc: [])
+      let r4 = pcore.expect(toks: r3, expected: ")")
+      return ParsedPat(
+        pat: SpannedPattern(node: PatConstructor(name: rdr_name, fields: fs, sigil), span: sp),
+        rest: r4
+      )
+    | _ ->
+      return ParsedPat(
+        pat: SpannedPattern(node: PatConstructor(name: rdr_name, fields: [], sigil), span: sp),
+        rest: toks
+      )
+  end
+end
+
+/** Parse a single pattern: a pattern atom optionally followed by right-associative `::` cons. */
+export let parse_pattern = fn (toks: [ SpannedToken ]) -> ParsedPat throws { NxParseError } do
+  let ParsedPat(pat: lhs, rest: r) = parse_atom_pattern(toks)
+  match pcore.peek_token(toks: r) do
+    | TkColonColon ->
+      let ParsedPat(pat: rhs, rest: r2) = parse_pattern(toks: pcore.skip(toks: r))
+      let SpannedPattern(node: _, span: sp) = lhs
+      let fields = [ CtorPatternField(name: "v", pattern: lhs),
+        CtorPatternField(name: "rest", pattern: rhs) ]
+      return ParsedPat(
+        pat: SpannedPattern(
+          node: PatConstructor(name: Unqual(name: "Cons"), fields, sigil: SigilImmutable),
+          span: sp
+        ),
+        rest: r2
+      )
+    | _ -> return ParsedPat(pat: lhs, rest: r)
+  end
+end
+
+let parse_pattern_or_loop = fn (
+  toks: [ SpannedToken ],
+  acc: [ SpannedPattern ]
+) -> ParsedPat throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkPipe ->
+      let ParsedPat(pat: next, rest: r) = parse_pattern(toks: pcore.skip(toks))
+      return parse_pattern_or_loop(toks: r, acc: next :: acc)
+    | _ ->
+      match acc do
+        | [ only ] -> return ParsedPat(pat: only, rest: toks)
+        | _ ->
+          let alts = list.reverse(xs: acc)
+          let SpannedPattern(node: _, span: sp) = list.head(xs: alts)
+          return ParsedPat(pat: SpannedPattern(node: PatOr(alts), span: sp), rest: toks)
+      end
+  end
+end
+
+/** Parse an or-pattern (`p1 | p2 | ... | pn`). Use at match/catch arm heads. */
+export let parse_pattern_or = fn (toks: [ SpannedToken ]) -> ParsedPat throws { NxParseError } do
+  let ParsedPat(pat: first, rest: r) = parse_pattern(toks)
+  return parse_pattern_or_loop(toks: r, acc: [ first ])
+end
+
+type MaybePunPat =
+  PunPatYes(name: string, pat: SpannedPattern, rest: [ SpannedToken ])
+  | PunPatNo
+
+let try_pun_pat_field_with_closer = fn (toks: [ SpannedToken ], closer: string) -> MaybePunPat do
+  let sp = pcore.peek_span(toks)
+
+  if let TkIdent(name: n) = pcore.peek_token(toks) then
+    if n == "_" then return PunPatNo end
+    let r1 = pcore.skip(toks)
+    if pcore.is_tok(toks: r1, expected: ",") || pcore.is_tok(toks: r1, expected: closer) then
+      return PunPatYes(
+        name: n,
+        pat: SpannedPattern(node: PatVariable(name: n, sigil: SigilImmutable), span: sp),
+        rest: r1
+      )
+    end
+    return PunPatNo
+  end
+
+  let leading = match pcore.peek_token(toks) do
+    | TkPercent -> SigilLinear
+    | TkTilde -> SigilMutable
+    | TkAt -> SigilLazy
+    | TkAmpersand -> SigilBorrow
+    | _ -> SigilImmutable
+  end
+  let has_sigil = match pcore.peek_token(toks) do
+    | TkPercent | TkTilde | TkAt | TkAmpersand -> true
+    | _ -> false
+  end
+  if has_sigil then
+    let r1 = pcore.skip(toks)
+    if let TkIdent(name: n) = pcore.peek_token(toks: r1) then
+      if n == "_" then return PunPatNo end
+      let r2 = pcore.skip(toks: r1)
+      if pcore.is_tok(toks: r2, expected: ",") || pcore.is_tok(toks: r2, expected: closer) then
+        return PunPatYes(
+          name: n,
+          pat: SpannedPattern(node: PatVariable(name: n, sigil: leading), span: sp),
+          rest: r2
+        )
+      end
+    end
+    return PunPatNo
+  end
+
+  return PunPatNo
+end
+
+let try_pun_pat_field = fn (toks: [ SpannedToken ]) -> MaybePunPat do
+  return try_pun_pat_field_with_closer(toks, closer: ")")
+end
+
+type ResolvedPatField = ResolvedPatField(name: string, pat: SpannedPattern, rest: [ SpannedToken ])
+
+let resolve_one_pat_field = fn (toks: [ SpannedToken ]) -> ResolvedPatField throws { NxParseError } do
+  let punned = try_pun_pat_field(toks)
+  if let PunPatYes(name: pn, pat: pp, rest: pr) = punned then
+    return ResolvedPatField(name: pn, pat: pp, rest: pr)
+  end
+  let sp = pcore.peek_span(toks)
+  let ParsedIdent(name: n, rest: r) = pcore.expect_ident(toks)
+  if pcore.is_tok(toks: r, expected: ":") then
+    let ParsedPat(pat: p, rest: r3) = parse_pattern(toks: pcore.skip(toks: r))
+    return ResolvedPatField(name: n, pat: p, rest: r3)
+  end
+  return ResolvedPatField(
+    name: n,
+    pat: SpannedPattern(node: PatVariable(name: n, sigil: SigilImmutable), span: sp),
+    rest: r
+  )
+end
+
+let parse_ctor_pat_fields = fn (
+  toks: [ SpannedToken ],
+  acc: [ CtorPatternField ]
+) -> ParsedCtorPatFields throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkRParen -> return ParsedCtorPatFields(fields: list.reverse(xs: acc), rest: toks)
+    | _ ->
+      if is_ctor_wildcard_all(toks) then
+        return ParsedCtorPatFields(fields: list.reverse(xs: acc), rest: pcore.skip(toks))
+      end
+      let ResolvedPatField(name: n, pat: p, rest: r3) = resolve_one_pat_field(toks)
+      let new_acc = CtorPatternField(name: n, pattern: p) :: acc
+      if pcore.is_tok(toks: r3, expected: ",") then
+        return parse_ctor_pat_fields(toks: pcore.skip(toks: r3), acc: new_acc)
+      else
+        return ParsedCtorPatFields(fields: list.reverse(xs: new_acc), rest: r3)
+      end
+  end
+end
+
+let parse_record_pat_fields = fn (
+  toks: [ SpannedToken ],
+  acc: [ RecordPatField ]
+) -> ParsedRecordPatFields throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkRBrace -> return ParsedRecordPatFields(
+      fields: list.reverse(xs: acc),
+      has_wildcard: false,
+      rest: toks
+    )
+    | TkIdent(name: n) ->
+      if n == "_" then
+        return ParsedRecordPatFields(
+          fields: list.reverse(xs: acc),
+          has_wildcard: true,
+          rest: pcore.skip(toks)
+        )
+      end
+      let punned = try_pun_pat_field_with_closer(toks, closer: "}")
+      if let PunPatYes(name: pn, pat: pp, rest: pr) = punned then
+        let new_acc_p = RecordPatField(name: pn, pattern: pp) :: acc
+        if pcore.is_tok(toks: pr, expected: ",") then
+          return parse_record_pat_fields(toks: pcore.skip(toks: pr), acc: new_acc_p)
+        else
+          return ParsedRecordPatFields(
+            fields: list.reverse(xs: new_acc_p),
+            has_wildcard: false,
+            rest: pr
+          )
+        end
+      end
+      let ParsedPat(
+        pat: p,
+        rest: r3
+      ) = parse_pattern(toks: pcore.expect(toks: pcore.skip(toks), expected: ":"))
+      let new_acc = RecordPatField(name: n, pattern: p) :: acc
+      if pcore.is_tok(toks: r3, expected: ",") then
+        return parse_record_pat_fields(toks: pcore.skip(toks: r3), acc: new_acc)
+      else
+        return ParsedRecordPatFields(
+          fields: list.reverse(xs: new_acc),
+          has_wildcard: false,
+          rest: r3
+        )
+      end
+    | _ ->
+      let punned = try_pun_pat_field_with_closer(toks, closer: "}")
+      if let PunPatYes(name: pn, pat: pp, rest: pr) = punned then
+        let new_acc_p = RecordPatField(name: pn, pattern: pp) :: acc
+        if pcore.is_tok(toks: pr, expected: ",") then
+          return parse_record_pat_fields(toks: pcore.skip(toks: pr), acc: new_acc_p)
+        else
+          return ParsedRecordPatFields(
+            fields: list.reverse(xs: new_acc_p),
+            has_wildcard: false,
+            rest: pr
+          )
+        end
+      end
+      throw NxUnexpectedToken(
+        expected: "record pattern field",
+        got: pcore.token_tag(tok: pcore.peek_token(toks)),
+        span: pcore.peek_span(toks)
+      )
+  end
+end

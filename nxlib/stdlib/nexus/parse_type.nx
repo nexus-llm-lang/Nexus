@@ -1,0 +1,330 @@
+/**
+ * nexus/parse_type: Type expression parsing for the Nexus parser.
+ *
+ * Parses all TypeExpr forms: primitives, user-defined (with type args),
+ * arrow types, rows, records, refs, linear, borrow, list, array, handler.
+ */
+
+import { SpannedToken } from "std:nexus/token"
+import { TypeExpr, NamedType } from "std:nexus/type_expr"
+import { NxUnexpectedToken, NxParseError } from "std:nexus/error"
+import {
+  ParsedType,
+  ParsedNamedTypes,
+  ParsedTypes,
+  ParsedIdent
+}, * as pcore from "std:nexus/parse_core"
+import * as list from "std:list"
+
+/** The empty effect/require row; reused as the default for `requires`/`throws` clauses. */
+export let empty_row = fn () -> TypeExpr do
+  return TyRow(types: [], rest: None)
+end
+
+let consume_qualified_tail = fn (name: string, toks: [ SpannedToken ]) -> ParsedIdent do
+  if pcore.is_tok(toks, expected: ".") then
+    let r = pcore.skip(toks)
+    match pcore.peek_token(toks: r) do
+      | TkIdent(name: next) | TkUident(name: next) -> return consume_qualified_tail(
+        name: next,
+        toks: pcore.skip(toks: r)
+      )
+      | _ -> return ParsedIdent(name, rest: toks)
+    end
+  else
+    return ParsedIdent(name, rest: toks)
+  end
+end
+
+/** Top-level type-expression entry point. */
+export let parse_type = fn (toks: [ SpannedToken ]) -> ParsedType throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkLParen -> parse_type_maybe_arrow(toks)
+    | TkUnit ->
+      match pcore.peek_token(toks: pcore.skip(toks)) do
+        | TkArrow -> parse_unit_arrow_type(toks)
+        | _ -> parse_type_atom(toks)
+      end
+    | _ -> parse_type_atom(toks)
+  end
+end
+
+let parse_type_maybe_arrow = fn (toks: [ SpannedToken ]) -> ParsedType throws { NxParseError } do
+  if pcore.is_arrow_start(toks) then return parse_arrow_type(toks)
+  else return parse_type_atom(toks)
+  end
+end
+
+// `() -> Ret [require ...] [throws ...]` — zero-param arrow
+let parse_unit_arrow_type = fn (toks: [ SpannedToken ]) -> ParsedType throws { NxParseError } do
+  let r1 = pcore.skip(toks)
+  let r2 = pcore.expect(toks: r1, expected: "->")
+  let ParsedType(typ: ret, rest: r3) = parse_type(toks: r2)
+  let ParsedType(typ: req_ty, rest: r4) = parse_optional_require(toks: r3)
+  let ParsedType(typ: thr_ty, rest: r5) = parse_optional_throws(toks: r4)
+  ParsedType(typ: TyArrow(params: [], ret, requires: req_ty, throw_row: thr_ty), rest: r5)
+end
+
+let parse_arrow_type = fn (toks: [ SpannedToken ]) -> ParsedType throws { NxParseError } do
+  let r = pcore.expect(toks, expected: "(")
+  let ParsedNamedTypes(fields: ps, rest: r2) = parse_arrow_params(toks: r, acc: [])
+  let r3 = pcore.expect(toks: r2, expected: ")")
+  let r4 = pcore.expect(toks: r3, expected: "->")
+  let ParsedType(typ: ret, rest: r5) = parse_type(toks: r4)
+  let ParsedType(typ: req_ty, rest: r6) = parse_optional_require(toks: r5)
+  let ParsedType(typ: thr_ty, rest: r7) = parse_optional_throws(toks: r6)
+  ParsedType(typ: TyArrow(params: ps, ret, requires: req_ty, throw_row: thr_ty), rest: r7)
+end
+
+let parse_arrow_params = fn (
+  toks: [ SpannedToken ],
+  acc: [ NamedType ]
+) -> ParsedNamedTypes throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkRParen -> return ParsedNamedTypes(fields: list.reverse(xs: acc), rest: toks)
+    | _ ->
+      let ParsedIdent(name: n, rest: r) = pcore.expect_ident(toks)
+      let r2 = pcore.expect(toks: r, expected: ":")
+      let ParsedType(typ: t, rest: r3) = parse_type(toks: r2)
+      let new_acc = NamedType(name: n, typ: t) :: acc
+      parse_arrow_params_continue(toks: r3, acc: new_acc)
+  end
+end
+
+let parse_arrow_params_continue = fn (
+  toks: [ SpannedToken ],
+  acc: [ NamedType ]
+) -> ParsedNamedTypes throws { NxParseError } do
+  if pcore.is_tok(toks, expected: ",") then return parse_arrow_params(toks: pcore.skip(toks), acc)
+  else return ParsedNamedTypes(fields: list.reverse(xs: acc), rest: toks)
+  end
+end
+
+/** Parse an optional `require ROW` clause. */
+export let parse_optional_require = fn (toks: [ SpannedToken ]) -> ParsedType throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkRequire ->
+      let ParsedType(typ: t, rest: r2) = parse_row_or_type(toks: pcore.skip(toks))
+      return ParsedType(typ: t, rest: r2)
+    | _ -> return ParsedType(typ: empty_row(), rest: toks)
+  end
+end
+
+/** Parse an optional `throws ROW` clause on an arrow/cap signature.
+ *
+ *  When absent, returns an open implicit row `TyRow(types: [], rest: Some(TyVar("__implicit")))`
+ *  which the typechecker treats as effect-polymorphic.
+ */
+export let parse_optional_throws = fn (toks: [ SpannedToken ]) -> ParsedType throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkThrows ->
+      let ParsedType(typ: t, rest: r2) = parse_row_or_type(toks: pcore.skip(toks))
+      return ParsedType(typ: t, rest: r2)
+    | _ ->
+      return ParsedType(
+        typ: TyRow(types: [], rest: Some(val: TyVar(name: "__implicit"))),
+        rest: toks
+      )
+  end
+end
+
+/** Parse an optional `throws ROW` inside `@(...)` — defaults to closed empty row when absent. */
+let parse_optional_thunk_throws = fn (toks: [ SpannedToken ]) -> ParsedType throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkThrows ->
+      let ParsedType(typ: t, rest: r2) = parse_row_or_type(toks: pcore.skip(toks))
+      return ParsedType(typ: t, rest: r2)
+    | _ -> return ParsedType(typ: empty_row(), rest: toks)
+  end
+end
+
+let parse_row_or_type = fn (toks: [ SpannedToken ]) -> ParsedType throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkLBrace ->
+      let r = pcore.skip(toks)
+      let ParsedTypes(types: ts, rest: r2) = parse_row_types(toks: r, acc: [])
+      match pcore.peek_token(toks: r2) do
+        | TkPipe ->
+          let ParsedType(typ: tail, rest: r4) = parse_type(toks: pcore.skip(toks: r2))
+          let r5 = pcore.expect(toks: r4, expected: "}")
+          ParsedType(typ: TyRow(types: ts, rest: Some(val: tail)), rest: r5)
+        | _ ->
+          let r3 = pcore.expect(toks: r2, expected: "}")
+          ParsedType(typ: TyRow(types: ts, rest: None), rest: r3)
+      end
+    | _ -> parse_type(toks)
+  end
+end
+
+let parse_row_types = fn (
+  toks: [ SpannedToken ],
+  acc: [ TypeExpr ]
+) -> ParsedTypes throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkRBrace | TkPipe -> return ParsedTypes(types: list.reverse(xs: acc), rest: toks)
+    | _ ->
+      let ParsedType(typ: t, rest: r) = parse_type(toks)
+      let new_acc = t :: acc
+      if pcore.is_tok(toks: r, expected: ",") then
+        return parse_row_types(toks: pcore.skip(toks: r), acc: new_acc)
+      else
+        return ParsedTypes(types: list.reverse(xs: new_acc), rest: r)
+      end
+  end
+end
+
+let resolve_primitive_type = fn (name: string) -> Option<TypeExpr> do
+  if name == "i32" then return Some(val: TyI32) end
+  if name == "i64" then return Some(val: TyI64) end
+  if name == "f32" then return Some(val: TyF32) end
+  if name == "f64" then return Some(val: TyF64) end
+  if name == "float" then return Some(val: TyF64) end
+  if name == "bool" then return Some(val: TyBool) end
+  if name == "char" then return Some(val: TyChar) end
+  if name == "string" then return Some(val: TyString) end
+  if name == "unit" then return Some(val: TyUnit) end
+  return None
+end
+
+let parse_type_atom = fn (toks: [ SpannedToken ]) -> ParsedType throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkIdent(name: n) ->
+      let prim = resolve_primitive_type(name: n)
+      match prim do
+        | Some(val: t) -> return ParsedType(typ: t, rest: pcore.skip(toks))
+        | None ->
+          let ParsedIdent(
+            name: final,
+            rest: r
+          ) = consume_qualified_tail(name: n, toks: pcore.skip(toks))
+          if pcore.is_tok(toks: r, expected: "<") then
+            let r2 = pcore.skip(toks: r)
+            let ParsedTypes(types: args, rest: r3) = parse_type_args(toks: r2, acc: [])
+            let r4 = pcore.expect(toks: r3, expected: ">")
+            return ParsedType(typ: TyUserDefined(name: final, args), rest: r4)
+          else
+            return ParsedType(typ: TyUserDefined(name: final, args: []), rest: r)
+          end
+      end
+    | TkUident(name: n) ->
+      let ParsedIdent(
+        name: final,
+        rest: r
+      ) = consume_qualified_tail(name: n, toks: pcore.skip(toks))
+      if pcore.is_tok(toks: r, expected: "<") then
+        let r2 = pcore.skip(toks: r)
+        let ParsedTypes(types: args, rest: r3) = parse_type_args(toks: r2, acc: [])
+        let r4 = pcore.expect(toks: r3, expected: ">")
+        return ParsedType(typ: TyUserDefined(name: final, args), rest: r4)
+      else
+        return ParsedType(typ: TyUserDefined(name: final, args: []), rest: r)
+      end
+    | TkUnit ->
+      return ParsedType(typ: TyUnit, rest: pcore.skip(toks))
+    | TkLParen ->
+      let r = pcore.skip(toks)
+      if pcore.is_tok(toks: r, expected: ")") then
+        return ParsedType(typ: TyUnit, rest: pcore.skip(toks: r))
+      else
+        let ParsedType(typ: t, rest: r2) = parse_type(toks: r)
+        let r3 = pcore.expect(toks: r2, expected: ")")
+        return ParsedType(typ: t, rest: r3)
+      end
+    | TkLBracket ->
+      let ParsedType(typ: elem, rest: r2) = parse_type(toks: pcore.skip(toks))
+      let r3 = pcore.expect(toks: r2, expected: "]")
+      return ParsedType(typ: TyList(elem), rest: r3)
+    | TkLArray ->
+      let ParsedType(typ: elem, rest: r2) = parse_type(toks: pcore.skip(toks))
+      let r3 = pcore.expect(toks: r2, expected: "|]")
+      return ParsedType(typ: TyArray(elem), rest: r3)
+    | TkLBrace ->
+      let ParsedNamedTypes(
+        fields: fs,
+        rest: r2
+      ) = parse_record_type_fields(toks: pcore.skip(toks), acc: [])
+      let r3 = pcore.expect(toks: r2, expected: "}")
+      return ParsedType(typ: TyRecord(fields: fs), rest: r3)
+    | TkRef ->
+      let r = pcore.skip(toks)
+      let r2 = pcore.expect(toks: r, expected: "(")
+      let ParsedType(typ: inner, rest: r3) = parse_type(toks: r2)
+      let r4 = pcore.expect(toks: r3, expected: ")")
+      return ParsedType(typ: TyRef(inner), rest: r4)
+    | TkAmpersand ->
+      let ParsedType(typ: inner, rest: r2) = parse_type(toks: pcore.skip(toks))
+      return ParsedType(typ: TyBorrow(inner), rest: r2)
+    | TkPercent ->
+      let ParsedType(typ: inner, rest: r2) = parse_type(toks: pcore.skip(toks))
+      return ParsedType(typ: TyLinear(inner), rest: r2)
+    | TkAt ->
+      let after_at = pcore.skip(toks)
+      match pcore.peek_token(after_at) do
+        | TkLParen ->
+          let after_lparen = pcore.skip(after_at)
+          let ParsedType(typ: inner, rest: after_inner) = parse_type(toks: after_lparen)
+          let ParsedType(typ: req_ty, rest: after_req) = parse_optional_require(toks: after_inner)
+          let ParsedType(
+            typ: thr_ty,
+            rest: after_thr
+          ) = parse_optional_thunk_throws(toks: after_req)
+          let after_rparen = pcore.expect(toks: after_thr, expected: ")")
+          return ParsedType(
+            typ: TyLazy(inner, require_row: req_ty, throw_row: thr_ty),
+            rest: after_rparen
+          )
+        | _ ->
+          let ParsedType(typ: inner, rest: r2) = parse_type(toks: after_at)
+          return ParsedType(
+            typ: TyLazy(inner, require_row: empty_row(), throw_row: empty_row()),
+            rest: r2
+          )
+      end
+    | TkHandler ->
+      let ParsedIdent(name: n, rest: r2) = pcore.expect_uident(toks: pcore.skip(toks))
+      return ParsedType(typ: TyHandler(name: n, requires: empty_row()), rest: r2)
+    | _ ->
+      throw NxUnexpectedToken(
+        expected: "type",
+        got: pcore.token_tag(tok: pcore.peek_token(toks)),
+        span: pcore.peek_span(toks)
+      )
+  end
+end
+
+let parse_type_args = fn (
+  toks: [ SpannedToken ],
+  acc: [ TypeExpr ]
+) -> ParsedTypes throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkGt -> return ParsedTypes(types: list.reverse(xs: acc), rest: toks)
+    | _ ->
+      let ParsedType(typ: t, rest: r) = parse_type(toks)
+      let new_acc = t :: acc
+      if pcore.is_tok(toks: r, expected: ",") then
+        return parse_type_args(toks: pcore.skip(toks: r), acc: new_acc)
+      else
+        return ParsedTypes(types: list.reverse(xs: new_acc), rest: r)
+      end
+  end
+end
+
+/** Parse the comma-separated `field: T, ...` body of a record type inside already-opened `{`. */
+export let parse_record_type_fields = fn (
+  toks: [ SpannedToken ],
+  acc: [ NamedType ]
+) -> ParsedNamedTypes throws { NxParseError } do
+  match pcore.peek_token(toks) do
+    | TkRBrace -> return ParsedNamedTypes(fields: list.reverse(xs: acc), rest: toks)
+    | _ ->
+      let ParsedIdent(name: n, rest: r) = pcore.expect_ident(toks)
+      let r2 = pcore.expect(toks: r, expected: ":")
+      let ParsedType(typ: t, rest: r3) = parse_type(toks: r2)
+      let new_acc = NamedType(name: n, typ: t) :: acc
+      if pcore.is_tok(toks: r3, expected: ",") then
+        return parse_record_type_fields(toks: pcore.skip(toks: r3), acc: new_acc)
+      else
+        return ParsedNamedTypes(fields: list.reverse(xs: new_acc), rest: r3)
+      end
+  end
+end
