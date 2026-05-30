@@ -409,14 +409,88 @@ let wrap_inject_register = fn (
       let restores = build_restores(runtime_hs, uniq, idx: 0, acc: [])
       let exn_name = "__hexn_" ++ i64_to_str(uniq)
       let ret_tmp = "__hret_" ++ i64_to_str(uniq)
+      let hval_tmp = "__hval_" ++ i64_to_str(uniq)
       let body_rw = rewrite_returns_in_stmts(stmts: body, restores, ret_tmp)
-      let try_body = concat_mir_stmts(a: body_rw, b: restores)
       let catch_body = concat_mir_stmts(
         a: restores,
         b: [ MirStmtExpr(expr: MirRaise(expr: MirVariable(name: exn_name))) ]
       )
-      let try_stmt = MirStmtTry(body: try_body, catch_param: exn_name, catch_body)
-      return concat_mir_stmts(a: saves, b: concat_mir_stmts(a: sets, b: [ try_stmt ]))
+      let rev = list.reverse(xs: body_rw)
+      match rev do
+        | MirStmtExpr(expr: trailing_e) :: rest_rev ->
+          // The inject body has an implicit trailing-value expression.  The
+          // register-restore statements (which evaluate to unit) must run
+          // BEFORE yielding that value, but they cannot be appended after the
+          // trailing MirStmtExpr because LIR's lower_block (used for try
+          // bodies) ignores trailing bare expressions — it never captures them
+          // as the block result.
+          //
+          // Fix: thread the value through a local variable slot (__hval_N)
+          // that is visible both inside and outside the try body:
+          //
+          //   let __hval_N = 0          // initialise slot (default)
+          //   saves; sets
+          //   try {
+          //     <prefix stmts>
+          //     __hval_N = trailing_e   // assign slot inside try
+          //     restores
+          //   } catch exn { restores; throw exn }
+          //   MirStmtExpr(__hval_N)     // yield value OUTSIDE the try
+          //
+          // The MirStmtExpr(__hval_N) outside the try is the last stmt of
+          // the inject's lowered form.  When inject is the last statement of
+          // a function body, lir_lower_stmts (which DOES capture trailing
+          // bare expressions) sees it and uses it as the function's return
+          // value.  When inject is mid-function the value is discarded (same
+          // as the old behaviour for unit-inject).
+          //
+          // Wasm local variables persist across try_table boundaries (they
+          // are not scoped to blocks), so local.set inside the try body and
+          // local.get after are correctly sequenced.
+          //
+          // For nested injects, the inner inject's trailing MirStmtExpr
+          // (__hval_inner) becomes the last stmt of the outer inject's body,
+          // where the outer hoist picks it up and assigns it to __hval_outer.
+          let prefix = list.reverse(xs: rest_rev)
+          // Initialize slot to a zero-value (default in case of early throw).
+          let init_stmt = MirStmtLet(
+            name: hval_tmp,
+            typ: TyI64,
+            expr: MirLiteral(lit: LitInt(val: 0))
+          )
+          // Assign the trailing value to the slot inside the try body.
+          let assign_stmt = MirStmtAssign(
+            target: MirVariable(name: hval_tmp),
+            value: trailing_e
+          )
+          let try_body = concat_mir_stmts(
+            a: prefix,
+            b: concat_mir_stmts(a: [ assign_stmt ], b: restores)
+          )
+          let try_stmt = MirStmtTry(body: try_body, catch_param: exn_name, catch_body)
+          // Expose the slot value as a trailing bare expression so the caller
+          // (lir_lower_stmts for function bodies) can capture it.
+          let result_stmt = MirStmtExpr(expr: MirVariable(name: hval_tmp))
+          return concat_mir_stmts(
+            a: [ init_stmt ],
+            b: concat_mir_stmts(
+              a: saves,
+              b: concat_mir_stmts(
+                a: sets,
+                b: concat_mir_stmts(a: [ try_stmt ], b: [ result_stmt ])
+              )
+            )
+          )
+        | _ ->
+          // No implicit trailing value.  Covers: empty body, all-return
+          // bodies, nested inject where the inner inject's trailing
+          // MirStmtExpr is already in place and will be picked up by the
+          // outer hoist, and any unit-producing body where the trailing stmt
+          // is MirStmtLet/MirStmtTry/MirStmtAssign.
+          let try_body = concat_mir_stmts(a: body_rw, b: restores)
+          let try_stmt = MirStmtTry(body: try_body, catch_param: exn_name, catch_body)
+          return concat_mir_stmts(a: saves, b: concat_mir_stmts(a: sets, b: [ try_stmt ]))
+      end
   end
 end
 
