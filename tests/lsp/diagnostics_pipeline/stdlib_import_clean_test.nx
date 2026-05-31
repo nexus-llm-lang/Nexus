@@ -1,0 +1,108 @@
+// Issue nexus-3fwco: targeted coverage for
+// `src/tools/lsp/state/diagnostics_pipeline.nx::compute_diagnostics_for_buffer`.
+//
+// REGRESSION: the LSP buffer pipeline used to pass `local_names = ALL HIR
+// function names` (including imported stdlib bodies) to the typechecker, so it
+// walked unreached stdlib functions (e.g. `str.from_char`) out of context and a
+// latent mismatch fired as a SPURIOUS E2001 into `nxlib/stdlib/text/str.nx` on a
+// clean buffer that merely `import * as str from "std:str"` and never called it.
+// `./nexus typecheck` of the same source was clean (0), and the sibling driver
+// path `compute_driver_diagnostics_for_buffer` was clean (0) — only the
+// didOpen/didChange path (`compute_diagnostics_for_buffer`) was wrong.
+//
+// The fix scopes `local_names` to the buffer's own top-level definitions (as the
+// driver path does). This test pins:
+//   1. A clean `std:str`-importing buffer yields 0 diagnostics (fail-before: 1,
+//      file=nxlib/stdlib/text/str.nx code=E2001).
+//   2. A buffer with a REAL error in user code still yields the correct
+//      diagnostic (right code E2001, located in the buffer itself).
+import * as pipeline from "src/tools/lsp/state/diagnostics_pipeline.nx"
+import { DiagEntry, DiagRange } from "src/tools/lsp/state/diagnostics.nx"
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+
+let count_diags = fn (xs: [ DiagEntry ], acc: i64) -> i64 do
+  match xs do
+    | [] -> return acc
+    | _ :: rest -> return count_diags(xs: rest, acc: acc + 1)
+  end
+end
+
+// Clean buffer: imports std:str, calls a real (well-typed) function, never
+// touches `str.from_char`. `./nexus typecheck` reports 0 diagnostics here.
+let clean_source = fn () -> string do
+  return "import * as str from \"std:str\"\nlet main = fn () -> unit do\n  let s = str.from_i64(val: 42)\n  return ()\nend\n"
+end
+
+// Buffer with a REAL user-code type error: assigning a string literal where an
+// i64 is annotated. This must still surface as an E2001 located IN the buffer.
+let user_error_source = fn () -> string do
+  return "let main = fn () -> unit do\n  let x: i64 = \"oops\"\n  return ()\nend\n"
+end
+
+let body = fn () -> unit require { Fs, Console } throws { Exn } do
+  // (1) Clean std:str-importing buffer → 0 diagnostics (no spurious stdlib E2001).
+  let clean_diags = pipeline.compute_diagnostics_for_buffer(
+    text: clean_source(),
+    file: "buffer://3fwco_clean.nx"
+  )
+  test_assert.assert_eq_i64(
+    actual: count_diags(xs: clean_diags, acc: 0),
+    expected: 0,
+    label: "clean std:str-importing buffer yields no diagnostics (no spurious stdlib E2001)"
+  )
+
+  // (2) Real user-code error → still reported, with the right code, in the buffer.
+  let err_diags = pipeline.compute_diagnostics_for_buffer(
+    text: user_error_source(),
+    file: "buffer://3fwco_user_err.nx"
+  )
+  test_assert.assert_eq_i64(
+    actual: count_diags(xs: err_diags, acc: 0),
+    expected: 1,
+    label: "real user-code type error yields exactly one diagnostic"
+  )
+  match err_diags do
+    | [] -> throw RuntimeError(val: "unreachable: count asserted 1")
+    | DiagEntry(file, range, severity: _, code, message: _) :: _ ->
+      test_assert.assert_eq_string(
+        actual: file,
+        expected: "buffer://3fwco_user_err.nx",
+        label: "user-code error diagnostic is located in the buffer itself"
+      )
+      test_assert.assert_eq_string(
+        actual: code,
+        expected: "E2001",
+        label: "user-code type mismatch reports E2001"
+      )
+      let DiagRange(start_line, start_col: _, end_line: _, end_col: _) = range
+      // The error is on line 2 (`let x: i64 = "oops"`); pin the line so a
+      // location regression is caught (1-based row).
+      test_assert.assert_eq_i64(
+        actual: start_line,
+        expected: 2,
+        label: "user-code error diagnostic points at the offending line (2)"
+      )
+  end
+  return ()
+end
+
+let safe_run = fn () -> i64 require { Fs, Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    1 / ok
+    return ()
+  end
+end
