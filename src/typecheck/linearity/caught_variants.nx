@@ -1,0 +1,362 @@
+/**
+ * typecheck/linearity/caught_variants: whole-program caught-variant analysis.
+ *
+ * Flow-sensitive throw analysis support for nexus-xd8ko. Computes
+ * `caught_variants(Π)` — the union, over every user `try … catch …` construct
+ * anywhere in the program (incl. stdlib + transitive imports), of the
+ * exception-constructor names each catch arm matches.
+ *
+ *   • A catch-all arm (`_` / bare variable pattern) contributes the sentinel
+ *     `"Exn"`, per spec §U-Row-Exn subsumption: `{ Exn } ⊇ V` for every
+ *     variant `V`. So a catch-all anywhere makes EVERY thrown variant
+ *     "caught upstream".
+ *   • Exception-group catch patterns expand to their member constructors.
+ *
+ * The linearity walker (`walk.nx`) consults the resulting set when an `if …
+ * then throw e end` (without `else`) abandons a live linear on the throw
+ * path: if the thrown variant is in `caught_variants(Π)` (incl. Exn
+ * subsumption) and no LOCAL try/catch frame catches it, the throw may be
+ * caught upstream and the abandoned linear is a real leak → strict check.
+ * Otherwise the throw propagates to process exit → relaxed check.
+ *
+ * The HIR shape of a `Try` after `convert/core.nx`:
+ *   • legacy single-variable catch: `Try(body, catch_param: <user-var>,
+ *     catch_body)` where catch_body is the user body directly → CATCH-ALL.
+ *   • multi-arm / non-variable catch: `Try(body, catch_param: "__exn",
+ *     catch_body: [ Expr(Match(Variable("__exn"), cases)) ])` where each
+ *     case pattern is the catch arm's pattern.
+ */
+
+import {
+  HirProgram, HirFunction, HirBody, EagerBody, LazyBody,
+  HirStmt, HirStmtKind, HirExpr, HirExprKind, HirMatchCase,
+  HirPatternKind, HirCallArg, HirNamedExpr,
+  HirHandlerBindingEntry, HirHandlerBinding,
+  HirHandlerArm, ExceptionGroupEntry
+} from "src/ir/hir/types.nx"
+import { str_member } from "src/typecheck/linearity/state.nx"
+import { Option, Some, None } from "std:option"
+
+/** Sentinel for the catch-all (subsumes every variant). */
+export let exn_sentinel = fn () -> string do return "Exn" end
+
+/** True when `caught` (a caught_variants set) covers variant `v`: either the
+ *  exact constructor name is present, or the catch-all sentinel "Exn" is
+ *  present (U-Row-Exn subsumption), or `v` itself is the "Exn" sentinel and
+ *  any catch exists.  Used both for the whole-program set and per-frame. */
+export let caught_covers = fn (caught: [ string ], v: string) -> bool do
+  if str_member(xs: caught, target: exn_sentinel()) then return true end
+  return str_member(xs: caught, target: v)
+end
+
+// ─── Whole-program scan ──────────────────────────────────────────────────────
+
+/** Compute caught_variants(Π): union of caught constructors over every Try in
+ *  the program, with catch-all contributing the "Exn" sentinel and exception
+ *  groups expanded to member constructors. */
+export let compute_caught_variants = fn (prog: HirProgram) -> [ string ] do
+  let HirProgram(
+    caps: _,
+    functions: fs,
+    externals: _,
+    handler_bindings: hbs,
+    enum_defs: _,
+    exception_groups: groups,
+    value_binding_names: _,
+    type_defs: _,
+    visible_enum_names: _,
+    ext_wasm_deps: _
+  ) = prog
+  let acc0 = scan_functions(funcs: fs, groups, acc: [])
+  return scan_handler_bindings(bindings: hbs, groups, acc: acc0)
+end
+
+let scan_functions = fn (
+  funcs: [ HirFunction ], groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match funcs do
+    | [] -> return acc
+    | f :: rest ->
+      let acc1 = scan_function(func: f, groups, acc)
+      return scan_functions(funcs: rest, groups, acc: acc1)
+  end
+end
+
+let scan_function = fn (
+  func: HirFunction, groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  let HirFunction(
+    name: _, type_params: _, params: _, ret_type: _, throw_row: _,
+    body: b, span: _, file: _, requires: _
+  ) = func
+  match b do
+    | EagerBody(stmts) -> return scan_stmts(stmts, groups, acc)
+    | LazyBody(_) -> return acc
+  end
+end
+
+let scan_handler_bindings = fn (
+  bindings: [ HirHandlerBindingEntry ], groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match bindings do
+    | [] -> return acc
+    | HirHandlerBindingEntry(
+        name: _, binding: HirHandlerBinding(cap_name: _, requires: _, arms)
+      ) :: rest ->
+      let acc1 = scan_handler_arms(arms, groups, acc)
+      return scan_handler_bindings(bindings: rest, groups, acc: acc1)
+  end
+end
+
+let scan_handler_arms = fn (
+  arms: [ HirHandlerArm ], groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match arms do
+    | [] -> return acc
+    | HirHandlerArm(arm: f, cont_binder: _) :: rest ->
+      let acc1 = scan_function(func: f, groups, acc)
+      return scan_handler_arms(arms: rest, groups, acc: acc1)
+  end
+end
+
+// ─── Statement / expression walk ─────────────────────────────────────────────
+
+let scan_stmts = fn (
+  stmts: [ HirStmt ], groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match stmts do
+    | [] -> return acc
+    | HirStmt(node: nd, span: _) :: rest ->
+      let acc1 = scan_stmt(stmt: nd, groups, acc)
+      return scan_stmts(stmts: rest, groups, acc: acc1)
+  end
+end
+
+let scan_stmt = fn (
+  stmt: HirStmtKind, groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match stmt do
+    | Let(name: _, sigil: _, typ: _, value: v) -> return scan_expr(expr: v, groups, acc)
+    | Expr(expr: e) -> return scan_expr(expr: e, groups, acc)
+    | Return(expr: e) -> return scan_expr(expr: e, groups, acc)
+    | Assign(target: t, value: v) ->
+      let acc1 = scan_expr(expr: t, groups, acc)
+      return scan_expr(expr: v, groups, acc: acc1)
+    | Try(body: b, catch_param: cp, catch_body: cb) ->
+      // Collect THIS try's caught variants, then recurse into both arms
+      // (nested try/catch contribute too).
+      let acc1 = caught_variants_of_try(catch_param: cp, catch_body: cb, groups, acc)
+      let acc2 = scan_stmts(stmts: b, groups, acc: acc1)
+      return scan_stmts(stmts: cb, groups, acc: acc2)
+    | Inject(handlers: _, body: b) -> return scan_stmts(stmts: b, groups, acc)
+  end
+end
+
+let scan_expr = fn (
+  expr: HirExpr, groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  let HirExpr(node: nd, span: _) = expr
+  return scan_expr_kind(expr: nd, groups, acc)
+end
+
+let scan_expr_kind = fn (
+  expr: HirExprKind, groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match expr do
+    | Literal(_) -> return acc
+    | Variable(name: _, sigil: _) -> return acc
+    | Borrow(name: _, sigil: _) -> return acc
+    | BinOp(left: l, op: _, right: r) ->
+      let acc1 = scan_expr(expr: l, groups, acc)
+      return scan_expr(expr: r, groups, acc: acc1)
+    | UnOp(op: _, operand: o) -> return scan_expr(expr: o, groups, acc)
+    | Call(func: _, args: cargs) -> return scan_call_args(args: cargs, groups, acc)
+    | CallExpr(callee: c, args: cargs) ->
+      let acc1 = scan_expr(expr: c, groups, acc)
+      return scan_call_args(args: cargs, groups, acc: acc1)
+    | Ctor(variant: _, args: cargs, labels: _, sigil: _) -> return scan_exprs(exprs: cargs, groups, acc)
+    | Record(fields: fs) -> return scan_named_exprs(fields: fs, groups, acc)
+    | Array(elems: es) -> return scan_exprs(exprs: es, groups, acc)
+    | Index(target: t, index: i) ->
+      let acc1 = scan_expr(expr: t, groups, acc)
+      return scan_expr(expr: i, groups, acc: acc1)
+    | FieldAccess(target: t, field: _) -> return scan_expr(expr: t, groups, acc)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      let acc1 = scan_expr(expr: c, groups, acc)
+      let acc2 = scan_stmts(stmts: tb, groups, acc: acc1)
+      match eb do
+        | None -> return acc2
+        | Some(val: ebs) -> return scan_stmts(stmts: ebs, groups, acc: acc2)
+      end
+    | Match(target: t, cases: cs) ->
+      let acc1 = scan_expr(expr: t, groups, acc)
+      return scan_match_cases(cases: cs, groups, acc: acc1)
+    | While(cond: c, body: b) ->
+      let acc1 = scan_expr(expr: c, groups, acc)
+      return scan_stmts(stmts: b, groups, acc: acc1)
+    | For(var: _, start: s, end_expr: e, body: b) ->
+      let acc1 = scan_expr(expr: s, groups, acc)
+      let acc2 = scan_expr(expr: e, groups, acc: acc1)
+      return scan_stmts(stmts: b, groups, acc: acc2)
+    | Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: b) ->
+      return scan_stmts(stmts: b, groups, acc)
+    | Raise(expr: e) -> return scan_expr(expr: e, groups, acc)
+    | Force(expr: e) -> return scan_expr(expr: e, groups, acc)
+    | Thunk(body: b) -> return scan_expr(expr: b, groups, acc)
+    | ExternalRef(_) -> return acc
+    | Handler(cap_name: _, requires: _, arms) -> return scan_handler_arms(arms, groups, acc)
+  end
+end
+
+let scan_exprs = fn (
+  exprs: [ HirExpr ], groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match exprs do
+    | [] -> return acc
+    | e :: rest ->
+      let acc1 = scan_expr(expr: e, groups, acc)
+      return scan_exprs(exprs: rest, groups, acc: acc1)
+  end
+end
+
+let scan_call_args = fn (
+  args: [ HirCallArg ], groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match args do
+    | [] -> return acc
+    | HirCallArg(label: _, value: v) :: rest ->
+      let acc1 = scan_expr(expr: v, groups, acc)
+      return scan_call_args(args: rest, groups, acc: acc1)
+  end
+end
+
+let scan_named_exprs = fn (
+  fields: [ HirNamedExpr ], groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match fields do
+    | [] -> return acc
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      let acc1 = scan_expr(expr: v, groups, acc)
+      return scan_named_exprs(fields: rest, groups, acc: acc1)
+  end
+end
+
+let scan_match_cases = fn (
+  cases: [ HirMatchCase ], groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match cases do
+    | [] -> return acc
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      let acc1 = scan_stmts(stmts: b, groups, acc)
+      return scan_match_cases(cases: rest, groups, acc: acc1)
+  end
+end
+
+// ─── Per-try caught-variant extraction ───────────────────────────────────────
+
+/** Caught variants of a single `Try`. The catch arm is always desugared to a
+ *  single `catch_param` binding plus an optional `match` over it in the body:
+ *   • catch_param != "__exn" (legacy single-variable catch) → the body binds
+ *     the exception unconditionally → CATCH-ALL → "Exn" sentinel.
+ *   • catch_param == "__exn" → the body is `[ Expr(Match(Variable("__exn"),
+ *     cases)) ]`; each case pattern names a caught constructor (PCtor),
+ *     a catch-all (PVar / PWild), or an or-pattern of those. */
+export let caught_variants_of_try = fn (
+  catch_param: string, catch_body: [ HirStmt ],
+  groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  if catch_param == "__exn" then
+    return caught_from_match_body(stmts: catch_body, groups, acc)
+  end
+  // Legacy single-variable catch (`catch | e -> ...`): catches everything.
+  return add_unique(xs: acc, x: exn_sentinel())
+end
+
+/** Find the synthetic `match __exn do ... end` in the catch body and collect
+ *  its case patterns. If the body is not that shape (defensive), treat as a
+ *  catch-all. */
+let caught_from_match_body = fn (
+  stmts: [ HirStmt ], groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match stmts do
+    | HirStmt(node: Expr(expr: HirExpr(node: Match(target: _, cases: cs), span: _)), span: _) :: [] ->
+      return caught_from_cases(cases: cs, groups, acc)
+    | _ ->
+      // Unexpected shape for a "__exn" catch — be conservative (catch-all).
+      return add_unique(xs: acc, x: exn_sentinel())
+  end
+end
+
+let caught_from_cases = fn (
+  cases: [ HirMatchCase ], groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match cases do
+    | [] -> return acc
+    | HirMatchCase(pattern: p, body: _) :: rest ->
+      let acc1 = caught_from_pattern(pat: p, groups, acc)
+      return caught_from_cases(cases: rest, groups, acc: acc1)
+  end
+end
+
+/** A catch pattern contributes:
+ *   • PWild / PVar → catch-all → "Exn".
+ *   • PCtor(V) → V, expanded if V is an exception-group name.
+ *   • POr(alts) → union of the alternatives.
+ *  Other pattern shapes (PLit/PRec) cannot appear in a catch position over an
+ *  exception; treat conservatively as catch-all. */
+export let caught_from_pattern = fn (
+  pat: HirPatternKind, groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match pat do
+    | PWild -> return add_unique(xs: acc, x: exn_sentinel())
+    | PVar(name: _, sigil: _) -> return add_unique(xs: acc, x: exn_sentinel())
+    | PCtor(variant: v, fields: _, sigil: _) -> return add_ctor_or_group(name: v, groups, acc)
+    | POr(alts: alts) -> return caught_from_or_alts(alts, groups, acc)
+    | PLit(_) -> return add_unique(xs: acc, x: exn_sentinel())
+    | PRec(fields: _, is_partial: _) -> return add_unique(xs: acc, x: exn_sentinel())
+  end
+end
+
+let caught_from_or_alts = fn (
+  alts: [ HirPatternKind ], groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match alts do
+    | [] -> return acc
+    | a :: rest ->
+      let acc1 = caught_from_pattern(pat: a, groups, acc)
+      return caught_from_or_alts(alts: rest, groups, acc: acc1)
+  end
+end
+
+/** Add a constructor name, expanding exception-group names to their members. */
+let add_ctor_or_group = fn (
+  name: string, groups: [ ExceptionGroupEntry ], acc: [ string ]
+) -> [ string ] do
+  match lookup_group(groups, name) do
+    | Some(val: members) -> return add_all_unique(xs: acc, ys: members)
+    | None -> return add_unique(xs: acc, x: name)
+  end
+end
+
+let lookup_group = fn (
+  groups: [ ExceptionGroupEntry ], name: string
+) -> Option<[ string ]> do
+  match groups do
+    | [] -> return None
+    | ExceptionGroupEntry(name: gn, members: ms) :: rest ->
+      if gn == name then return Some(val: ms) end
+      return lookup_group(groups: rest, name)
+  end
+end
+
+let add_unique = fn (xs: [ string ], x: string) -> [ string ] do
+  if str_member(xs, target: x) then return xs end
+  return x :: xs
+end
+
+let add_all_unique = fn (xs: [ string ], ys: [ string ]) -> [ string ] do
+  match ys do
+    | [] -> return xs
+    | y :: rest -> return add_all_unique(xs: add_unique(xs, x: y), ys: rest)
+  end
+end

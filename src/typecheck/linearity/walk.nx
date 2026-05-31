@@ -43,13 +43,18 @@ import { Option, Some, None } from "std:option"
 import { is_auto_droppable, is_linear_binding_type } from "src/ir/shared/type_pred.nx"
 import { SigEntry, sig_lookup, build_sig_map } from "src/typecheck/linearity/sig_map.nx"
 import {
-  LinState,
+  LinState, CatchFrame,
   lin_empty, lin_add, lin_remove, lin_member, lin_consumed_member, lin_clear_consumed, str_member,
   vars_equal, lin_push_frame, lin_pop_frame, lin_top_frame,
   join_simple, lin_set_vars, lin_get_must_consume, find_live_must_consume,
   lin_state_vars, lin_state_consumed, lin_restore_state, filter_not_in,
-  append_consumed, filter_in
+  append_consumed, filter_in,
+  lin_get_caught_set, lin_set_caught_set, lin_push_catch, lin_pop_catch,
+  lin_throw_caught_locally, lin_get_cur_fn
 } from "src/typecheck/linearity/state.nx"
+import {
+  compute_caught_variants, caught_covers, caught_variants_of_try
+} from "src/typecheck/linearity/caught_variants.nx"
 import {
   lin_field_is_linear, lin_variant_is_known, lin_any_record_has_linear_field,
   lin_variant_field_type_at, lin_ctor_enum_is_linear
@@ -66,7 +71,7 @@ import {
 } from "src/typecheck/linearity/pattern.nx"
 import {
   stmts_diverge, stmts_diverge_depth, hir_expr_diverges,
-  all_cases_diverge_depth, last_stmt
+  all_cases_diverge_depth, last_stmt, divergence_throw_variant
 } from "src/typecheck/linearity/diverge.nx"
 
 // ─── Sig-map-aware linearity classification ─────────────────────────────────
@@ -419,6 +424,10 @@ end
 /** Run the linearity pass over every function and handler-arm in `prog`: each linear binding consumed exactly once, no leaks across throwable calls. Raises TypeError on the first violation. */
 export let check_program = fn (prog: HirProgram) -> unit throws { TypeError } do
   let sigs = build_sig_map(prog)
+  // nexus-xd8ko: whole-program caught-variant set. Computed once and threaded
+  // (via LinState.caught_set) into every function check; consulted at each
+  // divergent throw to decide strict-vs-relaxed leak checking.
+  let caught_set = compute_caught_variants(prog)
   let HirProgram(
     caps: _,
     functions: fs,
@@ -430,26 +439,27 @@ export let check_program = fn (prog: HirProgram) -> unit throws { TypeError } do
     type_defs: tdefs,
     visible_enum_names: _
   ) = prog
-  check_functions(funcs: fs, sigs, tdefs, enum_defs: edefs)
-    return check_handler_bindings(bindings: hbs, sigs, tdefs, enum_defs: edefs)
+  check_functions(funcs: fs, sigs, tdefs, enum_defs: edefs, caught_set)
+    return check_handler_bindings(bindings: hbs, sigs, tdefs, enum_defs: edefs, caught_set)
 end
 
 let check_functions = fn (
   funcs: [ HirFunction ],
   sigs: [ SigEntry ],
   tdefs: [ RecordDef ],
-  enum_defs: [ EnumDef ]
+  enum_defs: [ EnumDef ],
+  caught_set: [ string ]
 ) -> unit throws { TypeError } do
   match funcs do
     | [] -> return ()
     | f :: rest ->
-      check_function(func: f, sigs, tdefs, enum_defs)
-      return check_functions(funcs: rest, sigs, tdefs, enum_defs)
+      check_function(func: f, sigs, tdefs, enum_defs, caught_set)
+      return check_functions(funcs: rest, sigs, tdefs, enum_defs, caught_set)
   end
 end
 
 let check_handler_bindings = fn (
-  bindings: [ HirHandlerBindingEntry ], sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+  bindings: [ HirHandlerBindingEntry ], sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ], caught_set: [ string ]
 ) -> unit throws { TypeError } do
   match bindings do
     | [] -> return ()
@@ -457,8 +467,8 @@ let check_handler_bindings = fn (
       name: _,
       binding: HirHandlerBinding(cap_name: _, requires: _, arms)
     ) :: rest ->
-      check_handler_arms(arms, sigs, tdefs, enum_defs)
-      return check_handler_bindings(bindings: rest, sigs, tdefs, enum_defs)
+      check_handler_arms(arms, sigs, tdefs, enum_defs, caught_set)
+      return check_handler_bindings(bindings: rest, sigs, tdefs, enum_defs, caught_set)
   end
 end
 
@@ -466,13 +476,14 @@ let check_handler_arms = fn (
   arms: [ HirHandlerArm ],
   sigs: [ SigEntry ],
   tdefs: [ RecordDef ],
-  enum_defs: [ EnumDef ]
+  enum_defs: [ EnumDef ],
+  caught_set: [ string ]
 ) -> unit throws { TypeError } do
   match arms do
     | [] -> return ()
     | HirHandlerArm(arm: f, cont_binder: kb) :: rest ->
-      check_function_with_kont(func: f, kont: kb, sigs, tdefs, enum_defs)
-      return check_handler_arms(arms: rest, sigs, tdefs, enum_defs)
+      check_function_with_kont(func: f, kont: kb, sigs, tdefs, enum_defs, caught_set)
+      return check_handler_arms(arms: rest, sigs, tdefs, enum_defs, caught_set)
   end
 end
 
@@ -480,9 +491,10 @@ let check_function = fn (
   func: HirFunction,
   sigs: [ SigEntry ],
   tdefs: [ RecordDef ],
-  enum_defs: [ EnumDef ]
+  enum_defs: [ EnumDef ],
+  caught_set: [ string ]
 ) -> unit throws { TypeError } do
-  return check_function_with_kont(func, kont: None, sigs, tdefs, enum_defs)
+  return check_function_with_kont(func, kont: None, sigs, tdefs, enum_defs, caught_set)
 end
 
 /** Check one function body for linearity. When `kont` is `Some(k)`, the
@@ -496,10 +508,11 @@ let check_function_with_kont = fn (
   kont: Option<string>,
   sigs: [ SigEntry ],
   tdefs: [ RecordDef ],
-  enum_defs: [ EnumDef ]
+  enum_defs: [ EnumDef ],
+  caught_set: [ string ]
 ) -> unit throws { TypeError } do
   let HirFunction(
-    name: _,
+    name: fn_name,
     type_params: _,
     params: ps,
     ret_type: _,
@@ -509,6 +522,9 @@ let check_function_with_kont = fn (
     file: _,
     requires: _
   ) = func
+  // The mangled `name` already encodes the originating file path, so it alone
+  // pinpoints the (file#function) site in the strict divergent-arm diagnostic.
+  let cur_fn_label = fn_name
   match b do
       | EagerBody(stmts) ->
         // Seed live set with linear params; push frame snapshot so the
@@ -530,7 +546,15 @@ let check_function_with_kont = fn (
             else k :: initial_vars
             end
         end
-        let st0 = LinState(vars: all_vars, frame_stack: [], must_consume: kont_vars, consumed: [])
+        let st0 = LinState(
+          vars: all_vars,
+          frame_stack: [],
+          must_consume: kont_vars,
+          consumed: [],
+          caught_set,
+          catch_stack: [],
+          cur_fn: cur_fn_label
+        )
         let st1 = lin_push_frame(st: st0)
         let st2 = check_stmts(stmts, st: st1, sigs, tdefs, enum_defs)
         // Function-end consumption check: any linear param or local left
@@ -625,7 +649,56 @@ end
 let check_divergent_arm_linears = fn (arm_out: LinState, span: Span) -> unit throws { TypeError } do
   // In an all-divergent arm, ALL remaining live vars (both inner-scope and
   // outer-scope) must have been consumed before the arm's return/throw.
-  return require_empty_or_droppable(vars: lin_state_vars(st: arm_out), params: [], span)
+  return require_empty_or_droppable_fn(
+    vars: lin_state_vars(st: arm_out), params: [], span, fn_label: lin_get_cur_fn(st: arm_out)
+  )
+end
+
+/** Like require_empty_or_droppable but embeds the enclosing function label in
+ *  the leak diagnostic, so the nexus-xd8ko strict divergent-arm leaks point at
+ *  the exact (file#function) site even though the linearity diagnostic prefix
+ *  is always the compile-entry path. */
+let require_empty_or_droppable_fn = fn (
+  vars: [ string ], params: [ HirParam ], span: Span, fn_label: string
+) -> unit throws { TypeError } do
+  match vars do
+    | [] -> return ()
+    | n :: rest ->
+      if param_inner_is_auto_droppable(params, name: n) then
+        return require_empty_or_droppable_fn(vars: rest, params, span, fn_label)
+      end
+      throw LinearUnused(name: n ++ " in " ++ fn_label, span)
+  end
+end
+
+/** nexus-xd8ko: decide whether a divergent (then-only) `if … end` arm gets the
+ *  STRICT leak check (all live linears, including outer-scope, must be
+ *  consumed) or the RELAXED one (only inner-scope leaks). `st` is the
+ *  pre-arm state (carries the program-wide caught_set and the local
+ *  catch-stack).
+ *
+ *  Strict when the arm:
+ *   • diverges by `return` (the function continuation is abandoned — any live
+ *     linear leaks, no upstream can reclaim it); OR
+ *   • diverges by `throw v` where `v` is NOT caught by a local try/catch frame
+ *     AND `v` is in the whole-program caught_variants set (incl. "Exn"
+ *     subsumption) — i.e. some upstream catch may receive it, so the
+ *     abandoned linear is a real leak.
+ *
+ *  Relaxed when the throw is caught locally (existing T-TryCatch handles it)
+ *  or when `v ∉ caught_variants(Π)` (propagates to process exit → resource
+ *  reclaimed by termination). */
+let divergent_arm_is_strict = fn (then_branch: [ HirStmt ], st: LinState) -> bool do
+  match divergence_throw_variant(stmts: then_branch) do
+    // return-style (or non-throw) divergence → always strict.
+    | None -> return true
+    | Some(val: v) ->
+      // Caught by an enclosing local try/catch → existing reconciliation;
+      // no extra strict check here.
+      if lin_throw_caught_locally(st, v) then return false end
+      // Escapes the function: strict iff some upstream catch may receive it.
+      return caught_covers(caught: lin_get_caught_set(st), v)
+  end
 end
 
 // ─── Statement walk ──────────────────────────────────────────────────────────
@@ -687,13 +760,22 @@ let check_stmt = fn (
     | Assign(target: t, value: v) ->
       let st1 = check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
       return check_expr(expr: v, st: st1, sigs, tdefs, enum_defs, at_stmt_level: false)
-    | Try(body: b, catch_param: _, catch_body: cb) ->
+    | Try(body: b, catch_param: cp, catch_body: cb) ->
       // Push pre-try snapshot for Strategy A: anything alive at this point
       // is the catch arm's responsibility on throw. Throwable-call check
       // inside the body excludes those vars from "leaked".
       let pre_try_vars = lin_state_vars(st)
       let pre_try_consumed = lin_state_consumed(st)
-      let st_try = lin_push_frame(st)
+      // nexus-xd8ko: push a local catch frame for the TRY-BODY walk only, so a
+      // divergent `throw v` inside the body whose `v` this try catches is
+      // recognised as locally handled (the existing T-TryCatch reconciliation
+      // governs its linearity) and does NOT trigger the strict divergent-arm
+      // leak check. Group expansion is handled by the whole-program caught_set;
+      // the local frame uses the unexpanded constructor/catch-all names, which
+      // covers the dominant cases (catch-all `_`/var → "Exn"; exact ctor).
+      let local_caught = caught_variants_of_try(catch_param: cp, catch_body: cb, groups: [], acc: [])
+      let st_try0 = lin_push_frame(st)
+      let st_try = lin_push_catch(st: st_try0, frame: CatchFrame(caught: local_caught))
       // Pre-scan: lightweight walk up to the first throwable call or raise to
       // find outer linears consumed BEFORE any possible throw. Uses a
       // scan-only pass (no full linearity check) to avoid calling check_stmt
@@ -708,7 +790,10 @@ let check_stmt = fn (
       // Full try body check (the pre-scan covers only up to the throw point;
       // this walk checks the remainder and enforces all linearity rules).
       let st_after_try = check_stmts(stmts: b, st: st_try, sigs, tdefs, enum_defs)
-      let st_after_try2 = lin_pop_frame(st: st_after_try)
+      // Pop both the throwable-call frame snapshot and the local catch frame:
+      // the catch body and the outer continuation are NOT guarded by this try.
+      let st_after_try1 = lin_pop_frame(st: st_after_try)
+      let st_after_try2 = lin_pop_catch(st: st_after_try1)
       // Build catch arm entry state: pre-try vars minus those consumed before
       // the first throw, consumed set extended with those consumed before throw.
       let catch_vars = filter_not_in(
@@ -818,9 +903,20 @@ let check_expr_kind = fn (
       match eb do
         | None ->
           if then_diverges then
-            // Then-branch always exits; only the fall-through path matters.
-            // But first verify no inner-scope linears leaked past the divergence.
-            check_divergent_arm_unused(arm_out: st_then, outer_vars: lin_state_vars(st: st1), span)
+            // Then-branch always exits; only the fall-through path matters for
+            // the outer continuation. nexus-xd8ko flow-sensitive dispatch:
+            //   • return-divergence, OR a throw whose variant is catchable
+            //     whole-program (and not caught by a local try/catch frame) →
+            //     STRICT: every live linear (outer-scope included) must be
+            //     consumed before the divergence, else it leaks on this path.
+            //   • throw that propagates to process exit (variant ∉ caught_set)
+            //     or is caught locally → RELAXED: only inner-scope linears
+            //     introduced inside the arm must be consumed.
+            if divergent_arm_is_strict(then_branch: tb, st: st1) then
+              check_divergent_arm_linears(arm_out: st_then, span)
+            else
+              check_divergent_arm_unused(arm_out: st_then, outer_vars: lin_state_vars(st: st1), span)
+            end
             return st1
           end
           // Without an else, the linear set must be the same on both paths
@@ -955,7 +1051,7 @@ let check_expr_kind = fn (
       // (`with @k`) need path-sensitive checking — k must be consumed on every
       // exit path. check_function_with_kont handles both the inline case (k
       // not yet a param) and the synthesized-binding case (k already a param).
-      check_handler_arms(arms, sigs, tdefs, enum_defs)
+      check_handler_arms(arms, sigs, tdefs, enum_defs, caught_set: lin_get_caught_set(st))
       return st
   end
 end
