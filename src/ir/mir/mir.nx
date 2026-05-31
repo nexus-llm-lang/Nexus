@@ -248,7 +248,16 @@ let lower_stmt = fn (
       else
         ctx
       end
-      let MirExprResult(ctx: ctx2, expr: mir_val) = lower_expr(expr: v, ctx: ctx_for_val)
+      // A `let <n> = fn (...) do ... end` whose body refers to `n` is a
+      // recursive local closure (spec types.md:236). Lift it with `n` as the
+      // self-name so the self-reference resolves via `__env` rather than being
+      // captured by value before the closure cell exists (nexus-d33l7).
+      let HirExpr(node: v_node, span: _) = v
+      let MirExprResult(ctx: ctx2, expr: mir_val) = match v_node do
+        | Lambda(type_params: _, params: lps, ret_type: lret, requires: _, throw_row: _, body: lbody) ->
+          lift_lambda_self(params: lps, ret_type: lret, body: lbody, span: v, self_name: n, ctx: ctx_for_val)
+        | _ -> lower_expr(expr: v, ctx: ctx_for_val)
+      end
       return MirStmtsResult(
           ctx: ctx2,
           stmts: [ MirStmtLet(name: n, typ: mir_typ, expr: mir_val) ]
@@ -1144,6 +1153,20 @@ let lower_match_cases_go = fn (
   end
 end
 
+/** Remove every occurrence of `name` from `names`, preserving order. */
+let remove_capture_name = fn (
+  name: string,
+  names: [ string ],
+  acc: [ string ]
+) -> [ string ] throws { MirError } do
+  match names do
+    | [] -> return list.reverse(xs: acc)
+    | hd :: rest ->
+      let acc2 = if hd == name then acc else hd :: acc end
+      return remove_capture_name(name, names: rest, acc: acc2)
+  end
+end
+
 /** Lift an inline `fn (...)` expression to a top-level `__closure_<N>` MIR
  *  function. The lifted function receives `__env: i64` as its first parameter
  *  (prepended before the original params) and opens the body with one
@@ -1157,6 +1180,34 @@ let lift_lambda = fn (
   ret_type: TypeExpr,
   body: [ HirStmt ],
   span: HirExpr,
+  ctx: MirCtx
+) -> MirExprResult throws { MirError } do
+  return lift_lambda_self(params, ret_type, body, span, self_name: "", ctx)
+end
+
+/** Like `lift_lambda`, but `self_name` (when non-empty) is the name of the
+ *  immutable `let` binding whose RHS is this lambda — i.e. a recursive local
+ *  closure (`let go: (...) -> ... = fn (...) do ... go(...) ... end`).
+ *
+ *  A self-recursive lambda references its own binding inside its body. If that
+ *  name were collected as an ordinary free variable it would be captured *by
+ *  value* into env slot 0 at the construction site — but the closure cell does
+ *  not exist yet when the capture is read (the `let go = closure(...)` only
+ *  binds it afterwards), so the slot holds garbage and the self `call_indirect`
+ *  jumps to table index 0 → "undefined element: out of bounds table access".
+ *
+ *  Fix: exclude `self_name` from the capture set, and bind it in the lifted
+ *  body to `__env` — which IS the closure object pointer the callee receives.
+ *  A `callcl <self_name>(...)` then re-extracts the table index from that same
+ *  object, so the self-call reaches the correct closure with no by-value
+ *  capture and no construction-site back-patch.
+ */
+let lift_lambda_self = fn (
+  params: [ HirParam ],
+  ret_type: TypeExpr,
+  body: [ HirStmt ],
+  span: HirExpr,
+  self_name: string,
   ctx: MirCtx
 ) -> MirExprResult throws { MirError } do
   let MirCtx(
@@ -1181,12 +1232,29 @@ let lift_lambda = fn (
   // top level (functions, externals, handler methods).
   let param_names = param_names_of(params)
   let known = build_known_names(ctx: ctx_after_name)
-  let captures = collect_hir_free_vars(body, params: param_names, known)
+  let raw_captures = collect_hir_free_vars(body, params: param_names, known)
+
+  // A recursive local closure references its own `let` binding inside its
+  // body, so `self_name` shows up among the raw free vars. Capturing it by
+  // value is impossible — the closure cell does not exist yet when the env
+  // slot is filled at the construction site (env slot garbage → self
+  // `call_indirect` to table index 0 → "undefined element: out of bounds
+  // table access"). Drop it from the capture set and bind it from `__env`
+  // (the closure object pointer the callee receives IS the self value) so
+  // `callcl <self_name>(...)` re-extracts the table index from that same
+  // object. Non-recursive lambdas never have `self_name` free → unchanged.
+  let is_recursive_self = (self_name != "") && list_has(name: self_name, names: raw_captures)
+  let captures = if is_recursive_self then remove_capture_name(name: self_name, names: raw_captures, acc: [])
+    else raw_captures end
 
   // Lower the original body once; capture names inside resolve to locals
   // bound by the env-load preamble below.
   let MirStmtsResult(ctx: ctx_body, stmts: mir_body) = lower_stmts(stmts: body, ctx: ctx_after_name)
-  let preamble = build_env_load_preamble(captures, index: 0)
+  let env_preamble = build_env_load_preamble(captures, index: 0)
+  let preamble = if is_recursive_self then
+      MirStmtLet(name: self_name, typ: TyI64, expr: MirVariable(name: "__env")) :: env_preamble
+    else env_preamble
+    end
     let full_body = concat_mir_stmts(a: preamble, b: mir_body)
 
     // Params: [__env: i64, *orig_params_with_closure_types]. Arrow types in
