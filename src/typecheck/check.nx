@@ -365,32 +365,38 @@ let check_handler_arm_bodies = fn (
     | [] -> return ()
     | HirHandlerBindingEntry(
       name: _,
-      binding: HirHandlerBinding(cap_name: _, requires: _, arms)
+      binding: HirHandlerBinding(cap_name: _, requires: hreq, arms)
     ) :: rest ->
-      check_arm_bodies(state, arms)
+      // `hreq` is the handler's declared `require { … }` row — the ambient ρ_q
+      // for every arm body (spec T-Handler / T-Inject). Thread it down so cap
+      // calls inside an arm are checked against it (T-CapCall x ∈ ρ_q).
+      check_arm_bodies(state, arms, handler_req: hreq)
       return check_handler_arm_bodies(state, hbs: rest)
   end
 end
 
 let check_arm_bodies = fn (
   state: CheckState,
-  arms: [ HirHandlerArm ]
+  arms: [ HirHandlerArm ],
+  handler_req: TypeExpr
 ) -> unit throws { TypeError } do
   match arms do
     | [] -> return ()
-    | HirHandlerArm(arm: f, cont_binder: Some(val: k)) :: rest ->
-      // Only with-kont arms re-checked here so we can bind @k in env;
-      // non-kont arms are picked up via the normal function pass.
-      check_arm_body(state, func: f, cont_binder: Some(val: k))
-      return check_arm_bodies(state, arms: rest)
-    | _ :: rest -> return check_arm_bodies(state, arms: rest)
+    | HirHandlerArm(arm: f, cont_binder: kb) :: rest ->
+      // Every arm body is checked here: synthesised arm function names are not
+      // in `local_names`, so `check_all_functions` never visits them. With-kont
+      // arms additionally bind @k in env. Both paths must pin the handler's
+      // require row as ambient ρ_q.
+      check_arm_body(state, func: f, cont_binder: kb, handler_req)
+      return check_arm_bodies(state, arms: rest, handler_req)
   end
 end
 
 let check_arm_body = fn (
   state: CheckState,
   func: HirFunction,
-  cont_binder: Option<string>
+  cont_binder: Option<string>,
+  handler_req: TypeExpr
 ) -> unit throws { TypeError } do
   let HirFunction(
     name,
@@ -420,7 +426,14 @@ let check_arm_body = fn (
   end
   let body_state = tctypes.state_with_env(state, env: body_env2)
   let body_state2 = tctypes.state_with_throw_row(state: body_state, throw_row: conv_tw)
-  match infer.infer_stmts(state: body_state2, stmts: body, ret_type: conv_ret) do
+  // Pin the handler's declared require row as the arm body's ambient ρ_q so
+  // T-CapCall (x ∈ ρ_q) rejects cap calls not covered by the handler require
+  // row. Mirrors check_function's state_with_require_row; without this the arm
+  // body inherits the surrounding (wide) require row and cap calls leak through
+  // to a downstream MIR "no handler bound" failure instead of a typecheck error.
+  let conv_req = convert_ud_to_var(typ: handler_req, vars: tps)
+  let body_state3 = tctypes.state_with_require_row(state: body_state2, require_row: conv_req)
+  match infer.infer_stmts(state: body_state3, stmts: body, ret_type: conv_ret) do
     | InferExprErr(message: m, span: err_span) ->
       throw TypeMismatch(func_name: name, detail: m, span: err_span)
     | InferExprOk(state: _, subst: _, typ: body_typ) ->
