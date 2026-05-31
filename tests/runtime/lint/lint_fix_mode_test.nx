@@ -1,11 +1,18 @@
-// nexus-pro10: `nexus lint --fix` must apply E2005/E2007 fix-its in place;
-// `nexus lint --fix-diff` must show the diff without writing; plain `nexus lint`
-// and `nexus lint --check` must remain AST-only and partial-program-tolerant.
+// nexus-pro10 / nexus-1jy02: `nexus lint --fix` must NOT corrupt source.
 //
-// Strategy: write a fixture with a known E2007 (LinearUnused) diagnostic, invoke
-// run_lint_subcommand with --fix, assert the file is rewritten and the name is
-// prefixed with `_`. Also verify --fix-diff leaves the file unchanged, and that
-// plain lint still works (exits 0 on a clean file).
+// HISTORY: pro10 originally asserted that `--fix` rewrote an unused linear
+// binding to a bare `_` (`let %_ = …`). nexus-1jy02 proved that rewrite is
+// SOURCE CORRUPTION: `_` is reserved for match wildcards, so `let %_ = …`
+// (and `let @_ = …` for E2005) no longer parses (E1001/E1004) while
+// `--fix` reports exit 0. There is no valid `_` sink for `%`/`@` bindings —
+// the linearity pass decides "unused" by consumption/force, ignoring the
+// name — so the E2005/E2007 autofixes were disabled (the diagnostics stay).
+//
+// This test now asserts the corruption does NOT happen: feeding an E2007
+// program and an E2005 program through `--fix` must leave the source
+// PARSEABLE (here: byte-for-byte unchanged, since the only candidate fix
+// is disabled). Before the fix this FAILED (file became `let %_`/`let @_`,
+// which the parser rejects); after the fix it PASSES.
 
 import * as test_assert from "std:test/assert"
 import { Console } from "std:stdio"
@@ -28,13 +35,21 @@ let fixture_source_linear_unused = fn () -> string do
     ++ "end\n"
 end
 
-let fixture_path_fix = fn () -> string do
-  return "./.pro10_fix_test_fixture.nx"
+// A fixture with an unused lazy binding — fires E2005 LazyBindingUnused.
+let fixture_source_lazy_unused = fn () -> string do
+  return "import { Console } from \"std:stdio\"\n"
+    ++ "import * as stdio from \"std:stdio\"\n"
+    ++ "let make = fn () -> i64 do return 7 end\n"
+    ++ "let main = fn () -> unit require { PermConsole } do\n"
+    ++ "  inject stdio.system_handler do\n"
+    ++ "    let @unused = make()\n"
+    ++ "    Console.println(val: \"done\")\n"
+    ++ "  end\n"
+    ++ "end\n"
 end
 
-let write_linear_fixture = fn () -> unit require { Fs } throws { Exn } do
-  Fs.write_string(path: fixture_path_fix(), content: fixture_source_linear_unused())
-  return ()
+let fixture_path_fix = fn () -> string do
+  return "./.pro10_fix_test_fixture.nx"
 end
 
 let cleanup_fix_fixture = fn () -> unit require { Fs } do
@@ -45,22 +60,55 @@ let cleanup_fix_fixture = fn () -> unit require { Fs } do
   end
 end
 
-// --fix mode: file should be rewritten with `_` prefix on unused binding.
-let test_fix_mode_applies_e2007 = fn () -> unit require { Console, Fs } throws { Exn } do
-  write_linear_fixture()
+// --fix mode on E2007: file must NOT be corrupted (the disabled autofix
+// leaves the unparseable `let %_` rewrite from happening). We assert the
+// source is unchanged — in particular it must NOT contain `let %_`.
+let test_fix_mode_no_corruption_e2007 = fn () -> unit require { Console, Fs } throws { Exn } do
+  let original = fixture_source_linear_unused()
+  Fs.write_string(path: fixture_path_fix(), content: original)
   let code = run_lint_subcommand(args: [ "--fix", fixture_path_fix() ])
-  // --fix exits 0 regardless of whether fixes were applied.
+  // With the autofix disabled there is no fix-it to apply, so --fix surfaces
+  // the unfixable E2007 diagnostic and exits 1 (it makes NO edit). The old
+  // behavior was a silent exit-0 with a corrupting `let %_` rewrite.
   test_assert.assert_eq_i64(
     actual: code,
-    expected: 0,
-    label: "pro10: --fix exits 0 after applying fix-its"
+    expected: 1,
+    label: "1jy02: --fix exits 1 on E2007 (no fix-it; diagnostic surfaced, no edit)"
   )
-  // Verify the file was rewritten: `unused` -> `_` or `_unused`.
   let new_src = Fs.read_to_string(path: fixture_path_fix())
-  // The fix renames the unused binding to `_`.
-  let fixed = str.contains(s: new_src, sub: "let %_")
-  test_assert.assert_true(cond: fixed,
-    label: "pro10: --fix rewrites unused binding to `_` prefix")
+  // The corrupting rewrite `let %_ = …` must NOT appear.
+  let corrupted = str.contains(s: new_src, sub: "let %_")
+  test_assert.assert_true(cond: !corrupted,
+    label: "1jy02: --fix does NOT rewrite E2007 binder to `_` (no corruption)")
+  // The source must be left untouched (the disabled fix-it makes no edit).
+  test_assert.assert_eq_string(actual: new_src, expected: original,
+    label: "1jy02: --fix leaves E2007 source byte-for-byte unchanged")
+  // And the (unchanged) source must still parse — original binder survives.
+  let still_has_binder = str.contains(s: new_src, sub: "let %unused")
+  test_assert.assert_true(cond: still_has_binder,
+    label: "1jy02: E2007 source still parses (original `%unused` binder intact)")
+  return ()
+end
+
+// --fix mode on E2005: same guarantee for lazy bindings.
+let test_fix_mode_no_corruption_e2005 = fn () -> unit require { Console, Fs } throws { Exn } do
+  let original = fixture_source_lazy_unused()
+  Fs.write_string(path: fixture_path_fix(), content: original)
+  let code = run_lint_subcommand(args: [ "--fix", fixture_path_fix() ])
+  test_assert.assert_eq_i64(
+    actual: code,
+    expected: 1,
+    label: "1jy02: --fix exits 1 on E2005 (no fix-it; diagnostic surfaced, no edit)"
+  )
+  let new_src = Fs.read_to_string(path: fixture_path_fix())
+  let corrupted = str.contains(s: new_src, sub: "let @_")
+  test_assert.assert_true(cond: !corrupted,
+    label: "1jy02: --fix does NOT rewrite E2005 binder to `_` (no corruption)")
+  test_assert.assert_eq_string(actual: new_src, expected: original,
+    label: "1jy02: --fix leaves E2005 source byte-for-byte unchanged")
+  let still_has_binder = str.contains(s: new_src, sub: "let @unused")
+  test_assert.assert_true(cond: still_has_binder,
+    label: "1jy02: E2005 source still parses (original `@unused` binder intact)")
   return ()
 end
 
@@ -79,7 +127,9 @@ end
 
 let body = fn () -> unit require { Console, Fs } throws { Exn } do
   try
-    test_fix_mode_applies_e2007()
+    test_fix_mode_no_corruption_e2007()
+    cleanup_fix_fixture()
+    test_fix_mode_no_corruption_e2005()
     cleanup_fix_fixture()
     test_plain_lint_clean_exits_0()
     cleanup_fix_fixture()
