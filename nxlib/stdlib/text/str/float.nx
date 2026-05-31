@@ -629,9 +629,98 @@ let digits_to_int_go = fn (digs: i64, k: i64, i: i64, acc: i64) -> i64 do
 end
 
 /**
+Reconstruct the f64 magnitude denoted by the integer significand `m_int`
+(>= 0, < 2^63) scaled by `10^q`, and compare it bit-exactly to `mag`.
+
+This mirrors the PARSE side: `string_to_f64` of the decimal "m_int * 10^q"
+produces exactly `eisel_lemire(m_int, q)` (or the legacy multiply when EL
+declines). So formatting round-trips iff this reconstruction equals `mag`'s
+bits. Using Eisel-Lemire here -- instead of the legacy `i64_to_float * pow10`
+-- is what makes low-magnitude normals (down to DBL_MIN) round-trip: the
+reciprocal `pow10(q)` for very negative q accumulates several ULPs, so the
+float-multiply reconstruction never matched `mag` and the shortest-prefix
+search fell through to an inaccurate 17-digit path. We keep the legacy
+multiply as the comparison only when EL returns its sentinel, so no value
+that previously matched can regress.
+*/
+let recon_bits = fn (m_int: i64, q: i64) -> i64 do
+  let el = eisel_lemire(w0: m_int, q)
+  if el != el_fallback() then return el end
+  // EL declined (out-of-range / ambiguous): mirror assemble_legacy's recipe.
+  let recon = i64_to_float(val: m_int) *. pow10(n: q)
+  return reinterpret_to_i64(x: recon)
+end
+/** True iff `m_int * 10^q` reconstructs bit-exactly to the magnitude `mag`. */
+let recon_eq_mag = fn (m_int: i64, q: i64, mag: float) -> bool do
+  return recon_bits(m_int, q) == reinterpret_to_i64(x: mag)
+end
+/** |x| for f64. */
+let absf = fn (x: float) -> float do if x <. f0() then return f0() -. x else return x end end
+
+/**
+Correct a 17-digit decimal significand so it round-trips to `mag` bit-exactly,
+choosing the *canonical* (nearest-to-the-true-value) significand among those
+that round-trip.
+
+The initial significand `m0` comes from extracting digits of `m = mag/pow10(e)`,
+whose scaling `pow10(e)` is a few ULPs off for very negative `e`; `m0` can be a
+handful of units from the value that actually round-trips (observed up to ~10
+near DBL_MIN). The significands `c` whose Eisel-Lemire reconstruction `c*10^q`
+equals `mag`'s bits form a contiguous run; the one we want is the one nearest the
+real value of `mag` (so f64::MAX prints 17976931348623157, not ...158, even
+though both round-trip). We scan a bounded window around `m0`, keep every
+round-tripping candidate, and pick the one minimising the legacy-product distance
+|i64_to_float(c)*pow10(q) - mag| (ties -> smaller c). That product is itself
+imprecise, but only ever has to discriminate between adjacent integer
+significands, whose true values differ by a full 10^q -- far above the product's
+error -- so the choice is reliable; near DBL_MIN, where the product underflows to
+0, only a single candidate round-trips anyway. Returns the chosen significand, or
+`el_fallback()` (-1) when none in the window round-trips (caller keeps legacy).
+*/
+let correct_significand = fn (m0: i64, q: i64, mag: float) -> i64 do
+  let target = reinterpret_to_i64(x: mag)
+  return correct_search(m0, q, target, mag, d: 0, best: el_fallback(), best_dist: f0())
+end
+let correct_search = fn (
+  m0: i64,
+  q: i64,
+  target: i64,
+  mag: float,
+  d: i64,
+  best: i64,
+  best_dist: float
+) -> i64 do
+  if d > 64 then return best end
+  // Consider m0-d (when d>0) then m0+d; smaller-c first so ties favour it.
+  let lo = m0 - d
+  let s1 = if d > 0 && lo > 0 && eisel_lemire(w0: lo, q) == target then consider(c: lo, q, mag, best, best_dist) else pack_best(best, best_dist) end
+  let b1 = unpack_c(s1)
+  let bd1 = unpack_d(s1)
+  let hi = m0 + d
+  let s2 = if eisel_lemire(w0: hi, q) == target then consider(c: hi, q, mag, best: b1, best_dist: bd1) else pack_best(b1, bd1) end
+  return correct_search(m0, q, target, mag, d: d + 1, best: unpack_c(s2), best_dist: unpack_d(s2))
+end
+// Helpers to thread (best_c, best_dist) through the scan via a 16-byte scratch
+// block, since Nexus `let` bindings can't return a tuple here.
+let consider = fn (c: i64, q: i64, mag: float, best: i64, best_dist: float) -> i64 do
+  let dist = absf(x: (i64_to_float(val: c) *. pow10(n: q)) -. mag)
+  if best == el_fallback() || dist <. best_dist then return pack_best(c, dist) end
+  return pack_best(best, best_dist)
+end
+let scratch_bc = fn () -> i64 do return arena.alloc_raw(size: 16) end
+let pack_best = fn (c: i64, dist: float) -> i64 do
+  let p = scratch_bc()
+  mem.store_i64(addr: p, val: c)
+  mem.store_f64(addr: p + 8, val: dist)
+  return p
+end
+let unpack_c = fn (p: i64) -> i64 do return mem.load_i64(addr: p) end
+let unpack_d = fn (p: i64) -> float do return mem.load_f64(addr: p + 8) end
+
+/**
 Safety clamp for the 17-digit fallback path: if the nd-digit string at `digs`
-with decimal exponent `e_after` reconstructs (via i64_to_float * pow10) to a
-value strictly greater than `mag`, decrement the last non-zero digit and retry.
+with decimal exponent `e_after` reconstructs to a value strictly greater than
+`mag`, decrement the last non-zero digit and retry.
 This handles the case where accumulated pow10 rounding error inflates `m` and
 pushes the 17th digit one (or two) too high -- ensuring `from_float(finite x)`
 never formats to a string that reparses to +inf or to a larger value.
@@ -688,9 +777,67 @@ let shortest_go = fn (digs: i64, e: i64, mag: float, out: i64, k: i64) -> i64 do
   let e_bumped = round_digits(dst: out, nd: k, next_digit: next_d, exp: 0)
   let m_int = digits_to_int(digs: out, k)
   // reconstruct: m_int has k digits, value = m_int * 10^(e + e_bumped - (k-1))
-  let recon = i64_to_float(val: m_int) *. pow10(n: e + e_bumped - (k - 1))
-  if recon ==. mag then return (k * 256) + e_bumped end
+  if recon_eq_mag(m_int, q: e + e_bumped - (k - 1), mag) then return (k * 256) + e_bumped end
   return shortest_go(digs, e, mag, out, k: k + 1)
+end
+
+/**
+Write the `nd` decimal digits of `v` (>= 0, having exactly `nd` digits) MSD-first
+into [dst, dst+nd).
+*/
+let write_n_digits = fn (v: i64, dst: i64, nd: i64) -> unit do
+  write_digits_pos(v, dst, i: nd - 1)
+  return ()
+end
+
+/**
+Restore a 17-digit significand `v` into `raw[0..17)` (used to undo an
+over-eager legacy clamp that broke round-trip); return the unchanged exponent.
+`v` is the pre-clamp 17-digit integer (digit count exactly 17), so a fixed
+17-digit write reinstates the original digits.
+*/
+let restore_pre_clamp = fn (raw: i64, v: i64, e: i64) -> i64 do
+  write_n_digits(v, dst: raw, nd: 17)
+  return e
+end
+
+/**
+Snap the 18-digit estimate at `raw` onto the significand that round-trips to
+`mag`, rewriting `raw` in place; return the adjusted decimal exponent `e`.
+
+`raw[0..18)` holds the digits of `m = mag/pow10(e)` (value ~ raw * 10^(e-17)).
+We form the rounded 17-digit significand `m17` (value m17 * 10^(e-16)), correct
+it via Eisel-Lemire (`correct_significand`), then re-lay the corrected digits
+back into `raw` so the downstream shortest-prefix / 17-digit paths operate on a
+round-tripping digit string. If the corrector declines (window miss / EL out of
+range) `raw` and `e` are left untouched so the legacy clamp path still applies.
+*/
+let correct_raw_digits = fn (raw: i64, e: i64, mag: float) -> i64 do
+  // Round the 17-digit significand at digit[17].
+  let base17 = digits_to_int(digs: raw, k: 17)
+  let m17 = if mem.load_u8(addr: raw + 17) >= 53 then base17 + 1 else base17 end
+  // value(m17) = m17 * 10^(e - 16)
+  let q = e - 16
+  // If m17 already round-trips, leave the digits untouched: the extraction is
+  // accurate at mid/high magnitudes, so m17 is the good estimate the downstream
+  // shortest-prefix search and (round-trip-aware) legacy clamp expect. We only
+  // snap when m17 fails to round-trip -- the low-magnitude regime where pow10's
+  // reciprocal error pushed the estimate off the value entirely (e.g. DBL_MIN,
+  // whose legacy rendering reparsed to 0).
+  if recon_eq_mag(m_int: m17, q, mag) then return e end
+  // Snap to the nearest round-tripping significand (canonical among the few that
+  // round-trip here). Declines (-1) leave raw/e for the legacy path.
+  let cand = correct_significand(m0: m17, q, mag)
+  if cand == el_fallback() then return e end
+  // Re-lay `cand` (which has 17 digits, or 18 after a 99..9 -> 10..0 carry) into
+  // raw. nc = digit count of cand; the MSD sits at decimal exponent e+(nc-17).
+  let nc = count_digits(v: cand, n: 0)
+  let enew = e + (nc - 17)
+  // Write up to 18 digits of cand; pad the rest of the 18-slot buffer with '0'.
+  let wn = if nc > 18 then 18 else nc end
+  write_n_digits(v: cand, dst: raw, nd: wn)
+  fill_zeros(dst: raw + wn, n: 18 - wn)
+  return enew
 end
 
 /**
@@ -751,6 +898,13 @@ export let string_from_float = fn (a_val: float) -> i64 do
   // Extract 18 digits.
   let raw = alloc_bytes(n: 24)
   extract_digits(m, dst: raw, i: 0, n: 18)
+  // The digit-extraction scaling pow10(e) is a few ULPs off for very negative e,
+  // so the raw significand can be several units away from the value that actually
+  // round-trips (notably near DBL_MIN, where the legacy path emitted a string the
+  // parser maps to 0). Snap the 17-digit significand onto the exact round-tripping
+  // value via Eisel-Lemire before the shortest-prefix search runs on those digits.
+  let e2 = correct_raw_digits(raw, e, mag)
+  let e = e2
   // Try the shortest round-tripping prefix; fall back to a rounded 17 digits.
   let chosen = alloc_bytes(n: 24)
   let sh = shortest_digits(digs: raw, e, mag, out: chosen)
@@ -771,8 +925,21 @@ export let string_from_float = fn (a_val: float) -> i64 do
   let e_after0 = round_digits(dst: raw, nd: 17, next_digit, exp: e)
   // Safety clamp: if pow10 accumulated rounding error inflated the 17th digit
   // so that the formatted value would exceed `mag` (e.g. f64::MAX → "...159e308"
-  // which reparses to +inf), decrement the last digit until recon <= mag.
-  let e_after = clamp_digits_to_mag(digs: raw, nd: 17, e_after: e_after0, mag)
+  // which reparses to +inf), decrement the last digit until recon <= mag. The
+  // clamp's legacy i64_to_float*pow10 comparison is itself imprecise, so it can
+  // over-decrement a significand that was already exact (breaking round-trip at
+  // mid magnitudes / near DBL_MIN). Snapshot the pre-clamp significand, run the
+  // clamp, and only keep its result if the clamped digits still round-trip
+  // bit-exactly; otherwise restore the pre-clamp digits.
+  let pre_clamp = digits_to_int(digs: raw, k: 17)
+  let pre_clamp_rt = recon_eq_mag(m_int: pre_clamp, q: e_after0 - 16, mag)
+  let e_clamped = clamp_digits_to_mag(digs: raw, nd: 17, e_after: e_after0, mag)
+  let clamped = digits_to_int(digs: raw, k: 17)
+  let clamp_rt = recon_eq_mag(m_int: clamped, q: e_clamped - 16, mag)
+  // Restore the pre-clamp digits only when the clamp turned a round-tripping
+  // significand into a non-round-tripping one (its imprecise comparison misfired).
+  let revert = pre_clamp_rt && !clamp_rt
+  let e_after = if revert then restore_pre_clamp(raw, v: pre_clamp, e: e_after0) else e_clamped end
   let lnz = last_nonzero(dst: raw, n: 17, i: 16)
   let nd = if lnz < 0 then 1 else lnz + 1 end
   if e_after >= 0 - 4 && e_after < 17 then return render_fixed(digs: raw, nd, e: e_after, neg) end

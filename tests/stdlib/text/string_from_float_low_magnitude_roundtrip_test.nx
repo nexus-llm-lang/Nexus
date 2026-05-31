@@ -1,0 +1,95 @@
+// Regression (nexus-c8152): from_float must round-trip bit-exactly across the
+// full normal exponent range, including the very bottom near DBL_MIN.
+//
+// Before the fix, string_from_float reconstructed candidate digits via
+// `i64_to_float(m) *. pow10(n)`; for very negative n, pow10's reciprocal
+// accumulates several ULPs, so the shortest-prefix search never found a
+// round-tripping prefix and the 17-digit fallback emitted digits that reparsed
+// to the wrong value (or, near DBL_MIN, to 0). Examples:
+//   DBL_MIN 2.2250738585072014e-308 -> "2.2250738585072005e-308" (reparses to 0)
+//   1.0e-307                        -> "9.9999999999999947e-308" (value changed)
+// The fix snaps the extracted significand onto the value that round-trips using
+// the Eisel-Lemire pow5 table (the same mechanism the parser uses), and makes
+// the 17-digit safety clamp round-trip-aware so it never over-decrements an
+// already-exact significand. Acceptance: parse(from_float(x)) == x bit-exactly.
+import * as test_assert from "std:test/assert"
+import { from_float, to_f64 } from "std:str"
+import { i64_to_float } from "std:math"
+import * as mem from "std:runtime/mem"
+import * as arena from "std:runtime/arena"
+
+let reinterpret_bits_to_f64 = fn (bits: i64) -> float do
+  let p = arena.alloc_raw(size: 8)
+  mem.store_i64(addr: p, val: bits)
+  return mem.load_f64(addr: p)
+end
+
+let reinterpret_f64_to_bits = fn (x: float) -> i64 do
+  let p = arena.alloc_raw(size: 8)
+  mem.store_f64(addr: p, val: x)
+  return mem.load_i64(addr: p)
+end
+
+// Assert parse(from_float(x)) reproduces x's exact bit pattern.
+let check_roundtrip_bits = fn (bits: i64, label: string) -> unit throws { Exn } do
+  let x = reinterpret_bits_to_f64(bits: bits)
+  let s = from_float(val: x)
+  let y = to_f64(s: s)
+  let bits_out = reinterpret_f64_to_bits(x: y)
+  test_assert.assert_eq_i64(actual: bits_out, expected: bits, label: label ++ " round-trip")
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  // --- Low-magnitude normals: the heart of nexus-c8152 ---
+  // DBL_MIN = 0x0010000000000000 = 2.2250738585072014e-308 (smallest normal).
+  check_roundtrip_bits(bits: 4503599627370496, label: "DBL_MIN")
+  // DBL_MIN + 1 ulp.
+  check_roundtrip_bits(bits: 4503599627370497, label: "DBL_MIN+1ulp")
+  // 1.0e-307 (the other reported failure).
+  check_roundtrip_bits(bits: reinterpret_f64_to_bits(x: to_f64(s: "1.0e-307")), label: "1e-307")
+  // A spread of low-exponent normals.
+  check_roundtrip_bits(bits: reinterpret_f64_to_bits(x: to_f64(s: "1.5e-306")), label: "1.5e-306")
+  check_roundtrip_bits(bits: reinterpret_f64_to_bits(x: to_f64(s: "5e-300")), label: "5e-300")
+  // 1e-300 (known bit pattern).
+  check_roundtrip_bits(bits: 118622047889322841, label: "1e-300")
+
+  // --- Mid-range normals (must not regress) ---
+  // 0.1
+  check_roundtrip_bits(bits: 4591870180066957722, label: "0.1")
+  // pi
+  check_roundtrip_bits(bits: 4614256656552045848, label: "pi")
+  // 1e-7
+  check_roundtrip_bits(bits: reinterpret_f64_to_bits(x: to_f64(s: "1e-7")), label: "1e-7")
+  // 0.5
+  let half = i64_to_float(val: 1) /. i64_to_float(val: 2)
+  check_roundtrip_bits(bits: reinterpret_f64_to_bits(x: half), label: "0.5")
+  // 2/3 (irrational decimal)
+  let two_thirds = i64_to_float(val: 2) /. i64_to_float(val: 3)
+  check_roundtrip_bits(bits: reinterpret_f64_to_bits(x: two_thirds), label: "2/3")
+  // A 16-sig-digit near-integer that exposed an over-eager clamp.
+  check_roundtrip_bits(bits: 4625196817309499391, label: "15.999999999999998")
+
+  // --- High-magnitude normals (must not regress) ---
+  // 1e21
+  check_roundtrip_bits(bits: reinterpret_f64_to_bits(x: to_f64(s: "1e21")), label: "1e21")
+  // 1e300
+  check_roundtrip_bits(bits: 9094988921128908188, label: "1e300")
+  // DBL_MAX = 0x7fefffffffffffff = 1.7976931348623157e308.
+  check_roundtrip_bits(bits: 9218868437227405311, label: "DBL_MAX")
+  // DBL_MAX - 1 ulp.
+  check_roundtrip_bits(bits: 9218868437227405310, label: "DBL_MAX-1ulp")
+
+  // --- Canonical string forms still correct (not just round-tripping) ---
+  test_assert.assert_eq_string(
+    actual: from_float(val: reinterpret_bits_to_f64(bits: 9218868437227405311)),
+    expected: "1.7976931348623157e308",
+    label: "DBL_MAX formats canonically"
+  )
+  test_assert.assert_eq_string(
+    actual: from_float(val: reinterpret_bits_to_f64(bits: 4503599627370496)),
+    expected: "2.2250738585072014e-308",
+    label: "DBL_MIN formats canonically"
+  )
+  return ()
+end
