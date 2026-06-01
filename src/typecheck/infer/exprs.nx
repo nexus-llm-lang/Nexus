@@ -58,7 +58,7 @@ import { lookup_named_type, find_linear_field } from "src/typecheck/infer/collec
 import { append_env, bind_pattern } from "src/typecheck/infer/statements.nx"
 import {
   infer_stmts_tail_diverges,
-  check_raise_admitted, exception_name_of_raised,
+  check_raise_admitted, exception_name_of_raised, is_residual_rethrow_var,
   check_call_throw_row_admitted,
   check_force_require_row,
   RaiseAdmissionResult, RaiseOk, RaiseRejected
@@ -431,20 +431,14 @@ export let infer_match = fn (
             span
           )
         | exhaustive.ExnNoCatchAll ->
-          // Suppress hasCatchAll inside a try/catch catch body: selective
-          // catch is valid — unmatched exceptions propagate via WASM EH.
-          if tctypes.state_in_catch_body(state: st1) then
-            return infer_match_cases(
-              state: st1,
-              cases,
-              target_type: tt,
-              subst: s1,
-              ret_type,
-              result_type: None,
-              span,
-              infer_stmts_fn
-            )
-          end
+          // T-Match requires a syntactic catch-all when matching an `Exn`-typed
+          // value: there is no residual channel, so an unmatched value is a stuck
+          // dispatch. This holds even inside a catch body — the selective `catch`
+          // desugar (src/ir/hir/convert/core.nx) appends its own synthetic
+          // `| __exn_v -> throw __exn_v` re-throw arm, which IS a catch-all, so
+          // that match passes here. A USER's bare `match e do ...` on an `Exn`
+          // value inside a catch body has no such arm and is correctly rejected
+          // (nexus-tgv4k, nexus-7hbia).
           return InferExprErr(
             message: "match on `Exn` must include a catch-all arm (`_ -> ...` or a variable pattern) to cover future exception constructors",
             span
@@ -985,9 +979,19 @@ export let infer_raise = fn (
       let row = subst.subst_apply(subst: sc, typ: tctypes.state_throw_row(state: st1))
       let groups = tctypes.state_exception_groups(state: st1)
       let exn_name_opt = exception_name_of_raised(state: st1, expr: inner)
-      match check_raise_admitted(name_opt: exn_name_opt, row, groups) do
-        | RaiseOk -> ()
-        | RaiseRejected(message: m) -> return InferExprErr(message: m, span)
+      // Synthetic residual re-throw arm `| __exn_v -> throw __exn_v` appended by
+      // the selective-`catch` desugar (src/ir/hir/convert/core.nx). It propagates
+      // the catch's RESIDUAL — the body-throw variants minus the caught ones —
+      // which is ⊆ the enclosing declared row by the T-TryCatch augmentation
+      // invariant (body row = outer ∪ caught). So admit it unconditionally rather
+      // than checking `Exn` (the catch param's universal type) against the narrow
+      // outer row, which would spuriously reject (nexus-7hbia, nexus-c3lk0).
+      let is_synthetic_residual_rethrow = is_residual_rethrow_var(expr: inner)
+      if !(is_synthetic_residual_rethrow) then
+        match check_raise_admitted(name_opt: exn_name_opt, row, groups) do
+          | RaiseOk -> ()
+          | RaiseRejected(message: m) -> return InferExprErr(message: m, span)
+        end
       end
       // T-Raise (inference-row pinning): when the active throws-row is still an
       // unsolved inference variable (the collecting row of a suspended thunk

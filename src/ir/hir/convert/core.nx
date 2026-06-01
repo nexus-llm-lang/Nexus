@@ -87,6 +87,10 @@ import {
   HirCallArg,
   HirNamedExpr,
   HirMatchCase,
+  HirPatternKind,
+  PVar,
+  PWild,
+  POr,
   EagerBody,
   LazyBody,
   HirFunction,
@@ -578,7 +582,35 @@ let convert_stmts_go = fn (
         ), span: sp) :: acc)
     | SpannedStmt(node: StmtTry(body: b, catch_arms: arms), span: sp) :: rest ->
       // Multi-arm or non-variable: desugar to catch __exn -> match __exn do ... end
-      let mir_cases = convert_catch_arms_to_match_cases(arms, entries)
+      // Append a synthetic catch-all re-throw arm `| __exn_v -> throw __exn_v` so
+      // a thrown exception matching no user arm PROPAGATES out via the function's
+      // throws row (rather than falling through into the adjacent ctor branch and
+      // reading a foreign payload). This also makes the synthesized match
+      // exhaustive over `Exn`, so the exhaustiveness check passes without any
+      // catch-body suppression hack (nexus-7hbia, nexus-tgv4k).
+      let user_cases = convert_catch_arms_to_match_cases(arms, entries)
+      // Only append the synthetic re-throw arm when the user arms don't already
+      // include an irrefutable catch-all (a bare variable/wildcard pattern). If
+      // they do, the user's own arm handles every variant and appending would
+      // produce an unreachable (redundant) arm.
+      let mir_cases = if catch_arms_have_catch_all(cases: user_cases) then
+        user_cases
+      else
+        let rethrow_arm = HirMatchCase(
+          pattern: hir.PVar(name: "__exn_v", sigil: SigilImmutable),
+          body: [ HirStmt(
+            node: hir.Expr(expr: HirExpr(
+              node: hir.Raise(expr: HirExpr(
+                node: hir.Variable(name: "__exn_v", sigil: SigilImmutable),
+                span: sp
+              )),
+              span: sp
+            )),
+            span: sp
+          ) ]
+        )
+        list.concat(xs: user_cases, ys: rethrow_arm :: [])
+      end
       let match_expr = hir.Match(
         target: HirExpr(node: hir.Variable(name: "__exn", sigil: SigilImmutable), span: sp),
         cases: mir_cases
@@ -696,6 +728,36 @@ let convert_catch_arms_to_match_cases = fn (
   entries: [ RenameEntry ]
 ) -> [ HirMatchCase ] throws { HirError } do
   return convert_catch_arms_go(arms, entries, acc: [])
+end
+
+/** True when any case is an irrefutable catch-all (bare variable / wildcard,
+ *  or an or-pattern containing one). Used to decide whether the selective-catch
+ *  desugar needs a synthetic re-throw arm appended. */
+let catch_arms_have_catch_all = fn (cases: [ HirMatchCase ]) -> bool do
+  match cases do
+    | [] -> return false
+    | HirMatchCase(pattern: p, body: _) :: rest ->
+      if pat_is_catch_all(pat: p) then return true end
+      return catch_arms_have_catch_all(cases: rest)
+  end
+end
+
+let pat_is_catch_all = fn (pat: HirPatternKind) -> bool do
+  match pat do
+    | PWild -> return true
+    | PVar(name: _, sigil: _) -> return true
+    | POr(alts: a) -> return any_pat_is_catch_all(pats: a)
+    | _ -> return false
+  end
+end
+
+let any_pat_is_catch_all = fn (pats: [ HirPatternKind ]) -> bool do
+  match pats do
+    | [] -> return false
+    | p :: rest ->
+      if pat_is_catch_all(pat: p) then return true end
+      return any_pat_is_catch_all(pats: rest)
+  end
 end
 
 let convert_catch_arms_go = fn (
