@@ -20,7 +20,7 @@
  *   (see src/ir/lir/lower_helpers.nx)
  * - LIR-level optimization passes (see src/ir/lir/opt.nx)
  */
-import { TypeExpr, TyUserDefined, TyLazy, TyArrow, TyRecord } from "src/types/type_expr.nx"
+import { TypeExpr, TyUserDefined, TyLazy, TyArrow, TyRecord, TyList, TyArray } from "src/types/type_expr.nx"
 import * as list from "std:list"
 import { LirError } from "src/ir/lir/errors.nx"
 import { Some, None } from "std:option"
@@ -600,6 +600,29 @@ end
 
 type LowerStmtResult = LowerStmtResult(ctx: LowerCtx, ret: Option<LirAtom>)
 
+/** True for a collection type that carries an element type (`[R]`). Used to
+ *  decide when a `let`-annotation should override an RHS-inferred semantic type
+ *  that collapsed to a non-list shape — recovering the element type for a
+ *  locally-bound empty list `[]` (`Nil`, no head to infer from) so the
+ *  cons-pattern binder's `.field` resolves instead of aborting LIR with E6002
+ *  (nexus-xa4si). Scoped to list/array so a record-typed annotation never
+ *  shadows the structurally-inferred `TyRecord` used for field resolution. */
+let is_list_or_array_ty = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyList(elem: _) -> return true
+    | TyArray(elem: _) -> return true
+    | _ -> return false
+  end
+end
+
+let prefer_annotation_sem = fn (annot: TypeExpr, atom_sem: TypeExpr) -> bool do
+  if is_list_or_array_ty(t: annot) then
+    if is_list_or_array_ty(t: atom_sem) then return false else return true end
+  else
+    return false
+  end
+end
+
 let lower_stmt_inner = fn (
   stmt: MirStmt,
   ret_type: TypeExpr,
@@ -611,7 +634,7 @@ let lower_stmt_inner = fn (
       let BindResult(ctx: ctx2, atom: a) = lower_expr_to_atom(expr: e, ctx)
       let inferred = atom_type(atom: a)
         // Prefer semantic type from lowered atom if available
-        let actual_sem = match a do
+        let atom_sem = match a do
           | LirAtomVar(name: vn, typ: _) ->
             let LowerCtx(vars: _, semantic_vars: sv, stmts: _, temp_counter: _, enum_defs: _) = ctx2
             match lir_lookup_type(name: vn, entries: sv) do
@@ -619,6 +642,18 @@ let lower_stmt_inner = fn (
                 | None -> sem_type
               end
           | _ -> sem_type
+        end
+        // A list literal / empty list / `::` desugars to `Cons`/`Nil`; the
+        // inferred semantic type recovers the element from a non-empty `Cons`
+        // head, but `[]` (`Nil`) and shapes where inference falls back to the
+        // catch-all `TyI64` lose the element type. When the user supplied a
+        // collection annotation (`let xs: [R] = ...`), prefer it so the bound
+        // list carries `TyList(R)` — without this the cons-pattern binder's
+        // `.field` aborts LIR with E6002 for the empty-tail case (nexus-xa4si).
+        let actual_sem = if prefer_annotation_sem(annot: t, atom_sem) then
+          t
+        else
+          atom_sem
         end
         let LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) = ctx2
         let ctx3 = LowerCtx(

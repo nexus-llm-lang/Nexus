@@ -1,0 +1,128 @@
+// Regression test for nexus-xa4si (n5gub sibling).
+//
+// A list LITERAL (`[{x:11}, ...]`) or cons EXPRESSION (`{x:1} :: rest`) bound
+// to a LOCAL `let`, then cons-pattern-matched with a `.field` on the bound
+// head/tail element, aborted LIR with E6002
+// ("field access '.x' on non-record semantic type for variable 'h'").
+//
+// Root cause: `infer_semantic_type` (src/ir/lir/semantic_types.nx) had no case
+// for the list constructors `Cons`/`Nil` (list literals and `::` both desugar
+// to `MirConstructor("Cons"/"Nil", ...)`), so a `let xs = [...]` recorded its
+// semantic type as the catch-all `TyI64`. When the match scrutinee `xs` was
+// looked up, `scr_sem = TyI64`, so `scrutinee_type_args` produced no type args,
+// the `Cons.v : T` field stayed an unresolved `TyVar`, and `.field` on the
+// bound element aborted at LIR. The n5gub fix only covered fn-PARAMETER
+// scrutinees (whose `[R]` is recorded at function entry).
+//
+// The fix makes `infer_semantic_type` recover the element type from a `Cons`
+// head (`TyList(elem)`) and prefers a `TyList`/`TyArray`/`TyUserDefined`
+// `let`-annotation when the inferred shape is the impoverished `TyI64`/`TyUnit`
+// (needed for the empty-tail `Nil` case), so the element semantic type reaches
+// the cons-pattern binder exactly as it does for fn parameters.
+import * as test_assert from "std:test/assert"
+
+type R = { x: i64, y: i64, z: i64 }
+
+// --- pin a: list-literal local let, head element .field (weighted x1/x10/x100) ---
+let listlit_head = fn () -> i64 do
+  let xs: [R] = [{x: 1, y: 2, z: 3}, {x: 4, y: 5, z: 6}]
+  match xs do
+    | [] -> return -1
+    | h :: _ -> return h.x + h.y * 10 + h.z * 100
+  end
+end
+
+// --- pin a2: list-literal local let WITHOUT annotation ---
+let listlit_head_noanno = fn () -> i64 do
+  let xs = [{x: 7, y: 8, z: 9}, {x: 1, y: 1, z: 1}]
+  match xs do
+    | [] -> return -1
+    | h :: _ -> return h.x + h.y * 10 + h.z * 100
+  end
+end
+
+// --- pin b: explicit cons-EXPR local let, second element ---
+let consexpr_second = fn () -> i64 do
+  let xs: [R] = {x: 1, y: 1, z: 1} :: {x: 2, y: 0, z: 2} :: []
+  match xs do
+    | _ :: v :: _ -> return v.x + v.y * 10 + v.z * 100
+    | _ -> return -1
+  end
+end
+
+// --- pin b2: cons-expr prepending onto a literal tail, head element ---
+let consexpr_head = fn () -> i64 do
+  let rest: [R] = [{x: 9, y: 9, z: 9}]
+  let xs: [R] = {x: 3, y: 4, z: 5} :: rest
+  match xs do
+    | h :: _ -> return h.x + h.y * 10 + h.z * 100
+    | _ -> return -1
+  end
+end
+
+// --- pin c (guard): the n5gub fn-PARAMETER shape must still work ---
+let param_head = fn (xs: [R]) -> i64 do
+  match xs do
+    | [] -> return -1
+    | h :: _ -> return h.x + h.y * 10 + h.z * 100
+  end
+end
+
+// --- pin c2 (guard): match-of-ctor-field still works (user variant) ---
+type Box = Box(inner: R)
+
+let ctor_field = fn (b: Box) -> i64 do
+  match b do
+    | Box(inner: r) -> return r.x + r.y * 10 + r.z * 100
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // pin a: head { x:1, y:2, z:3 } → 1 + 20 + 300 = 321.
+  test_assert.assert_eq_i64(
+    actual: listlit_head(),
+    expected: 321,
+    label: "xa4si pin a: list-literal local let, head .field weighted"
+  )
+
+  // pin a2: head { x:7, y:8, z:9 } → 7 + 80 + 900 = 987.
+  test_assert.assert_eq_i64(
+    actual: listlit_head_noanno(),
+    expected: 987,
+    label: "xa4si pin a2: list-literal local let no annotation"
+  )
+
+  // pin b: 2nd element { x:2, y:0, z:2 } → 2 + 0 + 200 = 202.
+  test_assert.assert_eq_i64(
+    actual: consexpr_second(),
+    expected: 202,
+    label: "xa4si pin b: cons-expr local let, 2nd element weighted"
+  )
+
+  // pin b2: head { x:3, y:4, z:5 } → 3 + 40 + 500 = 543.
+  test_assert.assert_eq_i64(
+    actual: consexpr_head(),
+    expected: 543,
+    label: "xa4si pin b2: cons-expr onto literal tail, head"
+  )
+
+  // pin c: fn-param head { x:6, y:1, z:0 } → 6 + 10 + 0 = 16.
+  test_assert.assert_eq_i64(
+    actual: param_head(xs: [{x: 6, y: 1, z: 0}]),
+    expected: 16,
+    label: "xa4si pin c: n5gub fn-param shape still works"
+  )
+
+  // pin c2: ctor-field { x:5, y:5, z:5 } → 5 + 50 + 500 = 555.
+  test_assert.assert_eq_i64(
+    actual: ctor_field(b: Box(inner: {x: 5, y: 5, z: 5})),
+    expected: 555,
+    label: "xa4si pin c2: match-of-ctor-field still works"
+  )
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end
