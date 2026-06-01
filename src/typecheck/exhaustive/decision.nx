@@ -802,48 +802,212 @@ let all_ctors_present = fn (needed: [ CtorSig ], have: [ string ]) -> bool do
   end
 end
 
+/**
+ * `witness_from_matrix(M, types)` — build a concrete missing-value witness
+ * for a matrix `M` that is *known* non-exhaustive over `types`
+ * (`is_useful(M, [_...], types) = true`).
+ *
+ * Mirrors the recursion of `is_useful` so the witness it names always points
+ * at a constructor (and, when nested, a sub-constructor) that actually leaves
+ * a value uncovered — never a fully-covered sibling constructor.
+ *
+ * The shape is a "missing-pattern fragment": a bare ctor name (`O2`), or a
+ * nested form (`O2(I2)`) when the uncovered case is inside a present ctor's
+ * fields. Only the column whose specialization is still non-exhaustive is
+ * expanded; sibling columns collapse to `_` (and are elided).
+ */
 export let witness_from_matrix = fn (
   matrix: [ [ HirPatternKind ] ], types: [ TypeExpr ],
   enum_defs: [ EnumEntry ], type_defs: [ TypeDefEntry ]
 ) -> string do
   match types do
     | [] -> return "_"
-    | t :: _ ->
+    | t_head :: t_rest ->
+      let t = strip_mod(typ: t_head)
       let sig = sigs.column_signature(
-        t: strip_mod(typ: t),
+        t: t,
         enum_defs: enum_defs,
         type_defs: type_defs
       )
       match sig do
         | SigFinite(ctors: cs) ->
           let head_ctors = collect_column_ctors(matrix: matrix, acc: [])
+          // 1. A top-level constructor entirely absent from the column is the
+          //    cleanest witness. Expand its fields (all wildcards) so a nested
+          //    arity is rendered faithfully, e.g. `Cons(_, _)`.
           let missing = first_missing_ctor(cs: cs, have: head_ctors)
           match missing do
-            | Some(val: name) -> return name
+            | Some(val: CtorSig(name: nm, arity: ar)) ->
+              return render_ctor(name: nm, arity: ar)
             | None ->
-              return first_present_ctor_or_underscore(ctors: cs)
+              // 2. Every top-level ctor is present, but coverage is still
+              //    incomplete — the gap lives inside some present ctor's
+              //    fields (e.g. `O2(i: I2(_))`). Find the first ctor whose
+              //    specialized sub-matrix is itself non-exhaustive and recurse
+              //    into its fields to name the genuinely-uncovered case.
+              return witness_in_present_ctor(
+                matrix: matrix, ctors: cs, t_head: t, t_rest: t_rest,
+                enum_defs: enum_defs, type_defs: type_defs
+              )
           end
-        | SigRecord(_) -> return "{...}"
+        | SigRecord(fields: rfts) ->
+          // The record itself is always present; recurse into its fields to
+          // find the uncovered column.
+          let arity = sigs.list_len(xs: rfts, acc: 0)
+          let field_types = sigs.named_types_to_types(nts: rfts, acc: [])
+          let spec_matrix = specialize_matrix_record(matrix: matrix, rec_fields: rfts)
+          let new_types = list.concat(xs: field_types, ys: t_rest)
+          let inner = witness_from_matrix(
+            matrix: spec_matrix, types: new_types,
+            enum_defs: enum_defs, type_defs: type_defs
+          )
+          if inner == "_" then return "{...}" end
+          return "{" ++ inner ++ "}"
         | SigInfinite -> return "_"
       end
   end
 end
 
-let first_missing_ctor = fn (cs: [ CtorSig ], have: [ string ]) -> Option<string> do
+/**
+ * Among the (all-present) constructors `ctors`, find the first one whose
+ * specialization keeps the matrix non-exhaustive, and render a nested witness
+ * naming that constructor plus the uncovered sub-pattern of its fields.
+ */
+let witness_in_present_ctor = fn (
+  matrix: [ [ HirPatternKind ] ], ctors: [ CtorSig ],
+  t_head: TypeExpr, t_rest: [ TypeExpr ],
+  enum_defs: [ EnumEntry ], type_defs: [ TypeDefEntry ]
+) -> string do
+  match ctors do
+    | [] -> return "_"
+    | CtorSig(name: c, arity: a) :: rest ->
+      let field_types = sigs.ctor_field_types(
+        t: t_head, variant: c, enum_defs: enum_defs, type_defs: type_defs
+      )
+      let variant_field_names = sigs.ctor_field_names(t: t_head, variant: c, enum_defs: enum_defs)
+      let spec_matrix = specialize_matrix_ctor(
+        matrix: matrix, target_variant: c, arity: a,
+        names: variant_field_names, enum_defs: enum_defs
+      )
+      let new_types = list.concat(xs: field_types, ys: t_rest)
+      let probe_row = list.concat(xs: make_wildcards(n: a, acc: []), ys: make_wildcards(n: sigs.list_len(xs: t_rest, acc: 0), acc: []))
+      if is_useful(
+        matrix: spec_matrix, row: probe_row, types: new_types,
+        enum_defs: enum_defs, type_defs: type_defs
+      ) then
+        // This ctor's sub-problem is non-exhaustive: name it, and recurse into
+        // its fields to expose the genuinely-uncovered nested case.
+        let inner = witness_ctor_fields(
+          spec_matrix: spec_matrix, arity: a, field_types: field_types,
+          enum_defs: enum_defs, type_defs: type_defs
+        )
+        return render_ctor_nested(name: c, arity: a, inner: inner)
+      end
+      return witness_in_present_ctor(
+        matrix: matrix, ctors: rest, t_head: t_head, t_rest: t_rest,
+        enum_defs: enum_defs, type_defs: type_defs
+      )
+  end
+end
+
+/**
+ * Build the field-witness list for a present ctor whose specialized matrix is
+ * non-exhaustive. Walks the ctor's fields left to right; the first field whose
+ * column is uncovered gets a concrete sub-witness, the rest stay `_`.
+ */
+let witness_ctor_fields = fn (
+  spec_matrix: [ [ HirPatternKind ] ], arity: i64, field_types: [ TypeExpr ],
+  enum_defs: [ EnumEntry ], type_defs: [ TypeDefEntry ]
+) -> [ string ] do
+  if arity <= 0 then return [] end
+  // Compute a witness over just the ctor's field columns. The witness
+  // recursion expands the first uncovered field; trailing fields collapse to
+  // `_`. We reconstruct per-field strings by recursing with progressively
+  // narrowed matrices.
+  return witness_ctor_fields_go(
+    spec_matrix: spec_matrix, field_types: field_types, idx: 0, arity: arity,
+    enum_defs: enum_defs, type_defs: type_defs, acc: []
+  )
+end
+
+let witness_ctor_fields_go = fn (
+  spec_matrix: [ [ HirPatternKind ] ], field_types: [ TypeExpr ], idx: i64, arity: i64,
+  enum_defs: [ EnumEntry ], type_defs: [ TypeDefEntry ], acc: [ string ]
+) -> [ string ] do
+  if idx >= arity then return list.reverse(xs: acc) end
+  match field_types do
+    | [] -> return list.reverse(xs: acc)
+    | ft :: ft_rest ->
+      let t = strip_mod(typ: ft)
+      let sig = sigs.column_signature(t: t, enum_defs: enum_defs, type_defs: type_defs)
+      // A field column is the "uncovered" one if, with this column expanded and
+      // the remaining columns as wildcards, the sub-matrix is non-exhaustive.
+      let w = witness_for_field_column(
+        spec_matrix: spec_matrix, t: t, sig: sig,
+        enum_defs: enum_defs, type_defs: type_defs
+      )
+      return witness_ctor_fields_go(
+        spec_matrix: spec_matrix, field_types: ft_rest, idx: idx + 1, arity: arity,
+        enum_defs: enum_defs, type_defs: type_defs, acc: w :: acc
+      )
+  end
+end
+
+/**
+ * Witness fragment for a single ctor field column, given the ctor-specialized
+ * matrix (whose first `arity` columns are the ctor's fields). Reuses the head
+ * column of `spec_matrix` to spot the uncovered sub-constructor.
+ */
+let witness_for_field_column = fn (
+  spec_matrix: [ [ HirPatternKind ] ], t: TypeExpr, sig: ColumnSig,
+  enum_defs: [ EnumEntry ], type_defs: [ TypeDefEntry ]
+) -> string do
+  match sig do
+    | SigFinite(ctors: cs) ->
+      let head_ctors = collect_column_ctors(matrix: spec_matrix, acc: [])
+      let missing = first_missing_ctor(cs: cs, have: head_ctors)
+      match missing do
+        | Some(val: CtorSig(name: nm, arity: ar)) -> return render_ctor(name: nm, arity: ar)
+        | None -> return "_"
+      end
+    | SigRecord(_) -> return "_"
+    | SigInfinite -> return "_"
+  end
+end
+
+let render_ctor = fn (name: string, arity: i64) -> string do
+  if arity <= 0 then return name end
+  return name ++ "(" ++ join_wildcards(n: arity) ++ ")"
+end
+
+let render_ctor_nested = fn (name: string, arity: i64, inner: [ string ]) -> string do
+  if arity <= 0 then return name end
+  let body = join_strings(xs: inner, sep: ", ")
+  if body == "" then return name ++ "(" ++ join_wildcards(n: arity) ++ ")" end
+  return name ++ "(" ++ body ++ ")"
+end
+
+let join_wildcards = fn (n: i64) -> string do
+  if n <= 1 then return "_" end
+  return "_, " ++ join_wildcards(n: n - 1)
+end
+
+let join_strings = fn (xs: [ string ], sep: string) -> string do
+  match xs do
+    | [] -> return ""
+    | x :: [] -> return x
+    | x :: rest -> return x ++ sep ++ join_strings(xs: rest, sep: sep)
+  end
+end
+
+let first_missing_ctor = fn (cs: [ CtorSig ], have: [ string ]) -> Option<CtorSig> do
   match cs do
     | [] -> return None
-    | CtorSig(name: n, arity: _) :: rest ->
+    | CtorSig(name: n, arity: a) :: rest ->
       if sigs.list_contains_str(
         xs: have,
         s: n
       ) then return first_missing_ctor(cs: rest, have: have) end
-      return Some(val: n)
-  end
-end
-
-let first_present_ctor_or_underscore = fn (ctors: [ CtorSig ]) -> string do
-  match ctors do
-    | [] -> return "_"
-    | CtorSig(name: n, arity: _) :: _ -> return n
+      return Some(val: CtorSig(name: n, arity: a))
   end
 end
