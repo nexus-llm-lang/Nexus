@@ -1,0 +1,261 @@
+/**
+ * str/float_parse: string -> f64.
+ *
+ * Scans the `[+-]?(digits('.'digits?)?|'.'digits)([eE][+-]?digits)?` grammar
+ * (plus case-insensitive `inf`/`infinity`/`nan`) into a 5-word scratch state,
+ * then assembles the f64 through the Eisel-Lemire core (with a legacy
+ * `i64_to_float * pow10` fallback for the inputs Eisel-Lemire declines).
+ *
+ * The shared bit-pattern constants, `pow10` family, and Eisel-Lemire core live
+ * in `text/str/float_core`; this module owns the scanner and the assembly. The
+ * public surface is re-exported through the `text/str/float` façade.
+ *
+ * These avoid f64 *literals* on purpose: float literals are themselves encoded
+ * at compile time via `bb.push_f64_str_le` -> `string_to_f64`, so the
+ * seed compiler that builds this file must not depend on a working float-literal
+ * path here. All constants are materialised via `i64_to_float`.
+ */
+import * as mem from "std:runtime/mem"
+import * as arena from "std:runtime/arena"
+import * as cast from "std:runtime/cast"
+import { i64_to_float } from "std:math"
+import {
+  f0, fnan, pow10, pow10_pos, reinterpret_to_f64, reinterpret_to_i64,
+  el_fallback, eisel_lemire
+} from "std:text/str/float_core"
+import { byte_at_addr, is_ws, skip_ws_go } from "std:text/str/core"
+
+/** Lowercase a single ASCII byte. */
+let lc = fn (b: i64) -> i64 do if b >= 65 && b <= 90 then return b + 32 else return b end end
+
+/**
+f64-string scan state, stored in a 5-word scratch block:
+  w0: pos (current byte offset, absolute)
+  w1: sign (0 or 1)
+  w2: mantissa (i64, accumulated, capped at 18 digits)
+  w3: decexp (i64, the base-10 exponent adjustment so far)
+  w4: flags: bit0 = saw at least one mantissa digit; bit1 = malformed
+*/
+let st_alloc = fn () -> i64 do return arena.alloc_raw(size: 40) end
+let st_pos = fn (s: i64) -> i64 do return mem.load_i64(addr: s) end
+let st_set_pos = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s, val: v) end
+let st_sign = fn (s: i64) -> i64 do return mem.load_i64(addr: s + 8) end
+let st_set_sign = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s + 8, val: v) end
+let st_mant = fn (s: i64) -> i64 do return mem.load_i64(addr: s + 16) end
+let st_set_mant = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s + 16, val: v) end
+let st_dexp = fn (s: i64) -> i64 do return mem.load_i64(addr: s + 24) end
+let st_set_dexp = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s + 24, val: v) end
+let st_flags = fn (s: i64) -> i64 do return mem.load_i64(addr: s + 32) end
+let st_set_flags = fn (s: i64, v: i64) -> unit do return mem.store_i64(addr: s + 32, val: v) end
+let st_saw_digit = fn (s: i64) -> bool do return (st_flags(s) & 1) != 0 end
+let st_mark_digit = fn (s: i64) -> unit do return st_set_flags(s, v: st_flags(s) | 1) end
+let st_bad = fn (s: i64) -> bool do return (st_flags(s) & 2) != 0 end
+let st_mark_bad = fn (s: i64) -> unit do return st_set_flags(s, v: st_flags(s) | 2) end
+
+/**
+Accumulate one decimal digit `d` (0..9) into the mantissa, but stop growing
+it past 18 digits -- excess integer digits bump `decexp` instead. `in_frac`
+indicates we are past the '.', so accepted fraction digits lower `decexp`.
+*/
+let acc_digit = fn (s: i64, d: i64, in_frac: bool) -> unit do
+  st_mark_digit(s)
+  let m = st_mant(s)
+  // 10^18 < 2^63 < 10^19; accept up to 18 digits into the mantissa.
+  if m < 100000000000000000 then
+    st_set_mant(s, v: (m * 10) + d)
+    if in_frac then st_set_dexp(s, v: st_dexp(s) - 1) end
+    return ()
+  end
+  // mantissa full: a dropped integer digit raises decexp; a dropped fraction
+  // digit is simply ignored (its place value is already absorbed by mantissa).
+  if !in_frac then st_set_dexp(s, v: st_dexp(s) + 1) end
+  return ()
+end
+
+/** Scan the sign at `s.pos` over [base, base+len): sets st_sign, advances pos. */
+let scan_sign = fn (s: i64, base: i64, len: i64) -> unit do
+  let p = st_pos(s)
+  if p >= len then return () end
+  let c = byte_at_addr(base, i: p)
+  if c == 45 then st_set_sign(s, v: 1) end
+  if c == 45 || c == 43 then st_set_pos(s, v: p + 1) end
+  return ()
+end
+
+/** Scan a run of digits from `s.pos`, feeding each to acc_digit(in_frac). */
+let scan_digit_run = fn (s: i64, base: i64, len: i64, in_frac: bool) -> unit do
+  let p = st_pos(s)
+  if p >= len then return () end
+  let c = byte_at_addr(base, i: p)
+  if c < 48 || c > 57 then return () end
+  acc_digit(s, d: c - 48, in_frac)
+  st_set_pos(s, v: p + 1)
+  return scan_digit_run(s, base, len, in_frac)
+end
+
+/**
+Scan a plain (unsigned) decimal int from `s.pos` into `acc`; advance pos.
+Returns the value; sets `saw` via the out word at `s + 32` is too coarse,
+so callers check whether pos advanced. Caps the magnitude (exponent values
+far past +-9999 are clamped to keep this i64).
+*/
+let scan_uint = fn (s: i64, base: i64, len: i64, acc: i64) -> i64 do
+  let p = st_pos(s)
+  if p >= len then return acc end
+  let c = byte_at_addr(base, i: p)
+  if c < 48 || c > 57 then return acc end
+  st_set_pos(s, v: p + 1)
+  let nacc = if acc > 100000 then acc else (acc * 10) + (c - 48) end
+  return scan_uint(s, base, len, acc: nacc)
+end
+
+/** Skip trailing ASCII whitespace from `s.pos`. */
+let skip_trailing_ws = fn (s: i64, base: i64, len: i64) -> unit do
+  let p = st_pos(s)
+  if p >= len then return () end
+  if !is_ws(b: byte_at_addr(base, i: p)) then return () end
+  st_set_pos(s, v: p + 1)
+  return skip_trailing_ws(s, base, len)
+end
+
+/** True iff the 3 bytes at [base+p, base+p+3) are an ASCII match for "inf"/"nan". */
+let three_eq = fn (base: i64, p: i64, len: i64, a: i64, b: i64, c: i64) -> bool do
+  if p + 3 > len then return false end
+  return lc(b: byte_at_addr(base, i: p)) == a && lc(b: byte_at_addr(base, i: p + 1)) == b && lc(b: byte_at_addr(base, i: p + 2)) == c
+end
+
+/**
+Run the shared scan over [base, base+len): skips leading ws, sign, the
+mantissa (digits, optional '.', digits), the optional exponent, then trailing
+ws. Recognises "inf"/"nan" (case-insensitive) after the sign as a whole-token
+match. Returns the scratch state `s`; the caller inspects st_bad / the final
+pos (== len means well-formed). When "inf"/"nan" matched, mantissa is left 0
+and a sentinel flag is encoded by setting decexp to a huge value (inf) -- but
+to keep the contract simple, callers use `scan_special` separately.
+*/
+let run_scan = fn (base: i64, len: i64) -> i64 do
+  let s = st_alloc()
+  st_set_pos(s, v: 0)
+  st_set_sign(s, v: 0)
+  st_set_mant(s, v: 0)
+  st_set_dexp(s, v: 0)
+  st_set_flags(s, v: 0)
+  // leading ws
+  st_set_pos(s, v: skip_ws_go(base, len, i: 0))
+  scan_sign(s, base, len)
+  // int digits, optional '.', frac digits
+  scan_digit_run(s, base, len, in_frac: false)
+  let p0 = st_pos(s)
+  if p0 < len && byte_at_addr(base, i: p0) == 46 then
+    st_set_pos(s, v: p0 + 1)
+    scan_digit_run(s, base, len, in_frac: true)
+  end
+  if !st_saw_digit(s) then st_mark_bad(s) end
+  // optional exponent
+  let pe = st_pos(s)
+  if pe < len && (byte_at_addr(base, i: pe) == 101 || byte_at_addr(base, i: pe) == 69) then
+    st_set_pos(s, v: pe + 1)
+    // exponent sign
+    let pe2 = st_pos(s)
+    let esign = if pe2 < len && byte_at_addr(base, i: pe2) == 45 then 1 else 0 end
+    if pe2 < len && (byte_at_addr(base, i: pe2) == 45 || byte_at_addr(base, i: pe2) == 43) then
+      st_set_pos(s, v: pe2 + 1)
+    end
+    let pe3 = st_pos(s)
+    let eval = scan_uint(s, base, len, acc: 0)
+    if st_pos(s) == pe3 then
+      // 'e' with no digits after -> malformed
+      st_mark_bad(s)
+    else
+      let signed_e = if esign == 1 then 0 - eval else eval end
+      st_set_dexp(s, v: st_dexp(s) + signed_e)
+    end
+  end
+  skip_trailing_ws(s, base, len)
+  return s
+end
+
+/**
+Detect a leading [+-]? "inf"/"infinity"/"nan" token (case-insensitive),
+possibly surrounded by whitespace. Returns: 0 = not special, 1 = +inf,
+2 = -inf, 3 = nan. Anything trailing the token (other than ws) -> 0.
+*/
+let scan_special = fn (base: i64, len: i64) -> i64 do
+  let p0 = skip_ws_go(base, len, i: 0)
+  let sign = if p0 < len && byte_at_addr(base, i: p0) == 45 then 1 else 0 end
+  let p1 = if p0 < len && (byte_at_addr(base, i: p0) == 45 || byte_at_addr(base, i: p0) == 43) then p0 + 1 else p0 end
+  // "inf" (optionally "inity")
+  if three_eq(base, p: p1, len, a: 105, b: 110, c: 102) then
+    let after = if p1 + 8 <= len && lc(b: byte_at_addr(base, i: p1 + 3)) == 105 && lc(b: byte_at_addr(base, i: p1 + 4)) == 110 && lc(b: byte_at_addr(base, i: p1 + 5)) == 105 && lc(b: byte_at_addr(base, i: p1 + 6)) == 116 && lc(b: byte_at_addr(base, i: p1 + 7)) == 121 then p1 + 8 else p1 + 3 end
+    let tail = skip_ws_go(base, len, i: after)
+    if tail != len then return 0 end
+    return if sign == 1 then 2 else 1 end
+  end
+  // "nan"
+  if three_eq(base, p: p1, len, a: 110, b: 97, c: 110) then
+    let tail = skip_ws_go(base, len, i: p1 + 3)
+    if tail != len then return 0 end
+    return 3
+  end
+  return 0
+end
+
+/**
+Legacy fallback: i64_to_float(w) *. pow10(q). Truncates w's low bits and
+inherits pow10 rounding error, so it is only correct for inputs Eisel-Lemire
+declines (out-of-range / ambiguous halfway); kept verbatim so no value that
+previously parsed correctly through this path can change.
+*/
+let assemble_legacy = fn (s: i64) -> float do
+  let mant_f = i64_to_float(val: st_mant(s))
+  let scaled = mant_f *. pow10(n: st_dexp(s))
+  if st_sign(s) == 1 then return f0() -. scaled else return scaled end
+end
+
+/** Combine a scan-state into an f64 (Eisel-Lemire, legacy fallback on -1). */
+let assemble_f64 = fn (s: i64) -> float do
+  let bits = eisel_lemire(w0: st_mant(s), q: st_dexp(s))
+  if bits == el_fallback() then return assemble_legacy(s) end
+  let mag = reinterpret_to_f64(bits)
+  if st_sign(s) == 1 then return f0() -. mag else return mag end
+end
+
+/**
+Parse [a_s_ptr, a_s_ptr+b_s_len) as an f64. Whitespace-tolerant; accepts
+the usual `[+-]?(digits('.'digits?)?|'.'digits)([eE][+-]?digits)?` grammar
+plus case-insensitive `inf`/`infinity`/`nan`. Returns 0.0 on a malformed
+string (callers gate with `string_is_valid_f64`).
+*/
+export let string_to_f64 = fn (a_s_ptr: i32, b_s_len: i32) -> float do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  if len <= 0 then return f0() end
+  let sp = scan_special(base, len)
+  if sp == 1 then return pow10_pos(n: 400) end
+  if sp == 2 then return f0() -. pow10_pos(n: 400) end
+  if sp == 3 then return fnan() end
+  let s = run_scan(base, len)
+  if st_bad(s) || st_pos(s) != len then return f0() end
+  return assemble_f64(s)
+end
+
+/**
+True iff [a_s_ptr, a_s_ptr+b_s_len) is a syntactically valid f64 literal
+(per the grammar above, including `inf`/`nan`).
+*/
+export let string_is_valid_f64 = fn (a_s_ptr: i32, b_s_len: i32) -> bool do
+  let base = cast.i64_of(x: a_s_ptr)
+  let len = cast.i64_of(x: b_s_len)
+  if len <= 0 then return false end
+  if scan_special(base, len) != 0 then return true end
+  let s = run_scan(base, len)
+  return !st_bad(s) && st_pos(s) == len && st_saw_digit(s)
+end
+
+/**
+Return the raw 8-byte IEEE-754 bit pattern of the f64 parsed from
+[a_s_ptr, a_s_ptr+b_s_len) as an i64 (used by bytebuffer's push_f64_str_le).
+*/
+export let f64_str_bits = fn (a_s_ptr: i32, b_s_len: i32) -> i64 do
+  return reinterpret_to_i64(x: string_to_f64(a_s_ptr, b_s_len))
+end
