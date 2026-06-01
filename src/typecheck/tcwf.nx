@@ -339,26 +339,44 @@ end
 // Recursion into structural wrappers (Linear, Lazy, Borrow, Array, List,
 // Record) is performed so that e.g. [~i64] or {f: ~i64} are also rejected.
 
-/** `escapes_ref(τ)` — true iff τ contains a TyRef (~σ) at any structurally
- *  reachable position (spec §"Gravity Rule"). Used to enforce:
- *    - T-Return: ¬escapesRef(τ) on the inferred return type
- *    - T-Lambda / T-Let-PolyFn: ¬escapesRef(τ_r) on the declared ret type
- *    - D-External: ¬escapesRef(τ_r) on the external binding ret type
+/** `escapes_ref(τ, borrow_escapes)` — true iff τ contains a TyRef (~σ) at any
+ *  structurally reachable position (spec §"Gravity Rule"). When
+ *  `borrow_escapes` is true, a TyBorrow (`&σ`) is ALSO treated as an escape;
+ *  this is set at RETURN-TYPE positions only (a returned `&σ` would outlive its
+ *  owner → use-after-free, nexus-opd38 Form A). At RECORD/ADT-FIELD positions
+ *  `borrow_escapes` is false so field-stored borrows remain a permitted idiom
+ *  (e.g. CompileCtx.internal_func_map: &HashMap). Used to enforce:
+ *    - T-Return: ¬escapesRef(τ) on the inferred return type   (borrow_escapes)
+ *    - T-Lambda / T-Let-PolyFn: ¬escapesRef(τ_r) on declared ret (borrow_escapes)
+ *    - D-External / D-Cap: ¬escapesRef(τ_r) on the ret type    (borrow_escapes)
+ *    - D-Type-Record / D-Type-Sum field types: ~σ only, borrows permitted
  */
-export let escapes_ref = fn (typ: TypeExpr) -> bool do
+export let escapes_ref = fn (typ: TypeExpr, borrow_escapes: bool) -> bool do
   match typ do
     | TyRef(_) -> return true
+    // A `&σ` borrow is a non-owning view with the same stack-confined lifetime
+    // hazard as `~σ`. In RETURN-TYPE position (`borrow_escapes = true`) a bare
+    // `&σ` would outlive its owner → use-after-free, so we treat it as an
+    // escape and reject (nexus-opd38, Form A). In RECORD/ADT-FIELD position
+    // (`borrow_escapes = false`) field-stored borrows are an intentional idiom
+    // (e.g. the compiler's own CompileCtx.internal_func_map: &HashMap) with no
+    // lifetime tracking — "trust the programmer" — so we recurse into the inner
+    // type rather than treating the borrow itself as escaping (Form B is left
+    // open; it needs region/lifetime tracking).
+    | TyBorrow(inner: i) ->
+      if borrow_escapes then return true end
+      return escapes_ref(typ: i, borrow_escapes)
     | TyLinear(inner: i) | TyLazy(
       inner: i,
       require_row: _,
       throw_row: _
-    ) | TyBorrow(inner: i) -> return escapes_ref(typ: i)
-    | TyArray(elem: e) | TyList(elem: e) -> return escapes_ref(typ: e)
-    | TyRecord(fields: fs) -> return escapes_ref_named(types: fs)
+    ) -> return escapes_ref(typ: i, borrow_escapes)
+    | TyArray(elem: e) | TyList(elem: e) -> return escapes_ref(typ: e, borrow_escapes)
+    | TyRecord(fields: fs) -> return escapes_ref_named(types: fs, borrow_escapes)
     // Spec §Gravity Rule: escapesRef is structural — a ~σ reachable through a
     // named type's TYPE ARGUMENT (e.g. `Box<ref(i64)>`) escapes just as a ref
     // in a record/variant field does. Recurse into the direct args.
-    | TyUserDefined(name: _, args: type_args) -> return escapes_ref_args(args: type_args)
+    | TyUserDefined(name: _, args: type_args) -> return escapes_ref_args(args: type_args, borrow_escapes)
     // Arrow: do not recurse — a fn-type in return position is not itself a
     // ref escape; the arrow's own ret-type is screened when that lambda is
     // registered (T-Lambda / T-Let-PolyFn enforcement).
@@ -366,21 +384,21 @@ export let escapes_ref = fn (typ: TypeExpr) -> bool do
   end
 end
 
-let escapes_ref_args = fn (args: [ TypeExpr ]) -> bool do
+let escapes_ref_args = fn (args: [ TypeExpr ], borrow_escapes: bool) -> bool do
   match args do
     | [] -> return false
     | a :: rest ->
-      if escapes_ref(typ: a) then return true end
-      return escapes_ref_args(args: rest)
+      if escapes_ref(typ: a, borrow_escapes) then return true end
+      return escapes_ref_args(args: rest, borrow_escapes)
   end
 end
 
-let escapes_ref_named = fn (types: [ NamedType ]) -> bool do
+let escapes_ref_named = fn (types: [ NamedType ], borrow_escapes: bool) -> bool do
   match types do
     | [] -> return false
     | NamedType(name: _, typ: t) :: rest ->
-      if escapes_ref(typ: t) then return true end
-      return escapes_ref_named(types: rest)
+      if escapes_ref(typ: t, borrow_escapes) then return true end
+      return escapes_ref_named(types: rest, borrow_escapes)
   end
 end
 
@@ -391,9 +409,10 @@ end
 export let enforce_no_escapes_ref = fn (
   typ: TypeExpr,
   context: string,
-  span: Span
+  span: Span,
+  borrow_escapes: bool
 ) -> unit throws { TypeError } do
-  if escapes_ref(typ) then
+  if escapes_ref(typ, borrow_escapes) then
     throw RefEscapes(context, span)
   end
 end
@@ -840,7 +859,7 @@ let walk_funcs = fn (
       wf_throw(row: tw, vidx_, groups, span: sp, type_params: tps)
       // Gravity rule: ¬escapesRef(τ_r) on the declared return type.
       // Pre-DCE so even unused functions with `ref(T)` return types are rejected.
-      enforce_no_escapes_ref(typ: ret, context: "return type of '" ++ fn_name ++ "'", span: sp)
+      enforce_no_escapes_ref(typ: ret, context: "return type of '" ++ fn_name ++ "'", span: sp, borrow_escapes: true)
       // wfRef on parameter types: pre-DCE so even unused functions with ref(%T) params are rejected.
       let fn_param_nts = hir_params_to_named_types_tcwf(params: fn_params)
       enforce_wf_ref_params(params: fn_param_nts, span: sp, tdefs)
@@ -992,7 +1011,8 @@ let walk_cap_methods_wf_ref = fn (
       enforce_no_escapes_ref(
         typ: mret,
         context: "return type of cap method '" ++ mname ++ "'",
-        span: sp
+        span: sp,
+        borrow_escapes: true
       )
       // wfRef on D-Cap method parameter types (spec §wfRef table, D-Cap).
       let method_param_nts = hir_params_to_named_types_tcwf(params: mparams)
@@ -1070,7 +1090,9 @@ let walk_variant_fields = fn (
         | _ -> ()
       end
       // escapesRef: reject ref(σ) at any structurally reachable position.
-      enforce_no_escapes_ref(typ: t, context: ctx, span: Span(offset: 0, line: 0, col: 0))
+      // Field-stored `&σ` borrows are permitted (intentional idiom, no lifetime
+      // tracking) → borrow_escapes: false (nexus-opd38, Form B left open).
+      enforce_no_escapes_ref(typ: t, context: ctx, span: Span(offset: 0, line: 0, col: 0), borrow_escapes: false)
       // Spec §Linearity (type-formation): a variant field that names a generic
       // type instantiated at a linear type-arg (e.g. `Pair<%bb, _>`) violates
       // the persistent-container rule. Concrete user enums whose body
@@ -1153,7 +1175,9 @@ let walk_record_fields = fn (
         | _ -> ()
       end
       // escapesRef: reject ref(σ) at any structurally reachable position.
-      enforce_no_escapes_ref(typ: t, context: ctx, span: Span(offset: 0, line: 0, col: 0))
+      // Field-stored `&σ` borrows are permitted (intentional idiom, no lifetime
+      // tracking) → borrow_escapes: false (nexus-opd38, Form B left open).
+      enforce_no_escapes_ref(typ: t, context: ctx, span: Span(offset: 0, line: 0, col: 0), borrow_escapes: false)
       // Spec §Linearity (type-formation): no generic-of-linear in record-typedef fields.
       enforce_no_linear_type_args(
         typ: t,
