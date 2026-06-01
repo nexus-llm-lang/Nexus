@@ -313,7 +313,7 @@ let lower_stmt = fn (
       // MirStmtInjectResume statement that codegen will expand to
       // ref.func + cont.new + resume + on-clauses.
       if any_handler_has_kont(handler_names: hs, bindings: ah) then
-        let LiftInjectResult(ctx: ctx2, body_fn: bfn) = lift_inject_body(
+        let LiftInjectResult(ctx: ctx2, body_fn: bfn, ret_type: inj_rt) = lift_inject_body(
           stmts: b,
           span,
           ctx: new_ctx
@@ -337,7 +337,7 @@ let lower_stmt = fn (
                                 all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
           return MirStmtsResult(
             ctx: restored,
-            stmts: [ MirStmtInjectResume(body_fn: bfn, handler_arm_fns: arm_fns, handler_arm_tags: arm_tags) ]
+            stmts: [ MirStmtInjectResume(body_fn: bfn, handler_arm_fns: arm_fns, handler_arm_tags: arm_tags, ret_type: inj_rt) ]
           )
       end
       // No with-kont arms: existing behaviour — inline body under injected scope.
@@ -552,7 +552,7 @@ let rewrite_returns_in_stmt = fn (
       // No returns can appear inside target/value expression trees in the
       // surface language; pass through.
       return [ MirStmtAssign(target: tgt, value: v) ]
-    | MirStmtInjectResume(body_fn: _, handler_arm_fns: _, handler_arm_tags: _) ->
+    | MirStmtInjectResume(body_fn: _, handler_arm_fns: _, handler_arm_tags: _, ret_type: _) ->
       // body_fn is a separately-lifted MirFunction; its returns are not ours.
       return [ stmt ]
   end
@@ -699,7 +699,44 @@ let runtime_dispatch_handlers = fn (
   end
 end
 
-type LiftInjectResult = LiftInjectResult(ctx: MirCtx, body_fn: string)
+type LiftInjectResult = LiftInjectResult(ctx: MirCtx, body_fn: string, ret_type: TypeExpr)
+
+/** Classify the trailing-value type of a lifted inject body. The inject site
+ *  yields whatever value the body's last bare expression produces; codegen
+ *  carries that value out of the `() -> ()` body continuation out-of-band via
+ *  the ss_inject_value global. Every non-unit value is i64-carried in this
+ *  backend (records/ctors/strings are heap handles, bool/i64 are scalars), so
+ *  the channel type collapses to TyI64 vs TyUnit. A value-less body (trailing
+ *  statement is a let/assign/return/try, or a unit-typed trailing expression)
+ *  keeps TyUnit and the inject site yields unit (nexus-h4v70). */
+let mir_inject_result_type = fn (stmts: [ MirStmt ]) -> TypeExpr do
+  match list.reverse(xs: stmts) do
+    | [] -> return TyUnit
+    | last :: _ ->
+      match last do
+        | MirStmtExpr(expr: e) ->
+          match e do
+            | MirLiteral(lit: LitUnit) -> return TyUnit
+            | MirCall(func: _, args: _, ret_type: rt) -> return mir_value_channel(rt)
+            | MirCallClosure(closure: _, args: _, ret_type: rt) -> return mir_value_channel(rt)
+            | MirSuspend(tag_name: _, payload: _, ret_type: rt) -> return mir_value_channel(rt)
+            | MirResume(cont_var: _, value: _, ret_type: rt) -> return mir_value_channel(rt)
+            | MirWhile(cond: _, body: _) -> return TyUnit
+            | MirBlock(stmts: _) -> return TyUnit
+            | _ -> return TyI64
+          end
+        | _ -> return TyUnit
+      end
+  end
+end
+
+/** Collapse a non-unit type to the i64 value channel; unit stays unit. */
+let mir_value_channel = fn (rt: TypeExpr) -> TypeExpr do
+  match rt do
+    | TyUnit -> return TyUnit
+    | _ -> return TyI64
+  end
+end
 
 /** Lift an inject body to a fresh top-level MirFunction. Naming convention:
  *  `__inject_<n>` shares the closure_counter so codegen's table-registration
@@ -741,13 +778,20 @@ let lift_inject_body = fn (
       value_binding_names: vbns2,
       thunk_param_names: tpn2
     ) = ctx_body
+    // The body continuation must keep the single program cont type () -> ()
+    // (nexus-oq3tj invariant), so the lifted function stays unit-returning at
+    // the wasm signature level. The body's trailing VALUE is delivered to the
+    // inject site out-of-band via the ss_inject_value global; result_ty records
+    // whether there is such a value (TyI64) or none (TyUnit) so the InjectResume
+    // expression yields the right thing (nexus-h4v70).
+    let result_ty = mir_inject_result_type(stmts: mir_body)
     let lifted_fn = MirFunction(name: lifted_name, params: [], ret_type: TyUnit,
                                 body: mir_body, span)
     let new_lf = append_mir_funcs(a: lf2, b: [ lifted_fn ])
     let ctx_final = MirCtx(scope: sc2, cap_layouts: pl2, handler_cap_names: hpn2,
                            all_funcs: af2, all_handlers: ah2, all_exts: ae2,
                            closure_counter: n2, lifted_funcs: new_lf, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
-    return LiftInjectResult(ctx: ctx_final, body_fn: lifted_name)
+    return LiftInjectResult(ctx: ctx_final, body_fn: lifted_name, ret_type: result_ty)
 end
 
 let desugar_for = fn (

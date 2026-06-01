@@ -745,13 +745,23 @@ let lower_stmt_inner = fn (
     | MirStmtTry(body, catch_param: cp, catch_body: cb) ->
       return lower_try_stmt(body, catch_param: cp, catch_body: cb, ret_type, ctx)
 
-    | MirStmtInjectResume(body_fn: bfn, handler_arm_fns: arms, handler_arm_tags: arm_tags) ->
+    | MirStmtInjectResume(body_fn: bfn, handler_arm_fns: arms, handler_arm_tags: arm_tags, ret_type: inj_rt) ->
       // Lower the inject resume to a let-bound LirExprInjectResume so the
-      // existing LirStmtLet → emit_stmt pipeline picks it up. Result type is
-      // unit — codegen handles drop accordingly.
+      // existing LirStmtLet → emit_stmt pipeline picks it up. The body's
+      // trailing value (when the inject is value-producing, inj_rt non-unit)
+      // is delivered to this site out-of-band via the ss_inject_value global;
+      // codegen leaves it on the stack so the temp binds the real value and a
+      // trailing inject can become the enclosing function's return value
+      // (nexus-h4v70). For unit bodies codegen drops, as before.
       let BindResult(ctx: ctx2, atom: _) = bind_expr_to_temp(ctx,
-        expr: LirExprInjectResume(body_fn: bfn, arm_fns: arms, arm_tags, typ: TyUnit),
-        typ: TyUnit)
+        expr: LirExprInjectResume(body_fn: bfn, arm_fns: arms, arm_tags, typ: inj_rt),
+        typ: inj_rt)
+      // Statement-position lowering never surfaces the value (it would
+      // short-circuit and drop following statements). When the inject is the
+      // enclosing function's trailing statement, lir_lower_stmts re-lowers it
+      // through the dedicated last-statement case below so the value is
+      // captured as the function's return. Mid-function injects discard the
+      // value (unit context), matching the pre-h4v70 behaviour.
       return LowerStmtResult(ctx: ctx2, ret: None)
   end
 end
@@ -1063,6 +1073,19 @@ export let lir_lower_stmts = fn (
     | [ s ] ->
       // Last statement — capture implicit return value
       match s do
+        | MirStmtInjectResume(body_fn: bfn, handler_arm_fns: arms, handler_arm_tags: arm_tags, ret_type: inj_rt) ->
+          // Trailing inject: bind the resume value to a temp and surface it as
+          // the function's return value when the body is value-producing. The
+          // value arrives on the wasm stack from the dispatcher (codegen reads
+          // ss_inject_value out-of-band). Unit bodies yield no value, as before
+          // (nexus-h4v70).
+          let BindResult(ctx: ctx2, atom: a) = bind_expr_to_temp(ctx,
+            expr: LirExprInjectResume(body_fn: bfn, arm_fns: arms, arm_tags, typ: inj_rt),
+            typ: inj_rt)
+          match inj_rt do
+            | TyUnit -> return LowerStmtsResult(ctx: ctx2, ret: None)
+            | _ -> return LowerStmtsResult(ctx: ctx2, ret: Some(val: a))
+          end
         | MirStmtExpr(expr: e) ->
           match e do
             | MirIf(_) | MirMatch(_) ->

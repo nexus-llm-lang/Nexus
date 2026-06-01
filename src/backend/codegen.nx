@@ -104,6 +104,7 @@ import {
 import { binary_operand_type, emit_binary } from "src/backend/codegen/emit/binop.nx"
 import {
   is_closure_lift,
+  is_inject_lift,
   filter_intrinsic_externals,
   filter_externals_p3
 } from "src/backend/codegen/intrinsics.nx"
@@ -445,8 +446,8 @@ let emit_expr = fn (
       let %buf = bb.push_uleb128(%buf, val: fref_idx)
       let %buf = bb.push_byte(%buf, byte: wdefs.op_cont_new)
       return bb.push_uleb128(%buf, val: cont_idx)
-    | LirExprInjectResume(body_fn: bfn, arm_fns: afs, arm_tags: ats, typ: _) ->
-      return emit_inject_resume_multi(%buf, body_fn: bfn, arm_fns: afs, arm_tags: ats, ctx)
+    | LirExprInjectResume(body_fn: bfn, arm_fns: afs, arm_tags: ats, typ: t) ->
+      return emit_inject_resume_multi(%buf, body_fn: bfn, arm_fns: afs, arm_tags: ats, result_typ: t, ctx)
   end
 end
 
@@ -658,6 +659,24 @@ let emit_stmts = fn (
   end
 end
 
+/** Store a lifted inject body's trailing value into the ss_inject_value global
+ *  (coerced to the i64 value channel). A unit `r` stores nothing — the inject
+ *  site yields unit in that case. The body keeps a `() -> ()` signature, so
+ *  this runs on the normal-completion path before the (unit) return; the
+ *  dispatcher reads the global back after the resume frame exits (nexus-h4v70). */
+let emit_inject_value_store = fn (
+  body: %ByteBuffer,
+  r: LirAtom,
+  ctx: CodegenCtx
+) -> %ByteBuffer throws { CodegenError } do
+  let from_type = wdefs.atom_type(atom: r)
+  if wdefs.is_unit(typ: from_type) then return %body end
+  let %body = emit_atom(atom: r, buf: %body, ctx)
+  let %body = emit_coercion(from_type, to_type: TyI64, buf: %body)
+  let %body = bb.push_byte(buf: %body, byte: op_global_set)
+  return bb.push_uleb128(buf: %body, val: wdefs.ss_inject_value_global_idx)
+end
+
 let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx,
                                   func_id: i64, coverage_enabled: bool) -> %ByteBuffer throws { CodegenError } do
   let LirFunction(name: fname, params: ps, ret_type: raw_rt, body: b, ret: r, span: _) = func
@@ -707,6 +726,17 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx,
 
   let %body = if is_tcmc then
     bb.push_byte(buf: %body, byte: op_end)
+  else %body end
+
+  // Lifted inject bodies (`__inject_N`) keep the `() -> ()` continuation
+  // signature (nexus-oq3tj single-cont-type invariant), so their trailing
+  // value cannot leave through the function result. Stash it into the
+  // ss_inject_value global instead; the inject dispatcher reads it back after
+  // the resume frame exits and leaves it on the stack as the inject
+  // expression's value (nexus-h4v70). Value-less bodies (ret is unit) store
+  // nothing.
+  let %body = if is_inject_lift(name: fname) then
+    emit_inject_value_store(%body, r, ctx)
   else %body end
 
   let %body = emit_return_value(%body, rt, r, ctx)
@@ -996,7 +1026,7 @@ export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_d
       // memo_globals_base is the index of the FIRST memo global in the main
       // module's local global namespace. wmerge later applies a glo_off to
       // these instructions when concatenating with the dep stdlib.
-      let memo_globals_base = 3 + (if has_ss then 4 else 0 end)
+      let memo_globals_base = 3 + (if has_ss then 5 else 0 end)
 
       // Global section — needed for bump allocator, cabi_realloc, arena, string
       // literals, or any memo-cache target. G1 (str_base) is always needed
