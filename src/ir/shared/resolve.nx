@@ -7,7 +7,7 @@
  * - register_top_level: populate symbol table from top-level definitions
  * - extract_imports: gather all import definitions
  */
-import { SpannedTopLevel, GlobalLet, Cap, ImportDef, ImportItem } from "src/syntax/ast.nx"
+import { SpannedTopLevel, GlobalLet, Cap, ImportDef, ImportItem, EnumDef, VariantDef } from "src/syntax/ast.nx"
 import { RenameEntry }, * as symtab from "src/ir/shared/symtab.nx"
 import { ImportNotExported } from "src/ir/shared/errors.nx"
 import * as str from "std:str"
@@ -55,6 +55,101 @@ let find_selected = fn (name: string, items: [ ImportItem ]) -> Option<string> d
   end
 end
 
+// nexus-987xh: route constructors through the import-binding rename map so a
+// bare constructor reference resolves to the ctor of the enum that is IN SCOPE
+// (the module's own enums via the internal/self view, or selectively/wildcard
+// imported enums via the importer view) rather than first/last-wins across the
+// flat whole-program variant index.
+//
+// To stay surgical we canonicalise ONLY constructors whose bare name COLLIDES
+// across two or more distinct enums in the whole program (the `colliding` set,
+// computed once in build_hir). Non-colliding ctors — the overwhelming majority,
+// including every builtin and every re-exported ctor like argparse's
+// SubcommandHit — keep their bare name everywhere (rename is identity on miss),
+// so legacy whole-program bare visibility and re-export chains are unchanged. A
+// colliding ctor maps its in-scope name to the defining module's canonical ctor
+// name `source#Variant`; the stored EnumDef variants are renamed identically
+// (src/ir/hir/build/defs.nx, via the same rename map) so the VariantIndex,
+// typecheck `find_variant`, and the runtime tag (a pure function of the name
+// string) all agree.
+
+/** nexus-987xh: collect the bare names of every enum constructor declared in a
+ *  single file's top-level defs (one entry per variant, so a ctor that recurs
+ *  across two enums contributes two entries — the basis for whole-program
+ *  collision detection in imports.nx). */
+export let collect_enum_ctor_names_in_defs = fn (defs: [ SpannedTopLevel ]) -> [ string ] do
+  return collect_enum_ctor_names_go(defs, acc: [])
+end
+
+let collect_enum_ctor_names_go = fn (defs: [ SpannedTopLevel ], acc: [ string ]) -> [ string ] do
+  match defs do
+    | [] -> return acc
+    | SpannedTopLevel(
+      node: TLEnum(def: EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs)),
+      span: _
+    ) :: rest ->
+      return collect_enum_ctor_names_go(defs: rest, acc: collect_variant_names(variants: vs, acc))
+    | _ :: rest ->
+      return collect_enum_ctor_names_go(defs: rest, acc)
+  end
+end
+
+let str_member = fn (xs: [ string ], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == s then return true end
+      return str_member(xs: rest, s)
+  end
+end
+
+/** Append a `bare_variant -> canonical_name(source, variant)` rename entry for
+ *  each COLLIDING variant of an enum. Used for a module's own (internal/self)
+ *  enums and for selectively-imported enums, where ctors are referenced bare. */
+let add_variant_entries_bare = fn (
+  variants: [ VariantDef ],
+  source: string,
+  colliding: [ string ],
+  acc: [ RenameEntry ]
+) -> [ RenameEntry ] do
+  match variants do
+    | [] -> return acc
+    | VariantDef(name: vn, fields: _) :: rest ->
+      let acc2 = if str_member(xs: colliding, s: vn) then
+          symtab.rename_add(
+            entries: acc,
+            original: vn,
+            qualified: rdr.canonical_name(source_path: source, name: vn)
+          )
+        else acc end
+      return add_variant_entries_bare(variants: rest, source, colliding, acc: acc2)
+  end
+end
+
+/** Append an `alias.Variant -> canonical_name(source, variant)` rename entry for
+ *  each COLLIDING variant of an enum. Used for wildcard imports where ctors are
+ *  referenced qualified (`m.Ctor`). */
+let add_variant_entries_qualified = fn (
+  variants: [ VariantDef ],
+  source: string,
+  alias: string,
+  colliding: [ string ],
+  acc: [ RenameEntry ]
+) -> [ RenameEntry ] do
+  match variants do
+    | [] -> return acc
+    | VariantDef(name: vn, fields: _) :: rest ->
+      let acc2 = if str_member(xs: colliding, s: vn) then
+          symtab.rename_add(
+            entries: acc,
+            original: alias ++ "." ++ vn,
+            qualified: rdr.canonical_name(source_path: source, name: vn)
+          )
+        else acc end
+      return add_variant_entries_qualified(variants: rest, source, alias, colliding, acc: acc2)
+  end
+end
+
 /** Build internal-view rename entries for an imported module: each top-level
  *  def gets mapped to its canonical name (source#name). Produced once per
  *  import and used for the imported module's own internal calls.
@@ -63,6 +158,7 @@ end
 let build_internal_rename_go = fn (
   defs: [ SpannedTopLevel ],
   source: string,
+  colliding: [ string ],
   acc: [ RenameEntry ]
 ) -> [ RenameEntry ] do
   match defs do
@@ -77,9 +173,17 @@ let build_internal_rename_go = fn (
         original: name,
         qualified: rdr.canonical_name(source_path: source, name)
       )
-      return build_internal_rename_go(defs: rest, source, acc: acc2)
+      return build_internal_rename_go(defs: rest, source, colliding, acc: acc2)
+    | SpannedTopLevel(
+      node: TLEnum(def: EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs)),
+      span: _
+    ) :: rest ->
+      // nexus-987xh: a module's own colliding enum ctors resolve (bare) to its
+      // canonical ctor name within its own bodies.
+      let acc2 = add_variant_entries_bare(variants: vs, source, colliding, acc)
+      return build_internal_rename_go(defs: rest, source, colliding, acc: acc2)
     | _ :: rest ->
-      return build_internal_rename_go(defs: rest, source, acc)
+      return build_internal_rename_go(defs: rest, source, colliding, acc)
   end
 end
 
@@ -90,7 +194,8 @@ end
 export let build_rename_map = fn (
   imported_defs: [ SpannedTopLevel ],
   import_def: ImportDef,
-  import_depth: i64
+  import_depth: i64,
+  colliding: [ string ]
 ) -> [ RenameEntry ] do
   let ImportDef(path, alias: _, items: _, is_external: is_ext) = import_def
   if is_ext then return []
@@ -98,6 +203,7 @@ export let build_rename_map = fn (
         return build_internal_rename_go(
           defs: imported_defs,
           source: pkg.resolve_import_path(path),
+          colliding,
           acc: []
         )
       end
@@ -111,6 +217,7 @@ let build_wildcard_importer_go = fn (
   defs: [ SpannedTopLevel ],
   source: string,
   alias: string,
+  colliding: [ string ],
   acc: [ RenameEntry ]
 ) -> [ RenameEntry ] do
   match defs do
@@ -129,9 +236,18 @@ let build_wildcard_importer_go = fn (
         original: key,
         qualified: rdr.canonical_name(source_path: source, name)
       )
-      return build_wildcard_importer_go(defs: rest, source, alias, acc: acc2)
+      return build_wildcard_importer_go(defs: rest, source, alias, colliding, acc: acc2)
+    | SpannedTopLevel(
+      node: TLEnum(def: EnumDef(name: _, is_public: true, is_opaque: opq, type_params: _, variants: vs)),
+      span: _
+    ) :: rest ->
+      // nexus-987xh: wildcard `import * as m` exposes a public enum's colliding
+      // ctors as `m.Ctor`. Opaque enums withhold their ctors (D-Type-Sum-Opaque),
+      // so emit no qualified ctor entries for them.
+      let acc2 = if opq then acc else add_variant_entries_qualified(variants: vs, source, alias, colliding, acc) end
+      return build_wildcard_importer_go(defs: rest, source, alias, colliding, acc: acc2)
     | _ :: rest ->
-      return build_wildcard_importer_go(defs: rest, source, alias, acc)
+      return build_wildcard_importer_go(defs: rest, source, alias, colliding, acc)
   end
 end
 
@@ -156,8 +272,23 @@ let collect_exported_names_go = fn (defs: [ SpannedTopLevel ], acc: [ string ]) 
       span: _
     ) :: rest ->
       return collect_exported_names_go(defs: rest, acc: name :: acc)
+    | SpannedTopLevel(
+      node: TLEnum(def: EnumDef(name: _, is_public: true, is_opaque: false, type_params: _, variants: vs)),
+      span: _
+    ) :: rest ->
+      // nexus-987xh: public enum ctors are importable, so include them as
+      // "did you mean?" candidates for selective imports.
+      return collect_exported_names_go(defs: rest, acc: collect_variant_names(variants: vs, acc))
     | _ :: rest ->
       return collect_exported_names_go(defs: rest, acc)
+  end
+end
+
+let collect_variant_names = fn (variants: [ VariantDef ], acc: [ string ]) -> [ string ] do
+  match variants do
+    | [] -> return acc
+    | VariantDef(name: vn, fields: _) :: rest ->
+      return collect_variant_names(variants: rest, acc: vn :: acc)
   end
 end
 
@@ -169,6 +300,7 @@ let build_selective_importer_go = fn (
   defs: [ SpannedTopLevel ],
   items: [ ImportItem ],
   source: string,
+  colliding: [ string ],
   acc: [ RenameEntry ],
   exported: [ string ]
 ) -> [ RenameEntry ] throws { ImportNotExported } do
@@ -186,13 +318,13 @@ let build_selective_importer_go = fn (
               original: visible,
               qualified: rdr.canonical_name(source_path: source, name)
             )
-            return build_selective_importer_go(defs: rest, items, source, acc: acc2, exported)
+            return build_selective_importer_go(defs: rest, items, source, colliding, acc: acc2, exported)
           else
             let sugs = suggest_names(typo: name, candidates: exported)
             throw ImportNotExported(name, module_path: source, suggestions: sugs)
           end
         | None ->
-          return build_selective_importer_go(defs: rest, items, source, acc, exported)
+          return build_selective_importer_go(defs: rest, items, source, colliding, acc, exported)
       end
     | SpannedTopLevel(node: TLCap(def: Cap(name, is_public, functions: _)), span: _) :: rest ->
       match find_selected(name, items) do
@@ -203,16 +335,70 @@ let build_selective_importer_go = fn (
               original: visible,
               qualified: rdr.canonical_name(source_path: source, name)
             )
-            return build_selective_importer_go(defs: rest, items, source, acc: acc2, exported)
+            return build_selective_importer_go(defs: rest, items, source, colliding, acc: acc2, exported)
           else
             let sugs = suggest_names(typo: name, candidates: exported)
             throw ImportNotExported(name, module_path: source, suggestions: sugs)
           end
         | None ->
-          return build_selective_importer_go(defs: rest, items, source, acc, exported)
+          return build_selective_importer_go(defs: rest, items, source, colliding, acc, exported)
       end
+    | SpannedTopLevel(
+      node: TLEnum(def: EnumDef(name: _, is_public: enum_pub, is_opaque: opq, type_params: _, variants: vs)),
+      span: _
+    ) :: rest ->
+      // nexus-987xh: a selectively-imported COLLIDING ctor (`import { MkV }`)
+      // binds its visible name to the defining module's canonical ctor name.
+      // Only public, non-opaque enums expose ctors; otherwise the name may be a
+      // legal type-only import (see add_selected_variant_entries).
+      let acc2 = add_selected_variant_entries(
+        variants: vs,
+        items,
+        source,
+        enum_visible: enum_pub && (! opq),
+        colliding,
+        acc
+      )
+      return build_selective_importer_go(defs: rest, items, source, colliding, acc: acc2, exported)
     | _ :: rest ->
-      return build_selective_importer_go(defs: rest, items, source, acc, exported)
+      return build_selective_importer_go(defs: rest, items, source, colliding, acc, exported)
+  end
+end
+
+/** Per-variant selective-import binding (nexus-987xh). For each enum variant
+ *  named in `items`, bind its visible name to `canonical(source, variant)` — but
+ *  only when the constructor is actually exposed (`enum_visible`: the enum is
+ *  public and not opaque). When the enum is non-public or opaque the
+ *  constructor is withheld, so we add no ctor entry and DO NOT raise: the same
+ *  selective name may legally be importing the *type* (an opaque type's name is
+ *  exported even though its ctor is hidden; type names resolve via whole-program
+ *  typedef visibility, not this rename map). Constructor-visibility for
+ *  withheld enums is enforced downstream at typecheck (register_enum_constructors
+ *  keys off visible_enum_names), preserving the prior layering. */
+let add_selected_variant_entries = fn (
+  variants: [ VariantDef ],
+  items: [ ImportItem ],
+  source: string,
+  enum_visible: bool,
+  colliding: [ string ],
+  acc: [ RenameEntry ]
+) -> [ RenameEntry ] do
+  if ! enum_visible then return acc end
+  match variants do
+    | [] -> return acc
+    | VariantDef(name: vn, fields: _) :: rest ->
+      let acc2 = match find_selected(name: vn, items) do
+          | Some(val: visible) ->
+            if str_member(xs: colliding, s: vn) then
+              symtab.rename_add(
+                entries: acc,
+                original: visible,
+                qualified: rdr.canonical_name(source_path: source, name: vn)
+              )
+            else acc end
+          | None -> acc
+        end
+      return add_selected_variant_entries(variants: rest, items, source, enum_visible, colliding, acc: acc2)
   end
 end
 
@@ -223,7 +409,8 @@ end
  */
 export let build_importer_entries = fn (
   imported_defs: [ SpannedTopLevel ],
-  import_def: ImportDef
+  import_def: ImportDef,
+  colliding: [ string ]
 ) -> [ RenameEntry ] throws { ImportNotExported } do
   let ImportDef(path, alias: alias_opt, items, is_external: is_ext) = import_def
   if is_ext then return []
@@ -235,13 +422,14 @@ export let build_importer_entries = fn (
               | Some(val: a) -> a
               | None -> default_alias(path)
             end
-            return build_wildcard_importer_go(defs: imported_defs, source: physical, alias, acc: [])
+            return build_wildcard_importer_go(defs: imported_defs, source: physical, alias, colliding, acc: [])
           | _ :: _ ->
             let exported = collect_exported_names(defs: imported_defs)
             let selective = build_selective_importer_go(
               defs: imported_defs,
               items,
               source: physical,
+              colliding,
               acc: [],
               exported
             )
@@ -251,6 +439,7 @@ export let build_importer_entries = fn (
                   defs: imported_defs,
                   source: physical,
                   alias,
+                  colliding,
                   acc: selective
                 )
               | None -> return selective
@@ -307,6 +496,7 @@ end
 export let build_entry_self_entries = fn (
   defs: [ SpannedTopLevel ],
   source: string,
+  colliding: [ string ],
   acc: [ RenameEntry ]
 ) -> [ RenameEntry ] do
   match defs do
@@ -317,22 +507,32 @@ export let build_entry_self_entries = fn (
     ) :: rest ->
       if name == "main" then
         let acc2 = symtab.rename_add(entries: acc, original: name, qualified: "main")
-        return build_entry_self_entries(defs: rest, source, acc: acc2)
+        return build_entry_self_entries(defs: rest, source, colliding, acc: acc2)
       end
       let acc2 = symtab.rename_add(
         entries: acc,
         original: name,
         qualified: rdr.canonical_name(source_path: source, name)
       )
-      return build_entry_self_entries(defs: rest, source, acc: acc2)
+      return build_entry_self_entries(defs: rest, source, colliding, acc: acc2)
     | SpannedTopLevel(node: TLCap(def: Cap(name, is_public: _, functions: _)), span: _) :: rest ->
       let acc2 = symtab.rename_add(
         entries: acc,
         original: name,
         qualified: rdr.canonical_name(source_path: source, name)
       )
-      return build_entry_self_entries(defs: rest, source, acc: acc2)
-    | _ :: rest -> return build_entry_self_entries(defs: rest, source, acc)
+      return build_entry_self_entries(defs: rest, source, colliding, acc: acc2)
+    | SpannedTopLevel(
+      node: TLEnum(def: EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs)),
+      span: _
+    ) :: rest ->
+      // nexus-987xh: the entry file's own colliding enum ctors resolve (bare) to
+      // their canonical ctor name, so they win over any same-named imported ctor
+      // unless the user also selectively imported the colliding name (in which
+      // case check_import_collisions diagnoses the genuine ambiguity).
+      let acc2 = add_variant_entries_bare(variants: vs, source, colliding, acc)
+      return build_entry_self_entries(defs: rest, source, colliding, acc: acc2)
+    | _ :: rest -> return build_entry_self_entries(defs: rest, source, colliding, acc)
   end
 end
 

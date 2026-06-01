@@ -15,6 +15,7 @@ import { Program, SpannedTopLevel, ImportDef } from "src/syntax/ast.nx"
 import { HirError, ParseError }, * as err from "src/diagnostics/error.nx"
 import { CyclicImport, InImport, DuplicateImport } from "src/ir/shared/errors.nx"
 import { RenameEntry } from "src/ir/shared/symtab.nx"
+import * as rdr from "src/ir/shared/rdrname.nx"
 import * as resolve from "src/ir/shared/resolve.nx"
 import { HirAccum } from "src/ir/hir/types.nx"
 import { process_defs } from "src/ir/hir/build/defs.nx"
@@ -25,6 +26,7 @@ import { Fs, FileNotFound } from "std:fs"
 import { Console } from "std:stdio"
 import * as str from "std:str"
 import { Option, Some, None } from "std:option"
+import { StringMap, Found, Missing }, * as smap from "std:stringmap"
 
 /** Public type CacheEntry. */
 export type CacheEntry = CacheEntry(
@@ -128,12 +130,23 @@ end
 // sibling accumulation is the caller's job.
 let load_imported_file = fn (imp: ImportDef, path: string, accum: HirAccum,
     import_stack: [ string ], visited: [ string ], cache: [ CacheEntry ],
-    depth: i64, verbose: bool) -> ImportResult require { Console, Fs } throws { HirError } do
+    colliding: CollisionInfo, depth: i64, verbose: bool) -> ImportResult require { Console, Fs } throws { HirError } do
   let physical = pkg.resolve_import_path(path)
+  let CollisionInfo(names: col_names, default_entries: col_defaults) = colliding
   try
-    let tokens = lexer.tokenize(src: Fs.read_to_string(path: physical))
-    let imported_defs = get_defs(prog: parser.parse(tokens))
-    let entries = resolve.build_rename_map(imported_defs, import_def: imp, import_depth: depth)
+    // nexus-987xh: reuse the parsed defs from the pre-built parse cache when
+    // present (collision detection seeds `cache` with every file's parse), so
+    // each file is parsed exactly once across the whole compile — no second
+    // whole-import-graph re-parse (the old pre-scan doubled peak RSS over the
+    // 4GB wasm ceiling). On a miss (e.g. LSP buffer path that did not seed the
+    // cache) fall back to reading+parsing here.
+    let imported_defs = match cache_lookup(cache, path: physical) do
+      | CacheHit(defs: cached, entries: _) -> cached
+      | CacheMiss ->
+        let tokens = lexer.tokenize(src: Fs.read_to_string(path: physical))
+        get_defs(prog: parser.parse(tokens))
+    end
+    let entries = resolve.build_rename_map(imported_defs, import_def: imp, import_depth: depth, colliding: col_names)
     let sub_imports = resolve.extract_imports(defs: imported_defs)
     let new_stack = physical :: import_stack
     let new_cache = CacheEntry(path: physical, defs: imported_defs, entries) :: cache
@@ -144,6 +157,7 @@ let load_imported_file = fn (imp: ImportDef, path: string, accum: HirAccum,
       visited: physical :: visited,
       cache: new_cache,
       caller_entries: [],
+      colliding,
       depth: depth + 1,
       verbose
     )
@@ -153,7 +167,10 @@ let load_imported_file = fn (imp: ImportDef, path: string, accum: HirAccum,
       cache: cache2,
       caller_entries: sub_caller
     ) = sub_result
-    let entries_for_imported = append_entries(xs: sub_caller, ys: entries)
+    // nexus-987xh: self/import ctor bindings win; the default fallback is appended
+    // LAST so an unimported bare colliding ctor still resolves to its default
+    // canonical (and the enum's own storage matches via its self-rename).
+    let entries_for_imported = append_entries(xs: append_entries(xs: sub_caller, ys: entries), ys: col_defaults)
       let accum3 = process_defs(
         defs: imported_defs,
         entries: entries_for_imported,
@@ -161,7 +178,7 @@ let load_imported_file = fn (imp: ImportDef, path: string, accum: HirAccum,
         source_file: physical,
         is_defining: 0
       )
-      let importer = resolve.build_importer_entries(imported_defs, import_def: imp)
+      let importer = resolve.build_importer_entries(imported_defs, import_def: imp, colliding: col_names)
       return ImportResult(accum: accum3, visited: visited2, cache: cache2, caller_entries: importer)
   catch e ->
     let formatted = err.format_error(err: e)
@@ -172,7 +189,7 @@ end
 /** Public function process_imports. */
 export let process_imports = fn (imports: [ ImportDef ], accum: HirAccum,
     import_stack: [ string ], visited: [ string ], cache: [ CacheEntry ],
-    caller_entries: [ RenameEntry ], depth: i64, verbose: bool) -> ImportResult require {
+    caller_entries: [ RenameEntry ], colliding: CollisionInfo, depth: i64, verbose: bool) -> ImportResult require {
       Console,
       Fs
     } throws { HirError } do
@@ -189,6 +206,7 @@ export let process_imports = fn (imports: [ ImportDef ], accum: HirAccum,
             visited,
             cache,
             caller_entries,
+            colliding,
             depth,
             verbose
           )
@@ -210,13 +228,16 @@ export let process_imports = fn (imports: [ ImportDef ], accum: HirAccum,
                 visited,
                 cache,
                 caller_entries,
+                colliding,
                 depth,
                 verbose
               )
             | CacheHit(defs: cached_defs, entries: _) ->
+              let CollisionInfo(names: col_names, default_entries: _) = colliding
               let importer = resolve.build_importer_entries(
                 imported_defs: cached_defs,
-                import_def: imp
+                import_def: imp,
+                colliding: col_names
               )
               check_import_collisions(importer, existing: caller_entries)
               let new_caller = append_entries(xs: importer, ys: caller_entries)
@@ -227,6 +248,7 @@ export let process_imports = fn (imports: [ ImportDef ], accum: HirAccum,
                 visited,
                 cache,
                 caller_entries: new_caller,
+                colliding,
                 depth,
                 verbose
               )
@@ -240,6 +262,7 @@ export let process_imports = fn (imports: [ ImportDef ], accum: HirAccum,
           import_stack,
           visited,
           cache,
+          colliding,
           depth,
           verbose
         )
@@ -258,10 +281,214 @@ export let process_imports = fn (imports: [ ImportDef ], accum: HirAccum,
             visited: visited2,
             cache: cache2,
             caller_entries: new_caller,
+            colliding,
             depth,
             verbose
           )
   end
+end
+
+// nexus-987xh: whole-program constructor-collision detection + default binding.
+//
+// We canonicalise (route through the import rename map) ONLY ctors whose bare
+// name is declared by two or more distinct enums across the whole program —
+// everything else keeps its bare name everywhere (zero behaviour change for the
+// vast majority of ctors, builtins, and re-export chains).
+//
+// For each colliding ctor we also compute a DEFAULT canonical: the canonical
+// name of the FIRST enum (in entry-first, depth-first import order) that
+// declares it. This default is appended as the lowest-priority fallback to
+// every module's rename map, so a colliding ctor that a module references by
+// bare name WITHOUT importing it (e.g. the compiler's own `OpAdd`/`OpEq` matches
+// over `vocab.BinaryOp` in lint/codegen/dump files, which import the *type* but
+// not the ctors) still resolves to the same canonical as the enum's own
+// definition and as modules that DO selectively import it — keeping the stored
+// EnumDef variant, every reference, and the runtime tag in lockstep. A module
+// that selectively imports the ctor from a *specific* module overrides the
+// default with that module's canonical (this is the bug fix); genuine in-scope
+// ambiguity is diagnosed by check_import_collisions.
+
+// nexus-987xh: collision detection now reuses the parse CACHE built by
+// `build_parse_cache` (one parse per file, shared with `process_imports` via
+// the seeded cache) instead of a second whole-import-graph re-parse — the old
+// pre-scan's never-freed re-parse ASTs pushed self-compile past the 4GB wasm
+// linear-memory ceiling. We fold every enum-ctor name in every cached file's
+// defs into two O(1)-amortised StringMaps (first-defining source, sight count),
+// then emit a default RenameEntry for each name seen in >=2 distinct enums.
+
+/** Public type ParseCacheResult (nexus-987xh): the parse-only import cache plus
+ *  the visited-set, returned by `build_parse_cache`. The cache holds every
+ *  imported file's parsed defs (entries left empty) so `process_imports` can be
+ *  seeded with it and skip re-parsing. */
+export type ParseCacheResult = ParseCacheResult(cache: [ CacheEntry ], visited: [ string ])
+
+// Parse-only walk of the import graph. Mirrors process_imports' traversal
+// (external skip, cyclic guard is unnecessary here because we never recurse
+// into an already-visited file, and a true cycle is reported later by the main
+// pass) but does NO rename-map build and NO process_defs — it just parses each
+// file once and records `CacheEntry(path, defs, entries: [])`. Cheap: the only
+// retained allocation is the parsed AST, which the main pass reuses, so total
+// peak memory is one set of ASTs (== legacy baseline), not two.
+let build_parse_cache = fn (
+  imports: [ ImportDef ],
+  visited: [ string ],
+  cache: [ CacheEntry ]
+) -> ParseCacheResult require { Fs } throws { FileNotFound, ParseError } do
+  match imports do
+    | [] -> return ParseCacheResult(cache, visited)
+    | imp :: rest ->
+      let ImportDef(path, alias: _, items: _, is_external: is_ext) = imp
+      if is_ext then return build_parse_cache(imports: rest, visited, cache) end
+      let physical = pkg.resolve_import_path(path)
+      if list_has_str(xs: visited, s: physical) then
+        return build_parse_cache(imports: rest, visited, cache)
+      end
+      let tokens = lexer.tokenize(src: Fs.read_to_string(path: physical))
+      let imported_defs = get_defs(prog: parser.parse(tokens))
+      let sub_imports = resolve.extract_imports(defs: imported_defs)
+      let sub = build_parse_cache(
+        imports: sub_imports,
+        visited: physical :: visited,
+        cache: CacheEntry(path: physical, defs: imported_defs, entries: []) :: cache
+      )
+      let ParseCacheResult(cache: c2, visited: v2) = sub
+      return build_parse_cache(imports: rest, visited: v2, cache: c2)
+  end
+end
+
+// Fold one file's enum-ctor names into the (first-source, count) StringMap pair.
+// `first` is only written on a name's FIRST sighting (entry-first, depth-first
+// order is preserved because `cache` is walked in that order); `counts` is
+// incremented for every sighting so >=2 means the bare name is declared by two
+// or more distinct enums.
+let fold_ctor_names = fn (
+  names: [ string ],
+  source: string,
+  first: %StringMap<string>,
+  counts: %StringMap<i64>
+) -> StringMapPair do
+  match names do
+    | [] -> return StringMapPair(first, counts)
+    | n :: rest ->
+      let prev = smap.get_or(map: &counts, key: n, default: 0)
+      let counts2 = smap.put(map: counts, key: n, value: prev + 1)
+      let first2 = if prev == 0 then smap.put(map: first, key: n, value: source) else first end
+      return fold_ctor_names(names: rest, source, first: first2, counts: counts2)
+  end
+end
+
+type StringMapPair = StringMapPair(first: %StringMap<string>, counts: %StringMap<i64>)
+
+// Walk the cached defs (plus the entry file's defs, prepended as the very first
+// source so its ctors win the default), folding every enum-ctor sighting into
+// the two maps.
+let fold_cache_ctors = fn (
+  cache: [ CacheEntry ],
+  first: %StringMap<string>,
+  counts: %StringMap<i64>
+) -> StringMapPair require { } do
+  match cache do
+    | [] -> return StringMapPair(first, counts)
+    | CacheEntry(path, defs, entries: _) :: rest ->
+      let names = resolve.collect_enum_ctor_names_in_defs(defs)
+      let StringMapPair(first: f2, counts: c2) = fold_ctor_names(names, source: path, first, counts)
+      return fold_cache_ctors(cache: rest, first: f2, counts: c2)
+  end
+end
+
+// For each colliding name (count >= 2) emit `bare -> canonical(first_source)`.
+// Linear over the distinct key set (`keys` is one pass); each lookup is O(1)
+// amortised — replaces the old O(N^2) count_sights/first_source_for scan.
+let defaults_from_maps = fn (
+  ks: [ string ],
+  first: &StringMap<string>,
+  counts: &StringMap<i64>,
+  acc: [ RenameEntry ]
+) -> [ RenameEntry ] do
+  match ks do
+    | [] -> return acc
+    | k :: rest ->
+      let cnt = smap.get_or(map: counts, key: k, default: 0)
+      let acc2 = if cnt >= 2 then
+          match smap.get(map: first, key: k) do
+            | Found(value: src) -> RenameEntry(original: k, qualified: rdr.canonical_name(source_path: src, name: k)) :: acc
+            | Missing -> acc
+          end
+        else acc end
+      return defaults_from_maps(ks: rest, first, counts, acc: acc2)
+  end
+end
+
+// The colliding bare-name set is just the `original`s of the default entries.
+let names_of_entries = fn (entries: [ RenameEntry ], acc: [ string ]) -> [ string ] do
+  match entries do
+    | [] -> return acc
+    | RenameEntry(original: o, qualified: _) :: rest ->
+      return names_of_entries(entries: rest, acc: o :: acc)
+  end
+end
+
+/** Public type CollisionInfo (nexus-987xh): the colliding bare ctor names plus
+ *  the default (bare -> first-defining-enum canonical) rename entries appended
+ *  as the lowest-priority fallback in every module's rename map. */
+export type CollisionInfo = CollisionInfo(names: [ string ], default_entries: [ RenameEntry ])
+
+/** Public type CollisionScan (nexus-987xh): the collision info plus the
+ *  parse-only cache it was derived from, so the caller can seed
+ *  `process_imports` with the cache and avoid re-parsing every file. */
+export type CollisionScan = CollisionScan(info: CollisionInfo, cache: [ CacheEntry ])
+
+/** Public function scan_collisions_with_cache (nexus-987xh): build the parse
+ *  cache for the whole import graph, derive the colliding-ctor set + default
+ *  entries from it, and return both. On any read/parse failure during the scan
+ *  returns empty info + empty cache — the main import pass then keeps every
+ *  ctor bare (legacy behaviour) and surfaces the real failure itself. */
+export let scan_collisions_with_cache = fn (
+  entry_defs: [ SpannedTopLevel ],
+  entry_source: string
+) -> CollisionScan require { Fs } do
+  try
+    let imports = resolve.extract_imports(defs: entry_defs)
+    // Seed the cache with the entry file itself FIRST so its ctors are the
+    // first-defining source (default winner); its `entries` are built later by
+    // the entry-self path in the pipeline, not reused from here.
+    let entry_entry = CacheEntry(path: entry_source, defs: entry_defs, entries: [])
+    let ParseCacheResult(cache, visited: _) = build_parse_cache(
+      imports, visited: entry_source :: [], cache: entry_entry :: []
+    )
+    // `cache` is prepended during the walk, so the entry file ends up LAST;
+    // reverse to restore entry-first, depth-first order for first-defining-wins.
+    let ordered = reverse_cache(cache, acc: [])
+    let %first = smap.empty()
+    let %counts = smap.empty()
+    let StringMapPair(first: f2, counts: c2) = fold_cache_ctors(cache: ordered, first: %first, counts: %counts)
+    let defaults = defaults_from_maps(ks: smap.keys(map: &f2), first: &f2, counts: &c2, acc: [])
+    smap.free(map: %f2)
+    smap.free(map: %c2)
+    let info = CollisionInfo(names: names_of_entries(entries: defaults, acc: []), default_entries: defaults)
+    return CollisionScan(info, cache: ordered)
+  catch _ ->
+    return CollisionScan(info: CollisionInfo(names: [], default_entries: []), cache: [])
+  end
+end
+
+let reverse_cache = fn (cache: [ CacheEntry ], acc: [ CacheEntry ]) -> [ CacheEntry ] do
+  match cache do
+    | [] -> return acc
+    | c :: rest -> return reverse_cache(cache: rest, acc: c :: acc)
+  end
+end
+
+/** Public function collect_colliding_ctors (nexus-987xh): back-compat shim that
+ *  returns just the CollisionInfo (drops the cache). Prefer
+ *  `scan_collisions_with_cache` when you can seed `process_imports` with the
+ *  cache to avoid re-parsing. */
+export let collect_colliding_ctors = fn (
+  entry_defs: [ SpannedTopLevel ],
+  entry_source: string
+) -> CollisionInfo require { Fs } do
+  let CollisionScan(info, cache: _) = scan_collisions_with_cache(entry_defs, entry_source)
+  return info
 end
 
 let append_edges = fn (xs: [ ImportEdge ], ys: [ ImportEdge ]) -> [ ImportEdge ] do
