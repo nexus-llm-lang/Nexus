@@ -150,7 +150,7 @@ import * as effect_analysis from "src/backend/effect_analysis.nx"
 import * as emap from "src/ir/shared/effect_map.nx"
 import * as memo_plan from "src/backend/memo_plan.nx"
 import * as list from "std:list"
-import { SymbolNotFound, StackSwitchingNotImplemented, CodegenError,
+import { SymbolNotFound, CodegenError,
   SkFunction, SkVariable } from "src/backend/errors.nx"
 import { EffectMap, EffectBits, lookup_bits } from "src/ir/shared/effect_map.nx"
 import { Some, None } from "std:option"
@@ -394,19 +394,57 @@ let emit_expr = fn (
       end
       let ss_idx = ss_base + tag_offset
       let %buf = bb.push_uleb128(%buf, val: ss_idx)
-      // suspend's tag has no result types; if the expression's wasm type is
-      // unit, leave the value-stack alone. Otherwise push an i64 0 placeholder
-      // — replaced by the resume-site's value when LirExprResume codegen lands.
+      // The ss tag type is (i64) -> (): suspend transfers the payload to the
+      // handler and returns nothing, keeping every cont at the single program
+      // cont type () -> (). The value the handler arm passes back via `resume`
+      // arrives out-of-band in ss_resume_value_global — read it here as the
+      // suspend expression's result. Unit-typed suspend leaves the stack alone.
+      if wdefs.is_unit(typ: t) then return %buf end
+      let %buf = bb.push_byte(%buf, byte: op_global_get)
+      return bb.push_uleb128(%buf, val: wdefs.ss_resume_value_global_idx)
+    | LirExprResume(cont: c, value: v, typ: t) ->
+      // Trampolined resume. The dispatcher loop (emit_inject_resume_multi) owns
+      // the actual `op_resume`; a handler arm cannot resume synchronously
+      // because control must return to that loop's `resume` frame. So this:
+      //   1. stashes the resume VALUE into ss_resume_value_global — the
+      //      re-entered `suspend` reads this global as its result, delivering
+      //      the value out-of-band so every cont stays at the single program
+      //      cont type () -> () (the tag is (i64) -> (), no result channel).
+      //   2. stores the cont-table SLOT (the arm's `k` param) into
+      //      ss_resume_slot_global so the loop knows which cont to re-enter.
+      // The arm body then returns to the loop, which re-resumes.
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = if wdefs.is_unit(typ: wdefs.atom_type(atom: v)) then
+        let %b = bb.push_byte(%buf, byte: op_i64_const)
+        bb.push_sleb128(buf: %b, val: 0)
+      else emit_coercion(from_type: wdefs.atom_type(atom: v), to_type: TyI64, %buf) end
+      let %buf = bb.push_byte(%buf, byte: op_global_set)
+      let %buf = bb.push_uleb128(%buf, val: wdefs.ss_resume_value_global_idx)
+      let %buf = emit_atom(atom: c, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_global_set)
+      let %buf = bb.push_uleb128(%buf, val: wdefs.ss_resume_slot_global_idx)
+      // `resume` is an expression; leave its declared result on the stack. The
+      // value never flows anywhere useful (control left for the loop), so a
+      // placeholder suffices — unit leaves nothing, otherwise an i64 0.
       if wdefs.is_unit(typ: t) then return %buf end
       let %buf = bb.push_byte(%buf, byte: op_i64_const)
-      let %buf = bb.push_sleb128(%buf, val: 0)
-      return %buf
-    | LirExprResume(cont: _, value: _, typ: _) ->
-      %buf
-      throw StackSwitchingNotImplemented(node: "cont.resume")
-    | LirExprContNew(_) ->
-      %buf
-      throw StackSwitchingNotImplemented(node: "cont.new")
+      return bb.push_sleb128(%buf, val: 0)
+    | LirExprContNew(func_ref: fref, typ: _) ->
+      // `cont.new` over the body function: push the funcref, then reify it into
+      // a continuation of the program's single cont type (() -> ()). Leaves
+      // (ref $ct) on the stack. (Not currently produced by MIR→LIR lowering —
+      // the inject dispatcher constructs the body cont inline — but kept live
+      // and correct for direct cont-construction paths.)
+      let CodegenCtx(internal_func_map: ifm_cn, ss_cont_type_idx: cont_idx, _) = ctx
+      let fref_idx = wdefs.lookup_func_fast(name: fref, map: &ifm_cn)
+      if fref_idx < 0 then
+        bb.free(buf: %buf)
+        throw SymbolNotFound(name: fref, kind: SkFunction, context: "LirExprContNew func_ref")
+      end
+      let %buf = bb.push_byte(%buf, byte: wdefs.op_ref_func)
+      let %buf = bb.push_uleb128(%buf, val: fref_idx)
+      let %buf = bb.push_byte(%buf, byte: wdefs.op_cont_new)
+      return bb.push_uleb128(%buf, val: cont_idx)
     | LirExprInjectResume(body_fn: bfn, arm_fns: afs, arm_tags: ats, typ: _) ->
       return emit_inject_resume_multi(%buf, body_fn: bfn, arm_fns: afs, arm_tags: ats, ctx)
   end
@@ -958,7 +996,7 @@ export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_d
       // memo_globals_base is the index of the FIRST memo global in the main
       // module's local global namespace. wmerge later applies a glo_off to
       // these instructions when concatenating with the dep stdlib.
-      let memo_globals_base = 3 + (if has_ss then 3 else 0 end)
+      let memo_globals_base = 3 + (if has_ss then 4 else 0 end)
 
       // Global section — needed for bump allocator, cabi_realloc, arena, string
       // literals, or any memo-cache target. G1 (str_base) is always needed
