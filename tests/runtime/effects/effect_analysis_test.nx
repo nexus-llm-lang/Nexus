@@ -9,6 +9,7 @@
 //     can_throw=true via fixed-point propagation.
 import * as test_assert from "std:test/assert"
 import { TyI64, TyUnit } from "src/syntax/ast.nx"
+import { BinaryOp, OpAdd, OpDiv, OpMod } from "src/types/vocab.nx"
 import {
   LirProgram,
   LirFunction,
@@ -16,7 +17,9 @@ import {
   LirParam,
   LirAtomInt,
   LirAtomUnit,
+  LirAtomVar,
   LirExprAtom,
+  LirExprBinary,
   LirExprCall,
   LirExprRaise,
   LirCallArg,
@@ -97,6 +100,39 @@ let make_try_catch_fn = fn () -> LirFunction do
   )
 end
 
+// Binary-op functions (nexus-53lkx): a function whose body is `a / b` or
+// `a mod b` performs a trap-capable integer op. A trap is an observable
+// effect, so such a function must NOT be summarized as pure — otherwise the
+// effect-aware DCE could drop an unused-result call to it and swallow a
+// guaranteed divide-by-zero / INT_MIN/-1 trap. A function whose body is
+// `a + b` (no trap) stays pure as a control.
+let mk_binop_fn = fn (name: string, op: BinaryOp) -> LirFunction do
+  let stmts = [
+    LirStmtLet(
+      name: "r",
+      typ: TyI64,
+      expr: LirExprBinary(
+        op,
+        lhs: LirAtomVar(name: "a", typ: TyI64),
+        rhs: LirAtomVar(name: "b", typ: TyI64),
+        typ: TyI64
+      )
+    )
+  ]
+  return mk_lir_fn(
+    name,
+    params: [ LirParam(label: "a", name: "a", typ: TyI64),
+              LirParam(label: "b", name: "b", typ: TyI64) ],
+    ret_type: TyI64,
+    body: stmts,
+    ret: LirAtomVar(name: "r", typ: TyI64)
+  )
+end
+
+let make_div_fn = fn () -> LirFunction do return mk_binop_fn(name: "div_fn", op: OpDiv) end
+let make_mod_fn = fn () -> LirFunction do return mk_binop_fn(name: "mod_fn", op: OpMod) end
+let make_add_fn = fn () -> LirFunction do return mk_binop_fn(name: "add_fn", op: OpAdd) end
+
 // External: __nx_print wired to nexus:std/stdio (Console capability).
 let make_print_external = fn () -> LirExternal do
   return LirExternal(
@@ -143,7 +179,10 @@ let body = fn () -> unit throws { Exn } do
       make_a_fn(),
       make_b_fn(),
       make_c_fn(),
-      make_try_catch_fn()
+      make_try_catch_fn(),
+      make_div_fn(),
+      make_mod_fn(),
+      make_add_fn()
     ],
     externals: [ make_print_external() ]
   )
@@ -162,9 +201,12 @@ let body = fn () -> unit throws { Exn } do
   let chain_b = summary_or_fail(&em, name: "chain_b")
   let chain_a = summary_or_fail(&em, name: "chain_a")
   let try_catch_sum = summary_or_fail(&em, name: "try_catch_fn")
+  let div_sum = summary_or_fail(&em, name: "div_fn")
+  let mod_sum = summary_or_fail(&em, name: "mod_fn")
+  let add_sum = summary_or_fail(&em, name: "add_fn")
   free_effect_map(%em)
 
-  test_assert.assert_eq_i64(actual: n_funcs, expected: 7, label: "size")
+  test_assert.assert_eq_i64(actual: n_funcs, expected: 10, label: "size")
 
   // Test 1: pure function.
   match pure_sum do | EffectSummary(capabilities_used: pc, can_throw: pt, is_pure: pp) ->
@@ -212,6 +254,20 @@ let body = fn () -> unit throws { Exn } do
   match try_catch_sum do | EffectSummary(capabilities_used: _, can_throw: tct, is_pure: tcp) ->
     test_assert.assert_false(cond: tct, label: "try_catch_fn.can_throw (body raise caught)")
     test_assert.assert_true(cond: tcp, label: "try_catch_fn.is_pure (caught raise is pure)")
+  end
+
+  // Test 6 (nexus-53lkx): trap-capable integer ops are not pure.
+  // `a / b` and `a mod b` can trap (divide-by-zero; INT_MIN / -1), an
+  // observable effect, so the function must NOT be summarized is_pure —
+  // mirroring opt_is_pure in src/ir/lir/opt/helpers.nx. `a + b` stays pure.
+  match div_sum do | EffectSummary(capabilities_used: _, can_throw: _, is_pure: dvp) ->
+    test_assert.assert_false(cond: dvp, label: "div_fn.is_pure (OpDiv can trap, must not be pure)")
+  end
+  match mod_sum do | EffectSummary(capabilities_used: _, can_throw: _, is_pure: mdp) ->
+    test_assert.assert_false(cond: mdp, label: "mod_fn.is_pure (OpMod can trap, must not be pure)")
+  end
+  match add_sum do | EffectSummary(capabilities_used: _, can_throw: _, is_pure: adp) ->
+    test_assert.assert_true(cond: adp, label: "add_fn.is_pure (OpAdd cannot trap, stays pure)")
   end
 
   return ()
