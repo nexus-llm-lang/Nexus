@@ -27,6 +27,7 @@ import {
   NamedType,
   RecordDef,
   EnumDef,
+  VariantDef,
   VariantField
 } from "src/types/type_expr.nx"
 import {
@@ -37,7 +38,8 @@ import {
 } from "src/ir/hir/types.nx"
 import {
   TypeError,
-  LinearUnused, LinearReuse, LinearMismatch, LinearLeakAcrossThrowableCall, BorrowOfConsumed
+  LinearUnused, LinearReuse, LinearMismatch, LinearLeakAcrossThrowableCall, BorrowOfConsumed,
+  RefEscapes
 } from "src/typecheck/errors.nx"
 import { Option, Some, None } from "std:option"
 import { is_auto_droppable, is_linear_binding_type } from "src/ir/shared/type_pred.nx"
@@ -448,6 +450,261 @@ export let check_program = fn (prog: HirProgram) -> unit throws { TypeError } do
     return check_handler_bindings(bindings: hbs, sigs, tdefs, enum_defs: edefs, caught_set)
 end
 
+// ─── Form-B borrow-escape: record/ADT holding a borrow of a LOCAL linear ─────
+//
+// nexus-ymx7u (opd38 Form B). A `&σ` borrow stored in a record/ADT field
+// escapes its owner when the record is RETURNED and the borrowed owner is a
+// LINEAR binding that this function must consume by function-end:
+//
+//   type Wrap = Wrap(b: &ByteBuffer)
+//   let mk = fn (c: &ByteBuffer) -> Wrap do return Wrap(b: c) end   // launders
+//   let leak = fn () -> Wrap do
+//     let %b1 = bb.empty()
+//     let w  = mk(c: &b1)   // w holds a borrow of the local linear %b1
+//     bb.free(buf: %b1)     // owner freed; w.b now dangles
+//     return w              // ← escape: the borrowed local cannot outlive leak
+//   end
+//
+// A DIRECT `Wrap(b: &b1)` over a linear `b1` is already rejected at T-Borrow
+// (E2001, infer_borrow): Ctor/Record fields are NOT argument position. The
+// residual hole is the CALL-LAUNDERED path: a callee whose declared return
+// type contains a `&σ` field, invoked with a borrow of a local linear, then
+// returned. We detect exactly that, owner-locally:
+//
+//   • A `let w = Call(f, args)` taints `w` when `f`'s declared return type is
+//     borrow-bearing (contains a TyBorrow, one resolution level into the
+//     returned record/enum def) AND some arg is `&x` for a LINEAR binding `x`
+//     live in THIS body (a `let %x` local OR a `%`-param — both are owned by
+//     this function and consumed by function-end, so a borrow of either cannot
+//     outlive the function).
+//   • A `return e` is rejected when `e` is a tainted name, or is directly such
+//     a borrow-laundering Call.
+//
+// CompileCtx/CodegenCtx idiom stays legal: it constructs the ctx via a DIRECT
+// `CompileCtx(internal_func_map: &internal_func_map, ...)` (not a laundering
+// call) and NEVER returns the ctx (it is consumed in-scope, freed before the
+// function returns). Borrows of NON-linear `&`-typed parameters (the genuine
+// CompileCtx-as-parameter shape) are not flagged: only linear owners trip this.
+
+/** True iff `t` is, or one resolution level into a returned record/enum def
+ *  contains, a `&σ` borrow. Bounded to one nominal-resolution level so a
+ *  recursive type cannot loop; that one level reaches the Wrap(b: &BB) field. */
+let ret_type_bears_borrow = fn (
+  t: TypeExpr, enum_defs: [ EnumDef ], tdefs: [ RecordDef ], resolve: bool
+) -> bool do
+  match t do
+    | TyBorrow(_) -> return true
+    | TyRef(_) -> return true
+    | TyLinear(inner: i) | TyLazy(inner: i, _) ->
+      return ret_type_bears_borrow(t: i, enum_defs, tdefs, resolve)
+    | TyArray(elem: e) | TyList(elem: e) ->
+      return ret_type_bears_borrow(t: e, enum_defs, tdefs, resolve)
+    | TyRecord(fields: fs) ->
+      return named_types_bear_borrow(nts: fs, enum_defs, tdefs)
+    | TyUserDefined(name: n, args: _) ->
+      if !resolve then return false end
+      // Resolve ONE level into the named type's variant/record fields.
+      match find_enum_def(defs: enum_defs, name: n) do
+        | Some(val: vfs) -> return variant_fields_bear_borrow(vfs, enum_defs, tdefs)
+        | None ->
+          match find_record_def(defs: tdefs, name: n) do
+            | Some(val: nts) -> return named_types_bear_borrow(nts, enum_defs, tdefs)
+            | None -> return false
+          end
+      end
+    | _ -> return false
+  end
+end
+
+let named_types_bear_borrow = fn (
+  nts: [ NamedType ], enum_defs: [ EnumDef ], tdefs: [ RecordDef ]
+) -> bool do
+  match nts do
+    | [] -> return false
+    | NamedType(name: _, typ: t) :: rest ->
+      if ret_type_bears_borrow(t, enum_defs, tdefs, resolve: false) then return true end
+      return named_types_bear_borrow(nts: rest, enum_defs, tdefs)
+  end
+end
+
+let variant_fields_bear_borrow = fn (
+  vfs: [ VariantField ], enum_defs: [ EnumDef ], tdefs: [ RecordDef ]
+) -> bool do
+  match vfs do
+    | [] -> return false
+    | VariantField(name: _, typ: t) :: rest ->
+      if ret_type_bears_borrow(t, enum_defs, tdefs, resolve: false) then return true end
+      return variant_fields_bear_borrow(vfs: rest, enum_defs, tdefs)
+  end
+end
+
+/** All variant fields of an enum, flattened (any variant holding a borrow
+ *  makes the type borrow-bearing). */
+let find_enum_def = fn (defs: [ EnumDef ], name: string) -> Option<[ VariantField ]> do
+  match defs do
+    | [] -> return None
+    | EnumDef(name: en, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      if en == name then return Some(val: flatten_variant_fields(vs, acc: [])) end
+      return find_enum_def(defs: rest, name)
+  end
+end
+
+let flatten_variant_fields = fn (vs: [ VariantDef ], acc: [ VariantField ]) -> [ VariantField ] do
+  match vs do
+    | [] -> return acc
+    | VariantDef(name: _, fields: fs) :: rest ->
+      return flatten_variant_fields(vs: rest, acc: append_vfields(a: acc, b: fs))
+  end
+end
+
+let append_vfields = fn (a: [ VariantField ], b: [ VariantField ]) -> [ VariantField ] do
+  match b do
+    | [] -> return a
+    | x :: rest -> return append_vfields(a: x :: a, b: rest)
+  end
+end
+
+let find_record_def = fn (defs: [ RecordDef ], name: string) -> Option<[ NamedType ]> do
+  match defs do
+    | [] -> return None
+    | RecordDef(name: rn, is_public: _, type_params: _, fields: fs) :: rest ->
+      if rn == name then return Some(val: fs) end
+      return find_record_def(defs: rest, name)
+  end
+end
+
+/** Local linear binding names: `%`-params + `let %x` bindings in the body.
+ *  Both are owned by this function (must be consumed by function-end), so a
+ *  borrow of either cannot soundly escape via the return. */
+let collect_owned_linears = fn (params: [ HirParam ], stmts: [ HirStmt ], acc: [ string ]) -> [ string ] do
+  let acc1 = collect_linear_param_names(params, acc)
+  return collect_local_linear_lets(stmts, acc: acc1)
+end
+
+let collect_linear_param_names = fn (params: [ HirParam ], acc: [ string ]) -> [ string ] do
+  match params do
+    | [] -> return acc
+    | HirParam(label: _, name: pn, sigil: psig, typ: _) :: rest ->
+      let acc1 = match psig do | SigilLinear | SigilLazy -> pn :: acc | _ -> acc end
+      return collect_linear_param_names(params: rest, acc: acc1)
+  end
+end
+
+let collect_local_linear_lets = fn (stmts: [ HirStmt ], acc: [ string ]) -> [ string ] do
+  match stmts do
+    | [] -> return acc
+    | HirStmt(node: nd, span: _) :: rest ->
+      let acc1 = match nd do
+        | Let(name: n, sigil: sg, typ: _, value: _) ->
+          match sg do | SigilLinear | SigilLazy -> n :: acc | _ -> acc end
+        | _ -> acc
+      end
+      return collect_local_linear_lets(stmts: rest, acc: acc1)
+  end
+end
+
+/** True iff some call arg is `&x` for `x ∈ owned`. */
+let call_borrows_owned_linear = fn (args: [ HirCallArg ], owned: [ string ]) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: _, value: HirExpr(node: vn, span: _)) :: rest ->
+      let hit = match vn do
+        | Borrow(name: bn, sigil: _) -> str_member(xs: owned, target: bn)
+        | _ -> false
+      end
+      if hit then return true end
+      return call_borrows_owned_linear(args: rest, owned)
+  end
+end
+
+/** Is `expr` a Call whose declared return type bears a `&σ` AND which is
+ *  passed a borrow of an owned linear? This is the laundering construction. */
+let is_borrow_laundering_call = fn (
+  expr: HirExprKind, owned: [ string ], sigs: [ SigEntry ],
+  enum_defs: [ EnumDef ], tdefs: [ RecordDef ]
+) -> bool do
+  match expr do
+    | Call(func: f, args: cargs) ->
+      if !call_borrows_owned_linear(args: cargs, owned) then return false end
+      match sig_lookup(sigs, name: f) do
+        | None -> return false
+        | Some(val: SigEntry(name: _, type_params: _, param_labels: _, param_types: _, ret_type: rt, throw_row: _)) ->
+          return ret_type_bears_borrow(t: rt, enum_defs, tdefs, resolve: true)
+      end
+    | _ -> return false
+  end
+end
+
+/** Build the set of `let`-bound names tainted by a borrow-laundering call. */
+let collect_tainted_names = fn (
+  stmts: [ HirStmt ], owned: [ string ], sigs: [ SigEntry ],
+  enum_defs: [ EnumDef ], tdefs: [ RecordDef ], acc: [ string ]
+) -> [ string ] do
+  match stmts do
+    | [] -> return acc
+    | HirStmt(node: nd, span: _) :: rest ->
+      let acc1 = match nd do
+        | Let(name: n, sigil: _, typ: _, value: HirExpr(node: vn, span: _)) ->
+          if is_borrow_laundering_call(expr: vn, owned, sigs, enum_defs, tdefs) then n :: acc
+          // Alias of an already-tainted name: `let w2 = w1`.
+          else match vn do
+            | Variable(name: src, sigil: _) ->
+              if str_member(xs: acc, target: src) then n :: acc else acc end
+            | _ -> acc
+          end end
+        | _ -> acc
+      end
+      return collect_tainted_names(stmts: rest, owned, sigs, enum_defs, tdefs, acc: acc1)
+  end
+end
+
+/** Reject any `return e` whose `e` is a tainted name or a direct laundering
+ *  call. Recurses into nested statement blocks (Try / Inject). */
+let check_borrow_escape_stmts = fn (
+  stmts: [ HirStmt ], tainted: [ string ], owned: [ string ], sigs: [ SigEntry ],
+  enum_defs: [ EnumDef ], tdefs: [ RecordDef ], fn_name: string
+) -> unit throws { TypeError } do
+  match stmts do
+    | [] -> return ()
+    | HirStmt(node: nd, span: sp) :: rest ->
+      match nd do
+        | Return(expr: HirExpr(node: en, span: esp)) ->
+          let escapes = match en do
+            | Variable(name: rn, sigil: _) -> str_member(xs: tainted, target: rn)
+            | _ -> is_borrow_laundering_call(expr: en, owned, sigs, enum_defs, tdefs)
+          end
+          if escapes then
+            throw RefEscapes(
+              context: "the returned value of '" ++ fn_name
+                ++ "' (a record/ADT field holds a borrow of a local linear binding, which the function consumes — use-after-free)",
+              span: esp
+            )
+          end
+        | Try(body: tb, catch_param: _, catch_body: cb) ->
+          check_borrow_escape_stmts(stmts: tb, tainted, owned, sigs, enum_defs, tdefs, fn_name)
+          check_borrow_escape_stmts(stmts: cb, tainted, owned, sigs, enum_defs, tdefs, fn_name)
+        | Inject(handlers: _, body: ib) ->
+          check_borrow_escape_stmts(stmts: ib, tainted, owned, sigs, enum_defs, tdefs, fn_name)
+        | _ -> ()
+      end
+      return check_borrow_escape_stmts(stmts: rest, tainted, owned, sigs, enum_defs, tdefs, fn_name)
+  end
+end
+
+/** Entry: detect a returned record/ADT holding a borrow of a local linear. */
+let check_borrow_escape_form_b = fn (
+  fn_name: string, params: [ HirParam ], stmts: [ HirStmt ], sigs: [ SigEntry ],
+  enum_defs: [ EnumDef ], tdefs: [ RecordDef ]
+) -> unit throws { TypeError } do
+  let owned = collect_owned_linears(params, stmts, acc: [])
+  match owned do
+    | [] -> return ()
+    | _ ->
+      let tainted = collect_tainted_names(stmts, owned, sigs, enum_defs, tdefs, acc: [])
+      return check_borrow_escape_stmts(stmts, tainted, owned, sigs, enum_defs, tdefs, fn_name)
+  end
+end
+
 let check_functions = fn (
   funcs: [ HirFunction ],
   sigs: [ SigEntry ],
@@ -532,6 +789,9 @@ let check_function_with_kont = fn (
   let cur_fn_label = fn_name
   match b do
       | EagerBody(stmts) ->
+        // nexus-ymx7u (opd38 Form B): reject a returned record/ADT holding a
+        // borrow of a local linear (use-after-free; owner-locality heuristic).
+        check_borrow_escape_form_b(fn_name: cur_fn_label, params: ps, stmts, sigs, enum_defs, tdefs)
         // Seed live set with linear params; push frame snapshot so the
         // body's throwable-call check excludes them (call-site contract).
         let initial_vars = collect_linear_params(params: ps, tdefs, enum_defs, acc: [])
