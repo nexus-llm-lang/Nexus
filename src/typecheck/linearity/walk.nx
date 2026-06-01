@@ -10,7 +10,7 @@
  */
 
 import { Span } from "src/types/span.nx"
-import { Sigil, SigilImmutable, SigilLinear, SigilLazy } from "src/types/vocab.nx"
+import { Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilLazy } from "src/types/vocab.nx"
 import {
   TypeExpr,
   TyLinear,
@@ -603,6 +603,25 @@ let collect_local_linear_lets = fn (stmts: [ HirStmt ], acc: [ string ]) -> [ st
   end
 end
 
+/** Local NON-LINEAR `let x = ...` binding names in the body (nexus-quuuq).
+ *  Parameters are deliberately EXCLUDED: a `&`-typed parameter is a non-local
+ *  owner whose lifetime outlives this frame (the CompileCtx-as-parameter
+ *  idiom), so a borrow of it may legally escape. Only a `let`-bound local —
+ *  whose backing storage is THIS frame — cannot soundly escape via a returned
+ *  record/ADT field. */
+let collect_local_nonlinear_lets = fn (stmts: [ HirStmt ], acc: [ string ]) -> [ string ] do
+  match stmts do
+    | [] -> return acc
+    | HirStmt(node: nd, span: _) :: rest ->
+      let acc1 = match nd do
+        | Let(name: n, sigil: sg, typ: _, value: _) ->
+          match sg do | SigilImmutable | SigilMutable -> n :: acc | _ -> acc end
+        | _ -> acc
+      end
+      return collect_local_nonlinear_lets(stmts: rest, acc: acc1)
+  end
+end
+
 /** True iff some call arg is `&x` for `x ∈ owned`. */
 let call_borrows_owned_linear = fn (args: [ HirCallArg ], owned: [ string ]) -> bool do
   match args do
@@ -635,9 +654,89 @@ let is_borrow_laundering_call = fn (
   end
 end
 
-/** Build the set of `let`-bound names tainted by a borrow-laundering call. */
+// ─── Non-linear local owner (nexus-quuuq) ────────────────────────────────────
+//
+// A borrow of a LOCAL NON-LINEAR `let` binding stored in a record/ADT field
+// that ESCAPES (is returned) is a use-after-scope: the local's backing storage
+// is this frame, so the returned aggregate's borrow field dangles after the
+// function returns. Unlike the linear case, a DIRECT `{ b: &x }` / `Ctor(b: &x)`
+// over a non-linear local is NOT rejected at T-Borrow (only linear borrows are
+// banned outside argument position), so we must detect both the direct
+// construction AND the call-laundered form here.
+//
+// Parameter owners are excluded (see collect_local_nonlinear_lets): the
+// CompileCtx-as-parameter idiom returns a record borrowing a `&`-parameter and
+// is sound. Only `let`-bound locals are screened.
+
+/** True iff some Record field value is `&x` for `x ∈ locals`. */
+let named_exprs_borrow_member = fn (fields: [ HirNamedExpr ], locals: [ string ]) -> bool do
+  match fields do
+    | [] -> return false
+    | HirNamedExpr(name: _, value: HirExpr(node: vn, span: _)) :: rest ->
+      let hit = match vn do
+        | Borrow(name: bn, sigil: _) -> str_member(xs: locals, target: bn)
+        | _ -> false
+      end
+      if hit then return true end
+      return named_exprs_borrow_member(fields: rest, locals)
+  end
+end
+
+/** True iff some Ctor positional arg is `&x` for `x ∈ locals`. */
+let exprs_borrow_member = fn (args: [ HirExpr ], locals: [ string ]) -> bool do
+  match args do
+    | [] -> return false
+    | HirExpr(node: vn, span: _) :: rest ->
+      let hit = match vn do
+        | Borrow(name: bn, sigil: _) -> str_member(xs: locals, target: bn)
+        | _ -> false
+      end
+      if hit then return true end
+      return exprs_borrow_member(args: rest, locals)
+  end
+end
+
+/** True iff some call arg is `&x` for `x ∈ locals` (laundering over locals). */
+let call_borrows_member = fn (args: [ HirCallArg ], locals: [ string ]) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: _, value: HirExpr(node: vn, span: _)) :: rest ->
+      let hit = match vn do
+        | Borrow(name: bn, sigil: _) -> str_member(xs: locals, target: bn)
+        | _ -> false
+      end
+      if hit then return true end
+      return call_borrows_member(args: rest, locals)
+  end
+end
+
+/** Is `expr` a record/ADT construction (direct or call-laundered) that stores
+ *  a borrow of a LOCAL NON-LINEAR binding in `locals`? Mirrors
+ *  is_borrow_laundering_call but covers the DIRECT Record/Ctor forms too, since
+ *  a direct `{ b: &x }` over a non-linear local is not screened at T-Borrow. */
+let constructs_borrow_of_nonlinear_local = fn (
+  expr: HirExprKind, locals: [ string ], sigs: [ SigEntry ],
+  enum_defs: [ EnumDef ], tdefs: [ RecordDef ]
+) -> bool do
+  match expr do
+    | Record(fields: fs) -> return named_exprs_borrow_member(fields: fs, locals)
+    | Ctor(variant: _, args: cargs, labels: _, sigil: _) -> return exprs_borrow_member(args: cargs, locals)
+    | Call(func: f, args: cargs) ->
+      if !call_borrows_member(args: cargs, locals) then return false end
+      match sig_lookup(sigs, name: f) do
+        | None -> return false
+        | Some(val: SigEntry(name: _, type_params: _, param_labels: _, param_types: _, ret_type: rt, throw_row: _)) ->
+          return ret_type_bears_borrow(t: rt, enum_defs, tdefs, resolve: true)
+      end
+    | _ -> return false
+  end
+end
+
+/** Build the set of `let`-bound names tainted by a borrow-laundering call
+ *  (linear owners) OR a record/ADT construction holding a borrow of a local
+ *  non-linear (nexus-quuuq). Either taint marks the binding as escape-unsafe. */
 let collect_tainted_names = fn (
-  stmts: [ HirStmt ], owned: [ string ], sigs: [ SigEntry ],
+  stmts: [ HirStmt ], owned: [ string ], nl_locals: [ string ], sigs: [ SigEntry ],
   enum_defs: [ EnumDef ], tdefs: [ RecordDef ], acc: [ string ]
 ) -> [ string ] do
   match stmts do
@@ -646,6 +745,7 @@ let collect_tainted_names = fn (
       let acc1 = match nd do
         | Let(name: n, sigil: _, typ: _, value: HirExpr(node: vn, span: _)) ->
           if is_borrow_laundering_call(expr: vn, owned, sigs, enum_defs, tdefs) then n :: acc
+          else if constructs_borrow_of_nonlinear_local(expr: vn, locals: nl_locals, sigs, enum_defs, tdefs) then n :: acc
           // Alias of an already-tainted name: `let w2 = w1`.
           else match vn do
             | Variable(name: src, sigil: _) ->
@@ -654,14 +754,15 @@ let collect_tainted_names = fn (
           end end
         | _ -> acc
       end
-      return collect_tainted_names(stmts: rest, owned, sigs, enum_defs, tdefs, acc: acc1)
+      return collect_tainted_names(stmts: rest, owned, nl_locals, sigs, enum_defs, tdefs, acc: acc1)
   end
 end
 
-/** Reject any `return e` whose `e` is a tainted name or a direct laundering
- *  call. Recurses into nested statement blocks (Try / Inject). */
+/** Reject any `return e` whose `e` is a tainted name, a direct laundering call
+ *  (linear owner), or a direct record/ADT construction holding a borrow of a
+ *  local non-linear (nexus-quuuq). Recurses into nested blocks (Try / Inject). */
 let check_borrow_escape_stmts = fn (
-  stmts: [ HirStmt ], tainted: [ string ], owned: [ string ], sigs: [ SigEntry ],
+  stmts: [ HirStmt ], tainted: [ string ], owned: [ string ], nl_locals: [ string ], sigs: [ SigEntry ],
   enum_defs: [ EnumDef ], tdefs: [ RecordDef ], fn_name: string
 ) -> unit throws { TypeError } do
   match stmts do
@@ -671,37 +772,48 @@ let check_borrow_escape_stmts = fn (
         | Return(expr: HirExpr(node: en, span: esp)) ->
           let escapes = match en do
             | Variable(name: rn, sigil: _) -> str_member(xs: tainted, target: rn)
-            | _ -> is_borrow_laundering_call(expr: en, owned, sigs, enum_defs, tdefs)
+            | _ ->
+              if is_borrow_laundering_call(expr: en, owned, sigs, enum_defs, tdefs) then true
+              else constructs_borrow_of_nonlinear_local(expr: en, locals: nl_locals, sigs, enum_defs, tdefs) end
           end
           if escapes then
             throw RefEscapes(
               context: "the returned value of '" ++ fn_name
-                ++ "' (a record/ADT field holds a borrow of a local linear binding, which the function consumes — use-after-free)",
+                ++ "' (a record/ADT field holds a borrow of a local binding owned by this function — the borrow escapes and dangles after the function returns, a use-after-free)",
               span: esp
             )
           end
         | Try(body: tb, catch_param: _, catch_body: cb) ->
-          check_borrow_escape_stmts(stmts: tb, tainted, owned, sigs, enum_defs, tdefs, fn_name)
-          check_borrow_escape_stmts(stmts: cb, tainted, owned, sigs, enum_defs, tdefs, fn_name)
+          check_borrow_escape_stmts(stmts: tb, tainted, owned, nl_locals, sigs, enum_defs, tdefs, fn_name)
+          check_borrow_escape_stmts(stmts: cb, tainted, owned, nl_locals, sigs, enum_defs, tdefs, fn_name)
         | Inject(handlers: _, body: ib) ->
-          check_borrow_escape_stmts(stmts: ib, tainted, owned, sigs, enum_defs, tdefs, fn_name)
+          check_borrow_escape_stmts(stmts: ib, tainted, owned, nl_locals, sigs, enum_defs, tdefs, fn_name)
         | _ -> ()
       end
-      return check_borrow_escape_stmts(stmts: rest, tainted, owned, sigs, enum_defs, tdefs, fn_name)
+      return check_borrow_escape_stmts(stmts: rest, tainted, owned, nl_locals, sigs, enum_defs, tdefs, fn_name)
   end
 end
 
-/** Entry: detect a returned record/ADT holding a borrow of a local linear. */
+/** Entry: detect a returned record/ADT holding a borrow of a local binding
+ *  owned by this function — a local LINEAR (ymx7u, call-laundered) or a local
+ *  NON-LINEAR (quuuq, direct or call-laundered). */
 let check_borrow_escape_form_b = fn (
   fn_name: string, params: [ HirParam ], stmts: [ HirStmt ], sigs: [ SigEntry ],
   enum_defs: [ EnumDef ], tdefs: [ RecordDef ]
 ) -> unit throws { TypeError } do
   let owned = collect_owned_linears(params, stmts, acc: [])
+  let nl_locals = collect_local_nonlinear_lets(stmts, acc: [])
   match owned do
-    | [] -> return ()
+    | [] ->
+      match nl_locals do
+        | [] -> return ()
+        | _ ->
+          let tainted = collect_tainted_names(stmts, owned, nl_locals, sigs, enum_defs, tdefs, acc: [])
+          return check_borrow_escape_stmts(stmts, tainted, owned, nl_locals, sigs, enum_defs, tdefs, fn_name)
+      end
     | _ ->
-      let tainted = collect_tainted_names(stmts, owned, sigs, enum_defs, tdefs, acc: [])
-      return check_borrow_escape_stmts(stmts, tainted, owned, sigs, enum_defs, tdefs, fn_name)
+      let tainted = collect_tainted_names(stmts, owned, nl_locals, sigs, enum_defs, tdefs, acc: [])
+      return check_borrow_escape_stmts(stmts, tainted, owned, nl_locals, sigs, enum_defs, tdefs, fn_name)
   end
 end
 
