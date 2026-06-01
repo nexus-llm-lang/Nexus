@@ -1,0 +1,95 @@
+// Regression test for nexus-pvscf (n5gub site #2): a record value CAPTURED
+// in a closure, then `.field`-accessed inside the closure body, used to lose
+// its semantic type and abort LIR lowering with E6002 ("field access on
+// non-record semantic type for variable ...").
+//
+// Root cause: captured-variable types are erased at MIR — `MirEnvLoad`
+// carries no type and `build_env_load_preamble` hardcodes TyI64, so the
+// env-load temp that re-binds the capture inside the lifted closure body had
+// semantic type TyI64; a subsequent `.field` then hit `resolve_record_field`
+// with a non-record semantic type and threw E6002. The program typechecked
+// (exit 0) but never reached runtime.
+//
+// Fix: a forward registry (`#ENVTYPE#<lifted_fn>#<slot>` sentinel entries,
+// built from each enclosing fn's MirMakeClosure captures and prepended into
+// the program-wide semantic-var table) lets the MirEnvLoad lowering recover
+// the captured record's TyRecord semantic type, so `.field` resolves.
+//
+// Pins (all must REACH runtime — pre-fix they crashed at codegen):
+//   1. issue repro: capture an annotated record, read three weighted fields
+//      (x1 / x10 / x100) inside the closure → 1 + 10*10 + 100*100 == 10101.
+//   2. inline (unannotated) captured record → `.field` in closure body.
+//   3. multi-capture: closure captures a record AND a plain i64.
+//   4. nested closure: inner closure captures the same record through an
+//      outer closure layer.
+import * as test_assert from "std:test/assert"
+
+type Inner = { a: i64, b: i64, c: i64 }
+
+// --- pin 1: issue repro (annotated capture, weighted fields) ---
+let weighted = fn () -> i64 do
+  let capv: Inner = { a: 1, b: 10, c: 100 }
+  let f = fn () -> i64 do return capv.a + capv.b * 10 + capv.c * 100 end
+  return f()
+end
+
+// --- pin 2: inline (unannotated) captured record ---
+let inline_cap = fn () -> i64 do
+  let capv = { a: 1, b: 10, c: 100 }
+  let f = fn () -> i64 do return capv.a + capv.b * 10 + capv.c * 100 end
+  return f()
+end
+
+// --- pin 3: capture a record AND a plain i64 in the same closure ---
+let multi_cap = fn () -> i64 do
+  let capv: Inner = { a: 2, b: 3, c: 4 }
+  let scale: i64 = 1000
+  let f = fn () -> i64 do return capv.a * scale + capv.b * 100 + capv.c end
+  return f()
+end
+
+// --- pin 4: nested closure captures the record through an outer layer ---
+let nested_cap = fn () -> i64 do
+  let capv: Inner = { a: 7, b: 8, c: 9 }
+  let outer = fn () -> i64 do
+    let inner = fn () -> i64 do return capv.a * 100 + capv.b * 10 + capv.c end
+    return inner()
+  end
+  return outer()
+end
+
+let body = fn () -> unit throws { Exn } do
+  // pin 1: weighted record-field reads inside captured closure
+  test_assert.assert_eq_i64(
+    actual: weighted(),
+    expected: 10101,
+    label: "pvscf pin1: weighted .field on captured annotated record (1 + 10*10 + 100*100)"
+  )
+
+  // pin 2: inline (unannotated) captured record
+  test_assert.assert_eq_i64(
+    actual: inline_cap(),
+    expected: 10101,
+    label: "pvscf pin2: weighted .field on captured inline record"
+  )
+
+  // pin 3: capture record + i64
+  test_assert.assert_eq_i64(
+    actual: multi_cap(),
+    expected: 2304,
+    label: "pvscf pin3: capture record AND i64 (2*1000 + 3*100 + 4)"
+  )
+
+  // pin 4: nested closure capture
+  test_assert.assert_eq_i64(
+    actual: nested_cap(),
+    expected: 789,
+    label: "pvscf pin4: nested closure capturing the record (7*100 + 8*10 + 9)"
+  )
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end

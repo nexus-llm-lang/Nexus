@@ -25,29 +25,70 @@ import {
   TypeExpr,
   TyUserDefined,
   TyRecord,
+  NamedType,
   EnumDef,
   VariantDef,
   VariantField,
   RecordDef,
   TyVar,
-  TyList
+  TyList,
+  TyI64,
+  TyF64,
+  TyString,
+  TyBool,
+  TyChar,
+  TyUnit
 } from "src/types/type_expr.nx"
+import {
+  Literal,
+  LitInt,
+  LitFloat,
+  LitBool,
+  LitChar,
+  LitString,
+  LitUnit
+} from "src/types/vocab.nx"
 import * as list from "std:list"
+import { from_i64 }, * as str from "std:str"
 import { LirError } from "src/ir/lir/errors.nx"
 import { Some, None } from "std:option"
-import { MirProgram, MirFunction, MirParam, MirExternal } from "src/ir/mir/types.nx"
+import {
+  MirProgram,
+  MirFunction,
+  MirParam,
+  MirExternal,
+  MirExpr,
+  MirVariable,
+  MirRecord,
+  MirLiteral,
+  MirNamedExpr,
+  MirStmt,
+  MirStmtLet,
+  MirStmtExpr,
+  MirStmtReturn,
+  MirStmtAssign,
+  MirStmtTry,
+  MirMakeClosure,
+  MirEnvLoad,
+  MirIf,
+  MirMatch,
+  MirWhile,
+  MirBlock,
+  MirMatchCase
+} from "src/ir/mir/types.nx"
 import { LirProgram, LirFunction, LirExternal, LirParam } from "src/ir/lir/types.nx"
 import { LowerCtx, TypeEntry, wasm_type, insert_type, default_atom } from "src/ir/lir/context.nx"
 import { VariantIndex }, * as vidx from "src/ir/support/variant_index.nx"
 import { lir_lower_stmts, LowerStmtsResult } from "src/ir/lir/lir.nx"
-import { lir_str_less_than, sort_mir_params } from "src/ir/lir/semantic_types.nx"
+import { lir_str_less_than, sort_mir_params, env_slot_sentinel } from "src/ir/lir/semantic_types.nx"
 
 let lir_lower_function = fn (
   f: MirFunction,
   enum_defs: VariantIndex,
   type_defs: [ RecordDef ],
   func_types: [ TypeEntry ],
-  sem_func_types: [ TypeEntry ]
+  sem_func_types: [ TypeEntry ],
+  env_type_entries: [ TypeEntry ]
 ) -> LirFunction throws { LirError } do
   let MirFunction(name: fname, params: raw_params, ret_type: rt, body, span: sp) = f
   let params = sort_mir_params(params: raw_params)
@@ -70,9 +111,17 @@ let lir_lower_function = fn (
     // MirCall results without threading type_defs through LowerCtx.
     let all_sem_vars = prepend_type_entries(xs: param_sem_vars, ys: sem_func_types)
     let sem_vars_with_fn_ret = insert_type(name: "#FN_RET#", typ: wasm_ret, entries: all_sem_vars)
+    // Captured-record env types (nexus-pvscf): the registry (a SEPARATE, small
+    // list holding only closure-capture entries) keys entries by the LIFTED
+    // closure fn name (`#ENVTYPE#<lifted_fn>#<slot>`). Re-key the entries
+    // belonging to THIS function down to the slot-only key (`#ENVTYPE#<slot>`)
+    // and prepend them, so the MirEnvLoad lowering inside this body can look
+    // them up without threading the current fn name. Kept out of
+    // `sem_func_types` so it does not bloat every function's semantic_vars.
+    let local_env_types = rekey_env_types_for_fn(fname, entries: env_type_entries, acc: [])
     let ctx = LowerCtx(
       vars: prepend_type_entries(xs: param_vars, ys: func_types),
-      semantic_vars: sem_vars_with_fn_ret,
+      semantic_vars: prepend_type_entries(xs: local_env_types, ys: sem_vars_with_fn_ret),
       stmts: [],
       temp_counter: 0,
       enum_defs
@@ -357,6 +406,372 @@ let prepend_type_entries_go = fn (
   end
 end
 
+// --- Captured-record env-type registry (nexus-pvscf) ---
+//
+// A record value captured into a closure loses its semantic type at MIR:
+// `MirEnvLoad` carries no type and the env-load preamble binds it as TyI64,
+// so a `.field` inside the lifted closure body aborts LIR lowering with
+// E6002. We recover the type with a forward registry: for each enclosing
+// function, walk its body for `MirMakeClosure(lifted_fn, captures)`; for
+// each capture that names a local of record shape, emit a sentinel entry
+// `#ENVTYPE#<lifted_fn>#<slot>` → its resolved TyRecord. These entries are
+// prepended into the program-wide `sem_func_types` (already threaded into
+// every function's `semantic_vars`), and the `MirEnvLoad` lowering looks
+// them up via the function's own `#FN_NAME#` sentinel. Lifted closures are
+// emitted after their enclosing function, but the registry is built from the
+// WHOLE program up front, so ordering does not matter.
+
+let env_type_sentinel = fn (lifted_fn: string, slot: i64) -> string throws { LirError } do
+  return "#ENVTYPE#" ++ lifted_fn ++ "#" ++ from_i64(val: slot)
+end
+
+// Keep only the registry entries belonging to `fname` (keyed
+// `#ENVTYPE#<fname>#<slot>`) and re-key them to the slot-only form so a
+// MirEnvLoad inside this function's body can look them up.
+let rekey_env_types_for_fn = fn (
+  fname: string,
+  entries: [ TypeEntry ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match entries do
+    | [] -> return list.reverse(xs: acc)
+    | TypeEntry(name: n, typ: t) :: rest ->
+      let prefix = "#ENVTYPE#" ++ fname ++ "#"
+      let plen = str.length(s: prefix)
+      let acc2 = if str.starts_with(s: n, prefix) then
+          // Drop the `<fname>#` middle, keeping the `#ENVTYPE#` head and the
+          // trailing `<slot>` → slot-only key consumed inside this body.
+          let slot_str = str.substring(s: n, start: plen, len: str.length(s: n) - plen)
+          TypeEntry(name: "#ENVTYPE#" ++ slot_str, typ: t) :: acc
+        else acc end
+      return rekey_env_types_for_fn(fname, entries: rest, acc: acc2)
+  end
+end
+
+// Best-effort semantic type of a record-literal field expression, used only
+// when the captured local was an unannotated `let capv = { ... }` (MIR let
+// type is TyUnit). Only record shapes matter for later `.field` resolution;
+// scalars resolve to their wasm-comparable semantic type and anything else
+// falls back to TyI64.
+let mir_record_field_type = fn (
+  e: MirExpr,
+  locals: [ TypeEntry ],
+  type_defs: [ RecordDef ]
+) -> TypeExpr throws { LirError } do
+  match e do
+    | MirLiteral(lit: l) ->
+      match l do
+        | LitInt(_) -> return TyI64
+        | LitFloat(_) -> return TyF64
+        | LitBool(_) -> return TyBool
+        | LitChar(_) -> return TyChar
+        | LitString(_) -> return TyString
+        | LitUnit -> return TyUnit
+      end
+    | MirRecord(fields: fs) -> return TyRecord(fields: mir_record_named_types(fields: fs, locals, type_defs, acc: []))
+    | MirVariable(name: n) ->
+      match lookup_type_entry(name: n, entries: locals) do
+        | Some(val: t) -> return t
+        | None -> return TyI64
+      end
+    | _ -> return TyI64
+  end
+end
+
+let mir_record_named_types = fn (
+  fields: [ MirNamedExpr ],
+  locals: [ TypeEntry ],
+  type_defs: [ RecordDef ],
+  acc: [ NamedType ]
+) -> [ NamedType ] throws { LirError } do
+  match fields do
+    | [] -> return list.reverse(xs: acc)
+    | MirNamedExpr(name: n, value: v) :: rest ->
+      let ft = mir_record_field_type(e: v, locals, type_defs)
+      return mir_record_named_types(fields: rest, locals, type_defs, acc: NamedType(name: n, typ: ft) :: acc)
+  end
+end
+
+let lookup_type_entry = fn (name: string, entries: [ TypeEntry ]) -> Option<TypeExpr> throws { LirError } do
+  match entries do
+    | [] -> return None
+    | TypeEntry(name: n, typ: t) :: rest ->
+      if n == name then return Some(val: t) else return lookup_type_entry(name, entries: rest) end
+  end
+end
+
+// Resolve a captured local's RECORD semantic type, or None when the binding
+// is not record-shaped (scalars / closures need no env-type recovery — the
+// existing TyI64 default is correct for them).
+let resolve_record_local = fn (
+  declared: TypeExpr,
+  rhs: Option<MirExpr>,
+  locals: [ TypeEntry ],
+  type_defs: [ RecordDef ]
+) -> Option<TypeExpr> throws { LirError } do
+  // Prefer the declared type (annotated `let capv: Inner` / params) resolved
+  // through the record-alias table.
+  let resolved = resolve_typedef(typ: declared, type_defs)
+  if let TyRecord(_) = resolved then
+    return Some(val: resolved)
+  end
+  // Unannotated `let capv = { ... }` → declared is TyUnit; recover from RHS.
+  match rhs do
+    | Some(val: r) ->
+      let from_rhs = mir_record_field_type(e: r, locals, type_defs)
+      if let TyRecord(_) = from_rhs then return Some(val: from_rhs) else return None end
+    | None -> return None
+  end
+end
+
+// Collect the record-shaped local bindings of a single function (params +
+// MirStmtLet, recursively through nested stmt-bearing exprs). The resulting
+// name→TypeExpr table is then consulted when a MakeClosure captures one of
+// these names. `env_for_fn` is the slot-keyed (`#ENVTYPE#<slot>`) env-type
+// registry already accumulated for THIS function — used to recognize an
+// env-load-preamble let (`let capv = MirEnvLoad(__env, idx)`) inside a lifted
+// closure as a record, so a NESTED closure capturing that re-bound name is
+// itself typed (nexus-pvscf pin4).
+let collect_func_record_locals = fn (
+  func: MirFunction,
+  type_defs: [ RecordDef ],
+  env_for_fn: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  let MirFunction(name: _, params: ps, ret_type: _, body, span: _) = func
+  let with_params = collect_param_record_locals(params: ps, type_defs, acc: [])
+  return collect_stmts_record_locals(stmts: body, type_defs, env_for_fn, acc: with_params)
+end
+
+let collect_param_record_locals = fn (
+  params: [ MirParam ],
+  type_defs: [ RecordDef ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match params do
+    | [] -> return acc
+    | MirParam(label: _, name: n, typ: t) :: rest ->
+      let resolved = resolve_typedef(typ: t, type_defs)
+      let acc2 = if let TyRecord(_) = resolved then TypeEntry(name: n, typ: resolved) :: acc else acc end
+      return collect_param_record_locals(params: rest, type_defs, acc: acc2)
+  end
+end
+
+let collect_stmts_record_locals = fn (
+  stmts: [ MirStmt ],
+  type_defs: [ RecordDef ],
+  env_for_fn: [ TypeEntry ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match stmts do
+    | [] -> return acc
+    | s :: rest ->
+      let acc2 = collect_stmt_record_locals(stmt: s, type_defs, env_for_fn, acc)
+      return collect_stmts_record_locals(stmts: rest, type_defs, env_for_fn, acc: acc2)
+  end
+end
+
+let collect_stmt_record_locals = fn (
+  stmt: MirStmt,
+  type_defs: [ RecordDef ],
+  env_for_fn: [ TypeEntry ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match stmt do
+    | MirStmtLet(name: n, typ: t, expr: e) ->
+      // An env-load-preamble let inside a lifted closure: recover its record
+      // type from this function's slot-keyed env registry.
+      match env_load_record_type(expr: e, env_for_fn) do
+        | Some(val: ert) -> return TypeEntry(name: n, typ: ert) :: acc
+        | None ->
+          match resolve_record_local(declared: t, rhs: Some(val: e), locals: acc, type_defs) do
+            | Some(val: rt) -> return TypeEntry(name: n, typ: rt) :: acc
+            | None -> return collect_expr_record_locals(expr: e, type_defs, env_for_fn, acc)
+          end
+      end
+    | MirStmtExpr(expr: e) | MirStmtReturn(expr: e) -> return collect_expr_record_locals(expr: e, type_defs, env_for_fn, acc)
+    | MirStmtAssign(target: _, value: v) -> return collect_expr_record_locals(expr: v, type_defs, env_for_fn, acc)
+    | MirStmtTry(body: b, catch_param: _, catch_body: cb) ->
+      let a1 = collect_stmts_record_locals(stmts: b, type_defs, env_for_fn, acc)
+      return collect_stmts_record_locals(stmts: cb, type_defs, env_for_fn, acc: a1)
+    | _ -> return acc
+  end
+end
+
+// If `e` is `MirEnvLoad(_, idx)` and the slot-keyed registry holds a TyRecord
+// for slot idx, return it. Used to type env-load-preamble lets.
+let env_load_record_type = fn (
+  expr: MirExpr,
+  env_for_fn: [ TypeEntry ]
+) -> Option<TypeExpr> throws { LirError } do
+  if let MirEnvLoad(env_var: _, index: idx) = expr then
+    match lookup_type_entry(name: env_slot_sentinel(slot: idx), entries: env_for_fn) do
+      | Some(val: TyRecord(fields: fs)) -> return Some(val: TyRecord(fields: fs))
+      | _ -> return None
+    end
+  else
+    return None
+  end
+end
+
+let collect_expr_record_locals = fn (
+  expr: MirExpr,
+  type_defs: [ RecordDef ],
+  env_for_fn: [ TypeEntry ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match expr do
+    | MirIf(cond: _, then_body: tb, else_body: eb) ->
+      let a1 = collect_stmts_record_locals(stmts: tb, type_defs, env_for_fn, acc)
+      match eb do
+        | Some(val: e2) -> return collect_stmts_record_locals(stmts: e2, type_defs, env_for_fn, acc: a1)
+        | None -> return a1
+      end
+    | MirWhile(cond: _, body: b) -> return collect_stmts_record_locals(stmts: b, type_defs, env_for_fn, acc)
+    | MirBlock(stmts: b) -> return collect_stmts_record_locals(stmts: b, type_defs, env_for_fn, acc)
+    | MirMatch(target: _, cases: cs) -> return collect_match_cases_record_locals(cases: cs, type_defs, env_for_fn, acc)
+    | _ -> return acc
+  end
+end
+
+let collect_match_cases_record_locals = fn (
+  cases: [ MirMatchCase ],
+  type_defs: [ RecordDef ],
+  env_for_fn: [ TypeEntry ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match cases do
+    | [] -> return acc
+    | MirMatchCase(pattern: _, body: b) :: rest ->
+      let a1 = collect_stmts_record_locals(stmts: b, type_defs, env_for_fn, acc)
+      return collect_match_cases_record_locals(cases: rest, type_defs, env_for_fn, acc: a1)
+  end
+end
+
+// Walk a function body for MakeClosure sites and emit env-type sentinel
+// entries for any capture that resolves to a record local of THIS function.
+// `registry_so_far` is the program-wide env-type registry accumulated for
+// already-processed functions; its entries for THIS function (re-keyed to the
+// slot-only form) let env-load-preamble lets in a lifted closure be typed as
+// records, so a nested closure capturing them is itself typed (pin4).
+let collect_env_type_entries_for_func = fn (
+  func: MirFunction,
+  type_defs: [ RecordDef ],
+  registry_so_far: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  let MirFunction(name: fname, params: _, ret_type: _, body, span: _) = func
+  let env_for_fn = rekey_env_types_for_fn(fname, entries: registry_so_far, acc: [])
+  let locals = collect_func_record_locals(func, type_defs, env_for_fn)
+  return env_entries_from_stmts(stmts: body, locals, acc: [])
+end
+
+let env_entries_from_stmts = fn (
+  stmts: [ MirStmt ],
+  locals: [ TypeEntry ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match stmts do
+    | [] -> return acc
+    | s :: rest ->
+      let acc2 = env_entries_from_stmt(stmt: s, locals, acc)
+      return env_entries_from_stmts(stmts: rest, locals, acc: acc2)
+  end
+end
+
+let env_entries_from_stmt = fn (
+  stmt: MirStmt,
+  locals: [ TypeEntry ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match stmt do
+    | MirStmtLet(name: _, typ: _, expr: e) -> return env_entries_from_expr(expr: e, locals, acc)
+    | MirStmtExpr(expr: e) | MirStmtReturn(expr: e) -> return env_entries_from_expr(expr: e, locals, acc)
+    | MirStmtAssign(target: _, value: v) -> return env_entries_from_expr(expr: v, locals, acc)
+    | MirStmtTry(body: b, catch_param: _, catch_body: cb) ->
+      let a1 = env_entries_from_stmts(stmts: b, locals, acc)
+      return env_entries_from_stmts(stmts: cb, locals, acc: a1)
+    | _ -> return acc
+  end
+end
+
+let env_entries_from_expr = fn (
+  expr: MirExpr,
+  locals: [ TypeEntry ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match expr do
+    | MirMakeClosure(func_name: fn_name, captures: caps) ->
+      return env_entries_from_captures(lifted_fn: fn_name, captures: caps, slot: 0, locals, acc)
+    | MirIf(cond: _, then_body: tb, else_body: eb) ->
+      let a1 = env_entries_from_stmts(stmts: tb, locals, acc)
+      match eb do
+        | Some(val: e2) -> return env_entries_from_stmts(stmts: e2, locals, acc: a1)
+        | None -> return a1
+      end
+    | MirWhile(cond: _, body: b) -> return env_entries_from_stmts(stmts: b, locals, acc)
+    | MirBlock(stmts: b) -> return env_entries_from_stmts(stmts: b, locals, acc)
+    | MirMatch(target: _, cases: cs) -> return env_entries_from_match_cases(cases: cs, locals, acc)
+    | _ -> return acc
+  end
+end
+
+let env_entries_from_match_cases = fn (
+  cases: [ MirMatchCase ],
+  locals: [ TypeEntry ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match cases do
+    | [] -> return acc
+    | MirMatchCase(pattern: _, body: b) :: rest ->
+      let a1 = env_entries_from_stmts(stmts: b, locals, acc)
+      return env_entries_from_match_cases(cases: rest, locals, acc: a1)
+  end
+end
+
+let env_entries_from_captures = fn (
+  lifted_fn: string,
+  captures: [ MirExpr ],
+  slot: i64,
+  locals: [ TypeEntry ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match captures do
+    | [] -> return acc
+    | cap_expr :: rest ->
+      let acc2 = match cap_expr do
+        | MirVariable(name: vn) ->
+          match lookup_type_entry(name: vn, entries: locals) do
+            | Some(val: rt) -> TypeEntry(name: env_type_sentinel(lifted_fn, slot), typ: rt) :: acc
+            | None -> acc
+          end
+        | _ -> acc
+      end
+      return env_entries_from_captures(lifted_fn, captures: rest, slot: slot + 1, locals, acc: acc2)
+  end
+end
+
+let collect_all_env_type_entries = fn (
+  funcs: [ MirFunction ],
+  type_defs: [ RecordDef ]
+) -> [ TypeEntry ] throws { LirError } do
+  return collect_all_env_type_entries_go(funcs, type_defs, acc: [])
+end
+
+let collect_all_env_type_entries_go = fn (
+  funcs: [ MirFunction ],
+  type_defs: [ RecordDef ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match funcs do
+    | [] -> return acc
+    | f :: rest ->
+      // Forward accumulation: pass the registry built so far so a lifted
+      // closure (which appears after its enclosing fn in program order) can
+      // see its own env-load preamble lets typed as records (pin4).
+      let entries = collect_env_type_entries_for_func(func: f, type_defs, registry_so_far: acc)
+      return collect_all_env_type_entries_go(funcs: rest, type_defs, acc: prepend_type_entries(xs: entries, ys: acc))
+  end
+end
+
 /** Entry point: lower a MirProgram to a LirProgram. */
 export let lower_mir_to_lir = fn (
   mir: MirProgram,
@@ -371,8 +786,12 @@ export let lower_mir_to_lir = fn (
   let MirProgram(functions: fs, externals: exts) = mir
   let func_types = build_func_type_entries(funcs: fs)
   let sem_func_types = build_func_semantic_type_entries(funcs: fs, type_defs)
+  // Captured-record env types (nexus-pvscf): a SEPARATE, small registry (only
+  // closures that capture a record contribute) — kept out of sem_func_types so
+  // it does not bloat every function's semantic_vars. Threaded alongside.
+  let env_type_entries = collect_all_env_type_entries(funcs: fs, type_defs)
     return LirProgram(
-      functions: lir_lower_functions(functions: fs, enum_defs: variant_idx, type_defs, func_types, sem_func_types),
+      functions: lir_lower_functions(functions: fs, enum_defs: variant_idx, type_defs, func_types, sem_func_types, env_type_entries),
       externals: convert_externals(externals: exts)
     )
 end
@@ -382,9 +801,10 @@ let lir_lower_functions = fn (
   enum_defs: VariantIndex,
   type_defs: [ RecordDef ],
   func_types: [ TypeEntry ],
-  sem_func_types: [ TypeEntry ]
+  sem_func_types: [ TypeEntry ],
+  env_type_entries: [ TypeEntry ]
 ) -> [ LirFunction ] throws { LirError } do
-  return lir_lower_functions_go(functions, enum_defs, type_defs, func_types, sem_func_types, acc: [])
+  return lir_lower_functions_go(functions, enum_defs, type_defs, func_types, sem_func_types, env_type_entries, acc: [])
 end
 
 let lir_lower_functions_go = fn (
@@ -393,13 +813,14 @@ let lir_lower_functions_go = fn (
   type_defs: [ RecordDef ],
   func_types: [ TypeEntry ],
   sem_func_types: [ TypeEntry ],
+  env_type_entries: [ TypeEntry ],
   acc: [ LirFunction ]
 ) -> [ LirFunction ] throws { LirError } do
   match functions do
     | [] -> return list.reverse(xs: acc)
     | f :: rest ->
-      return lir_lower_functions_go(functions: rest, enum_defs, type_defs, func_types, sem_func_types,
-        acc: lir_lower_function(f, enum_defs, type_defs, func_types, sem_func_types) :: acc)
+      return lir_lower_functions_go(functions: rest, enum_defs, type_defs, func_types, sem_func_types, env_type_entries,
+        acc: lir_lower_function(f, enum_defs, type_defs, func_types, sem_func_types, env_type_entries) :: acc)
   end
 end
 
