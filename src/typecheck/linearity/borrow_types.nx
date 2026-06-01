@@ -1,0 +1,255 @@
+/**
+ * typecheck/linearity/borrow_types: type-structure machinery for the linearity
+ * pass — TyVar occurrence/collection over TypeExpr, and borrow-bearing type
+ * resolution over EnumDef / RecordDef.
+ *
+ * These helpers are pure walks over the type structure (no HIR / LinState
+ * dependency). They are consumed by:
+ *   • walk.nx          — `let_binds_linear`'s param→result-slot linear flow
+ *                         (collect_tyvars / pt_shares_tyvar_with_rt / …).
+ *   • borrow_escape.nx — the Form-B borrow-escape walk
+ *                         (ret_type_bears_borrow / …).
+ *
+ * Splitting these out keeps the dependency one-directional:
+ *   borrow_types  ←  borrow_escape  ←  walk
+ */
+
+import {
+  TypeExpr,
+  TyLinear,
+  TyVar,
+  TyUserDefined,
+  TyArrow,
+  TyRef,
+  TyLazy,
+  TyBorrow,
+  TyArray,
+  TyList,
+  TyRecord,
+  TyRow,
+  NamedType,
+  RecordDef,
+  EnumDef,
+  VariantDef,
+  VariantField
+} from "src/types/type_expr.nx"
+import { Option, Some, None } from "std:option"
+import { filter_in } from "src/typecheck/linearity/state.nx"
+
+// ─── TyVar occurrence / collection over TypeExpr ─────────────────────────────
+
+/** Lookup a parameter type by label; param labels and types are positionally
+ *  parallel. Returns None if the label is not declared (no match — the
+ *  caller treats this as "skip this arg"). */
+export let lookup_param_type_by_label = fn (
+  labels: [ string ], types: [ TypeExpr ], target: string
+) -> Option<TypeExpr> do
+  match labels do
+    | [] -> return None
+    | l :: lrest ->
+      match types do
+        | [] -> return None
+        | t :: trest ->
+          if l == target then return Some(val: t) end
+          return lookup_param_type_by_label(labels: lrest, types: trest, target)
+      end
+  end
+end
+
+/** True if `α` occurs anywhere inside `t` as a type-variable reference.
+ *  Linearity runs BEFORE typecheck, so type-parameter references in the
+ *  raw HIR appear as either `TyVar(α)` (already-converted in fixtures) OR
+ *  `TyUserDefined(α, [])` (the parser's lossy encoding of a bare name).
+ *  Both forms denote the same abstract slot and we treat them
+ *  interchangeably here. Walks the type structurally. */
+export let tyvar_occurs_in_type = fn (a: string, t: TypeExpr) -> bool do
+  match t do
+    | TyVar(name: n) -> return n == a
+    | TyUserDefined(name: n, args: []) -> return n == a
+    | TyUserDefined(name: _, args: ts) -> return tyvar_occurs_in_types(a, ts)
+    | TyArrow(params: ps, ret: r, requires: _, throw_row: _) ->
+      if tyvar_occurs_in_named_types(a, nts: ps) then return true end
+      return tyvar_occurs_in_type(a, t: r)
+    | TyRef(inner: i) -> return tyvar_occurs_in_type(a, t: i)
+    | TyLinear(inner: i) -> return tyvar_occurs_in_type(a, t: i)
+    | TyLazy(inner: i, require_row: _, throw_row: _) -> return tyvar_occurs_in_type(a, t: i)
+    | TyBorrow(inner: i) -> return tyvar_occurs_in_type(a, t: i)
+    | TyArray(elem: e) -> return tyvar_occurs_in_type(a, t: e)
+    | TyList(elem: e) -> return tyvar_occurs_in_type(a, t: e)
+    | TyRecord(fields: fs) -> return tyvar_occurs_in_named_types(a, nts: fs)
+    | TyRow(types: ts, rest: _) -> return tyvar_occurs_in_types(a, ts)
+    | _ -> return false
+  end
+end
+
+export let tyvar_occurs_in_types = fn (a: string, ts: [ TypeExpr ]) -> bool do
+  match ts do
+    | [] -> return false
+    | t :: rest ->
+      if tyvar_occurs_in_type(a, t) then return true end
+      return tyvar_occurs_in_types(a, ts: rest)
+  end
+end
+
+export let tyvar_occurs_in_named_types = fn (a: string, nts: [ NamedType ]) -> bool do
+  match nts do
+    | [] -> return false
+    | NamedType(name: _, typ: t) :: rest ->
+      if tyvar_occurs_in_type(a, t) then return true end
+      return tyvar_occurs_in_named_types(a, nts: rest)
+  end
+end
+
+/** Collect all type-variable names occurring anywhere inside `t` as a flat
+ *  list (with possible duplicates; callers test membership). Treats both
+ *  `TyVar(α)` and the raw-HIR-pre-typecheck shape `TyUserDefined(α, [])` as
+ *  type-variable references — see [[tyvar_occurs_in_type]] for the rationale. */
+export let collect_tyvars = fn (t: TypeExpr, acc: [ string ]) -> [ string ] do
+  match t do
+    | TyVar(name: n) -> return n :: acc
+    | TyUserDefined(name: n, args: []) -> return n :: acc
+    | TyUserDefined(name: _, args: ts) -> return collect_tyvars_list(ts, acc)
+    | TyArrow(params: ps, ret: r, requires: _, throw_row: _) ->
+      let acc1 = collect_tyvars_named(nts: ps, acc)
+      return collect_tyvars(t: r, acc: acc1)
+    | TyRef(inner: i) -> return collect_tyvars(t: i, acc)
+    | TyLinear(inner: i) -> return collect_tyvars(t: i, acc)
+    | TyLazy(inner: i, require_row: _, throw_row: _) -> return collect_tyvars(t: i, acc)
+    | TyBorrow(inner: i) -> return collect_tyvars(t: i, acc)
+    | TyArray(elem: e) -> return collect_tyvars(t: e, acc)
+    | TyList(elem: e) -> return collect_tyvars(t: e, acc)
+    | TyRecord(fields: fs) -> return collect_tyvars_named(nts: fs, acc)
+    | TyRow(types: ts, rest: _) -> return collect_tyvars_list(ts, acc)
+    | _ -> return acc
+  end
+end
+
+export let collect_tyvars_list = fn (ts: [ TypeExpr ], acc: [ string ]) -> [ string ] do
+  match ts do
+    | [] -> return acc
+    | t :: rest ->
+      let acc1 = collect_tyvars(t, acc)
+      return collect_tyvars_list(ts: rest, acc: acc1)
+  end
+end
+
+export let collect_tyvars_named = fn (nts: [ NamedType ], acc: [ string ]) -> [ string ] do
+  match nts do
+    | [] -> return acc
+    | NamedType(name: _, typ: t) :: rest ->
+      let acc1 = collect_tyvars(t, acc)
+      return collect_tyvars_named(nts: rest, acc: acc1)
+  end
+end
+
+/** True if any declared type-parameter `α ∈ type_params` occurs inside
+ *  `pt` AND also occurs inside `rt`. Used as the "param→result-slot flow"
+ *  predicate: a linear arg flowing into this parameter slot propagates
+ *  into the result wherever `α` survives in `rt`. The `type_params` gate
+ *  restricts the check to true generics — without it, a concrete nominal
+ *  type like `Bb` in `wrap_id(b: %Bb) -> Bb` would spuriously self-match.
+ *  Returns false when `pt` has no TyVar slots OR when `pt`'s TyVars don't
+ *  reach `rt` (e.g. `take_bb(b: %Bb) -> i64`). */
+export let pt_shares_tyvar_with_rt = fn (pt: TypeExpr, rt: TypeExpr, type_params: [ string ]) -> bool do
+  let pt_tyvars = collect_tyvars(t: pt, acc: [])
+  let pt_in_tps = filter_in(xs: pt_tyvars, keep: type_params, acc: [])
+  return any_tyvar_in_rt(tyvars: pt_in_tps, rt)
+end
+
+export let any_tyvar_in_rt = fn (tyvars: [ string ], rt: TypeExpr) -> bool do
+  match tyvars do
+    | [] -> return false
+    | a :: rest ->
+      if tyvar_occurs_in_type(a, t: rt) then return true end
+      return any_tyvar_in_rt(tyvars: rest, rt)
+  end
+end
+
+// ─── Borrow-bearing type resolution over EnumDef / RecordDef ─────────────────
+
+/** True iff `t` is, or one resolution level into a returned record/enum def
+ *  contains, a `&σ` borrow. Bounded to one nominal-resolution level so a
+ *  recursive type cannot loop; that one level reaches the Wrap(b: &BB) field. */
+export let ret_type_bears_borrow = fn (
+  t: TypeExpr, enum_defs: [ EnumDef ], tdefs: [ RecordDef ], resolve: bool
+) -> bool do
+  match t do
+    | TyBorrow(_) -> return true
+    | TyRef(_) -> return true
+    | TyLinear(inner: i) | TyLazy(inner: i, _) ->
+      return ret_type_bears_borrow(t: i, enum_defs, tdefs, resolve)
+    | TyArray(elem: e) | TyList(elem: e) ->
+      return ret_type_bears_borrow(t: e, enum_defs, tdefs, resolve)
+    | TyRecord(fields: fs) ->
+      return named_types_bear_borrow(nts: fs, enum_defs, tdefs)
+    | TyUserDefined(name: n, args: _) ->
+      if !resolve then return false end
+      // Resolve ONE level into the named type's variant/record fields.
+      match find_enum_def(defs: enum_defs, name: n) do
+        | Some(val: vfs) -> return variant_fields_bear_borrow(vfs, enum_defs, tdefs)
+        | None ->
+          match find_record_def(defs: tdefs, name: n) do
+            | Some(val: nts) -> return named_types_bear_borrow(nts, enum_defs, tdefs)
+            | None -> return false
+          end
+      end
+    | _ -> return false
+  end
+end
+
+export let named_types_bear_borrow = fn (
+  nts: [ NamedType ], enum_defs: [ EnumDef ], tdefs: [ RecordDef ]
+) -> bool do
+  match nts do
+    | [] -> return false
+    | NamedType(name: _, typ: t) :: rest ->
+      if ret_type_bears_borrow(t, enum_defs, tdefs, resolve: false) then return true end
+      return named_types_bear_borrow(nts: rest, enum_defs, tdefs)
+  end
+end
+
+export let variant_fields_bear_borrow = fn (
+  vfs: [ VariantField ], enum_defs: [ EnumDef ], tdefs: [ RecordDef ]
+) -> bool do
+  match vfs do
+    | [] -> return false
+    | VariantField(name: _, typ: t) :: rest ->
+      if ret_type_bears_borrow(t, enum_defs, tdefs, resolve: false) then return true end
+      return variant_fields_bear_borrow(vfs: rest, enum_defs, tdefs)
+  end
+end
+
+/** All variant fields of an enum, flattened (any variant holding a borrow
+ *  makes the type borrow-bearing). */
+export let find_enum_def = fn (defs: [ EnumDef ], name: string) -> Option<[ VariantField ]> do
+  match defs do
+    | [] -> return None
+    | EnumDef(name: en, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
+      if en == name then return Some(val: flatten_variant_fields(vs, acc: [])) end
+      return find_enum_def(defs: rest, name)
+  end
+end
+
+export let flatten_variant_fields = fn (vs: [ VariantDef ], acc: [ VariantField ]) -> [ VariantField ] do
+  match vs do
+    | [] -> return acc
+    | VariantDef(name: _, fields: fs) :: rest ->
+      return flatten_variant_fields(vs: rest, acc: append_vfields(a: acc, b: fs))
+  end
+end
+
+export let append_vfields = fn (a: [ VariantField ], b: [ VariantField ]) -> [ VariantField ] do
+  match b do
+    | [] -> return a
+    | x :: rest -> return append_vfields(a: x :: a, b: rest)
+  end
+end
+
+export let find_record_def = fn (defs: [ RecordDef ], name: string) -> Option<[ NamedType ]> do
+  match defs do
+    | [] -> return None
+    | RecordDef(name: rn, is_public: _, type_params: _, fields: fs) :: rest ->
+      if rn == name then return Some(val: fs) end
+      return find_record_def(defs: rest, name)
+  end
+end
