@@ -122,6 +122,89 @@ let lir_builtin_field_mem_idx = fn (ctor_name: string, def_idx: i64) -> i64 thro
   return def_idx
 end
 
+// Concrete type arguments carried by a scrutinee's semantic type, in the order
+// of the owning enum's `type_params`. A `match` over a generic container binds
+// constructor fields whose DECLARED type is a bare type-param (`Cons.v : T`,
+// `MkPair.fst : X`); substituting these args lets the field's real type reach
+// the bound variable so `.field` doesn't abort LIR with E6002 (nexus-n5gub).
+//   TyList(e)            → [e]            (built-in List<T>)
+//   TyUserDefined(_, as) → as            (user generic enum / record alias)
+// Other shapes carry no args; substitution then leaves type-params untouched.
+let scrutinee_type_args = fn (scr_sem: TypeExpr) -> [ TypeExpr ] do
+  match scr_sem do
+    | TyList(elem: e) -> return [ e ]
+    | TyUserDefined(name: _, args: a) -> return a
+    | _ -> return []
+  end
+end
+
+// Substitute bare type-param occurrences (`TyVar(p_i)`) in `typ` with the
+// corresponding concrete arg, pairing `params[i]` with `args[i]` positionally.
+// One level deep is enough for variant fields (`T`, `[T]`, `Foo<T>`); recursive
+// record bodies stay unexpanded so cyclic types never loop.
+let subst_type_params = fn (typ: TypeExpr, params: [ string ], args: [ TypeExpr ]) -> TypeExpr throws { LirError } do
+  match typ do
+    | TyVar(name: n) -> return lookup_type_param(name: n, params, args)
+    | TyList(elem: e) -> return TyList(elem: subst_type_params(typ: e, params, args))
+    | TyArray(elem: e) -> return TyArray(elem: subst_type_params(typ: e, params, args))
+    | TyUserDefined(name: n, args: a) ->
+      // Bare type-param references reach LIR as `TyUserDefined(n, [])` (the
+      // frontend has not run convert_ud_to_var on these enum_defs), so an
+      // arg-less user type whose name is a declared type-param IS a type-param
+      // occurrence — substitute it. Named types keep their (recursed) args.
+      if string_in(name: n, names: params) && is_empty_args(a) then
+        return lookup_type_param(name: n, params, args)
+      else
+        return TyUserDefined(name: n, args: subst_type_params_list(types: a, params, args))
+      end
+    | _ -> return typ
+  end
+end
+
+let is_empty_args = fn (a: [ TypeExpr ]) -> bool do
+  match a do
+    | [] -> return true
+    | _ -> return false
+  end
+end
+
+let string_in = fn (name: string, names: [ string ]) -> bool do
+  match names do
+    | [] -> return false
+    | n :: rest -> if n == name then return true else return string_in(name, names: rest) end
+  end
+end
+
+let subst_type_params_list = fn (types: [ TypeExpr ], params: [ string ], args: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match types do
+    | [] -> return []
+    | t :: rest -> return subst_type_params(typ: t, params, args) :: subst_type_params_list(types: rest, params, args)
+  end
+end
+
+// The owning enum's type-param names for a constructor (`List` → ["T"],
+// `Pair` → ["X","Y"]). Empty when the ctor is unknown or monomorphic.
+let variant_type_params = fn (idx: VariantIndex, ctor_name: string) -> [ string ] throws { LirError } do
+  match vidx.lookup_variant_info(idx, variant: ctor_name) do
+    | Some(val: vidx.VariantInfo(enum_name: _, type_params: tps, def: _)) -> return tps
+    | None -> return []
+  end
+end
+
+let lookup_type_param = fn (name: string, params: [ string ], args: [ TypeExpr ]) -> TypeExpr throws { LirError } do
+  match params do
+    | [] -> return TyVar(name)
+    | p :: rest_p ->
+      match args do
+        | [] -> return TyVar(name)
+        | a :: rest_a ->
+          if p == name then return a
+          else return lookup_type_param(name, params: rest_p, args: rest_a)
+          end
+      end
+  end
+end
+
 let lir_str_less_than_loop = fn (
   a: string,
   b: string,
@@ -399,7 +482,18 @@ let lir_extract_fields_loop = fn (scr_atom: LirAtom, scr_sem: TypeExpr, ctor_nam
       let names = get_variant_field_names(vd)
       let field_name = lir_nth_string(lst: names, n: idx)
       let heap_idx = constructor_field_heap_index(field_name, ctor_name, enum_defs)
-      let sem_ft = constructor_field_type(field_name, ctor_name, enum_defs)
+      let raw_ft = constructor_field_type(field_name, ctor_name, enum_defs)
+      // A generic-container field is declared with a bare type-param
+      // (`Cons.v : T`, `MkPair.fst : X`). Substitute the scrutinee's concrete
+      // type args (`[Inner]` → T=Inner; `Pair<Inner,i64>` → X=Inner, Y=i64)
+      // before resolving the alias so the bound variable carries the field's
+      // real semantic type instead of an unresolved `TyVar`, otherwise
+      // `.field` on it aborts LIR with E6002 (nexus-n5gub #1 cons-elem / #3
+      // generic-field). One level on demand → recursive types never loop.
+      let tps = variant_type_params(idx: enum_defs, ctor_name)
+      let substituted = subst_type_params(typ: raw_ft, params: tps,
+        args: scrutinee_type_args(scr_sem))
+      let sem_ft = vidx.resolve_record_alias(idx: enum_defs, typ: substituted)
       let wasm_ft = wasm_type(typ: sem_ft)
       let BindResult(ctx: ctx2, atom: field_atom) = bind_expr_to_temp_semantic(ctx,
         expr: LirExprObjectField(value: scr_atom, index: heap_idx, typ: wasm_ft),

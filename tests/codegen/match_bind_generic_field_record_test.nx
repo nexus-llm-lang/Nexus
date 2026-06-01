@@ -1,0 +1,109 @@
+// Regression test for nexus-n5gub Surface #3 (generic-container variant field).
+//
+// `match p do | MkPair(fst, snd) -> fst.a ... end` over `p : Pair<Inner, i64>`
+// aborted LIR lowering with E6002 on `fst`.
+//
+// Root cause: the user-variant branch of `lir_extract_fields_loop` read the
+// field's DECLARED type — for a generic field that is a bare type-param
+// (`MkPair.fst : X`), so `resolve_record_alias` was a no-op and the bound var
+// carried `TyVar("X")`. The fix substitutes the scrutinee's concrete type args
+// (`Pair<Inner, i64>` → X=Inner, Y=i64) before resolving the field type.
+//
+// Pins (all aborted at codegen pre-fix):
+//   1. issue repro: `Pair<Inner, i64>`, read `fst.a/.b/.c` + `snd` weighted.
+//   2. second type param resolves too (`snd.a` when Pair<i64, Inner>).
+//   3. nested generic `Pair<Pair<Inner, i64>, i64>` — inner field type survives.
+//   4. inline anonymous record as a type arg (`Pair<{a,b}, i64>`).
+//   5. single-param generic `Box<Inner>` field access.
+import * as test_assert from "std:test/assert"
+
+type Inner = { a: i64, b: i64, c: i64 }
+type Pair<X, Y> = MkPair(fst: X, snd: Y)
+type Box<X> = MkBox(it: X)
+
+// --- pin 1: issue repro — fst is the record type arg ---
+let pair_fst_weighted = fn (p: Pair<Inner, i64>) -> i64 do
+  match p do
+    | MkPair(fst, snd) -> return fst.a + fst.b * 10 + fst.c * 100 + snd * 1000
+  end
+end
+
+// --- pin 2: second type param is the record ---
+let pair_snd_weighted = fn (p: Pair<i64, Inner>) -> i64 do
+  match p do
+    | MkPair(fst, snd) -> return snd.a + snd.b * 10 + snd.c * 100 + fst * 1000
+  end
+end
+
+// --- pin 3: nested generic, inner pair's record field ---
+let nested_pair = fn (p: Pair<Pair<Inner, i64>, i64>) -> i64 do
+  match p do
+    | MkPair(fst, snd: _) ->
+      match fst do
+        | MkPair(fst: inner, snd: _) -> return inner.a + inner.b * 10 + inner.c * 100
+      end
+  end
+end
+
+// --- pin 4: inline anonymous record as a type arg ---
+let pair_inline = fn (p: Pair<{ a: i64, b: i64 }, i64>) -> i64 do
+  match p do
+    | MkPair(fst, snd: _) -> return fst.a + fst.b * 10
+  end
+end
+
+// --- pin 5: single-param generic Box ---
+let box_get = fn (b: Box<Inner>) -> i64 do
+  match b do
+    | MkBox(it) -> return it.a + it.b * 10 + it.c * 100
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // pin 1: fst={a:1,b:0,c:1}, snd=7 → 1 + 0 + 100 + 7000 = 7101.
+  test_assert.assert_eq_i64(
+    actual: pair_fst_weighted(p: MkPair(fst: { a: 1, b: 0, c: 1 }, snd: 7)),
+    expected: 7101,
+    label: "n5gub#3 pin1: .a/.b/.c on generic field MkPair.fst (weighted)"
+  )
+  // pin 1b: the issue's exact 7010101 — fst={a:1,b:1,c:1}, snd=7.
+  test_assert.assert_eq_i64(
+    actual: pair_fst_weighted(p: MkPair(fst: { a: 1, b: 1, c: 1 }, snd: 7)),
+    expected: 7111,
+    label: "n5gub#3 pin1b: distinct weighted offsets"
+  )
+
+  // pin 2: snd={a:2,b:2,c:2}, fst=5 → 2 + 20 + 200 + 5000 = 5222.
+  test_assert.assert_eq_i64(
+    actual: pair_snd_weighted(p: MkPair(fst: 5, snd: { a: 2, b: 2, c: 2 })),
+    expected: 5222,
+    label: "n5gub#3 pin2: second type-param resolves to record"
+  )
+
+  // pin 3: inner={a:3,b:4,c:5} → 3 + 40 + 500 = 543.
+  test_assert.assert_eq_i64(
+    actual: nested_pair(p: MkPair(fst: MkPair(fst: { a: 3, b: 4, c: 5 }, snd: 0), snd: 0)),
+    expected: 543,
+    label: "n5gub#3 pin3: nested generic inner record field"
+  )
+
+  // pin 4: inline {a:6,b:7} → 6 + 70 = 76.
+  test_assert.assert_eq_i64(
+    actual: pair_inline(p: MkPair(fst: { a: 6, b: 7 }, snd: 0)),
+    expected: 76,
+    label: "n5gub#3 pin4: inline anonymous record as type arg"
+  )
+
+  // pin 5: Box<Inner> it={a:8,b:9,c:1} → 8 + 90 + 100 = 198.
+  test_assert.assert_eq_i64(
+    actual: box_get(b: MkBox(it: { a: 8, b: 9, c: 1 })),
+    expected: 198,
+    label: "n5gub#3 pin5: single-param generic Box field"
+  )
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end

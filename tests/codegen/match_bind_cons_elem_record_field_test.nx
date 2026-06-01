@@ -1,0 +1,129 @@
+// Regression test for nexus-n5gub Surface #1 (cons-pattern-bound list element).
+//
+// `match xs do | _ :: v :: _ -> v.a ... end` over `xs : [Inner]` aborted LIR
+// lowering with E6002 ("field access on non-record semantic type") on `v`.
+//
+// Root cause: the BUILT-IN-constructor branch of `lir_extract_fields_loop`
+// (match_tree/emit.nx) hardcoded `sem_type: TyI64` for every `Cons` field,
+// unlike the user-variant branch which derives the real field type. So the
+// bound element `v` carried TyI64, and `.field` on it aborted. The fix derives
+// the element's semantic type from the list element type (head → element type,
+// tail → the list type itself, so a nested Cons match keeps the element type).
+//
+// Pins (all aborted at codegen pre-fix):
+//   1. issue repro: 2nd element of `[Inner]` via `_ :: v :: _`, weighted read.
+//   2. head element via `v :: _` (def-idx 0 on the OUTER cons).
+//   3. deeper nesting `_ :: _ :: v :: _` (element type survives 2 tails).
+//   4. inline anonymous record element type (not a named alias).
+//   5. record carrying a float field (head wasm-type derives correctly).
+import * as test_assert from "std:test/assert"
+
+type Inner = { a: i64, b: i64, c: i64 }
+
+// --- pin 1: issue repro — 2nd element, weighted x1/x10/x100 ---
+let second_weighted = fn (xs: [Inner]) -> i64 do
+  match xs do
+    | _ :: v :: _ -> return v.a + v.b * 10 + v.c * 100
+    | _ -> return -1
+  end
+end
+
+// --- pin 2: head element ---
+let head_weighted = fn (xs: [Inner]) -> i64 do
+  match xs do
+    | v :: _ -> return v.a + v.b * 10 + v.c * 100
+    | _ -> return -1
+  end
+end
+
+// --- pin 3: third element (element type survives two tails) ---
+let third_weighted = fn (xs: [Inner]) -> i64 do
+  match xs do
+    | _ :: _ :: v :: _ -> return v.a + v.b * 10 + v.c * 100
+    | _ -> return -1
+  end
+end
+
+// --- pin 4: inline anonymous record element ---
+let inline_second = fn (xs: [ { a: i64, b: i64 } ]) -> i64 do
+  match xs do
+    | _ :: v :: _ -> return v.a + v.b * 10
+    | _ -> return -1
+  end
+end
+
+// --- pin 5: record carrying a float field ---
+type FInner = { n: i64, r: float }
+
+let float_second = fn (xs: [FInner]) -> float do
+  match xs do
+    | _ :: v :: _ -> return v.r
+    | _ -> return 0.0
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  // pin 1: 2nd element = { a: 2, b: 2, c: 2 } → 2 + 20 + 200 = 222.
+  // Use distinct per-element values so an offset/element collapse is
+  // numerically detectable; expected for {a:2,b:2,c:2} is 222.
+  let xs: [Inner] = [
+    { a: 1, b: 1, c: 1 },
+    { a: 2, b: 2, c: 2 },
+    { a: 3, b: 3, c: 3 }
+  ]
+  test_assert.assert_eq_i64(
+    actual: second_weighted(xs),
+    expected: 222,
+    label: "n5gub#1 pin1: .a/.b/.c on cons-bound 2nd element (weighted)"
+  )
+
+  // pin 1b: an element whose fields differ across positions → 20202 form.
+  let ys: [Inner] = [
+    { a: 9, b: 9, c: 9 },
+    { a: 2, b: 0, c: 2 },
+    { a: 0, b: 0, c: 0 }
+  ]
+  test_assert.assert_eq_i64(
+    actual: second_weighted(xs: ys),
+    expected: 202,
+    label: "n5gub#1 pin1b: weighted offsets distinct (2 + 0*10 + 2*100)"
+  )
+
+  // pin 2: head element { a: 1, b: 1, c: 1 } → 111.
+  test_assert.assert_eq_i64(
+    actual: head_weighted(xs: [ { a: 1, b: 1, c: 1 }, { a: 2, b: 2, c: 2 } ]),
+    expected: 111,
+    label: "n5gub#1 pin2: head element .field"
+  )
+
+  // pin 3: third element { a: 3, b: 3, c: 3 } → 333.
+  test_assert.assert_eq_i64(
+    actual: third_weighted(xs: [
+      { a: 1, b: 1, c: 1 },
+      { a: 2, b: 2, c: 2 },
+      { a: 3, b: 3, c: 3 },
+      { a: 4, b: 4, c: 4 }
+    ]),
+    expected: 333,
+    label: "n5gub#1 pin3: element type survives two tails"
+  )
+
+  // pin 4: inline anonymous record, 2nd element { a: 5, b: 7 } → 5 + 70 = 75.
+  test_assert.assert_eq_i64(
+    actual: inline_second(xs: [ { a: 1, b: 1 }, { a: 5, b: 7 } ]),
+    expected: 75,
+    label: "n5gub#1 pin4: inline anonymous record element"
+  )
+
+  // pin 5: float field on cons-bound element.
+  test_assert.assert_true(
+    cond: float_second(xs: [ { n: 1, r: 1.5 }, { n: 2, r: 2.5 } ]) ==. 2.5,
+    label: "n5gub#1 pin5: float field on cons-bound element"
+  )
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end
