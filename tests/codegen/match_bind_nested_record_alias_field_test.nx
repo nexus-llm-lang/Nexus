@@ -1,0 +1,167 @@
+// Regression test for nexus-9kkrc (the NESTED sibling of nexus-xs3dl).
+//
+// xs3dl resolved only the TOP-LEVEL match-bound variable's record-alias to
+// `TyRecord`, but left the field types INSIDE that `TyRecord` as unresolved
+// `TyUserDefined`. So a NESTED record-alias still mis-resolved:
+//
+//   Surface A (SILENT wrong value): destructuring a match-bound record whose
+//   field is itself a named record alias read offset 0 for EVERY nested field
+//   (`lir_record_sorted_idx` collapses to 0 when its `sem` arg is not a
+//   `TyRecord`), printing 100/100/100 instead of 100/200/300.
+//
+//   Surface B (codegen abort E6002): a chained / re-accessed nested alias
+//   field (`oo.inner` bound, then `inr.a`) aborted LIR lowering because the
+//   bound temp carried the unresolved alias as its semantic type.
+//
+// The fix resolves a field type through `resolve_record_alias` at the two
+// field-extraction boundaries (the nested-destructure loop in match_tree/emit
+// and `resolve_record_field`), one level on demand — so arbitrary nesting
+// depth resolves lazily and recursive record types never expand infinitely.
+//
+// Pins (all SILENT/abort pre-fix):
+//   A1. nested record-alias destructure via match reads correct offsets.
+//   A2. three-level nesting (Outer.middle.inner) reads correct offsets.
+//   B1. chained `.field` on a match-bound nested alias (oo.inner.a).
+//   B2. `let inr = oo.inner` then `inr.a + inr.b` (the issue's Surface B).
+// Guards (must stay green):
+//   G1. single-level alias destructure (xs3dl path).
+//   G2. let-bound (non-match) nested destructure control.
+//   G3. a recursive record type still compiles and reads correctly.
+import * as test_assert from "std:test/assert"
+import { Option, Some, None } from "std:option"
+
+// --- nested aliases ---
+type Inner = { a: i64, b: i64, c: i64 }
+type Outer = { inner: Inner, tag: i64 }
+type Box = Box(o: Outer)
+
+// A1 + B1: match-bind the ctor field, then nested-destructure and chained-access.
+let nested_destructure_sum = fn (bx: Box) -> i64 do
+  match bx do
+    | Box(o: oo) ->
+      let { inner: { a: aa, b: bb, c: cc }, tag: _ } = oo
+      // weight each field so an offset collapse (all == aa) is detectable.
+      return aa * 1 + bb * 10 + cc * 100
+  end
+end
+
+let chained_access = fn (bx: Box) -> i64 do
+  match bx do
+    | Box(o: oo) -> return oo.inner.a * 1 + oo.inner.b * 10 + oo.inner.c * 100
+  end
+end
+
+// B2: the issue's exact Surface B shape (let-bound intermediate alias).
+let let_bound_nested_access = fn (bx: Box) -> i64 do
+  match bx do
+    | Box(o: oo) ->
+      let inr = oo.inner
+      let s: i64 = inr.a + inr.b + inr.c
+      return s
+  end
+end
+
+// A2: three levels of named-alias nesting.
+type Deep = { x: i64, y: i64 }
+type Mid = { deep: Deep, m: i64 }
+type Top = { mid: Mid, t: i64 }
+type TopBox = TB(top: Top)
+
+let three_level_destructure = fn (tb: TopBox) -> i64 do
+  match tb do
+    | TB(top: tt) ->
+      let { mid: { deep: { x: xx, y: yy }, m: _ }, t: _ } = tt
+      return xx * 1 + yy * 10
+  end
+end
+
+// G1: single-level alias destructure (the xs3dl-covered shape).
+type Flat = { p: i64, q: i64 }
+type FlatBox = FB(f: Flat)
+
+let single_level = fn (fb: FlatBox) -> i64 do
+  match fb do
+    | FB(f: ff) ->
+      let { p: pp, q: qq } = ff
+      return pp * 1 + qq * 10
+  end
+end
+
+// G2: let-bound (non-match) nested destructure control.
+let let_control = fn (o: Outer) -> i64 do
+  let { inner: { a: aa, b: bb, c: cc }, tag: _ } = o
+  return aa * 1 + bb * 10 + cc * 100
+end
+
+// G3: recursive record type must still compile and read correctly.
+type RList = { head: i64, tail: Option<RList> }
+
+let rlist_sum = fn (r: RList) -> i64 do
+  let { head: h, tail: t } = r
+  match t do
+    | None -> return h
+    | Some(val: rest) -> return h + rlist_sum(r: rest)
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  let bx = Box(o: { inner: { a: 100, b: 200, c: 300 }, tag: 9 })
+
+  // A1: pre-fix returned 100*1 + 100*10 + 100*100 == 11100 (all offset 0).
+  test_assert.assert_eq_i64(
+    actual: nested_destructure_sum(bx: Box(o: { inner: { a: 100, b: 200, c: 300 }, tag: 9 })),
+    expected: 100 + 2000 + 30000,
+    label: "9kkrc A1: nested record-alias destructure reads correct offsets"
+  )
+
+  // B1: chained `.field` after match.
+  test_assert.assert_eq_i64(
+    actual: chained_access(bx: Box(o: { inner: { a: 100, b: 200, c: 300 }, tag: 9 })),
+    expected: 100 + 2000 + 30000,
+    label: "9kkrc B1: oo.inner.a/.b/.c chained access after match"
+  )
+
+  // B2: issue Surface B exact shape, expect 5+7+0=... use distinct values.
+  let bx2 = Box(o: { inner: { a: 5, b: 7, c: 9 }, tag: 99 })
+  test_assert.assert_eq_i64(
+    actual: let_bound_nested_access(bx: bx2),
+    expected: 21,
+    label: "9kkrc B2: let inr = oo.inner; inr.a+inr.b+inr.c (was E6002)"
+  )
+
+  // A2: three-level nesting.
+  let tb = TB(top: { mid: { deep: { x: 4, y: 6 }, m: 1 }, t: 2 })
+  test_assert.assert_eq_i64(
+    actual: three_level_destructure(tb: TB(top: { mid: { deep: { x: 4, y: 6 }, m: 1 }, t: 2 })),
+    expected: 4 + 60,
+    label: "9kkrc A2: three-level named-alias destructure offsets"
+  )
+
+  // G1: single-level alias destructure (xs3dl).
+  test_assert.assert_eq_i64(
+    actual: single_level(fb: FB(f: { p: 3, q: 8 })),
+    expected: 3 + 80,
+    label: "9kkrc G1: single-level alias destructure still correct"
+  )
+
+  // G2: let-bound (non-match) nested destructure control.
+  test_assert.assert_eq_i64(
+    actual: let_control(o: { inner: { a: 100, b: 200, c: 300 }, tag: 9 }),
+    expected: 100 + 2000 + 30000,
+    label: "9kkrc G2: let-bound nested destructure control still correct"
+  )
+
+  // G3: recursive record type [1, 2, 3] sums to 6.
+  let rl = { head: 1, tail: Some(val: { head: 2, tail: Some(val: { head: 3, tail: None }) }) }
+  test_assert.assert_eq_i64(
+    actual: rlist_sum(r: rl),
+    expected: 6,
+    label: "9kkrc G3: recursive record type compiles and reads correctly"
+  )
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end
