@@ -2,13 +2,16 @@
 #
 # bootstrap.sh — Multi-stage bootstrap for the Nexus self-hosted compiler (src/)
 #
-# Stage 0: Run committed ./nexus.wasm (seed) to compile src/main.nx → stage0.wasm
+# Stage 0: Run committed ./nexus launcher (seed) to compile src/main.nx → stage0.wasm
 # Stage 1: Run stage0.wasm to compile src/main.nx → stage1.wasm
 # Stage 2: Run stage1.wasm to compile src/main.nx → stage2.wasm
 # Verify:  stage1.wasm == stage2.wasm (fixed point)
 #
-# The committed ./nexus.wasm is the Stage 0 source of truth; this script
-# no longer rebuilds the seed from Rust.
+# The committed ./nexus polyglot launcher is the Stage 0 source of truth (it
+# execs wasmtime against its embedded compiler payload, the same path
+# production users hit). Override NEXUS_SEED with a raw .wasm module to drive
+# Stage 0 through `wasmtime run` directly instead. This script no longer
+# rebuilds the seed from Rust.
 #
 # Usage: ./bootstrap.sh [--ci] [--install [PREFIX]]
 #   --ci              Strict mode for CI: fail on stage2 failure or non-identical output
@@ -40,7 +43,7 @@ while [[ $i -lt ${#args[@]} ]]; do
   i=$((i + 1))
 done
 
-NEXUS_SEED="${NEXUS_SEED:-./nexus.wasm}"
+NEXUS_SEED="${NEXUS_SEED:-./nexus}"
 NEXUS_ENTRY="src/main.nx"
 WASMTIME="${WASMTIME:-wasmtime}"
 # shellcheck disable=SC2054  # commas inside -W are wasmtime delimiters, not array separators
@@ -75,15 +78,29 @@ info "Using Stage 0 seed: $NEXUS_SEED (commit ${CURRENT_COMMIT:0:7})"
 
 run_seed_compile() {
   # Run the committed Stage 0 seed to compile <input.nx> → <output.wasm>.
+  #
+  # The seed is the committed `./nexus` polyglot launcher by default, which
+  # execs wasmtime against its embedded compiler payload internally — so it is
+  # invoked directly. When $NEXUS_SEED is overridden to a raw `.wasm` module
+  # (e.g. NEXUS_SEED=./nexus.wasm, or negative tests pointing elsewhere), it
+  # must be driven through `wasmtime run` with the core flags. Dispatch on the
+  # `.wasm` suffix so both forms keep working.
   local input="$1"
   local output="$2"
-  "$WASMTIME" run "${WASMTIME_FLAGS_CORE[@]}" "$NEXUS_SEED" build "$input" -o "$output"
+  case "$NEXUS_SEED" in
+    *.wasm)
+      "$WASMTIME" run "${WASMTIME_FLAGS_CORE[@]}" "$NEXUS_SEED" build "$input" -o "$output"
+      ;;
+    *)
+      "$NEXUS_SEED" build "$input" -o "$output"
+      ;;
+  esac
 }
 
 # ─── Stage 0: committed seed → stage0.wasm ───────────────────────────────
 
 STAGE0="$BUILD_DIR/stage0.wasm"
-info "Stage 0: wasmtime run $NEXUS_SEED $NEXUS_ENTRY → $STAGE0"
+info "Stage 0: $NEXUS_SEED build $NEXUS_ENTRY → $STAGE0"
 run_seed_compile "$NEXUS_ENTRY" "$STAGE0"
 ok "Stage 0 complete: $STAGE0 ($(wc -c < "$STAGE0" | tr -d ' ') bytes)"
 
@@ -198,6 +215,12 @@ ok "Installed lsp.wasm ($(wc -c < lsp.wasm | tr -d ' ') bytes)"
 # `#__NEXUS_PAYLOAD_BEGIN__` marker. Payload bytes are concatenated in the
 # manifest order: compiler first, then lsp.
 
+# Back up the currently-committed ./nexus launcher before we overwrite it, so
+# the post-assembly fixed-point gate can compare the rebuilt launcher against
+# what was on disk (peer to the cmp -s ./nexus.wasm $STAGE1 seed gate above).
+NEXUS_BACKUP="$BUILD_DIR/nexus.before"
+[[ -f ./nexus ]] && cp ./nexus "$NEXUS_BACKUP"
+
 info "Building polyglot launcher: header.sh + nexus.wasm + lsp.wasm → nexus"
 COMPILER_SIZE=$(wc -c < nexus.wasm | tr -d ' ')
 LSP_SIZE=$(wc -c < lsp.wasm | tr -d ' ')
@@ -230,6 +253,35 @@ LSP_SHA=$(sha256_file lsp.wasm)
 } > nexus
 chmod +x nexus
 ok "Installed nexus polyglot ($(wc -c < nexus | tr -d ' ') bytes; compiler=$COMPILER_SIZE, lsp=$LSP_SIZE)"
+
+# ─── Launcher fixed-point gate: rebuilt ./nexus must match committed one ──
+# Peer to the `cmp -s ./nexus.wasm $STAGE1` seed gate above. Because Stage 0
+# now runs through the committed ./nexus launcher, that launcher must be
+# reproducible: re-assembling header.sh + nexus.wasm + lsp.wasm must yield the
+# same bytes that were committed. A mismatch means header.sh, lsp.wasm, or the
+# assembly drifted relative to the committed launcher.
+#
+# CI fails hard (the committed launcher must be byte-reproducible). Local dev
+# only warns: the orchestrator's reseed legitimately rewrites ./nexus, so a
+# non-CI bootstrap after a source change is expected to differ.
+if [[ -f "$NEXUS_BACKUP" ]]; then
+  if cmp -s "$NEXUS_BACKUP" ./nexus; then
+    ok "Committed launcher matches rebuilt ./nexus (launcher fixed point)."
+  elif [[ "$CI_MODE" -eq 1 ]]; then
+    BK_SIZE=$(wc -c < "$NEXUS_BACKUP" | tr -d ' ')
+    NX_SIZE=$(wc -c < nexus | tr -d ' ')
+    info "committed ./nexus: $BK_SIZE bytes, rebuilt ./nexus: $NX_SIZE bytes"
+    fail "Launcher mismatch: committed ./nexus differs from the rebuilt launcher.
+[bootstrap] The committed polyglot launcher is not reproduced by this bootstrap.
+[bootstrap] header.sh, lsp.wasm, or the launcher assembly has drifted. Regenerate
+[bootstrap] and commit ./nexus alongside the source change."
+  else
+    warn "Committed ./nexus differs from the rebuilt launcher (expected after a"
+    warn "source/seed change; the reseed will commit the new ./nexus)."
+  fi
+else
+  info "No prior ./nexus to compare against; skipping launcher fixed-point gate."
+fi
 
 # ─── --install: copy polyglot launcher to ${PREFIX}/bin/nexus ─────────────
 if [[ "$INSTALL_MODE" -eq 1 ]]; then
