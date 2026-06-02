@@ -1,0 +1,137 @@
+// Acceptance: a value-producing `inject H do ... end` whose body exits via an
+// EXPLICIT `return <v>` (an interior early return, not the body's trailing
+// expression) must yield that returned value at the inject site — even when H
+// captures a continuation (`with @k`) and the inject routes through the
+// stack-switching resume frame.
+//
+// Predecessor (nexus-h4v70) wired the inject-site value return by storing the
+// body's TRAILING-expression value into the ss_inject_value global on
+// completion; the dispatcher reads it back after the resume frame exits. But
+// that fix intercepted only the function-tail path: an interior `op_return`
+// (e.g. a conditional `return sum`) bypassed the tail store and still dropped
+// the value, so `let total = inject ...` bound 0/"" instead of the real value.
+//
+// Fix (nexus-9ibht): interior returns inside a lifted `__inject_N` body store
+// their value into the SAME ss_inject_value global before the `() -> ()`
+// continuation returns (mirroring the tail store), and the inject result
+// channel is classified i64 when any return path carries a non-unit value. The
+// single program cont type stays `() -> ()` (oq3tj invariant); the
+// trailing-expression path (h4v70) is unchanged.
+//
+// Each `Gen.tick()` SUSPENDS into the handler, whose `@k` arm RESUMES the
+// captured continuation so the body continues past the suspend boundary. The
+// explicit `return <v>` after a resume boundary must surface as the enclosing
+// function's return value.
+//
+// Cases:
+//   1. i64 explicit early return after a resume boundary (12+30 = 42)
+//   2. trailing-expr fallthrough when the early return is NOT taken (must still
+//      yield the trailing value, not a stale global)
+//   3. string (heap-handle) explicit return through the i64 value channel
+//   4. unit-body control with an interior `return ()` — must still yield unit
+//      and leave nothing on the stack (no stale global read)
+//
+// Each case throws RuntimeError on mismatch; exit 0 means all pass.
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+
+cap Gen do
+  fn tick() -> i64
+end
+
+let gen_h = handler Gen do
+  fn tick() -> i64 with @k do
+    @k
+  end
+end
+
+// Case 1: explicit early return taken (body-internal condition true). The
+// value is accumulated across two suspend/resume boundaries.
+let early_taken = fn () -> i64 throws { RuntimeError } do
+  inject gen_h do
+    let _a = Gen.tick()
+    let s1 = 12
+    let _b = Gen.tick()
+    let s2 = s1 + 30
+    if s2 == 42 then
+      return s2
+    end
+    let _c = Gen.tick()
+    s2 + 100
+  end
+end
+
+// Case 2: early return NOT taken → falls through to the trailing expression.
+let early_not_taken = fn () -> i64 throws { RuntimeError } do
+  inject gen_h do
+    let _a = Gen.tick()
+    let s1 = 12
+    let _b = Gen.tick()
+    let s2 = s1 + 30
+    if s2 == 99 then
+      return s2
+    end
+    let _c = Gen.tick()
+    s2 + 100
+  end
+end
+
+// Case 3: string (heap-handle) explicit return through the i64 value channel.
+let str_early = fn () -> string throws { RuntimeError } do
+  inject gen_h do
+    let _a = Gen.tick()
+    let p = "kont"
+    let _b = Gen.tick()
+    if true then
+      return p ++ "-value"
+    end
+    p
+  end
+end
+
+// Case 4: unit-body control with an interior `return ()` — yields unit, runs
+// the side effect, must NOT read a stale global value.
+let unit_early = fn () -> unit require { Console } throws { RuntimeError } do
+  inject gen_h do
+    let _a = Gen.tick()
+    if true then
+      Console.println(val: "unit-early-ran")
+      return ()
+    end
+    Console.println(val: "unit-early-unreached")
+  end
+end
+
+let assert_i64 = fn (label: string, got: i64, want: i64) -> unit throws { RuntimeError } do
+  if !(got == want) then
+    throw RuntimeError(val: label ++ ": got " ++ str.from_i64(val: got) ++ ", want " ++ str.from_i64(val: want))
+  end
+end
+
+let assert_str = fn (label: string, got: string, want: string) -> unit throws { RuntimeError } do
+  if !(got == want) then
+    throw RuntimeError(val: label ++ ": got '" ++ got ++ "', want '" ++ want ++ "'")
+  end
+end
+
+let main = fn () -> unit require { PermConsole } throws { RuntimeError } do
+  inject stdio.system_handler do
+    // Case 1: explicit early return (was 0 before the fix)
+    let n1 = early_taken()
+    assert_i64(label: "kont-explicit-return-i64", got: n1, want: 42)
+
+    // Case 2: trailing-expr fallthrough still correct (no stale global)
+    let n2 = early_not_taken()
+    assert_i64(label: "kont-fallthrough-trailing", got: n2, want: 142)
+
+    // Case 3: string explicit return (was "" before the fix)
+    let s3 = str_early()
+    assert_str(label: "kont-explicit-return-string", got: s3, want: "kont-value")
+
+    // Case 4: unit-body control with interior return () — must run, yield unit
+    unit_early()
+
+    Console.println(val: "ok")
+  end
+end
