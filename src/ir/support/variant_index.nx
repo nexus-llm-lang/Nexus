@@ -36,10 +36,21 @@ export type VariantInfo = VariantInfo(enum_name: string, type_params: [ string ]
 // the field to a variable (nexus-xs3dl). The typecheck builders leave this
 // empty — they never resolve record aliases through this index — so existing
 // callers are unaffected.
+//
+// `opaque_layouts` is a LAYOUT-ONLY fallback map (variant name → VariantInfo)
+// populated from each `EnumDef.layout_variants` (nexus-wj8mk). For an opaque
+// imported enum the `variants` were stripped to `[]` (D-Type-Sum-Opaque), so
+// `by_variant` has no entry; the field DECLARATION order it needs for the
+// alphabetical heap layout survives only here. `lookup_variant_def_in_index`
+// (LIR field-extraction only) consults this when `by_variant` misses, so the
+// layout never reaches typecheck's `lookup_variant_info` (visibility /
+// exhaustiveness / constructor-registration stay opaque). Empty for every enum
+// whose constructors are NOT withheld, since `by_variant` already covers them.
 /** Public type VariantIndex. */
 export type VariantIndex = VariantIndex(
   by_variant: Map<string, VariantInfo>,
-  record_defs: [ RecordDef ]
+  record_defs: [ RecordDef ],
+  opaque_layouts: Map<string, VariantInfo>
 )
 
 let insert_variants = fn (
@@ -60,19 +71,40 @@ let insert_variants = fn (
   end
 end
 
+// Insert each enum's `variants` into the public `by_variant` map (unchanged
+// shape — a bare-map accumulator, never a record holding the map, so the
+// dictionary-passing fn fields the Map carries stay intact through codegen).
 let build_go = fn (defs: [ EnumDef ], acc: Map<string, VariantInfo>) -> Map<string, VariantInfo> do
   match defs do
     | [] -> return acc
     | ed :: rest ->
-      let EnumDef(name: ename, is_public: _, is_opaque: _, type_params: tps, variants: vs) = ed
+      let EnumDef(name: ename, is_public: _, is_opaque: _, type_params: tps, variants: vs, layout_variants: _) = ed
       let acc2 = insert_variants(acc, enum_name: ename, type_params: tps, variants: vs)
         return build_go(defs: rest, acc: acc2)
   end
 end
 
+// Independent pass that fills the LAYOUT-ONLY fallback from each enum's
+// `layout_variants` (non-empty only for an opaque imported enum whose
+// `variants` were stripped). Kept SEPARATE from `build_go` so neither map is
+// ever stored in a record field (nexus-wj8mk).
+let build_layouts_go = fn (defs: [ EnumDef ], acc: Map<string, VariantInfo>) -> Map<string, VariantInfo> do
+  match defs do
+    | [] -> return acc
+    | ed :: rest ->
+      let EnumDef(name: ename, is_public: _, is_opaque: _, type_params: tps, variants: _, layout_variants: lvs) = ed
+      let acc2 = insert_variants(acc, enum_name: ename, type_params: tps, variants: lvs)
+        return build_layouts_go(defs: rest, acc: acc2)
+  end
+end
+
 /** Public function build_variant_index. */
 export let build_variant_index = fn (defs: [ EnumDef ]) -> VariantIndex do
-  return VariantIndex(by_variant: build_go(defs, acc: map.string_map()), record_defs: [])
+  return VariantIndex(
+    by_variant: build_go(defs, acc: map.string_map()),
+    record_defs: [],
+    opaque_layouts: build_layouts_go(defs, acc: map.string_map())
+  )
 end
 
 /** Direct path that consumes an `EnumDef` stream lazily without first
@@ -81,21 +113,25 @@ end
  *  chained call from the unwrapped `[EnumEntry]`.
  */
 export let extend_variant_index = fn (idx: VariantIndex, defs: [ EnumDef ]) -> VariantIndex do
-  let VariantIndex(by_variant: m, record_defs: rds) = idx
-  return VariantIndex(by_variant: build_go(defs, acc: m), record_defs: rds)
+  let VariantIndex(by_variant: m, record_defs: rds, opaque_layouts: ol) = idx
+  return VariantIndex(
+    by_variant: build_go(defs, acc: m),
+    record_defs: rds,
+    opaque_layouts: build_layouts_go(defs, acc: ol)
+  )
 end
 
 /** Public function empty_variant_index. */
 export let empty_variant_index = fn () -> VariantIndex do
-  return VariantIndex(by_variant: map.string_map(), record_defs: [])
+  return VariantIndex(by_variant: map.string_map(), record_defs: [], opaque_layouts: map.string_map())
 end
 
 /** Attach the program's record-type-alias table to an existing index so the
  *  LIR path can expand `TyUserDefined` field types to their `TyRecord` body
  *  (nexus-xs3dl). */
 export let with_record_defs = fn (idx: VariantIndex, record_defs: [ RecordDef ]) -> VariantIndex do
-  let VariantIndex(by_variant: m, record_defs: _) = idx
-  return VariantIndex(by_variant: m, record_defs)
+  let VariantIndex(by_variant: m, record_defs: _, opaque_layouts: ol) = idx
+  return VariantIndex(by_variant: m, record_defs, opaque_layouts: ol)
 end
 
 let lookup_record_def_in_index = fn (defs: [ RecordDef ], name: string) -> Option<RecordDef> do
@@ -114,7 +150,7 @@ end
  *  (alias-of-alias) and leaves non-record / unknown types unchanged. */
 export let resolve_record_alias = fn (idx: VariantIndex, typ: TypeExpr) -> TypeExpr do
   if let TyUserDefined(name: n, args: _) = typ then
-    let VariantIndex(by_variant: _, record_defs: rds) = idx
+    let VariantIndex(by_variant: _, record_defs: rds, opaque_layouts: _) = idx
     match lookup_record_def_in_index(defs: rds, name: n) do
       | Some(val: RecordDef(name: _, is_public: _, type_params: _, fields)) ->
         return TyRecord(fields)
@@ -125,19 +161,30 @@ export let resolve_record_alias = fn (idx: VariantIndex, typ: TypeExpr) -> TypeE
   end
 end
 
-/** Public function lookup_variant_info. */
+/** Public function lookup_variant_info.
+ *  Consults ONLY `by_variant` — opaque imported constructors are intentionally
+ *  absent here so typecheck visibility / exhaustiveness stay opaque. */
 export let lookup_variant_info = fn (idx: VariantIndex, variant: string) -> Option<VariantInfo> do
-  let VariantIndex(by_variant: m, record_defs: _) = idx
+  let VariantIndex(by_variant: m, record_defs: _, opaque_layouts: _) = idx
   return map.get(m, k: variant)
 end
 
-/** Public function lookup_variant_def_in_index. */
+/** Public function lookup_variant_def_in_index.
+ *  LIR field-extraction path: falls back to the LAYOUT-ONLY `opaque_layouts`
+ *  map when `by_variant` misses, so an opaque imported constructor's field
+ *  DECLARATION order is recoverable for the alphabetical heap layout
+ *  (nexus-wj8mk). This is the only lookup that sees the stripped layout. */
 export let lookup_variant_def_in_index = fn (
   idx: VariantIndex,
   variant: string
 ) -> Option<VariantDef> do
   match lookup_variant_info(idx, variant) do
-    | None -> return None
     | Some(val: VariantInfo(enum_name: _, type_params: _, def: vd)) -> return Some(val: vd)
+    | None ->
+      let VariantIndex(by_variant: _, record_defs: _, opaque_layouts: ol) = idx
+      match map.get(m: ol, k: variant) do
+        | None -> return None
+        | Some(val: VariantInfo(enum_name: _, type_params: _, def: vd)) -> return Some(val: vd)
+      end
   end
 end
