@@ -24,7 +24,8 @@ import { bt_i32, bt_void,
          op_call,
          op_local_get, op_local_set, op_local_tee, op_global_get, op_global_set,
          op_i32_const, op_i64_const,
-         op_i32_add, op_i32_ne, op_i32_ge_u, op_i32_eqz,
+         op_i32_add, op_i32_mul, op_i32_ne, op_i32_eq, op_i32_ge_u, op_i32_eqz,
+         op_i32_lt_u, op_i32_lt_s, op_i32_gt_s, op_i32_le_s, op_i32_ge_s,
          op_i64_extend_i32_u,
          op_i64_shl, op_i64_or,
          op_block, op_loop, op_br, op_br_if, op_end }, * as wdefs from "src/backend/wasm/defs.nx"
@@ -105,17 +106,26 @@ let is_string_type = fn (t: TypeExpr) -> bool do
   if let TyString = wdefs.peel_linear(typ: t) then true else false end
 end
 
-/** Return true iff `op` should route through this module rather than `emit_binary`: i.e. it is `OpEq`/`OpNe`/`OpConcat`/`OpAdd` and *either* operand is `TyString` (pattern-extracted string vars are typed i64, so the predicate trusts `TyString` on either side as the canonical signal). */
+/** Return true iff `op` should route through this module rather than `emit_binary`: i.e. it is `OpEq`/`OpNe`/`OpConcat`/`OpAdd` (equality / concat) or `OpLt`/`OpLe`/`OpGt`/`OpGe` (lexicographic ordering) and *either* operand is `TyString` (pattern-extracted string vars are typed i64, so the predicate trusts `TyString` on either side as the canonical signal). The ordering ops are routed here because `emit_binary` would otherwise emit a numeric compare of the packed `(ptr<<32)|len` handle — an allocation-dependent, lexicographically-wrong result; `emit_string_order` lowers them to a byte-wise lexicographic compare instead. */
 export let is_string_op = fn (op: BinaryOp, lhs_type: TypeExpr, rhs_type: TypeExpr) -> bool do
   // Pattern-extracted string vars have WASM type i64 but string literals
   // carry TyString; trust TyString on either side as the canonical signal.
   if is_string_type(t: lhs_type) || is_string_type(t: rhs_type) then
     match op do
       | OpEq | OpNe | OpConcat | OpAdd -> return true
+      | OpLt | OpLe | OpGt | OpGe -> return true
       | _ -> return false
     end
   end
   return false
+end
+
+/** Return true iff `op` is a lexicographic ordering op (`OpLt`/`OpLe`/`OpGt`/`OpGe`) so the dispatcher routes it to `emit_string_order` instead of `emit_string_compare` (which handles only `OpEq`/`OpNe`). */
+export let is_string_order_op = fn (op: BinaryOp) -> bool do
+  match op do
+    | OpLt | OpLe | OpGt | OpGe -> true
+    | _ -> false
+  end
 end
 
 /** Return true iff `op` on a value typed `typ` should be emitted by `emit_string_concat` (i.e. `typ` peels to `TyString` and `op` is `OpConcat` or `OpAdd`). Used by `emit_expr` to pick between the binop and concat paths when both sides already have the same concrete type. */
@@ -214,4 +224,194 @@ export let emit_string_compare = fn (op: BinaryOp, lhs: LirAtom, rhs: LirAtom,
   let %buf = bb.push_byte(%buf, byte: op_end)
 
   return if let OpNe = op then bb.push_byte(%buf, byte: op_i32_eqz) else %buf end
+end
+
+/** Emit a byte-wise lexicographic comparison for `lhs op rhs` where `op` is one of `OpLt`/`OpLe`/`OpGt`/`OpGe` on string operands. Unpacks both packed `(ptr<<32)|len` handles, computes a three-way comparison result `cmp` (-1 / 0 / 1) — first differing byte (unsigned, since payload bytes are 0..255) decides, and equal prefixes are broken by length (shorter is less) — then derives the requested predicate by comparing `cmp` against 0. Mirrors the compile-time `lir_str_less_than` folding logic (semantic_types.nx) so runtime and constant-folded results agree. Leaves an `i32` boolean on the stack. Chosen over a packed-i64 numeric compare (which `emit_binary` would otherwise emit) because that is allocation-dependent and lexicographically wrong. */
+export let emit_string_order = fn (op: BinaryOp, lhs: LirAtom, rhs: LirAtom,
+                             buf: %ByteBuffer, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+  let t = ctx_temps_base(ctx)
+  let lhs_packed = t + 4
+  let rhs_packed = t + 5
+  let lhs_ptr = t + 6
+  let lhs_len = t + 7
+  let rhs_ptr = t + 8
+  let rhs_len = t + 9
+  let cmp_var = t + 10
+  let min_len = t + 11
+  let idx_var = t + 12
+
+  let %buf = emit_atom(atom: lhs, %buf, ctx)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: lhs_packed)
+  let %buf = emit_atom(atom: rhs, %buf, ctx)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: rhs_packed)
+  let %buf = emit_unpack_string(
+    %buf,
+    packed_local: lhs_packed,
+    ptr_local: lhs_ptr,
+    len_local: lhs_len
+  )
+  let %buf = emit_unpack_string(
+    %buf,
+    packed_local: rhs_packed,
+    ptr_local: rhs_ptr,
+    len_local: rhs_len
+  )
+
+  // cmp_var := 0  (default: equal up to min_len)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 0)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: cmp_var)
+
+  // min_len := lhs_len ; if rhs_len < lhs_len then min_len := rhs_len
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: lhs_len)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: min_len)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_block, bt_void ])
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: rhs_len)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: min_len)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_ge_s, op_br_if ])
+  let %buf = bb.push_uleb128(%buf, val: 0)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: rhs_len)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: min_len)
+  let %buf = bb.push_byte(%buf, byte: op_end)
+
+  // idx := 0
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 0)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: idx_var)
+
+  // block $loop_done { loop $loop {
+  let %buf = bb.push_bytes(%buf, bytes: [ op_block, bt_void, op_loop, bt_void ])
+
+  // if idx >= min_len then break to $loop_done (relative depth 1)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: idx_var)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: min_len)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_ge_s, op_br_if ])
+  let %buf = bb.push_uleb128(%buf, val: 1)
+
+  // block $eq_byte {  (relative depth 0 inside the loop body)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_block, bt_void ])
+
+  // if ca == cb then break to $eq_byte (continue scanning)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: lhs_ptr)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: idx_var)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_add, wdefs.op_i32_load8_u ])
+  let %buf = wdefs.emit_memarg_i8(%buf)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: rhs_ptr)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: idx_var)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_add, wdefs.op_i32_load8_u ])
+  let %buf = wdefs.emit_memarg_i8(%buf)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_eq, op_br_if ])
+  let %buf = bb.push_uleb128(%buf, val: 0)
+
+  // bytes differ: cmp := (ca <_u cb) * -2 + 1  =>  less: -1, greater: 1
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: lhs_ptr)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: idx_var)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_add, wdefs.op_i32_load8_u ])
+  let %buf = wdefs.emit_memarg_i8(%buf)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: rhs_ptr)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: idx_var)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_add, wdefs.op_i32_load8_u ])
+  let %buf = wdefs.emit_memarg_i8(%buf)
+  let %buf = bb.push_byte(%buf, byte: op_i32_lt_u)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: -2)
+  let %buf = bb.push_byte(%buf, byte: op_i32_mul)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 1)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_add, op_local_set ])
+  let %buf = bb.push_uleb128(%buf, val: cmp_var)
+  // break to $loop_done with cmp set (out of $eq_byte=0, loop=1, $loop_done=2)
+  let %buf = bb.push_byte(%buf, byte: op_br)
+  let %buf = bb.push_uleb128(%buf, val: 2)
+
+  // } end $eq_byte ; bytes equal: idx++ and continue the loop
+  let %buf = bb.push_byte(%buf, byte: op_end)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: idx_var)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 1)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_add, op_local_set ])
+  let %buf = bb.push_uleb128(%buf, val: idx_var)
+  let %buf = bb.push_byte(%buf, byte: op_br)
+  let %buf = bb.push_uleb128(%buf, val: 0)
+
+  // } end $loop  } end $loop_done
+  let %buf = bb.push_bytes(%buf, bytes: [ op_end, op_end ])
+
+  // Length tiebreak when cmp == 0.
+  // block $tie_done { if cmp != 0 -> $tie_done ;
+  //   block $not_lt { if lhs_len >= rhs_len -> $not_lt ; cmp:=-1 ; -> $tie_done } end
+  //   block $not_gt { if lhs_len <= rhs_len -> $not_gt ; cmp:= 1 ; -> $tie_done } end }
+  let %buf = bb.push_bytes(%buf, bytes: [ op_block, bt_void ])
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: cmp_var)
+  let %buf = bb.push_byte(%buf, byte: op_br_if)
+  let %buf = bb.push_uleb128(%buf, val: 0)
+
+  let %buf = bb.push_bytes(%buf, bytes: [ op_block, bt_void ])
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: lhs_len)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: rhs_len)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_ge_s, op_br_if ])
+  let %buf = bb.push_uleb128(%buf, val: 0)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: -1)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: cmp_var)
+  // break to $tie_done (out of $not_lt=0, $tie_done=1)
+  let %buf = bb.push_byte(%buf, byte: op_br)
+  let %buf = bb.push_uleb128(%buf, val: 1)
+  let %buf = bb.push_byte(%buf, byte: op_end)
+
+  let %buf = bb.push_bytes(%buf, bytes: [ op_block, bt_void ])
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: lhs_len)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: rhs_len)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_le_s, op_br_if ])
+  let %buf = bb.push_uleb128(%buf, val: 0)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 1)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: cmp_var)
+  let %buf = bb.push_byte(%buf, byte: op_br)
+  let %buf = bb.push_uleb128(%buf, val: 1)
+  let %buf = bb.push_byte(%buf, byte: op_end)
+
+  let %buf = bb.push_byte(%buf, byte: op_end)
+
+  // Derive the predicate: compare cmp against 0.
+  let pred_op = match op do
+    | OpLt -> op_i32_lt_s
+    | OpLe -> op_i32_le_s
+    | OpGt -> op_i32_gt_s
+    | OpGe -> op_i32_ge_s
+    | _ -> op_i32_lt_s
+  end
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: cmp_var)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 0)
+  return bb.push_byte(%buf, byte: pred_op)
 end
