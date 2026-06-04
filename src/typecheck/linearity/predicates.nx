@@ -17,6 +17,8 @@ import {
   TyBorrow,
   TyVar,
   TyUserDefined,
+  TyList,
+  TyRecord,
   RecordDef,
   EnumDef,
   VariantDef,
@@ -218,19 +220,64 @@ let lin_check_named_field_is_tyvar = fn (
   end
 end
 
-/** True when `t` directly names one of `type_params` — either as a `TyVar`
- *  (post-convert) or as a nullary `TyUserDefined(name, [])` (pre-convert raw
- *  HIR). Gating on `type_params` membership prevents concrete nullary nominal
- *  types (a field of type `Box`) from being treated as generic slots. */
+/** True when `t` *depends on* one of `type_params` — i.e. a generic parameter
+ *  occurs anywhere in `t`, either as the type itself (a bare slot) or buried
+ *  inside a CARRIER (list element, type-argument, record field, ref/borrow
+ *  wrapper). Such a type's concrete linearity is fixed only at instantiation,
+ *  which the name-based linearity pass cannot see; when the matched value is a
+ *  live linear binding, a parameter-dependent field must conservatively inherit
+ *  that linearity so a linear payload routed through e.g. `Pair<%T, _>` (bare
+ *  slot) OR `Wrap<[%T]>` (carrier `items: [A]`) is tracked at the inner binder.
+ *
+ *  Recognised forms:
+ *    - bare slot:    `TyVar(p)` (post-convert) or `TyUserDefined(p, [])`
+ *      (pre-convert raw HIR), gated on membership in `type_params` so a concrete
+ *      nullary nominal field (type `Box`) is NOT misclassified;
+ *    - carriers:     `[A]` (TyList), `Pair<A,_>` / `C<…, A, …>`
+ *      (TyUserDefined with args), `~A`/`&A` (TyRef/TyBorrow), `{ f: A }`
+ *      (TyRecord) — true when ANY component is itself parameter-dependent.
+ *
+ *  Matches the spec's transitive `linear(τ)` (type-system-formal §Linearity:
+ *  linear holds if any transitive component — including LIST ELEMENT TYPES and
+ *  type arguments — is linear), applied at instantiation time where the slot is
+ *  bound to a linear scrutinee. */
 let lin_type_is_param_slot = fn (t: TypeExpr, type_params: [ string ]) -> bool do
   match t do
     | TyVar(name: n) -> return lin_str_member(xs: type_params, target: n)
     | TyUserDefined(name: n, args: args) ->
       match args do
         | [] -> return lin_str_member(xs: type_params, target: n)
-        | _ :: _ -> return false
+        // A named CARRIER (e.g. `Pair<A, _>`): parameter-dependent when any
+        // type argument is itself parameter-dependent. The carrier name `n`
+        // is a concrete type constructor, not a slot, so it is not checked
+        // against `type_params`.
+        | _ :: _ -> return lin_any_arg_is_param_slot(args, type_params)
       end
+    // `[A]` (list carrier) — parameter-dependent iff its element type is.
+    | TyList(elem: e) -> return lin_type_is_param_slot(t: e, type_params)
+    // `~A`/`&A` wrappers thread through to the inner type.
+    | TyRef(inner: i) | TyBorrow(inner: i) -> return lin_type_is_param_slot(t: i, type_params)
+    // `{ f: A, … }` record carrier — parameter-dependent iff any field is.
+    | TyRecord(fields: fs) -> return lin_any_named_is_param_slot(fields: fs, type_params)
     | _ -> return false
+  end
+end
+
+let lin_any_arg_is_param_slot = fn (args: [ TypeExpr ], type_params: [ string ]) -> bool do
+  match args do
+    | [] -> return false
+    | a :: rest ->
+      if lin_type_is_param_slot(t: a, type_params) then return true end
+      return lin_any_arg_is_param_slot(args: rest, type_params)
+  end
+end
+
+let lin_any_named_is_param_slot = fn (fields: [ NamedType ], type_params: [ string ]) -> bool do
+  match fields do
+    | [] -> return false
+    | NamedType(name: _, typ: ft) :: rest ->
+      if lin_type_is_param_slot(t: ft, type_params) then return true end
+      return lin_any_named_is_param_slot(fields: rest, type_params)
   end
 end
 
