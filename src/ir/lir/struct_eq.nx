@@ -7,41 +7,54 @@
  * well-typed and MUST compute STRUCTURAL value equality — not the pointer
  * identity that a plain `LirExprBinary(OpEq)` on the i32 heap pointer produces.
  *
- * The expansion is INLINE: it emits a sequence of LIR statements that compute a
- * boolean result into a fresh temp, recursing over the static field structure:
+ * Strategy — GENERATED RUNTIME HELPERS. For every named aggregate type in the
+ * program (each `EnumDef` and each record-alias `RecordDef`) a structural
+ * compare helper `__streq_<TypeName>(l, r) -> bool` is synthesized as an extra
+ * `LirFunction` and appended to the program (see `gen_struct_eq_helpers`,
+ * called from `lower_mir_to_lir`). The helper recurses at RUN TIME:
  *   - Record  : equal iff ALL fields structurally equal (AND-fold; the record
  *               tag is fixed by construction so equal-typed records always share
  *               it — no runtime tag check needed).
  *   - Sum/ADT : equal iff same constructor tag AND all payload fields equal.
  *               Nullary constructors bottom out at tag equality; differing tags
- *               short-circuit to false. Because the runtime variant is not known
- *               statically, a tag check selects the per-variant payload compare
- *               via a chain of `LirStmtIf` on `tag == constructor_tag(V)`.
- *   - Primitive / string : reuse the existing value-compare path (a plain
- *               `LirExprBinary(OpEq)`; codegen routes TyString operands through
- *               `emit_string_compare` via `is_string_op`).
- * Recursion bottoms out on the static type, so it terminates at the depth of
- * the (finite) type structure. `!=` is the negation of `==`.
+ *               short-circuit to false. A tag check selects the per-variant
+ *               payload compare via a chain of `LirStmtIf` on
+ *               `tag == constructor_tag(V)`.
+ *   - Aggregate (named record/sum) field : a CALL to that type's helper. A
+ *               RECURSIVE field position (e.g. `Node.left: Tree`) is just a call
+ *               to the SAME helper, which terminates on finite data; a sibling
+ *               field of another aggregate type calls that type's helper. Because
+ *               the recursion is in the emitted wasm — not in this static
+ *               expansion — self- and mutually-recursive types (Tree, Even/Odd)
+ *               compare structurally with no depth limit.
+ *   - Primitive / string : a single value-compare binary (`LirExprBinary(OpEq)`;
+ *               codegen routes TyString operands through `emit_string_compare`
+ *               via `is_string_op`). A type-parameter field (`TyVar`, e.g. the
+ *               element of a generic `List<T>`) is type-erased at this stage and
+ *               also bottoms out at the i64 value compare — generic element
+ *               recursion is out of scope of the monomorphic helper.
+ * `!=` is the negation of `==`.
  *
- * RECURSIVE TYPES (e.g. `type Tree = Leaf | Node(left: Tree, …)`): the inline
- * static expansion cannot unfold an infinitely-deep type to a fixed depth. A
- * `visited` set of the type names currently being expanded detects a recursive
- * field position; at that position the compare falls back to the legacy
- * value/identity binary for that sub-value (matching the pre-fix behavior there).
- * Every NON-recursive component is still compared structurally. A fully correct
- * recursive structural compare needs a generated runtime helper that recurses at
- * run time (terminating on finite data); that is a larger follow-up.
+ * The LIR `MirBinaryOp` dispatch (lir.nx) lowers `lhs op rhs` on a NAMED
+ * aggregate to a single CALL of that type's helper. An ANONYMOUS record literal
+ * type (`{a, b}` with no name — never recursive, since recursion needs a name to
+ * close the loop) is expanded INLINE one level, its aggregate fields still
+ * routed through the generated helpers.
  *
  * Owns:
+ * - gen_struct_eq_helpers (synthesizes the per-type helper LirFunctions)
  * - lower_struct_eq (entry; called from lir.nx's MirBinaryOp OpEq/OpNe case)
  * - should_struct_eq (classifier: operand type is a record / known sum)
+ * - struct_eq_helper_name (the canonical helper name for a named aggregate)
  *
  * Does not own:
  * - LowerCtx / temp + stmt helpers (see src/ir/lir/context.nx)
  * - Field/tag heap layout opcodes (see src/backend/codegen.nx, wasm/defs.nx)
+ * - Function injection (see src/ir/lir/func_lower.nx — appends the helpers)
  */
 import { TypeExpr, TyRecord, TyUserDefined, TyBool, TyI64, TyString, NamedType,
-         VariantDef, VariantField } from "src/types/type_expr.nx"
+         EnumDef, RecordDef, VariantDef, VariantField } from "src/types/type_expr.nx"
+import { Span } from "src/types/span.nx"
 import { BinaryOp, OpEq, OpNe, OpAnd } from "src/types/vocab.nx"
 import {
   LirAtom,
@@ -51,8 +64,12 @@ import {
   LirExpr,
   LirExprAtom,
   LirExprBinary,
+  LirExprCall,
   LirExprObjectField,
   LirExprObjectTag,
+  LirCallArg,
+  LirParam,
+  LirFunction,
   LirStmt,
   LirStmtLet,
   LirStmtIf
@@ -66,8 +83,17 @@ import { LirError } from "src/ir/lir/errors.nx"
 import { Some, None, Option } from "std:option"
 import * as list from "std:list"
 import * as str from "std:str"
-import * as vidx from "src/ir/support/variant_index.nx"
+import { VariantIndex }, * as vidx from "src/ir/support/variant_index.nx"
 import { constructor_tag } from "src/backend/wasm/defs.nx"
+
+// ─── Helper naming ──────────────────────────────────────────────────────────
+
+/** Canonical synthesized helper name for a named aggregate type. One helper per
+ *  distinct type name; recursive / mutually-recursive references reuse the same
+ *  name so the emitted wasm calls itself / its sibling. */
+export let struct_eq_helper_name = fn (type_name: string) -> string do
+  return "__streq_" ++ type_name
+end
 
 // ─── Operand-type classification ────────────────────────────────────────────
 
@@ -105,6 +131,27 @@ export let should_struct_eq = fn (t: TypeExpr, ctx: LowerCtx) -> bool do
         | _ -> return true
       end
     | _ -> return false
+  end
+end
+
+// `named_aggregate_name`: the helper-bearing type name of `t`, if `t` is a named
+// sum (TyUserDefined with known variants) or a named record alias (TyUserDefined
+// resolving to a TyRecord body). Anonymous TyRecord carries no name → None.
+let named_aggregate_name = fn (t: TypeExpr, ctx: LowerCtx) -> Option<string> do
+  match t do
+    | TyUserDefined(name: n, args: _) ->
+      // Either a record alias or a sum with known variants gets a helper.
+      match resolve_operand_type(t, ctx) do
+        | TyRecord(fields: _) -> return Some(val: n)
+        | TyUserDefined(name: en, args: _) ->
+          let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
+          match vidx.variants_of_enum(idx: ed, enum_name: en) do
+            | [] -> return None
+            | _ -> return Some(val: en)
+          end
+        | _ -> return None
+      end
+    | _ -> return None
   end
 end
 
@@ -169,31 +216,13 @@ end
 
 type CmpResult = CmpResult(ctx: LowerCtx, atom: LirAtom)
 
-// The trackable name of a (possibly aliased) named type, used to detect
-// RECURSIVE type positions. Records (anonymous TyRecord) carry no name; they can
-// only re-enter recursion through a named alias / enum field, which IS tracked.
-let type_name_opt = fn (t: TypeExpr) -> Option<string> do
-  match t do
-    | TyUserDefined(name: n, args: _) -> return Some(val: n)
-    | _ -> return None
-  end
-end
-
-let name_in = fn (n: string, names: [ string ]) -> bool do
-  match names do
-    | [] -> return false
-    | h :: rest -> if h == n then return true else return name_in(n, names: rest) end
-  end
-end
-
 // Load `parent.field[heap_idx]` (object field at alphabetical index) for both
-// operands and compare them structurally, recursing on aggregate field types.
+// operands and compare them structurally.
 let compare_field = fn (
   lhs_parent: LirAtom,
   rhs_parent: LirAtom,
   heap_idx: i64,
   field_type: TypeExpr,
-  visited: [ string ],
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   // wasm slot type for the field load: strings flow as i64 packed handles but
@@ -214,55 +243,59 @@ let compare_field = fn (
     expr: LirExprObjectField(value: rhs_parent, index: heap_idx, typ: load_wt),
     typ: load_wt
   )
-  return compare_values(l: l_field, r: r_field, sem_type: field_type, visited, ctx: ctx2)
+  return compare_values(l: l_field, r: r_field, sem_type: field_type, ctx: ctx2)
 end
 
 // Compare two already-loaded operand atoms of semantic type `sem_type`,
 // emitting whatever statements the comparison needs and yielding a bool atom.
 //
-// `visited` carries the named types currently on the expansion path. A field
-// whose type re-enters a name already on that path is a RECURSIVE position; the
-// inline static expansion cannot unfold it to a fixed depth, so it falls back to
-// the legacy value/identity compare for that sub-value (a known limitation — see
-// the module header). Non-recursive aggregates expand fully.
+// A NAMED aggregate (sum / record alias) routes to a CALL of that type's
+// generated helper — including recursive positions, which terminate at run time.
+// An ANONYMOUS record is expanded inline one level (its aggregate fields recurse
+// through their helpers). Everything else is a single value compare.
 let compare_values = fn (
   l: LirAtom,
   r: LirAtom,
   sem_type: TypeExpr,
-  visited: [ string ],
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
-  let nm_opt = type_name_opt(t: sem_type)
-  // Recursion guard: a named type already being expanded re-enters here.
-  let recursing = match nm_opt do
-    | Some(val: nm) -> name_in(n: nm, names: visited)
-    | None -> false
-  end
-  if recursing then
-    return compare_primitive(l, r, sem_type: sem_type, ctx)
-  end
-  let next_visited = match nm_opt do
-    | Some(val: nm) -> nm :: visited
-    | None -> visited
-  end
-  match resolve_operand_type(t: sem_type, ctx) do
-    | TyRecord(fields: fs) -> return compare_record(l, r, fields: fs, visited: next_visited, ctx)
-    | TyUserDefined(name: en, args: _) ->
-      let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
-      match vidx.variants_of_enum(idx: ed, enum_name: en) do
-        | [] -> return compare_primitive(l, r, sem_type: sem_type, ctx)
-        | vs -> return compare_sum(l, r, variants: vs, visited: next_visited, ctx)
+  match named_aggregate_name(t: sem_type, ctx) do
+    | Some(val: nm) -> return call_helper(l, r, type_name: nm, ctx)
+    | None ->
+      match resolve_operand_type(t: sem_type, ctx) do
+        | TyRecord(fields: fs) -> return compare_record(l, r, fields: fs, ctx)
+        | _ -> return compare_primitive(l, r, ctx)
       end
-    | _ -> return compare_primitive(l, r, sem_type: sem_type, ctx)
   end
 end
 
-// Primitive / string / opaque: a single value-compare binary. TyString operands
-// route to emit_string_compare in codegen; everything else to i32/i64 eq.
+// Emit `__streq_<type_name>(l, r)` and bind the bool result. The args are
+// emitted in sorted-param order (labels "l" < "r") so the positional
+// internal-call ABI lines up with the helper's sorted params.
+let call_helper = fn (
+  l: LirAtom,
+  r: LirAtom,
+  type_name: string,
+  ctx: LowerCtx
+) -> CmpResult throws { LirError } do
+  let BindResult(ctx: ctx1, atom) = bind_expr_to_temp(
+    ctx,
+    expr: LirExprCall(
+      func: struct_eq_helper_name(type_name),
+      args: [ LirCallArg(label: "l", value: l), LirCallArg(label: "r", value: r) ],
+      typ: TyBool
+    ),
+    typ: TyBool
+  )
+  return CmpResult(ctx: ctx1, atom)
+end
+
+// Primitive / string / type-param / opaque: a single value-compare binary.
+// TyString operands route to emit_string_compare in codegen; everything else to
+// i32/i64 eq.
 let compare_primitive = fn (
   l: LirAtom,
   r: LirAtom,
-  sem_type: TypeExpr,
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   let BindResult(ctx: ctx1, atom) = bind_expr_to_temp(
@@ -286,11 +319,10 @@ let compare_record = fn (
   l: LirAtom,
   r: LirAtom,
   fields: [ NamedType ],
-  visited: [ string ],
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   let all_names = record_field_names(fields, acc: [])
-  return compare_record_go(l, r, fields, all_names, acc: None, visited, ctx)
+  return compare_record_go(l, r, fields, all_names, acc: None, ctx)
 end
 
 let compare_record_go = fn (
@@ -299,7 +331,6 @@ let compare_record_go = fn (
   fields: [ NamedType ],
   all_names: [ string ],
   acc: Option<LirAtom>,
-  visited: [ string ],
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   match fields do
@@ -312,7 +343,7 @@ let compare_record_go = fn (
     | NamedType(name: fname, typ: ftyp) :: rest ->
       let heap_idx = heap_index_of(name: fname, all_names)
       let CmpResult(ctx: ctx1, atom: feq) = compare_field(
-        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, visited, ctx
+        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, ctx
       )
       let next_acc = match acc do
         | None -> CmpResult(ctx: ctx1, atom: feq)
@@ -325,7 +356,7 @@ let compare_record_go = fn (
           CmpResult(ctx: ctx2, atom: anded)
       end
       let CmpResult(ctx: ctx3, atom: acc_atom) = next_acc
-      return compare_record_go(l, r, fields: rest, all_names, acc: Some(val: acc_atom), visited, ctx: ctx3)
+      return compare_record_go(l, r, fields: rest, all_names, acc: Some(val: acc_atom), ctx: ctx3)
   end
 end
 
@@ -369,12 +400,11 @@ let compare_variant_payload = fn (
   l: LirAtom,
   r: LirAtom,
   vd: VariantDef,
-  visited: [ string ],
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   let VariantDef(name: _, fields: fs) = vd
   let all_names = variant_field_names(fs, acc: [])
-  return compare_variant_fields_go(l, r, fields: fs, all_names, acc: None, visited, ctx)
+  return compare_variant_fields_go(l, r, fields: fs, all_names, acc: None, ctx)
 end
 
 let compare_variant_fields_go = fn (
@@ -383,7 +413,6 @@ let compare_variant_fields_go = fn (
   fields: [ VariantField ],
   all_names: [ string ],
   acc: Option<LirAtom>,
-  visited: [ string ],
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   match fields do
@@ -399,7 +428,7 @@ let compare_variant_fields_go = fn (
       end
       let heap_idx = heap_index_of(name: fname, all_names)
       let CmpResult(ctx: ctx1, atom: feq) = compare_field(
-        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, visited, ctx
+        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, ctx
       )
       let next_acc = match acc do
         | None -> CmpResult(ctx: ctx1, atom: feq)
@@ -413,7 +442,7 @@ let compare_variant_fields_go = fn (
       end
       let CmpResult(ctx: ctx3, atom: acc_atom) = next_acc
       return compare_variant_fields_go(l, r, fields: rest, all_names,
-                                       acc: Some(val: acc_atom), visited, ctx: ctx3)
+                                       acc: Some(val: acc_atom), ctx: ctx3)
   end
 end
 
@@ -427,7 +456,6 @@ let compare_sum = fn (
   l: LirAtom,
   r: LirAtom,
   variants: [ VariantDef ],
-  visited: [ string ],
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   // tag_l / tag_r
@@ -440,7 +468,7 @@ let compare_sum = fn (
   let BindResult(ctx: c3, atom: tags_eq) = bind_expr_to_temp(
     ctx: c2, expr: LirExprBinary(op: OpEq, lhs: tag_l, rhs: tag_r, typ: TyBool), typ: TyBool
   )
-  // Pre-declare the payload-result temp; each variant branch assigns it.
+  // Pre-declare the payload-result temp; the guarded dispatch assigns it.
   let BindResult(ctx: c4, atom: payload_eq) = bind_expr_to_temp(
     ctx: c3, expr: LirExprBinary(op: OpEq, lhs: tag_l, rhs: tag_l, typ: TyBool), typ: TyBool
   )
@@ -448,10 +476,22 @@ let compare_sum = fn (
     | LirAtomVar(name: pn, typ: _) -> pn
     | _ -> ""
   end
-  let c5 = emit_variant_dispatch(
-    l, r, tag_l, variants, payload_name, visited, ctx: c4
+  // Guard the per-variant payload compare behind tag equality. When the tags
+  // DIFFER the payloads must NOT be read: with structural recursion a field of
+  // the wrong-shaped operand would be loaded as a heap pointer and recursed
+  // into, faulting on garbage. So: `if tags_eq then <dispatch> else payload=false`.
+  let LowerCtx(vars: gv, semantic_vars: gsv, stmts: g_saved, temp_counter: gc, enum_defs: ged) = c4
+  let then_ctx0 = LowerCtx(vars: gv, semantic_vars: gsv, stmts: [], temp_counter: gc, enum_defs: ged)
+  let then_done = emit_variant_dispatch(l, r, tag_l, variants, payload_name, ctx: then_ctx0)
+  let LowerCtx(vars: tv, semantic_vars: tsv, stmts: then_rev, temp_counter: tc, enum_defs: ted) = then_done
+  let then_stmts = list.reverse(xs: then_rev)
+  let else_stmts = [ LirStmtLet(name: payload_name, typ: TyBool, expr: LirExprAtom(atom: LirAtomBool(val: false))) ]
+  let c5 = LowerCtx(
+    vars: tv, semantic_vars: tsv,
+    stmts: LirStmtIf(cond: tags_eq, then_body: then_stmts, else_body: else_stmts) :: g_saved,
+    temp_counter: tc, enum_defs: ted
   )
-  // result = tags_eq && payload_eq
+  // result = tags_eq && payload_eq (payload_eq already false on tag mismatch).
   let BindResult(ctx: c6, atom: result) = bind_expr_to_temp(
     ctx: c5,
     expr: LirExprBinary(op: OpAnd, lhs: tags_eq, rhs: payload_eq, typ: TyBool),
@@ -469,7 +509,6 @@ let emit_variant_dispatch = fn (
   tag_l: LirAtom,
   variants: [ VariantDef ],
   payload_name: string,
-  visited: [ string ],
   ctx: LowerCtx
 ) -> LowerCtx throws { LirError } do
   match variants do
@@ -485,14 +524,14 @@ let emit_variant_dispatch = fn (
       )
       // THEN branch: compute this variant's payload eq into payload_name.
       let then_stmts = build_branch_stmts(
-        l, r, vd, payload_name, visited, ctx: c1
+        l, r, vd, payload_name, ctx: c1
       )
       // ELSE branch: recurse over the remaining variants, again isolated.
       let LowerCtx(vars: ev, semantic_vars: esv, stmts: saved, temp_counter: ec, enum_defs: eed) = c1
       let else_ctx0 = LowerCtx(vars: ev, semantic_vars: esv, stmts: [],
                                temp_counter: ec, enum_defs: eed)
       let else_done = emit_variant_dispatch(l, r, tag_l, variants: rest,
-                                            payload_name, visited, ctx: else_ctx0)
+                                            payload_name, ctx: else_ctx0)
       let LowerCtx(vars: ev2, semantic_vars: esv2, stmts: else_rev,
                    temp_counter: ec2, enum_defs: eed2) = else_done
       let else_stmts = list.reverse(xs: else_rev)
@@ -514,22 +553,122 @@ let build_branch_stmts = fn (
   r: LirAtom,
   vd: VariantDef,
   payload_name: string,
-  visited: [ string ],
   ctx: LowerCtx
 ) -> [ LirStmt ] throws { LirError } do
   let LowerCtx(vars: v, semantic_vars: sv, stmts: _, temp_counter: c, enum_defs: ed) = ctx
   let iso = LowerCtx(vars: v, semantic_vars: sv, stmts: [], temp_counter: c, enum_defs: ed)
-  let CmpResult(ctx: iso2, atom: peq) = compare_variant_payload(l, r, vd, visited, ctx: iso)
+  let CmpResult(ctx: iso2, atom: peq) = compare_variant_payload(l, r, vd, ctx: iso)
   let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = iso2
   let assign = LirStmtLet(name: payload_name, typ: TyBool, expr: LirExprAtom(atom: peq))
   return list.reverse(xs: assign :: body_rev)
 end
 
+// ─── Generated runtime helpers ──────────────────────────────────────────────
+
+let zero_span = Span(offset: 0, line: 0, col: 0)
+
+// Build the body of a structural-compare helper for `sem_type` with the two
+// operands bound to params `l` / `r`. Returns the helper's statement list
+// (forward order) and the final bool result atom. The body compares ONE LEVEL
+// of `sem_type`'s structure inline; aggregate field positions emit a CALL to the
+// relevant helper (self-call for recursive positions), so recursion is at run
+// time and always terminates on finite values.
+let build_helper_body = fn (
+  sem_type: TypeExpr,
+  enum_defs: VariantIndex
+) -> BindResult throws { LirError } do
+  let l = LirAtomVar(name: "l", typ: TyI64)
+  let r = LirAtomVar(name: "r", typ: TyI64)
+  let ctx0 = LowerCtx(vars: [], semantic_vars: [], stmts: [], temp_counter: 0, enum_defs)
+  // Dispatch on the type's own shape (NOT named_aggregate_name — that would emit
+  // a self-call and never bottom out).
+  let CmpResult(ctx: ctx1, atom: result) = match vidx.resolve_record_alias(idx: enum_defs, typ: sem_type) do
+    | TyRecord(fields: fs) -> compare_record(l, r, fields: fs, ctx: ctx0)
+    | TyUserDefined(name: en, args: _) ->
+      match vidx.variants_of_enum(idx: enum_defs, enum_name: en) do
+        | [] -> compare_primitive(l, r, ctx: ctx0)
+        | vs -> compare_sum(l, r, variants: vs, ctx: ctx0)
+      end
+    | _ -> compare_primitive(l, r, ctx: ctx0)
+  end
+  let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = ctx1
+  return BindResult(ctx: ctx1, atom: result)
+end
+
+// Synthesize one `__streq_<Name>(l, r) -> bool` helper for a named aggregate.
+let make_helper = fn (
+  type_name: string,
+  sem_type: TypeExpr,
+  enum_defs: VariantIndex
+) -> LirFunction throws { LirError } do
+  let BindResult(ctx: ctx1, atom: result) = build_helper_body(sem_type, enum_defs)
+  let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = ctx1
+  // Params labelled "l" < "r" so sort_lir_params keeps [l, r]; call sites emit
+  // args in that same order (positional internal-call ABI).
+  return LirFunction(
+    name: struct_eq_helper_name(type_name),
+    params: [ LirParam(label: "l", name: "l", typ: TyI64),
+              LirParam(label: "r", name: "r", typ: TyI64) ],
+    ret_type: TyBool,
+    body: list.reverse(xs: body_rev),
+    ret: result,
+    span: zero_span
+  )
+end
+
+let make_enum_helpers = fn (
+  defs: [ EnumDef ],
+  enum_defs: VariantIndex,
+  acc: [ LirFunction ]
+) -> [ LirFunction ] throws { LirError } do
+  match defs do
+    | [] -> return list.reverse(xs: acc)
+    | EnumDef(name: en, is_public: _, is_opaque: _, type_params: _, variants: vs, layout_variants: _) :: rest ->
+      // Skip enums with no in-scope variants (opaque imported) — no structure to
+      // compare; a compare on such a value keeps the legacy i64 path.
+      let acc2 = match vs do
+        | [] -> acc
+        | _ -> make_helper(type_name: en, sem_type: TyUserDefined(name: en, args: []), enum_defs) :: acc
+      end
+      return make_enum_helpers(defs: rest, enum_defs, acc: acc2)
+  end
+end
+
+let make_record_helpers = fn (
+  defs: [ RecordDef ],
+  enum_defs: VariantIndex,
+  acc: [ LirFunction ]
+) -> [ LirFunction ] throws { LirError } do
+  match defs do
+    | [] -> return list.reverse(xs: acc)
+    | RecordDef(name: rn, is_public: _, type_params: _, fields: fs) :: rest ->
+      let helper = make_helper(type_name: rn, sem_type: TyRecord(fields: fs), enum_defs)
+      return make_record_helpers(defs: rest, enum_defs, acc: helper :: acc)
+  end
+end
+
+/** Synthesize the structural-compare helper functions for every named aggregate
+ *  type in the program — one per `EnumDef` (with in-scope variants) and one per
+ *  record-alias `RecordDef`. Appended to the LirProgram by `lower_mir_to_lir`.
+ *  Recursive and mutually-recursive references resolve to the same helper names,
+ *  so the emitted wasm recurses at run time and terminates on finite data. */
+export let gen_struct_eq_helpers = fn (
+  enum_def_list: [ EnumDef ],
+  record_defs: [ RecordDef ],
+  enum_defs: VariantIndex
+) -> [ LirFunction ] throws { LirError } do
+  let enum_helpers = make_enum_helpers(defs: enum_def_list, enum_defs, acc: [])
+  let record_helpers = make_record_helpers(defs: record_defs, enum_defs, acc: [])
+  return list.concat(xs: enum_helpers, ys: record_helpers)
+end
+
 // ─── Entry point ────────────────────────────────────────────────────────────
 
 /** Lower `lhs op rhs` (op ∈ {OpEq, OpNe}) on a record / sum operand to a
- *  structural compare, returning the result atom. `op == OpNe` negates the
- *  structural-equal result. Callers must guard with `should_struct_eq` first. */
+ *  structural compare, returning the result atom. A NAMED aggregate routes to a
+ *  CALL of its generated helper (`__streq_<Name>`); an ANONYMOUS record is
+ *  expanded inline. `op == OpNe` negates the structural-equal result. Callers
+ *  must guard with `should_struct_eq` first. */
 export let lower_struct_eq = fn (
   op: BinaryOp,
   lhs: LirAtom,
@@ -537,7 +676,7 @@ export let lower_struct_eq = fn (
   sem_type: TypeExpr,
   ctx: LowerCtx
 ) -> BindResult throws { LirError } do
-  let CmpResult(ctx: ctx1, atom: eq_atom) = compare_values(l: lhs, r: rhs, sem_type: sem_type, visited: [], ctx)
+  let CmpResult(ctx: ctx1, atom: eq_atom) = compare_values(l: lhs, r: rhs, sem_type: sem_type, ctx)
   match op do
     | OpNe ->
       // != is `eq == false`.
