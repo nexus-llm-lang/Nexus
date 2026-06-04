@@ -418,15 +418,177 @@ let bind_constructor_pattern = fn (
             | UnifyErr(message: m) -> return BindErr(message: "constructor pattern type: " ++ m)
             | UnifyOk(subst: s1) ->
               let full_subst = subst.subst_compose(s1: psubst, s2: s1)
-              return bind_ctor_fields(
-                state: st1,
-                fields,
-                field_types,
-                param_subst: full_subst,
-                subst: s1,
-                env: []
-              )
+              // Spec P-Ctor {ℓ'} = {ℓ} (set equality): when the constructor's
+              // declared fields are all labelled, the surface pattern may list
+              // them in any permutation. Canonicalize the pattern field list
+              // into the declared field order (binding by LABEL, not position)
+              // so `First(aa: a, zz: z)` binds `a`/`z` to the `aa`/`zz` fields,
+              // mirroring how P-Record (bind_rec_pat_fields) resolves by name.
+              // Positional (unlabelled) constructors keep the positional walk.
+              match reorder_ctor_pat_fields(fields, field_types) do
+                | CanonErr(message: m) -> return BindErr(message: m)
+                | CanonOk(fields: canon_fields) ->
+                  return bind_ctor_fields(
+                    state: st1,
+                    fields: canon_fields,
+                    field_types,
+                    param_subst: full_subst,
+                    subst: s1,
+                    env: []
+                  )
+              end
           end
+  end
+end
+
+// Result of canonicalizing a constructor pattern's field list into the
+// constructor's declared field order. CanonOk carries the reordered list
+// (positional / wildcard-all constructors pass through unchanged).
+type CanonResult =
+  CanonOk(fields: [ HirPatternField ])
+  | CanonErr(message: string)
+
+// Spec P-Ctor {ℓ'} = {ℓ}: reorder the surface pattern fields into the
+// constructor's declared field order, binding by LABEL rather than position.
+//
+// This kicks in ONLY when the pattern's field labels form an exact permutation
+// of the constructor's declared labels (set equality, same multiplicity, every
+// label a real declared label). In that case `First(aa: a, zz: z)` is reordered
+// to declared order so each binder maps to its LABEL's field, mirroring P-Record.
+//
+// Every other shape passes through UNCHANGED so the existing positional walk in
+// bind_ctor_fields preserves its prior behaviour:
+//   - wildcard-all `Ctor(_)` (empty field list),
+//   - positional constructors (declared fields unnamed),
+//   - partial / mixed patterns like `Ctor(present: p, _)` where `_` is a
+//     positional remainder rather than a real label,
+//   - pun shorthand already written in declared order.
+let reorder_ctor_pat_fields = fn (
+  fields: [ HirPatternField ], field_types: [ VariantField ]
+) -> CanonResult do
+  let declared_labels = variant_field_labels(field_types, acc: [])
+  let pat_labels = pat_field_labels(fields, acc: [])
+  if is_full_label_permutation(pat_labels, declared_labels) then
+    return canon_by_label(declared: field_types, pat_fields: fields, acc: [])
+  else
+    return CanonOk(fields: fields)
+  end
+end
+
+// Declared field labels, in declared order. Returns [] (treated as "not a
+// fully-labelled constructor") if ANY field is positional/unnamed.
+let variant_field_labels = fn (field_types: [ VariantField ], acc: [ string ]) -> [ string ] do
+  match field_types do
+    | [] -> return list.reverse(xs: acc)
+    | VariantField(name: None, typ: _) :: _ -> return []
+    | VariantField(name: Some(val: n), typ: _) :: rest ->
+      return variant_field_labels(field_types: rest, acc: n :: acc)
+  end
+end
+
+// Pattern field labels, in surface order. Returns [] if any field is unnamed.
+let pat_field_labels = fn (fields: [ HirPatternField ], acc: [ string ]) -> [ string ] do
+  match fields do
+    | [] -> return list.reverse(xs: acc)
+    | HirPatternField(name: None, pattern: _) :: _ -> return []
+    | HirPatternField(name: Some(val: n), pattern: _) :: rest ->
+      return pat_field_labels(fields: rest, acc: n :: acc)
+  end
+end
+
+// True iff `pat_labels` is a permutation of `declared_labels`: same length,
+// and every declared label appears exactly once in the pattern. Both lists are
+// non-empty and label-distinct in the cases we care about; a `_` positional
+// remainder is not a declared label, so a mixed pattern fails this test and
+// falls back to the positional walk.
+let is_full_label_permutation = fn (pat_labels: [ string ], declared_labels: [ string ]) -> bool do
+  match declared_labels do
+    | [] -> return false
+    | _ ->
+      if list.length(xs: pat_labels) != list.length(xs: declared_labels) then
+        return false
+      else
+        return every_label_present(needles: declared_labels, haystack: pat_labels)
+      end
+  end
+end
+
+let every_label_present = fn (needles: [ string ], haystack: [ string ]) -> bool do
+  match needles do
+    | [] -> return true
+    | n :: rest ->
+      if label_in_list(label: n, haystack) then
+        return every_label_present(needles: rest, haystack)
+      else
+        return false
+      end
+  end
+end
+
+// For each declared field (in declared order) pull the matching pattern field
+// out of `pat_fields` by label. Errors on a missing label (no pattern field
+// for a declared field) or, after all declared fields are consumed, a leftover
+// pattern field whose label is not declared (unknown / extra / duplicate).
+let canon_by_label = fn (
+  declared: [ VariantField ], pat_fields: [ HirPatternField ],
+  acc: [ HirPatternField ]
+) -> CanonResult do
+  match declared do
+    | [] ->
+      // No more declared fields. Any remaining pattern field is unknown/extra.
+      match pat_fields do
+        | [] -> return CanonOk(fields: list.reverse(xs: acc))
+        | HirPatternField(name: extra_opt, pattern: _) :: _ ->
+          let extra = match extra_opt do
+            | Some(val: n) -> n
+            | None -> "(positional)"
+          end
+          return CanonErr(message: "constructor pattern has unknown or duplicate field label `"
+            ++ extra ++ "`; P-Ctor requires {ℓ'} = {ℓ}")
+      end
+    | VariantField(name: dname_opt, typ: _) :: rest_declared ->
+      let dname = match dname_opt do
+        | Some(val: n) -> n
+        | None -> ""
+      end
+      match take_pat_field_by_label(label: dname, fields: pat_fields, seen: []) do
+        | None ->
+          return CanonErr(message: "constructor pattern is missing field label `"
+            ++ dname ++ "`; P-Ctor requires {ℓ'} = {ℓ}")
+        | Some(val: TakenPatField(field: f, rest: remaining)) ->
+          return canon_by_label(declared: rest_declared, pat_fields: remaining, acc: f :: acc)
+      end
+  end
+end
+
+type TakenPatField = TakenPatField(field: HirPatternField, rest: [ HirPatternField ])
+
+// Remove and return the first pattern field whose label equals `label`,
+// preserving the order of the remaining fields. `seen` accumulates the
+// already-scanned (non-matching) fields to splice back in.
+let take_pat_field_by_label = fn (
+  label: string, fields: [ HirPatternField ], seen: [ HirPatternField ]
+) -> Option<TakenPatField> do
+  match fields do
+    | [] -> return None
+    | HirPatternField(name: fname_opt, pattern: pat) :: rest ->
+      let matches = match fname_opt do
+        | Some(val: fname) -> fname == label
+        | None -> false
+      end
+      if matches then
+        let remaining = list.concat(xs: list.reverse(xs: seen), ys: rest)
+        return Some(val: TakenPatField(
+          field: HirPatternField(name: fname_opt, pattern: pat),
+          rest: remaining
+        ))
+      else
+        return take_pat_field_by_label(
+          label,
+          fields: rest,
+          seen: HirPatternField(name: fname_opt, pattern: pat) :: seen
+        )
+      end
   end
 end
 
