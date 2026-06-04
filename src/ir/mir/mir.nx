@@ -313,7 +313,7 @@ let lower_stmt = fn (
       // MirStmtInjectResume statement that codegen will expand to
       // ref.func + cont.new + resume + on-clauses.
       if any_handler_has_kont(handler_names: hs, bindings: ah) then
-        let LiftInjectResult(ctx: ctx2, body_fn: bfn, ret_type: inj_rt) = lift_inject_body(
+        let LiftInjectResult(ctx: ctx2, body_fn: bfn, ret_type: inj_rt, captures: caps) = lift_inject_body(
           stmts: b,
           span,
           ctx: new_ctx
@@ -335,9 +335,22 @@ let lower_stmt = fn (
           ) = ctx2
           let restored = MirCtx(scope, cap_layouts: pl2, handler_cap_names: hpn2,
                                 all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
+          // Build the env object from the captured enclosing variables (in scope
+          // here at the inject site) and hand it off through the fixed inject-env
+          // cell right before the resume frame runs; `__inject_N` reads it back.
+          // `MirMakeClosure` gives the `[func_idx@0, cap0@1, ...]` layout the
+          // body's env-load preamble expects. When there are no captures the
+          // body never calls `__inject_env_get` meaningfully, but the env object
+          // (a single func-idx word) is still built and stored harmlessly.
+          let env_obj = MirMakeClosure(func_name: bfn, captures: captures_to_mir_exprs(caps, acc: []))
+          let env_set = MirStmtExpr(expr: MirCall(
+            func: "__inject_env_set",
+            args: [ MirCallArg(label: "env", value: env_obj) ],
+            ret_type: TyUnit
+          ))
           return MirStmtsResult(
             ctx: restored,
-            stmts: [ MirStmtInjectResume(body_fn: bfn, handler_arm_fns: arm_fns, handler_arm_tags: arm_tags, ret_type: inj_rt) ]
+            stmts: [ env_set, MirStmtInjectResume(body_fn: bfn, handler_arm_fns: arm_fns, handler_arm_tags: arm_tags, ret_type: inj_rt) ]
           )
       end
       // No with-kont arms: existing behaviour — inline body under injected scope.
@@ -699,7 +712,7 @@ let runtime_dispatch_handlers = fn (
   end
 end
 
-type LiftInjectResult = LiftInjectResult(ctx: MirCtx, body_fn: string, ret_type: TypeExpr)
+type LiftInjectResult = LiftInjectResult(ctx: MirCtx, body_fn: string, ret_type: TypeExpr, captures: [ string ])
 
 /** Classify the trailing-value type of a lifted inject body. The inject site
  *  yields whatever value the body's last bare expression produces; codegen
@@ -825,7 +838,26 @@ let lift_inject_body = fn (
   let ctx_after_name = MirCtx(scope: sc, cap_layouts: pl, handler_cap_names: hpn,
                               all_funcs: af, all_handlers: ah, all_exts: ae,
                               closure_counter: n + 1, lifted_funcs: lf, cont_binders: cb, value_binding_names: vbns, thunk_param_names: tpn)
-  let MirStmtsResult(ctx: ctx_body, stmts: mir_body) = lower_stmts(stmts, ctx: ctx_after_name)
+  // Free variables of the inject body that refer to the ENCLOSING scope. The
+  // lifted `__inject_N` is reified by `cont.new` over a parameterless `() -> ()`
+  // funcref, so these cannot arrive through parameters. Compute them with the
+  // same machinery as lambda lifting (`collect_hir_free_vars` over the HIR body,
+  // minus top-level funcs / externals / cap-method names), then bind them inside
+  // the lifted body from a closure-env object the inject site hands off through
+  // the fixed inject-env cell. Cap-method calls (`Gen.tick`) stay out of the
+  // capture set via `build_known_names`, so only real enclosing locals/params
+  // are captured.
+  let known = build_known_names(ctx: ctx_after_name)
+  let captures = collect_hir_free_vars(body: stmts, params: [], known)
+  let MirStmtsResult(ctx: ctx_body, stmts: mir_body_inner) = lower_stmts(stmts, ctx: ctx_after_name)
+  // Env-load preamble: `let __env = __inject_env_get()` recovers the env object
+  // pointer the inject site stored before `resume`; each capture is then read
+  // from it by field index, matching the `MirMakeClosure` object layout the
+  // site builds (`[func_idx@0, cap0@1, ...]`, and `MirEnvLoad` adds the +1).
+  let env_load = MirStmtLet(name: "__env", typ: TyI64,
+                            expr: MirCall(func: "__inject_env_get", args: [], ret_type: TyI64))
+  let cap_preamble = build_env_load_preamble(captures, index: 0)
+  let mir_body = concat_mir_stmts(a: env_load :: cap_preamble, b: mir_body_inner)
   let MirCtx(
       scope: sc2,
       cap_layouts: pl2,
@@ -852,7 +884,7 @@ let lift_inject_body = fn (
     let ctx_final = MirCtx(scope: sc2, cap_layouts: pl2, handler_cap_names: hpn2,
                            all_funcs: af2, all_handlers: ah2, all_exts: ae2,
                            closure_counter: n2, lifted_funcs: new_lf, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
-    return LiftInjectResult(ctx: ctx_final, body_fn: lifted_name, ret_type: result_ty)
+    return LiftInjectResult(ctx: ctx_final, body_fn: lifted_name, ret_type: result_ty, captures)
 end
 
 let desugar_for = fn (

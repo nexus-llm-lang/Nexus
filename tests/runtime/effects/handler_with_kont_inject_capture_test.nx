@@ -1,0 +1,110 @@
+// Acceptance: an `inject H do <body> end` body may reference variables from the
+// ENCLOSING scope even when H captures a continuation (`with @k`) and the inject
+// therefore routes through the stack-switching resume frame.
+//
+// Before the fix, the lifted `__inject_N` body was a parameterless top-level
+// `() -> ()` function (reified by `cont.new` over a bare funcref), so any
+// reference to an enclosing variable failed codegen with
+//   codegen error: variable 'X' not found (in emit_atom_var) [E3001]
+// and the program never built. Only inject bodies that touched zero enclosing
+// state compiled.
+//
+// Fix: the inject body's free variables are computed with the same machinery as
+// lambda lifting and bound inside the lifted body from a closure-env object. The
+// inject site builds the env object from the captured enclosing variables and
+// hands it off through a fixed memory cell right before `resume`; `__inject_N`
+// reads it back at entry and an env-load preamble recovers each capture. The
+// captures live in the continuation frame's locals once loaded, so they survive
+// every suspend/resume boundary.
+//
+// Cases:
+//   1. direct reference to an enclosing param  (`base + 5`)
+//   2. enclosing params passed as call arguments inside the body
+//   3. multiple captures used across suspend/resume boundaries
+//   4. string (heap-handle) capture
+//
+// Each case throws RuntimeError on mismatch; exit 0 means all pass.
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+
+cap Gen do
+  fn tick() -> i64
+end
+
+// `@k` resumes the suspended continuation so the body continues after each tick.
+let gen_h = handler Gen do
+  fn tick() -> i64 with @k do
+    @k
+  end
+end
+
+let combine = fn (a: i64, b: i64) -> i64 do
+  a * b
+end
+
+// Case 1: direct reference to the enclosing parameter `base`.
+let direct_ref = fn (base: i64) -> i64 throws { RuntimeError } do
+  inject gen_h do
+    let _t = Gen.tick()
+    base + 5
+  end
+end
+
+// Case 2: enclosing params `base`/`mul` passed as call arguments in the body.
+let pass_as_arg = fn (base: i64, mul: i64) -> i64 throws { RuntimeError } do
+  inject gen_h do
+    let _t = Gen.tick()
+    combine(a: base, b: mul)
+  end
+end
+
+// Case 3: two captures used across three suspend/resume boundaries.
+let multi_capture = fn (x: i64, y: i64) -> i64 throws { RuntimeError } do
+  inject gen_h do
+    let _a = Gen.tick()
+    let s1 = x + y
+    let _b = Gen.tick()
+    let s2 = s1 + x
+    let _c = Gen.tick()
+    s2 + y
+  end
+end
+
+// Case 4: string (heap-handle) capture.
+let str_capture = fn (prefix: string) -> string throws { RuntimeError } do
+  inject gen_h do
+    let _a = Gen.tick()
+    prefix ++ "-done"
+  end
+end
+
+let assert_i64 = fn (label: string, got: i64, want: i64) -> unit throws { RuntimeError } do
+  if !(got == want) then
+    throw RuntimeError(val: label ++ ": got " ++ str.from_i64(val: got) ++ ", want " ++ str.from_i64(val: want))
+  end
+end
+
+let assert_str = fn (label: string, got: string, want: string) -> unit throws { RuntimeError } do
+  if !(got == want) then
+    throw RuntimeError(val: label ++ ": got '" ++ got ++ "', want '" ++ want ++ "'")
+  end
+end
+
+let main = fn () -> unit require { PermConsole } throws { RuntimeError } do
+  inject stdio.system_handler do
+    // Case 1: base + 5 with base threaded in
+    assert_i64(label: "direct-ref", got: direct_ref(base: 100), want: 105)
+
+    // Case 2: combine(base, mul) = base * mul
+    assert_i64(label: "pass-as-arg", got: pass_as_arg(base: 6, mul: 7), want: 42)
+
+    // Case 3: (x+y) + x + y across three resumes = x + 2y + x = 2x + 2y
+    assert_i64(label: "multi-capture", got: multi_capture(x: 10, y: 3), want: 26)
+
+    // Case 4: string capture
+    assert_str(label: "str-capture", got: str_capture(prefix: "task"), want: "task-done")
+
+    Console.println(val: "ok")
+  end
+end
