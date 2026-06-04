@@ -175,7 +175,7 @@ export let check_program = fn (
   // provably non-throwing (no direct Raise, no call to a can-throw function).
   // Used by check_call_throw_row_admitted to admit unannotated callees that
   // are statically pure under a `throws {}` caller.
-  let pure_set = build_fn_pure_set(funcs)
+  let pure_set = build_fn_pure_set(funcs, exts)
   let st6 = tctypes.state_with_fn_pure_set(state: st5, fn_pure_set: pure_set)
 
   check_all_functions(state: st6, funcs, local_names, cont_map: cont_binder_map)
@@ -399,6 +399,28 @@ let check_arm_bodies = fn (
   end
 end
 
+/** Close the implicit-open tail of a cap-method/arm throw row.
+ *
+ *  An absent `throws` clause parses to `TyRow([], Some(TyVar("__implicit")))`
+ *  — an open row that the inference engine treats as effect-polymorphic (any
+ *  throw admitted) for backward-compat with un-annotated function arrows. A
+ *  handler arm body, however, is the runtime implementation of a cap method:
+ *  its published interface is the cap-method declaration, and an absent throws
+ *  clause there means "raises nothing". We therefore strip only the
+ *  `__implicit` tail, turning it into a closed row while preserving any
+ *  concrete labels (a thunk-deferred `TyRow([E], Some(__implicit))` keeps E but
+ *  loses the open tail). Genuine effect-polymorphic tails (fresh inference
+ *  variables) and already-closed rows are returned unchanged.
+ */
+let close_implicit_throw_row = fn (row: TypeExpr) -> TypeExpr do
+  match row do
+    | TyRow(types: ts, rest: Some(val: TyVar(name: nm))) ->
+      if nm == "__implicit" then return TyRow(types: ts, rest: None) end
+      return row
+    | _ -> return row
+  end
+end
+
 let check_arm_body = fn (
   state: CheckState,
   func: HirFunction,
@@ -432,7 +454,24 @@ let check_arm_body = fn (
     | None -> body_env
   end
   let body_state = tctypes.state_with_env(state, env: body_env2)
-  let body_state2 = tctypes.state_with_throw_row(state: body_state, throw_row: conv_tw)
+  // T-Handler throws reconciliation: a handler arm IS the implementation of a
+  // cap method, dispatched at runtime through the cap table. The arm body's
+  // throws must therefore stay within the method's declared `throws` row — an
+  // exception the body raises but the method does not declare escapes invisibly
+  // (the main-wrap pass only wraps exceptions present in a body's *inferred*
+  // throw row, so an unreconciled throw leaks straight to the host as a Wasm
+  // exception under a closed `throws {}` entry point).
+  //
+  // `validate_handler_arm_throw_rows` already pins `arm_tw == method_tw`, so the
+  // arm's own `conv_tw` is the method's declared row. The only gap is that an
+  // *absent* `throws` clause parses to the open `__implicit` row (legacy
+  // effect-polymorphism for un-annotated function arrows), which would admit any
+  // throw. A cap-method declaration is an interface site, not legacy code: an
+  // absent throws clause means the method publishes no exceptions, so close the
+  // implicit tail before pinning it as the arm body's ambient throw row. This is
+  // the throws-side sibling of the require-row pinning below (nexus-4twfh).
+  let arm_throw_row = close_implicit_throw_row(row: conv_tw)
+  let body_state2 = tctypes.state_with_throw_row(state: body_state, throw_row: arm_throw_row)
   // Pin the handler's declared require row as the arm body's ambient ρ_q so
   // T-CapCall (x ∈ ρ_q) rejects cap calls not covered by the handler require
   // row. Mirrors check_function's state_with_require_row; without this the arm
@@ -714,12 +753,16 @@ let stmt_kind_can_escape = fn (
     | Assign(target: t, value: v) ->
       if expr_can_escape(expr: t, can_throw, all_fns) then return true end
       return expr_can_escape(expr: v, can_throw, all_fns)
-    | Try(body: tb, catch_param: _, catch_body: cb) ->
-      // try/catch: throws from the try body that are caught don't escape;
-      // throws from the catch body do. Conservatively treat both as potential
-      // escape sources (the try body may still escape if it throws something
-      // the catch doesn't handle).
-      if stmts_can_escape(stmts: tb, can_throw, all_fns) then return true end
+    | Try(body: _, catch_param: _, catch_body: cb) ->
+      // In HIR, `try`/`catch` is already desugared to a single catch-all binder
+      // (`catch_param` binds every exception; selective `catch | E -> …` lowers
+      // to a `match` inside `catch_body` with a synthetic `_ -> throw param`
+      // rethrow arm). The catch binder therefore absorbs ALL throws from the try
+      // body — only the catch body can let an exception escape (via its own
+      // raises/throwing calls or the synthetic rethrow). Counting the try body
+      // as an escape source mislabels otherwise-pure functions that fully absorb
+      // their throws (e.g. `emit_json`'s `try … catch _ -> ()`), which then
+      // spuriously fails the closed-throw check at a handler-arm call site.
       return stmts_can_escape(stmts: cb, can_throw, all_fns)
     | Inject(handlers: _, body: b) -> return stmts_can_escape(stmts: b, can_throw, all_fns)
   end
@@ -797,14 +840,63 @@ end
 /** Build the set of provably-non-throwing top-level function names.
  *  Returns a list of function names that cannot throw (directly or transitively).
  */
-let build_fn_pure_set = fn (funcs: [ HirFunction ]) -> [ string ] do
-  let all_fns = collect_fn_names(funcs)
+let build_fn_pure_set = fn (
+  funcs: [ HirFunction ],
+  exts: [ HirExternal ]
+) -> [ string ] do
+  // Externals are WASM imports with no body — they can never contain a `Raise`,
+  // so an external whose declared throw row is empty/closed is provably
+  // non-throwing. Fold those names into `all_fns` so a call to (e.g.) a pure
+  // `w_proc_exit` intrinsic is treated as a known non-escaping callee rather
+  // than the conservative unknown-callee `return true`. Without this, handler
+  // arm bodies that delegate to such intrinsics under the closed throw row
+  // pinned by `check_arm_body` would be spuriously rejected.
+  let nothrow_ext_names = collect_nothrow_external_names(exts)
+  let all_fns = list_append(xs: collect_fn_names(funcs), ys: nothrow_ext_names)
   // Initial can_throw: functions whose bodies directly contain Raise or call unknowns.
   let initial_can_throw = initial_can_throw_set(funcs, all_fns)
   // Fixpoint: propagate transitively.
   let final_can_throw = fixpoint_can_throw(funcs, can_throw: initial_can_throw, all_fns)
-  // Pure set = all_fns minus can_throw.
+  // Pure set = all_fns minus can_throw. (External names carry through too — a
+  // closed-throw external call site admits them just like a pure top-level fn.)
   return filter_not_in(xs: all_fns, exclude: final_can_throw)
+end
+
+/** Names of externals whose declared throw row admits no exceptions: either a
+ *  closed empty row `{}` or the implicit absent-throws row. Externals have no
+ *  body, so an empty declared row is an honest no-throw contract.
+ */
+let collect_nothrow_external_names = fn (exts: [ HirExternal ]) -> [ string ] do
+  match exts do
+    | [] -> return []
+    | HirExternal(
+      name: n,
+      wasm_module: _,
+      wasm_name: _,
+      type_params: _,
+      params: _,
+      ret_type: _,
+      throw_row: tw
+    ) :: rest ->
+      let tail = collect_nothrow_external_names(exts: rest)
+      if external_throw_row_is_empty(row: tw) then return n :: tail end
+      return tail
+  end
+end
+
+let external_throw_row_is_empty = fn (row: TypeExpr) -> bool do
+  match row do
+    | TyRow(types: [], rest: None) -> return true
+    | TyRow(types: [], rest: Some(val: TyVar(name: nm))) -> return nm == "__implicit"
+    | _ -> return false
+  end
+end
+
+let list_append = fn (xs: [ string ], ys: [ string ]) -> [ string ] do
+  match xs do
+    | [] -> return ys
+    | x :: rest -> return x :: list_append(xs: rest, ys)
+  end
 end
 
 let initial_can_throw_set = fn (funcs: [ HirFunction ], all_fns: [ string ]) -> [ string ] do
