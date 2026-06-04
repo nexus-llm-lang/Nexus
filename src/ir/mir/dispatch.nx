@@ -40,8 +40,11 @@ import {
   handlers_for_cap,
   lookup_handler_by_cap
 } from "src/ir/mir/cap.nx"
+import { arm_cont_binder } from "src/ir/mir/utils.nx"
+import { MirSuspend } from "src/ir/mir/types.nx"
+import { MirMultiArgSuspend } from "src/ir/mir/errors.nx"
 import { HirCap, HirCapMethod, HirParam, HirHandlerBindingEntry } from "src/ir/hir/types.nx"
-import { LitInt, OpEq } from "src/types/vocab.nx"
+import { LitInt, LitUnit, OpEq } from "src/types/vocab.nx"
 import { TypeExpr, TyI64 } from "src/types/type_expr.nx"
 import { Span } from "src/types/span.nx"
 import { Some, None, Option } from "std:option"
@@ -162,13 +165,17 @@ let build_one_dispatcher = fn (
     | Some(val: b) -> b
     | None -> ""
   end
-  let default_call = MirStmtReturn(expr: MirCall(
-    func: naming.handler_func_name(handler_name: default_binding, method_name),
-    args: fwd_args,
-    ret_type
-  ))
+  let default_call = forward_stmt(
+    cap_name,
+    method_name,
+    handler_name: default_binding,
+    fwd_args,
+    ret_type,
+    bindings
+  )
   let handler_names = handlers_for_cap(cap_name, bindings)
   let if_chain = build_if_chain(
+    cap_name,
     slot_name,
     method_name,
     fwd_args,
@@ -187,9 +194,51 @@ let build_one_dispatcher = fn (
   )
 end
 
+/** Build the per-arm forward statement for one handler. A plain arm leaves an
+ *  i64 by normal value flow, so it forwards with a direct value-returning call
+ *  to the handler's `__handler_*` method. A `with @k` arm does NOT return a
+ *  value by normal flow — its lifted handler function performs a `resume` and
+ *  never leaves an i64 on the stack — so it must lower to a `MirSuspend` exactly
+ *  as `lower_cap_call` does on the single-handler path. The suspend tag is the
+ *  per-cap-method `<cap>::<method>` string the active inject-resume frame's
+ *  `on tag → arm-label` clause matches against, so the suspend reaches the
+ *  dynamically-active with-kont arm regardless of which handler the dispatcher
+ *  statically selected. Emitting a plain value call here instead produces a
+ *  malformed dispatcher (the function declares an i64 return but the with-kont
+ *  branch pushes nothing) → an invalid Wasm module. */
+let forward_stmt = fn (
+  cap_name: string,
+  method_name: string,
+  handler_name: string,
+  fwd_args: [ MirCallArg ],
+  ret_type: TypeExpr,
+  bindings: [ HirHandlerBindingEntry ]
+) -> MirStmt throws { MirError } do
+  match arm_cont_binder(handler_name, method_name, bindings) do
+    | Some(_) ->
+      let tag = cap_name ++ "::" ++ method_name
+      let n_args = list.length(xs: fwd_args)
+      if n_args > 1 then
+        throw MirMultiArgSuspend(cap_name, method_name, arg_count: n_args)
+      end
+      let payload = match fwd_args do
+        | MirCallArg(label: _, value: v) :: _ -> v
+        | [] -> MirLiteral(lit: LitUnit)
+      end
+      return MirStmtReturn(expr: MirSuspend(tag_name: tag, payload, ret_type))
+    | None ->
+      return MirStmtReturn(expr: MirCall(
+        func: naming.handler_func_name(handler_name, method_name),
+        args: fwd_args,
+        ret_type
+      ))
+  end
+end
+
 /** Construct the nested if-chain that compares the loaded slot against each
  *  handler's id and forwards to its method, falling through to `default_stmts`. */
 let build_if_chain = fn (
+  cap_name: string,
   slot_name: string,
   method_name: string,
   fwd_args: [ MirCallArg ],
@@ -202,12 +251,16 @@ let build_if_chain = fn (
     | [] -> return default_stmts
     | hname :: rest ->
       let hid = handler_id(binding_name: hname, bindings)
-      let then_stmt = MirStmtReturn(expr: MirCall(
-        func: naming.handler_func_name(handler_name: hname, method_name),
-        args: fwd_args,
-        ret_type
-      ))
+      let then_stmt = forward_stmt(
+        cap_name,
+        method_name,
+        handler_name: hname,
+        fwd_args,
+        ret_type,
+        bindings
+      )
       let else_stmts = build_if_chain(
+        cap_name,
         slot_name,
         method_name,
         fwd_args,

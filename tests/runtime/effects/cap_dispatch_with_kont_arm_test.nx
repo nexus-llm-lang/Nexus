@@ -1,0 +1,91 @@
+// Regression: a runtime cap dispatcher (generated when a cap has 2+ handler
+// bindings) must lower a `with @k` arm to a SUSPEND, not a plain value call.
+//
+// When the same cap has both a plain handler and a `with @k` handler, cap calls
+// reached across a function-call boundary route through the generated
+// `__dispatch_<Cap>_<method>` function. That dispatcher used to emit, for EVERY
+// arm, a direct `return __handler_<H>_<method>(args)` value call. For the
+// `with @k` arm that is wrong: the lifted handler performs a `resume` and never
+// leaves an i64 on the stack by normal value flow, so the dispatcher function
+// declared an i64 return with nothing pushed on that branch → an invalid Wasm
+// module that refused to instantiate ("expected i64 but nothing on stack").
+//
+// The fix makes the dispatcher consult each arm's `cont_binder` (with-kont
+// status) and, for a `with @k` arm, lower to a `MirSuspend` mirroring the
+// single-handler `lower_cap_call` path. The suspend's `<cap>::<method>` tag is
+// matched by the active inject-resume frame, so control transfers into the
+// with-kont arm, `@k` resumes the suspended body, and the body runs to
+// completion.
+//
+// This test forces the dispatcher path: the cap call lives in a CALLED helper
+// (so it resolves statically to the first-declared plain handler and routes
+// through the dispatcher), while a `with @k` handler is the dynamically-active
+// inject. The body accumulates a running sum ACROSS several suspend/resume
+// boundaries and asserts the final value; a regression would either fail to
+// instantiate the module, trap on an unhandled suspend, or compute a wrong sum.
+// A pass is exit 0.
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+
+cap Gen do
+  fn tick() -> i64
+end
+
+// First-declared handler for Gen: plain arm. The helper's cap call resolves
+// statically to THIS one, so two handlers for Gen force the runtime dispatcher.
+let plain_h = handler Gen do
+  fn tick() -> i64 do
+    return 7
+  end
+end
+
+// Second handler for Gen: `with @k` arm. Injected dynamically; the dispatcher's
+// if-chain arm for it must lower to a suspend, not a value call. `@k` resumes
+// the suspended continuation (resume value is unit today) so the body continues
+// past each tick.
+let kont_h = handler Gen do
+  fn tick() -> i64 with @k do
+    @k
+  end
+end
+
+let assert_i64 = fn (label: string, got: i64, want: i64) -> unit throws { RuntimeError } do
+  if !(got == want) then
+    throw RuntimeError(val: label ++ ": got " ++ str.from_i64(val: got) ++ ", want " ++ str.from_i64(val: want))
+  end
+end
+
+// Cap calls reached across a function-call boundary → route through the
+// generated dispatcher. Each tick must suspend into the active with-kont arm
+// and resume so the body keeps running and the sum accumulates correctly.
+let sum_across_dispatch = fn () -> unit require { Gen, Console } throws { RuntimeError } do
+  let _t1 = Gen.tick()
+  let s1 = 1
+  Console.println(val: "step-1")
+  let _t2 = Gen.tick()
+  let s2 = s1 + 2
+  Console.println(val: "step-2")
+  let _t3 = Gen.tick()
+  let s3 = s2 + 3
+  Console.println(val: "step-3")
+  assert_i64(label: "sum-across-dispatch", got: s3, want: 6)
+  Console.println(val: "ok")
+end
+
+// plain_h is injected as an outer scope (so both bindings are live and the cap
+// dispatches dynamically); kont_h is the dynamically-active innermost handler,
+// so the dispatcher's with-kont branch is the one exercised.
+let run = fn () -> unit require { Console } throws { RuntimeError } do
+  inject plain_h do
+    inject kont_h do
+      sum_across_dispatch()
+    end
+  end
+end
+
+let main = fn () -> unit require { PermConsole } throws { RuntimeError } do
+  inject stdio.system_handler do
+    run()
+  end
+end
