@@ -26,7 +26,7 @@
  * - Pattern-shape conversion (see src/ir/hir/pattern.nx)
  */
 import { Span } from "src/types/span.nx"
-import { Sigil, SigilImmutable, SigilLazy, SigilMutable, Unqual, OpAnd, OpOr, LitBool } from "src/types/vocab.nx"
+import { Sigil, SigilImmutable, SigilLazy, SigilMutable, RdrName, Unqual, Qual, OpAnd, OpOr, LitBool } from "src/types/vocab.nx"
 import { TypeExpr, TyUnit, TyRow, TyLazy } from "src/types/type_expr.nx"
 import {
   Expr,
@@ -500,21 +500,190 @@ let convert_stmts = fn (
 end
 
 /**
- * Collect the names introduced by direct `let`/`let Pattern` statements at
- * THIS block level (not descending into nested blocks). Used to compute the
- * set of sibling locals a recursive/mutually-recursive local-let lambda body
- * must see as LOCAL bindings rather than same-named top-levels.
- * A block may interleave lets with other statements, so we
- * walk the whole list rather than stopping at the first non-let.
+ * True if `name` appears as a free-ish call/variable reference anywhere in the
+ * given statement list. Used to decide whether a forward block-level sibling
+ * let is a genuine MUTUAL-recursion partner of a preceding lambda (and so must
+ * be routed to the local binding) vs. an unrelated later shadow whose presence
+ * must NOT steal a preceding lambda's reference away from an enclosing
+ * top-level of the same name (nexus-grbmk over-rejection).
+ *
+ * This is a deliberately shadow-agnostic structural walk: any `Unqual(name)`
+ * occurrence counts as a reference. That over-approximates across inner
+ * rebindings of `name`, which only ever biases toward DROPPING the sibling
+ * (preserving the qbxqe mutual-recursion routing) — never toward stealing a
+ * legitimate top-level reference.
  */
-let collect_block_let_names = fn (stmts: [ SpannedStmt ]) -> [ string ] do
+let block_refs_name = fn (stmts: [ SpannedStmt ], name: string) -> bool do
   match stmts do
+    | [] -> return false
+    | s :: rest ->
+      if stmt_refs_name(stmt: s, name) then return true end
+      return block_refs_name(stmts: rest, name)
+  end
+end
+
+let stmt_refs_name = fn (stmt: SpannedStmt, name: string) -> bool do
+  let SpannedStmt(node: sn, span: _) = stmt
+  match sn do
+    | StmtLet(name: _, sigil: _, typ: _, value: v) -> return expr_refs_name(expr: v, name)
+    | StmtLetPattern(pattern: _, value: v) -> return expr_refs_name(expr: v, name)
+    | StmtExpr(expr: e) -> return expr_refs_name(expr: e, name)
+    | StmtReturn(value: e) -> return expr_refs_name(expr: e, name)
+    | StmtAssign(target: _, value: v) -> return expr_refs_name(expr: v, name)
+    | StmtIndexAssign(target: a, index: i, value: v) ->
+      if expr_refs_name(expr: a, name) then return true end
+      if expr_refs_name(expr: i, name) then return true end
+      return expr_refs_name(expr: v, name)
+    | StmtTry(body: b, catch_arms: arms) ->
+      if block_refs_name(stmts: b, name) then return true end
+      return catch_arms_ref_name(arms: arms, name)
+    | StmtInject(handlers: hs, body: b) ->
+      if exprs_ref_name(exprs: hs, name) then return true end
+      return block_refs_name(stmts: b, name)
+  end
+end
+
+let expr_refs_name = fn (expr: SpannedExpr, name: string) -> bool do
+  let SpannedExpr(node: en, span: _) = expr
+  match en do
+    | ExprLiteral(lit: _) -> return false
+    | ExprVariable(name: rn, sigil: _) -> return rdr_is_unqual_named(rn: rn, name)
+    | ExprBorrow(name: bn, sigil: _) -> return bn == name
+    | ExprBinaryOp(left: l, op: _, right: r) ->
+      if expr_refs_name(expr: l, name) then return true end
+      return expr_refs_name(expr: r, name)
+    | ExprUnaryOp(op: _, operand: o) -> return expr_refs_name(expr: o, name)
+    | ExprCall(func: rn, args: args) ->
+      if rdr_is_unqual_named(rn: rn, name) then return true end
+      return call_args_ref_name(args: args, name)
+    | ExprCallExpr(callee: c, args: args) ->
+      if expr_refs_name(expr: c, name) then return true end
+      return call_args_ref_name(args: args, name)
+    | ExprConstructor(name: _, args: args, sigil: _) -> return ctor_args_ref_name(args: args, name)
+    | ExprExternal(symbol: _, type_params: _, arg_names: _, typ: _) -> return false
+    | ExprArray(elements: es) -> return exprs_ref_name(exprs: es, name)
+    | ExprList(elements: es) -> return exprs_ref_name(exprs: es, name)
+    | ExprRecord(fields: fs) -> return named_exprs_ref_name(fields: fs, name)
+    | ExprIndex(target: t, index: i) ->
+      if expr_refs_name(expr: t, name) then return true end
+      return expr_refs_name(expr: i, name)
+    | ExprFieldAccess(target: t, field: _) -> return expr_refs_name(expr: t, name)
+    | ExprIf(cond: c, then_branch: tb, else_branch: eb) ->
+      if expr_refs_name(expr: c, name) then return true end
+      if block_refs_name(stmts: tb, name) then return true end
+      return block_refs_name(stmts: eb, name)
+    | ExprMatch(target: t, cases: cs) ->
+      if expr_refs_name(expr: t, name) then return true end
+      return match_cases_ref_name(cases: cs, name)
+    | ExprWhile(cond: c, body: b) ->
+      if expr_refs_name(expr: c, name) then return true end
+      return block_refs_name(stmts: b, name)
+    | ExprFor(var: _, start: s, end_expr: e, body: b) ->
+      if expr_refs_name(expr: s, name) then return true end
+      if expr_refs_name(expr: e, name) then return true end
+      return block_refs_name(stmts: b, name)
+    | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: b) ->
+      return block_refs_name(stmts: b, name)
+    | ExprRaise(value: v) -> return expr_refs_name(expr: v, name)
+    | ExprForce(value: v) -> return expr_refs_name(expr: v, name)
+    | ExprHandler(coeffect_name: _, requires: _, arms: arms) -> return handler_arms_ref_name(arms: arms, name)
+  end
+end
+
+let rdr_is_unqual_named = fn (rn: RdrName, name: string) -> bool do
+  match rn do
+    | Unqual(name: u) -> return u == name
+    | Qual(alias: _, name: _) -> return false
+  end
+end
+
+let exprs_ref_name = fn (exprs: [ SpannedExpr ], name: string) -> bool do
+  match exprs do
+    | [] -> return false
+    | e :: rest ->
+      if expr_refs_name(expr: e, name) then return true end
+      return exprs_ref_name(exprs: rest, name)
+  end
+end
+
+let call_args_ref_name = fn (args: [ CallArg ], name: string) -> bool do
+  match args do
+    | [] -> return false
+    | CallArg(name: _, value: v) :: rest ->
+      if expr_refs_name(expr: v, name) then return true end
+      return call_args_ref_name(args: rest, name)
+  end
+end
+
+let ctor_args_ref_name = fn (args: [ CtorArg ], name: string) -> bool do
+  match args do
+    | [] -> return false
+    | CtorArg(name: _, value: v) :: rest ->
+      if expr_refs_name(expr: v, name) then return true end
+      return ctor_args_ref_name(args: rest, name)
+  end
+end
+
+let named_exprs_ref_name = fn (fields: [ NamedExpr ], name: string) -> bool do
+  match fields do
+    | [] -> return false
+    | NamedExpr(name: _, value: v) :: rest ->
+      if expr_refs_name(expr: v, name) then return true end
+      return named_exprs_ref_name(fields: rest, name)
+  end
+end
+
+let match_cases_ref_name = fn (cases: [ MatchCase ], name: string) -> bool do
+  match cases do
+    | [] -> return false
+    | MatchCase(pattern: _, body: b) :: rest ->
+      if block_refs_name(stmts: b, name) then return true end
+      return match_cases_ref_name(cases: rest, name)
+  end
+end
+
+let catch_arms_ref_name = fn (arms: [ CatchArm ], name: string) -> bool do
+  match arms do
+    | [] -> return false
+    | CatchArm(pattern: _, body: b) :: rest ->
+      if block_refs_name(stmts: b, name) then return true end
+      return catch_arms_ref_name(arms: rest, name)
+  end
+end
+
+let handler_arms_ref_name = fn (arms: [ HandlerArm ], name: string) -> bool do
+  match arms do
+    | [] -> return false
+    | HandlerArm(arm: Function(name: _, is_public: _, type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: b, span: _), cont_binder: _, span: _) :: rest ->
+      if block_refs_name(stmts: b, name) then return true end
+      return handler_arms_ref_name(arms: rest, name)
+  end
+end
+
+/**
+ * From the statements that FOLLOW a lambda-RHS `let n = fn ...` at this block
+ * level, collect only those later block-level let names that are genuine
+ * forward MUTUAL-recursion partners of the lambda named `self_name` whose body
+ * is `self_body`: a later `let m = fn ...` whose own body references
+ * `self_name`. Names with non-lambda RHS, or lambda RHS that do not refer back
+ * to `self_name`, are NOT collected — so a preceding lambda's reference to a
+ * same-named enclosing/top-level binding is preserved (nexus-grbmk).
+ */
+let collect_mutual_sibling_names = fn (
+  rest: [ SpannedStmt ],
+  self_name: string,
+  self_body: [ SpannedStmt ]
+) -> [ string ] do
+  match rest do
     | [] -> return []
-    | SpannedStmt(node: StmtLet(name: n, sigil: _, typ: _, value: _), span: _) :: rest ->
-      return n :: collect_block_let_names(stmts: rest)
-    | SpannedStmt(node: StmtLetPattern(pattern: pat, value: _), span: _) :: rest ->
-      return list.concat(xs: hpat.pattern_binders(pat), ys: collect_block_let_names(stmts: rest))
-    | _ :: rest -> return collect_block_let_names(stmts: rest)
+    | SpannedStmt(node: StmtLet(name: m, sigil: _, typ: _, value: SpannedExpr(node: ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: mb), span: _)), span: _) :: more ->
+      // `m` is a mutual-recursion partner iff the preceding lambda actually
+      // refers to `m` AND `m`'s body refers back to `self_name`.
+      if block_refs_name(stmts: self_body, name: m) && block_refs_name(stmts: mb, name: self_name) then
+        return m :: collect_mutual_sibling_names(rest: more, self_name, self_body)
+      end
+      return collect_mutual_sibling_names(rest: more, self_name, self_body)
+    | _ :: more -> return collect_mutual_sibling_names(rest: more, self_name, self_body)
   end
 end
 
@@ -533,18 +702,30 @@ let convert_stmts_go = fn (
       let inner_entries = symtab.rename_drop(entries, name: n)
       // A `let n = fn (...)` is a (possibly mutually) recursive local closure
       // (types.md:236 / the d33l7 lift_lambda_self path): the body may refer
-      // to `n` to recurse, and to SIBLING local-let lambdas to mutually
-      // recurse. Every such block-level local name must resolve to the LOCAL
-      // binding, so the RHS lambda body is converted with ALL sibling let
-      // names dropped — otherwise, when a local name shadows a same-named
-      // top-level fn, the self/sibling call would be renamed to the toplevel
-      // canonical (e.g. `g` → `src#g`) and route to the OUTER binding instead
-      // of recursing.
+      // to `n` to recurse, and to forward SIBLING local-let lambdas to
+      // mutually recurse. Those names must resolve to the LOCAL binding so the
+      // self/sibling call is not renamed to a same-named top-level canonical
+      // (e.g. `g` → `src#g`) and routed to the OUTER binding instead of
+      // recursing.
+      //
+      // The drop is NARROWED to genuine forward mutual-recursion partners:
+      // `n` itself (self-recursion) plus any later block-level `let m = fn ...`
+      // such that this body references `m` AND `m`'s body references `n` back
+      // (collect_mutual_sibling_names). Dropping every later same-named let
+      // unconditionally over-rejected a lambda that legitimately references an
+      // enclosing/top-level fn `g` when an UNRELATED later `let g` happens to
+      // sit in the same block (nexus-grbmk) — that later `g` does not refer
+      // back, so it is no longer dropped and the reference keeps targeting the
+      // top-level canonical.
+      //
       // Non-lambda RHS keeps the outer entries: a non-recursive `let n = E`
       // does not bring the block locals into scope within E.
       let rhs_entries = match v_node do
-        | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: _) ->
-          symtab.rename_drop_many(entries, names: n :: collect_block_let_names(stmts: rest))
+        | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: lam_body) ->
+          symtab.rename_drop_many(
+            entries,
+            names: n :: collect_mutual_sibling_names(rest, self_name: n, self_body: lam_body)
+          )
         | _ -> entries
       end
       let hir_val = match sig do
