@@ -80,8 +80,17 @@ export let register_handler_bindings = fn (
         | [] -> false
         | _ -> true
       end
-      let env2 = if cap_is_generic then env1
-        else register_handler_methods(env: env1, cap_name: pname, prefix_len, arms, cap_methods) end
+      // Monomorphic caps: register the arm scheme directly under `<cap>.<method>`
+      // (the call-site scheme). Generic caps: the plain key stays owned by the
+      // poly `forall T` scheme (registration.register_cap_method_schemes); instead
+      // record THIS handler binding's concrete instantiation under a per-handler
+      // key so `inject <handler>` can shadow the poly scheme with it (soundness —
+      // prevents a generic call at one type under a handler for another type).
+      let env2 = if cap_is_generic then
+          register_handler_methods(
+            env: env1, cap_name: pname, prefix_len, arms, cap_methods,
+            key_prefix: handler_instance_key_prefix(handler_name: n))
+        else register_handler_methods(env: env1, cap_name: pname, prefix_len, arms, cap_methods, key_prefix: "") end
       // Per-arm wfThrow at the T-Handler introduction site: each arm body
       // is a HirFunction whose `throw_row` was preserved through HIR, so a
       // typo like `throws { BogusVariant }` on an arm is rejected here.
@@ -450,7 +459,16 @@ let register_handler_methods = fn (
   cap_name: string,
   prefix_len: i64,
   arms: [ HirHandlerArm ],
-  cap_methods: [ HirCapMethod ]
+  cap_methods: [ HirCapMethod ],
+  // Env-key prefix. "" registers under the plain `<cap>.<method>` key (the
+  // monomorphic-cap path, where the handler-arm scheme IS the call-site scheme).
+  // For GENERIC caps the plain key is suppressed (the poly `forall T` scheme owns
+  // it); instead we register the concrete arm-derived scheme under a
+  // per-handler-binding key (`__handlerinst::<handler>::`) so that an `inject`
+  // of that specific handler can shadow `<cap>.<method>` with THIS handler's
+  // instantiation. Ties the generic call site to the injected handler (soundness;
+  // a mismatched call type vs handler type then fails to unify → rejected).
+  key_prefix: string
 ) -> [ EnvEntry ] do
   match arms do
     | [] -> return env
@@ -459,7 +477,7 @@ let register_handler_methods = fn (
       cont_binder: kb
     ) :: rest ->
       let original_name = str.substring(s: n, start: prefix_len, len: str.length(s: n) - prefix_len)
-      let method_name = bb.concat(parts: [ cap_name, ".", original_name ])
+      let method_name = bb.concat(parts: [ key_prefix, cap_name, ".", original_name ])
       let user_params = match kb do
         | Some(_) -> list_init(xs: params)
         | None -> params
@@ -481,8 +499,62 @@ let register_handler_methods = fn (
         throw_row: method_throw_row
       )
       let env1 = tctypes.env_insert(env, name: method_name, scheme: tctypes.mono(typ: arrow))
-      return register_handler_methods(env: env1, cap_name, prefix_len, arms: rest, cap_methods)
+      return register_handler_methods(env: env1, cap_name, prefix_len, arms: rest, cap_methods, key_prefix)
   end
+end
+
+/** Env-key prefix under which a generic-cap handler binding's CONCRETE
+ *  arm-derived call-site schemes are stored. An `inject <handler>` then copies
+ *  these into the plain `<cap>.<method>` key inside the inject body, shadowing
+ *  the polymorphic `forall T` scheme with the specific injected instantiation. */
+export let handler_instance_key_prefix = fn (handler_name: string) -> string do
+  return bb.concat(parts: [ "__handlerinst::", handler_name, "::" ])
+end
+
+/** Inside an `inject` body, shadow each injected generic-cap handler's method
+ *  call-site scheme with the CONCRETE instantiation recorded for that handler
+ *  binding (under `handler_instance_key_prefix`). This binds a generic-cap call
+ *  (`Box.wrap(...)`) to the element type of the handler actually in scope, so a
+ *  call at one type under a handler for a DIFFERENT type fails to unify and is
+ *  rejected (soundness: prevents the generic-cap type confusion / OOB).
+ *  Monomorphic-cap handlers have no `__handlerinst::` entries → no-op for them. */
+export let apply_injected_handler_instances = fn (
+  env: [ EnvEntry ],
+  handler_names: [ string ]
+) -> [ EnvEntry ] do
+  match handler_names do
+    | [] -> return env
+    | h :: rest ->
+      let prefix = handler_instance_key_prefix(handler_name: h)
+      let env1 = shadow_handler_instances(env, prefix, src: env)
+      return apply_injected_handler_instances(env: env1, handler_names: rest)
+  end
+end
+
+/** Scan `src` for entries keyed `<prefix><cap>.<method>` and re-insert each under
+ *  the plain `<cap>.<method>` key in `env`, shadowing any existing (poly) scheme.
+ *  `src` is the original env (read-only) so newly-prepended entries aren't rescanned. */
+let shadow_handler_instances = fn (
+  env: [ EnvEntry ],
+  prefix: string,
+  src: [ EnvEntry ]
+) -> [ EnvEntry ] do
+  match src do
+    | [] -> return env
+    | EnvEntry(name: k, scheme: sc) :: rest ->
+      if str_has_prefix(s: k, prefix) then
+        let plain = str.substring(s: k, start: str.length(s: prefix), len: str.length(s: k) - str.length(s: prefix))
+        let env1 = tctypes.env_insert(env, name: plain, scheme: sc)
+        return shadow_handler_instances(env: env1, prefix, src: rest)
+      end
+      return shadow_handler_instances(env, prefix, src: rest)
+  end
+end
+
+let str_has_prefix = fn (s: string, prefix: string) -> bool do
+  let pl = str.length(s: prefix)
+  if str.length(s: s) < pl then return false end
+  return str.substring(s, start: 0, len: pl) == prefix
 end
 
 /** Build the env'd require row for a cap method: {cap_name} ∪ α (spec §T-CapCall).
