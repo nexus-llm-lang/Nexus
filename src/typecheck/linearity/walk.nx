@@ -237,12 +237,92 @@ let ctor_arg_is_linear = fn (
       end
     | Array(elems: es) -> return any_ctor_arg_is_linear(args: es, st, sigs, tdefs, enum_defs)
     | Record(fields: fs) -> return any_record_field_is_linear(fields: fs, st, sigs, tdefs, enum_defs)
+    // A Call result is classified LIVENESS-INDEPENDENTLY here: this call is
+    // itself an argument of the enclosing construction, so any linear value it
+    // launders (e.g. `Mix(gen: pick(x: %p))`) was ALREADY consumed by that
+    // construction and is no longer live at the match site. Delegating to
+    // `let_binds_linear` would read the (now-stale) live set for the call's
+    // args and wrongly classify the result non-linear, demoting a field that in
+    // fact carries a linear payload → silent drop / double-use (the c642e3d7
+    // pre-7umo8 behavior correctly rejected this). We instead classify the call
+    // statically and recurse into its args with THIS same liveness-independent
+    // classifier. When the result is not PROVABLY non-linear (an opaque/closure
+    // call whose return type we cannot resolve), we err toward `true` — keeping
+    // the field tracked, the conservative-and-sound direction.
+    | Call(func: f, args: cargs) ->
+      return ctor_call_result_is_linear(
+        func: f, cargs, st, sigs, tdefs, enum_defs
+      )
+    | CallExpr(callee: _, args: _) ->
+      // Closure / field call: return type is unknown at this level, so the
+      // result is NOT provably non-linear. Keep the field tracked.
+      return true
     | _ ->
-      // Calls / other expressions: defer to the structural classifier. A Call's
-      // linear args are not consumed by THIS construction's argument
-      // expressions, so liveness is still meaningful for them.
+      // Other expression shapes: defer to the structural classifier. These do
+      // not launder a construction-consumed linear through a generic slot, so
+      // their liveness reads remain meaningful.
       return let_binds_linear(
         sigil: SigilImmutable, ann: None, value: arg, sigs, tdefs, enum_defs, pre_st: st
+      )
+  end
+end
+
+/** Liveness-INDEPENDENT linearity of a `Call(func, args)` appearing as a
+ *  construction argument (so its own linear args were already consumed by the
+ *  enclosing construction). Linear iff:
+ *    (a) the callee's declared return type is itself statically linear, or
+ *    (b) some call arg flows (by label) into a parameter whose type shares a
+ *        callee type-parameter slot with the return type AND that arg is linear
+ *        under `ctor_arg_is_linear` (the same liveness-independent classifier),
+ *        i.e. a linear payload is laundered through the result's TyVar slot, or
+ *    (c) the callee signature is unresolved — the result is not provably
+ *        non-linear, so we conservatively keep it tracked.
+ *  Returns false ONLY for a resolved signature with a provably non-linear
+ *  return type and no linear payload flowing through a shared TyVar slot. */
+let ctor_call_result_is_linear = fn (
+  func: string, cargs: [ HirCallArg ], st: LinState, sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> bool do
+  match sig_lookup(sigs, name: func) do
+    | None ->
+      // (c) Unresolved callee → not provably non-linear → keep tracked.
+      return true
+    | Some(val: SigEntry(name: _, type_params: tps, param_labels: pls, param_types: pts, ret_type: rt, throw_row: _)) ->
+      // (a) Statically-linear return type.
+      if is_linear_binding_type(t: rt, tdefs, enum_defs) then return true end
+      // No declared type parameters → no TyVar slot can carry a laundered
+      // linear; with a non-linear `rt` the result is provably non-linear.
+      match tps do
+        | [] -> return false
+        | _ ->
+          // (b) Param→result-slot flow with a liveness-independent arg check.
+          return any_ctor_call_arg_propagates_linear(
+            args: cargs, type_params: tps, param_labels: pls,
+            param_types: pts, ret_type: rt, st, sigs, tdefs, enum_defs
+          )
+      end
+  end
+end
+
+let any_ctor_call_arg_propagates_linear = fn (
+  args: [ HirCallArg ], type_params: [ string ], param_labels: [ string ],
+  param_types: [ TypeExpr ], ret_type: TypeExpr, st: LinState,
+  sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: l, value: v) :: rest ->
+      match lookup_param_type_by_label(labels: param_labels, types: param_types, target: l) do
+        | Some(val: pt) ->
+          if pt_shares_tyvar_with_rt(pt, rt: ret_type, type_params) then
+            // Classify the propagated arg with the SAME liveness-independent
+            // classifier — its linear was consumed by the outer construction.
+            if ctor_arg_is_linear(arg: v, st, sigs, tdefs, enum_defs) then return true end
+          end
+        | None -> ()
+      end
+      return any_ctor_call_arg_propagates_linear(
+        args: rest, type_params, param_labels, param_types, ret_type, st, sigs, tdefs, enum_defs
       )
   end
 end
