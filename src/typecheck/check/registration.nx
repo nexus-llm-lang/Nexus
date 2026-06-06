@@ -14,9 +14,12 @@
  */
 
 import * as list from "std:list"
+import * as bb from "std:bytebuffer"
 import {
+  TypeExpr,
   TyArrow,
   TyRow,
+  TyUserDefined,
   NamedType,
   RecordDef
 } from "src/types/type_expr.nx"
@@ -233,11 +236,90 @@ let register_caps_go = fn (
 ) -> CheckState throws { TypeError } do
   match caps do
     | [] -> return state
-    | HirCap(name: _, methods) :: rest ->
+    | HirCap(name: cap_qname, type_params: tps, methods) :: rest ->
       // Pass the full caps list so that wf_cap can resolve user-declared caps
       // named in method require rows (e.g. `require { B }` where B is a cap).
       check_cap_method_rows(methods, state, exception_groups, caps: all_caps)
-      return register_caps_go(state, caps: rest, all_caps, exception_groups)
+      // Generic caps (`cap Foo<T>`) register their call-site method schemes
+      // POLYMORPHICALLY from the declaration, mirroring generic functions:
+      // each `Foo.method(...)` call instantiates the quantified params fresh,
+      // so one generic producer can be reused at several element types. The
+      // handler-arm registration (register_handler_methods) is suppressed for
+      // generic caps so this poly scheme is the one that resolves at call sites.
+      // Monomorphic caps keep their existing handler-arm-only registration
+      // (tps == [] → skip here, behaviour unchanged).
+      let state1 = match tps do
+        | [] -> state
+        | _ -> register_cap_method_schemes(state, cap_qname, tps, methods)
+      end
+      return register_caps_go(state: state1, caps: rest, all_caps, exception_groups)
+  end
+end
+
+// Register each method of a GENERIC cap as a polymorphic env scheme keyed on
+// `<cap_qname>.<method>`, quantified over the cap's type parameters. Mirrors
+// the generic-function registration (register_functions_go): user-defined names
+// matching a type param are converted to TyVar and bound by Scheme.vars, so a
+// call site instantiates fresh and unifies against the actual argument types.
+let register_cap_method_schemes = fn (
+  state: CheckState,
+  cap_qname: string,
+  tps: [ string ],
+  methods: [ HirCapMethod ]
+) -> CheckState do
+  match methods do
+    | [] -> return state
+    | HirCapMethod(
+      name: mname,
+      requires: mreq,
+      span: _,
+      throw_row: mtw,
+      typ_params: mparams,
+      typ_ret: mret
+    ) :: rest ->
+      // T-CapCall env'd require row: {cap_name} ∪ α. The cap name is the BARE
+      // identifier (T-Inject extends ρ_q with bare cap names), so strip the
+      // qualifier before adding the row entry.
+      let bare_cap = tcwf.base_name_of(qualified: cap_qname)
+      let method_requires = build_method_requires(bare_cap, alpha: mreq)
+      let param_nts = hir_params_to_named_types(params: mparams)
+      let arrow = TyArrow(
+        params: convert_named_types(nts: param_nts, vars: tps),
+        ret: convert_ud_to_var(typ: mret, vars: tps),
+        requires: convert_ud_to_var(typ: method_requires, vars: tps),
+        throw_row: convert_ud_to_var(typ: mtw, vars: tps)
+      )
+      let method_qname = bb.concat(parts: [ cap_qname, ".", mname ])
+      let env1 = tctypes.env_insert(
+        env: tctypes.state_env(state),
+        name: method_qname,
+        scheme: Scheme(vars: tps, typ: arrow)
+      )
+      return register_cap_method_schemes(
+        state: tctypes.state_with_env(state, env: env1),
+        cap_qname, tps, methods: rest
+      )
+  end
+end
+
+// Build {bare_cap} ∪ α as a require row (α = method's declared require row).
+let build_method_requires = fn (bare_cap: string, alpha: TypeExpr) -> TypeExpr do
+  let cap_entry = TyUserDefined(name: bare_cap, args: [])
+  match alpha do
+    | TyRow(types: ts, rest: tail) ->
+      if row_contains_cap(name: bare_cap, ts) then return alpha end
+      return TyRow(types: cap_entry :: ts, rest: tail)
+    | _ -> return TyRow(types: [ cap_entry ], rest: None)
+  end
+end
+
+let row_contains_cap = fn (name: string, ts: [ TypeExpr ]) -> bool do
+  match ts do
+    | [] -> return false
+    | TyUserDefined(name: n, args: _) :: rest ->
+      if n == name then return true end
+      return row_contains_cap(name, ts: rest)
+    | _ :: rest -> return row_contains_cap(name, ts: rest)
   end
 end
 

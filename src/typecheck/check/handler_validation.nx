@@ -38,8 +38,9 @@ import { CheckState, EnvEntry } from "src/typecheck/types.nx"
 import * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
 import * as tcwf from "src/typecheck/tcwf.nx"
-import { str_list_contains } from "src/typecheck/check/occurs.nx"
+import { str_list_contains, convert_ud_to_var, convert_named_types } from "src/typecheck/check/occurs.nx"
 import { hir_params_to_named_types } from "src/typecheck/check/registration.nx"
+import { SubstEntry } from "src/typecheck/types.nx"
 import * as str from "std:str"
 import * as list from "std:list"
 
@@ -70,7 +71,17 @@ export let register_handler_bindings = fn (
       // hardcoded `{}`. Thread the full caps list (includes imports) so the
       // per-method α can be resolved from its HirCapMethod declaration.
       let cap_methods = lookup_cap_methods_tw(caps, cap_name: pname)
-      let env2 = register_handler_methods(env: env1, cap_name: pname, prefix_len, arms, cap_methods)
+      // Generic caps register their call-site method schemes polymorphically from
+      // the cap declaration (registration.register_cap_method_schemes). Suppress
+      // the monomorphic handler-arm registration for them so the poly scheme is
+      // the one that resolves at call sites; otherwise this (concrete) arm scheme
+      // would shadow it and defeat per-call-site instantiation.
+      let cap_is_generic = match lookup_cap_type_params(caps, cap_name: pname) do
+        | [] -> false
+        | _ -> true
+      end
+      let env2 = if cap_is_generic then env1
+        else register_handler_methods(env: env1, cap_name: pname, prefix_len, arms, cap_methods) end
       // Per-arm wfThrow at the T-Handler introduction site: each arm body
       // is a HirFunction whose `throw_row` was preserved through HIR, so a
       // typo like `throws { BogusVariant }` on an arm is rejected here.
@@ -138,7 +149,124 @@ let validate_handler_arm_throw_rows = fn (
   prefix_len: i64
 ) -> unit throws { TypeError } do
   let cap_methods = lookup_cap_methods_tw(caps, cap_name)
-  return validate_arm_sig_go(handler_name, cap_name, arms, cap_methods, prefix_len)
+  let cap_tps = lookup_cap_type_params(caps, cap_name)
+  return validate_arm_sig_go(handler_name, cap_name, arms, cap_methods, prefix_len, cap_tps)
+end
+
+// ─── Generic cap instantiation (cap Foo<T>) ─────────────────────────────────
+// Given a generic cap method declaration (with type params appearing as
+// `TyUserDefined name` in its param/ret/throw slots) and a concrete handler arm
+// signature, derive the param→concrete substitution from the arm and apply it
+// to the method, so the structural equality checks in validate_arm_sig_go see a
+// fully-instantiated method. The handler arm is therefore the instantiation
+// site: `handler Yield do fn emit(v: i64) ...` instantiates `Yield<T>` at i64.
+
+/** Collect `TyVar name → concrete` bindings by structurally matching a pattern
+ *  type (cap-decl method type, type params already converted to TyVar) against a
+ *  concrete arm type. Unknown / mismatched shapes contribute no binding; the
+ *  downstream type_eq check rejects a genuinely wrong arm. */
+let collect_tp_bindings = fn (
+  pat: TypeExpr, concrete: TypeExpr, acc: [ SubstEntry ]
+) -> [ SubstEntry ] do
+  match pat do
+    | TyVar(name: nm) -> return SubstEntry(var: nm, typ: concrete) :: acc
+    | TyList(elem: pe) ->
+      match concrete do
+        | TyList(elem: ce) -> return collect_tp_bindings(pat: pe, concrete: ce, acc)
+        | _ -> return acc
+      end
+    | TyArray(elem: pe) ->
+      match concrete do
+        | TyArray(elem: ce) -> return collect_tp_bindings(pat: pe, concrete: ce, acc)
+        | _ -> return acc
+      end
+    | TyRef(inner: pi) ->
+      match concrete do
+        | TyRef(inner: ci) -> return collect_tp_bindings(pat: pi, concrete: ci, acc)
+        | _ -> return acc
+      end
+    | TyBorrow(inner: pi) ->
+      match concrete do
+        | TyBorrow(inner: ci) -> return collect_tp_bindings(pat: pi, concrete: ci, acc)
+        | _ -> return acc
+      end
+    | _ -> return acc
+  end
+end
+
+/** Collect bindings from two parallel NamedType lists (pattern vs concrete). */
+let collect_tp_bindings_nts = fn (
+  pats: [ NamedType ], concretes: [ NamedType ], acc: [ SubstEntry ]
+) -> [ SubstEntry ] do
+  match pats do
+    | [] -> return acc
+    | NamedType(name: _, typ: pt) :: prest ->
+      match concretes do
+        | [] -> return acc
+        | NamedType(name: _, typ: ct) :: crest ->
+          let acc1 = collect_tp_bindings(pat: pt, concrete: ct, acc)
+          return collect_tp_bindings_nts(pats: prest, concretes: crest, acc: acc1)
+      end
+  end
+end
+
+/** Rebuild [HirParam] from substituted NamedTypes, preserving the original
+ *  params' labels / names / sigils (only the type slot changes). */
+let named_types_to_hir_params = fn (nts: [ NamedType ], orig: [ HirParam ]) -> [ HirParam ] do
+  match nts do
+    | [] -> return []
+    | NamedType(name: _, typ: t) :: nrest ->
+      match orig do
+        | [] -> return []
+        | HirParam(label: l, name: nm, sigil: sg, typ: _) :: orest ->
+          let rest1 = named_types_to_hir_params(nts: nrest, orig: orest)
+          return HirParam(label: l, name: nm, sigil: sg, typ: t) :: rest1
+      end
+  end
+end
+
+/** Instantiate a (possibly generic) cap method against a concrete handler arm.
+ *  For monomorphic caps (cap_tps == []) the method is returned unchanged. */
+let instantiate_cap_method_for_arm = fn (
+  method: HirCapMethod,
+  cap_tps: [ string ],
+  arm_params: [ HirParam ],
+  arm_ret: TypeExpr,
+  arm_tw: TypeExpr,
+  kb: Option<string>
+) -> HirCapMethod do
+  match cap_tps do
+    | [] -> return method
+    | _ ->
+      let HirCapMethod(
+        name: mname, requires: mreq, span: msp, throw_row: mtw,
+        typ_params: mparams, typ_ret: mret
+      ) = method
+      // The arm's user params exclude the continuation binder (last param).
+      let arm_user_params = match kb do
+        | Some(_) -> list_init(xs: arm_params)
+        | None -> arm_params
+      end
+      // Convert the cap-decl method types' type params (TyUserDefined name) to
+      // TyVar once, via the proven occurs/subst helpers (same path generic fns use).
+      let mparam_nts = hir_params_to_named_types(params: mparams)
+      let mparam_nts_var = convert_named_types(nts: mparam_nts, vars: cap_tps)
+      let mret_var = convert_ud_to_var(typ: mret, vars: cap_tps)
+      let mtw_var = convert_ud_to_var(typ: mtw, vars: cap_tps)
+      // Derive bindings from param types and the return type against the arm.
+      let arm_nts = hir_params_to_named_types(params: arm_user_params)
+      let b0 = collect_tp_bindings_nts(pats: mparam_nts_var, concretes: arm_nts, acc: [])
+      let bindings = collect_tp_bindings(pat: mret_var, concrete: arm_ret, acc: b0)
+      // Apply the substitution to the converted method types.
+      let new_param_nts = subst.apply_named_types(subst: bindings, nts: mparam_nts_var)
+      let new_params = named_types_to_hir_params(nts: new_param_nts, orig: mparams)
+      let new_ret = subst.subst_apply(subst: bindings, typ: mret_var)
+      let new_tw = subst.subst_apply(subst: bindings, typ: mtw_var)
+      return HirCapMethod(
+        name: mname, requires: mreq, span: msp, throw_row: new_tw,
+        typ_params: new_params, typ_ret: new_ret
+      )
+  end
 end
 
 let validate_arm_sig_go = fn (
@@ -146,7 +274,8 @@ let validate_arm_sig_go = fn (
   cap_name: string,
   arms: [ HirHandlerArm ],
   cap_methods: [ HirCapMethod ],
-  prefix_len: i64
+  prefix_len: i64,
+  cap_tps: [ string ]
 ) -> unit throws { TypeError } do
   match arms do
     | [] -> return ()
@@ -168,8 +297,18 @@ let validate_arm_sig_go = fn (
       match lookup_cap_method(methods: cap_methods, name: original) do
         | None ->
           // Cap method not found: already caught by validate_handler_arm_sets; skip.
-          return validate_arm_sig_go(handler_name, cap_name, arms: rest, cap_methods, prefix_len)
-        | Some(val: method) ->
+          return validate_arm_sig_go(handler_name, cap_name, arms: rest, cap_methods, prefix_len, cap_tps)
+        | Some(val: method0) ->
+          // GENERIC CAP INSTANTIATION (`cap Foo<T>` + `handler Foo do fn m(v: i64) ...`):
+          // the handler arm signature IS the instantiation. Derive the cap's type
+          // params from the concrete arm signature, then substitute into the
+          // cap-method declaration before the structural equality checks below.
+          // The arm's concrete types thus drive `T := i64` (or `:= string`, ...),
+          // and a single generic cap can be handled at any element type without a
+          // separate `<i64>` annotation. Monomorphic caps (cap_tps == []) leave
+          // the method unchanged.
+          let method = instantiate_cap_method_for_arm(
+            method: method0, cap_tps, arm_params, arm_ret, arm_tw, kb)
           let HirCapMethod(
             name: _,
             requires: _,
@@ -229,7 +368,7 @@ let validate_arm_sig_go = fn (
               span: sp
             )
           end
-          return validate_arm_sig_go(handler_name, cap_name, arms: rest, cap_methods, prefix_len)
+          return validate_arm_sig_go(handler_name, cap_name, arms: rest, cap_methods, prefix_len, cap_tps)
       end
   end
 end
@@ -240,6 +379,16 @@ let lookup_cap_methods_tw = fn (caps: [ HirCap ], cap_name: string) -> [ HirCapM
     | HirCap(name: n, methods) :: rest ->
       if n == cap_name then return methods end
       return lookup_cap_methods_tw(caps: rest, cap_name)
+  end
+end
+
+/** type_params of the named cap (empty for monomorphic caps / not found). */
+let lookup_cap_type_params = fn (caps: [ HirCap ], cap_name: string) -> [ string ] do
+  match caps do
+    | [] -> return []
+    | HirCap(name: n, type_params: tps, methods: _) :: rest ->
+      if n == cap_name then return tps end
+      return lookup_cap_type_params(caps: rest, cap_name)
   end
 end
 
