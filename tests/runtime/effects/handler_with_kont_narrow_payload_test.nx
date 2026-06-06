@@ -1,0 +1,131 @@
+// Acceptance: a cap method whose single payload is NARROWER than i64
+// (bool / char / i32) handled by a `with @k` arm must build to VALID wasm and
+// round-trip the payload through the suspend/resume channel.
+//
+// The stack-switching suspend tag is `(i64) -> ()` and the dispatcher delivers
+// the payload on a uniform i64 channel, so a narrow operand must be widened to
+// i64 at the `suspend` site and narrowed back to the handler parameter's native
+// type when the dispatcher calls the arm. Before the fix, the narrow operand was
+// pushed/read at i32 width while the tag and the dispatcher's i64 temp expected
+// i64, so the module failed wasmtime translation ("type mismatch: expected i32,
+// found i64") and never instantiated.
+//
+// The arms here all force `@k`, so the body runs to completion past each cap
+// call. Cases 1-3 (bool/char/i32) guard the width fix: a regression makes the
+// module invalid and wasmtime refuses to instantiate, so reaching exit 0 proves
+// the narrow payloads suspend/resume cleanly.
+//
+// Case 4 additionally guards the dispatcher's argument ORDER. Handler-arm
+// parameters are sorted alphabetically by label during LIR lowering, so the
+// synthesized cont-binder `k` is NOT always the first parameter — its position
+// depends on whether `k` sorts before or after the cap-method payload label.
+// The dispatcher routes the resume-slot value to the cont-binder parameter and
+// the (narrowed) payload to the cap-method parameter strictly by parameter
+// order. A regression that hardcoded `(slot, payload)` order swapped the two for
+// a payload whose label sorts before `k` (here `a` < `k`), so the body's
+// trailing value came back wrong. The value-producing inject surfaces that.
+//
+// twyov: every arm RESUMES on the success path and all asserts run AFTER the
+// inject function returns (the resume frame has exited), so the success path
+// never unwinds host-ward from inside a resume. A pass is exit 0.
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+import * as cast from "std:runtime/cast"
+
+cap Flag do
+  fn set(v: bool) -> unit
+end
+
+cap Emit do
+  fn ch(c: char) -> unit
+end
+
+cap Code do
+  fn put(n: i32) -> unit
+end
+
+// Payload label `a` sorts BEFORE the cont-binder label `k`, so the arm's
+// LIR-sorted parameters are `[a, k]` — the cont binder is the SECOND parameter.
+cap Box do
+  fn aput(a: i64) -> unit
+end
+
+let flag_h = handler Flag do
+  fn set(v: bool) -> unit with @k do
+    @k
+  end
+end
+
+let emit_h = handler Emit do
+  fn ch(c: char) -> unit with @k do
+    @k
+  end
+end
+
+let code_h = handler Code do
+  fn put(n: i32) -> unit with @k do
+    @k
+  end
+end
+
+let box_h = handler Box do
+  fn aput(a: i64) -> unit with @k do
+    @k
+  end
+end
+
+// Case 1: bool payload through suspend/resume. Returns a value built across the
+// boundary so a value-producing inject is exercised as well.
+let bool_round_trip = fn () -> i64 throws { RuntimeError } do
+  inject flag_h do
+    let _a = Flag.set(v: true)
+    let r = 11
+    let _b = Flag.set(v: false)
+    r
+  end
+end
+
+// Case 2: char payload through suspend/resume.
+let char_round_trip = fn () -> i64 throws { RuntimeError } do
+  inject emit_h do
+    let _a = Emit.ch(c: str.char_at(s: "Z", idx: 0))
+    let r = 22
+    r
+  end
+end
+
+// Case 3: i32 payload through suspend/resume.
+let i32_round_trip = fn () -> i64 throws { RuntimeError } do
+  inject code_h do
+    let _a = Code.put(n: cast.i32_of(x: 99))
+    let r = 33
+    r
+  end
+end
+
+// Case 4: i64 payload whose label `a` sorts before the cont binder `k` — guards
+// the dispatcher argument-order fix. The trailing value must survive correctly.
+let order_round_trip = fn () -> i64 throws { RuntimeError } do
+  inject box_h do
+    let _a = Box.aput(a: 7)
+    let r = 44
+    r
+  end
+end
+
+let assert_i64 = fn (label: string, got: i64, want: i64) -> unit throws { RuntimeError } do
+  if !(got == want) then
+    throw RuntimeError(val: label ++ ": got " ++ str.from_i64(val: got) ++ ", want " ++ str.from_i64(val: want))
+  end
+end
+
+let main = fn () -> unit require { PermConsole } throws { RuntimeError } do
+  inject stdio.system_handler do
+    assert_i64(label: "bool-payload-with-kont", got: bool_round_trip(), want: 11)
+    assert_i64(label: "char-payload-with-kont", got: char_round_trip(), want: 22)
+    assert_i64(label: "i32-payload-with-kont", got: i32_round_trip(), want: 33)
+    assert_i64(label: "i64-low-label-payload-order", got: order_round_trip(), want: 44)
+    Console.println(val: "ok")
+  end
+end

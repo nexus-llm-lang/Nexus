@@ -15,8 +15,9 @@
  * None of these functions recurse through emit_expr / emit_stmt.
  */
 import { ByteBuffer }, * as bb from "std:bytebuffer"
-import { TypeExpr } from "src/types/type_expr.nx"
-import { LirFunction } from "src/ir/lir/types.nx"
+import { TypeExpr, TyI64 } from "src/types/type_expr.nx"
+import { LirFunction, LirParam } from "src/ir/lir/types.nx"
+import { emit_coercion } from "src/backend/codegen/emit/atom.nx"
 import {
   CodegenCtx,
   ctx_temps_base,
@@ -68,7 +69,7 @@ import {
  *  sidestep whatever runtime pattern was responsible).
  */
 export let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm_fns: [ string ],
-                                           arm_tags: [ string ], result_typ: TypeExpr, ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
+                                           arm_tags: [ string ], result_typ: TypeExpr, arm_cont_binders: [ string ], ctx: CodegenCtx) -> %ByteBuffer throws { CodegenError } do
   let CodegenCtx(internal_func_map: ifm, ss_cont_type_idx: cont_t_idx,
                   ss_dispatch_block_type_idx: dispatch_t_idx, ss_tag_idx: ss_base,
                   ss_tag_idx_map: tag_idx_map, _) = ctx
@@ -158,7 +159,7 @@ export let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm
   end
 
   // Close arm blocks innermost first; emit per-arm dispatch + br to @loop
-  let %buf = close_and_dispatch_arms(%buf, arm_fns, n_arms, ctx, idx: 0)
+  let %buf = close_and_dispatch_arms(%buf, arm_fns, arm_cont_binders, n_arms, ctx, idx: 0)
 
   let %buf = bb.push_byte(%buf, byte: op_end)  // close @loop
   let %buf = bb.push_byte(%buf, byte: op_end)  // close @outer
@@ -229,20 +230,70 @@ let nth_string = fn (xs: [ string ], idx: i64) -> string throws { CodegenError }
   end
 end
 
-let close_and_dispatch_arms = fn (buf: %ByteBuffer, arm_fns: [ string ], n_arms: i64,
+let close_and_dispatch_arms = fn (buf: %ByteBuffer, arm_fns: [ string ], arm_cont_binders: [ string ], n_arms: i64,
                                    ctx: CodegenCtx, idx: i64) -> %ByteBuffer throws { CodegenError } do
   if idx >= n_arms then return %buf end
   let %buf = bb.push_byte(%buf, byte: op_end)  // close arm `idx`'s block
   let arm_fn = nth_string(xs: arm_fns, idx)
-  let %buf = emit_arm_dispatch(%buf, arm_fn, ctx)
+  // The cont-binder name is parallel to arm_fns; fall back to "" (treat all
+  // params as payload) when absent so a tag-less single-arm path still emits.
+  let cont_binder = match arm_cont_binders do
+    | [] -> ""
+    | _ -> nth_string(xs: arm_cont_binders, idx)
+  end
+  let %buf = emit_arm_dispatch(%buf, arm_fn, cont_binder, ctx)
   let %buf = bb.push_byte(%buf, byte: op_br)
   let %buf = bb.push_uleb128(%buf, val: n_arms - idx - 1)
-  return close_and_dispatch_arms(%buf, arm_fns, n_arms, ctx, idx: idx + 1)
+  return close_and_dispatch_arms(%buf, arm_fns, arm_cont_binders, n_arms, ctx, idx: idx + 1)
+end
+
+/** Look up the handler arm's (label-sorted) LIR parameters. Empty on miss. */
+let arm_params = fn (ctx: CodegenCtx, arm_fn: string) -> [ LirParam ] do
+  match ctx_lookup_function(ctx, name: arm_fn) do
+    | Some(val: LirFunction(name: _, params: ps, ret_type: _, body: _, ret: _, span: _)) -> ps
+    | None -> []
+  end
+end
+
+/** Emit the call arguments for one handler arm in its (label-sorted) parameter
+ *  order. Two logical values are routed to their parameters by NAME:
+ *   - the `with @k` cont-binder parameter (name == `cont_binder`) receives the
+ *     resume-slot value `ss_next_alloc` (i64, the freshly reified continuation
+ *     table slot — the same value the post-call bookkeeping increments);
+ *   - every other parameter is the cap-method payload, delivered on the uniform
+ *     i64 channel via `temp_idx`, narrowed back to the parameter's native type
+ *     (bool/i32/char → i32, f64 reinterpret; i64/string unchanged).
+ *  Parameters are alphabetically label-sorted at LIR lowering, so the binder is
+ *  NOT necessarily first — emitting strictly in param order keeps the wasm call
+ *  ABI aligned regardless of how `k` sorts against the payload label. */
+let emit_arm_call_args = fn (
+  buf: %ByteBuffer,
+  params: [ LirParam ],
+  cont_binder: string,
+  temp_idx: i64,
+  ctx: CodegenCtx
+) -> %ByteBuffer throws { CodegenError } do
+  match params do
+    | [] -> return %buf
+    | LirParam(label: _, name: pn, typ: pt) :: rest ->
+      let %buf = if pn == cont_binder then
+        // Cont-binder parameter: the resume-slot value (i64).
+        let %b = bb.push_byte(%buf, byte: op_global_get)
+        bb.push_uleb128(buf: %b, val: wdefs.ss_next_alloc_global_idx)
+      else
+        // Payload parameter: read off the i64 channel, narrow to native type.
+        let %b = bb.push_byte(%buf, byte: op_local_get)
+        let %b = bb.push_uleb128(buf: %b, val: temp_idx)
+        emit_coercion(from_type: TyI64, to_type: pt, buf: %b)
+      end
+      return emit_arm_call_args(%buf, params: rest, cont_binder, temp_idx, ctx)
+  end
 end
 
 let emit_arm_dispatch = fn (
   buf: %ByteBuffer,
   arm_fn: string,
+  cont_binder: string,
   ctx: CodegenCtx
 ) -> %ByteBuffer throws { CodegenError } do
   let CodegenCtx(internal_func_map: ifm, _) = ctx
@@ -251,10 +302,7 @@ let emit_arm_dispatch = fn (
     bb.free(buf: %buf)
     throw SymbolNotFound(name: arm_fn, kind: SkFunction, context: "emit_arm_dispatch")
   end
-  let arm_param_count = match ctx_lookup_function(ctx, name: arm_fn) do
-    | Some(val: LirFunction(name: _, params: ps, ret_type: _, body: _, ret: _, span: _)) -> list.length(xs: ps)
-    | None -> 2
-  end
+  let params = arm_params(ctx, arm_fn)
   let temp_idx = ctx_temps_base(ctx)
   let %buf = bb.push_byte(%buf, byte: op_global_set)
   let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_global_idx)
@@ -268,12 +316,9 @@ let emit_arm_dispatch = fn (
   let %buf = bb.push_byte(%buf, byte: op_table_set)
   let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_table_idx)
 
-  let %buf = bb.push_byte(%buf, byte: op_global_get)
-  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
-  let %buf = if arm_param_count >= 2 then
-    let %bb = bb.push_byte(%buf, byte: op_local_get)
-    bb.push_uleb128(buf: %bb, val: temp_idx)
-  else %buf end
+  // Push the arm's arguments in label-sorted parameter order: the resume slot
+  // to the cont-binder param, the (narrowed) payload to the cap-method param.
+  let %buf = emit_arm_call_args(%buf, params, cont_binder, temp_idx, ctx)
   let %buf = bb.push_byte(%buf, byte: op_call)
   let %buf = bb.push_uleb128(%buf, val: arm_idx)
 
