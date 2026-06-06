@@ -39,7 +39,7 @@ import {
   vars_equal, lin_push_frame, lin_pop_frame, lin_top_frame,
   join_simple, lin_set_vars, lin_get_must_consume, find_live_must_consume,
   lin_state_vars, lin_state_consumed, lin_restore_state, filter_not_in,
-  append_consumed, filter_in,
+  append_consumed, filter_in, lin_record_consumed_since,
   lin_get_caught_set, lin_set_caught_set, lin_push_catch, lin_pop_catch,
   lin_throw_caught_locally, lin_get_cur_fn,
   lin_set_ctor_env, lin_lookup_ctor
@@ -257,6 +257,28 @@ let ctor_arg_is_linear = fn (
       // Closure / field call: return type is unknown at this level, so the
       // result is NOT provably non-linear. Keep the field tracked.
       return true
+    // A branch EXPRESSION (`if … then a else b end`) whose value is the
+    // enclosing construction's argument. The construction has already consumed
+    // any linear that one of its branches laundered (e.g.
+    // `Mix(gen: if c then pick(x: %p) else … end)`), so the branch trailing
+    // values must be classified with THIS liveness-independent classifier — not
+    // `let_binds_linear`, whose `If`/`Match` cases fall through to `false`,
+    // demoting a generic field that in fact carries a linear payload → silent
+    // drop / double-use (the sibling of the 44873d2d direct-`Call` fix). ANY
+    // branch yielding a linear makes the whole expression carry a linear (the
+    // conservative-and-sound direction; the branches are alternatives, so a
+    // linear flows out along whichever branch is taken).
+    | If(cond: _, then_branch: tb, else_branch: eb) ->
+      if block_trailing_value_is_linear(stmts: tb, st, sigs, tdefs, enum_defs) then return true end
+      match eb do
+        | Some(val: ebs) -> return block_trailing_value_is_linear(stmts: ebs, st, sigs, tdefs, enum_defs)
+        | None -> return false
+      end
+    // A `match … do | p -> a | … end` branch expression — same reasoning as the
+    // `If` arm: classify every arm's trailing value with this liveness-
+    // independent classifier; any linear-yielding arm carries a linear out.
+    | Match(target: _, cases: cs) ->
+      return any_case_trailing_value_is_linear(cases: cs, st, sigs, tdefs, enum_defs)
     | _ ->
       // Other expression shapes: defer to the structural classifier. These do
       // not launder a construction-consumed linear through a generic slot, so
@@ -348,6 +370,41 @@ let any_record_field_is_linear = fn (
     | HirNamedExpr(name: _, value: v) :: rest ->
       if ctor_arg_is_linear(arg: v, st, sigs, tdefs, enum_defs) then return true end
       return any_record_field_is_linear(fields: rest, st, sigs, tdefs, enum_defs)
+  end
+end
+
+/** Liveness-INDEPENDENT linearity of a branch-body block's VALUE. A block used
+ *  as a branch of an `if`/`match` EXPRESSION yields its trailing statement's
+ *  expression; classify that expression with `ctor_arg_is_linear` (the same
+ *  liveness-independent classifier the enclosing construction context uses). A
+ *  block whose trailing statement is not value-producing (e.g. an assignment,
+ *  or it diverges) contributes no linear value along that branch → false. */
+let block_trailing_value_is_linear = fn (
+  stmts: [ HirStmt ], st: LinState, sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> bool do
+  match last_stmt(stmts: stmts) do
+    | None -> return false
+    | Some(val: HirStmt(node: sk, span: _)) ->
+      match sk do
+        | Expr(expr: e) -> return ctor_arg_is_linear(arg: e, st, sigs, tdefs, enum_defs)
+        | Return(expr: e) -> return ctor_arg_is_linear(arg: e, st, sigs, tdefs, enum_defs)
+        | _ -> return false
+      end
+  end
+end
+
+/** ANY `match` arm whose trailing value is linear under the liveness-
+ *  independent classifier makes the whole `match` expression carry a linear. */
+let any_case_trailing_value_is_linear = fn (
+  cases: [ HirMatchCase ], st: LinState, sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> bool do
+  match cases do
+    | [] -> return false
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      if block_trailing_value_is_linear(stmts: b, st, sigs, tdefs, enum_defs) then return true end
+      return any_case_trailing_value_is_linear(cases: rest, st, sigs, tdefs, enum_defs)
   end
 end
 
@@ -457,8 +514,65 @@ let let_binds_linear = fn (
             | [] -> return false
             | _ :: _ -> return true
           end
+        // An `if`/`match` EXPRESSION whose value is bound (e.g.
+        // `let w = Mix(gen: if c then pick(x: %p) else … end)`): the bound
+        // value is linear iff some branch's trailing value is linear. Without
+        // this arm the `If`/`Match` falls through to `| _ -> return false`, so
+        // a `let` whose RHS launders a linear through a branch expression is
+        // not tracked as linear — and the scrutinee-linear gate at the match
+        // site never demotes/keeps its generic fields, silently dropping the
+        // payload (the binding-site half of the 44873d2d generic-field fix).
+        // The branches are alternatives → ANY linear branch makes the binding
+        // linear. Classification reads the LIVE set (`pre_st`): at the binding
+        // site the laundered linear args are still live (the construction has
+        // not yet consumed them), so the liveness-dependent classifier is the
+        // correct one here (unlike the post-consumption match site).
+        | If(cond: _, then_branch: tb, else_branch: eb) ->
+          if block_trailing_value_binds_linear(stmts: tb, sigs, tdefs, enum_defs, pre_st) then return true end
+          match eb do
+            | Some(val: ebs) -> return block_trailing_value_binds_linear(stmts: ebs, sigs, tdefs, enum_defs, pre_st)
+            | None -> return false
+          end
+        | Match(target: _, cases: cs) ->
+          return any_case_trailing_value_binds_linear(cases: cs, sigs, tdefs, enum_defs, pre_st)
         | _ -> return false
       end
+  end
+end
+
+/** Liveness-DEPENDENT companion of `block_trailing_value_is_linear`: the VALUE
+ *  of a branch-body block used as a bound `if`/`match` expression. Classifies
+ *  the trailing statement's expression with `let_binds_linear` (reading the
+ *  LIVE set `pre_st`, since the binding site has not yet consumed the laundered
+ *  linear). Non-value-producing trailing statements contribute no linear. */
+let block_trailing_value_binds_linear = fn (
+  stmts: [ HirStmt ], sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ], pre_st: LinState
+) -> bool do
+  match last_stmt(stmts: stmts) do
+    | None -> return false
+    | Some(val: HirStmt(node: sk, span: _)) ->
+      match sk do
+        | Expr(expr: e) ->
+          return let_binds_linear(sigil: SigilImmutable, ann: None, value: e, sigs, tdefs, enum_defs, pre_st)
+        | Return(expr: e) ->
+          return let_binds_linear(sigil: SigilImmutable, ann: None, value: e, sigs, tdefs, enum_defs, pre_st)
+        | _ -> return false
+      end
+  end
+end
+
+/** ANY `match` arm whose trailing value binds linear under `let_binds_linear`
+ *  makes the whole `match` expression's value linear. */
+let any_case_trailing_value_binds_linear = fn (
+  cases: [ HirMatchCase ], sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ], pre_st: LinState
+) -> bool do
+  match cases do
+    | [] -> return false
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      if block_trailing_value_binds_linear(stmts: b, sigs, tdefs, enum_defs, pre_st) then return true end
+      return any_case_trailing_value_binds_linear(cases: rest, sigs, tdefs, enum_defs, pre_st)
   end
 end
 
@@ -1004,7 +1118,14 @@ let check_stmt = fn (
       // Walk RHS first so any linear use inside it is consumed before the
       // new binding is added. Pass pre-check st so Variable-alias detection
       // can see whether the RHS variable was live before being consumed.
-      let st1 = check_expr(expr: v, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      let st1_raw = check_expr(expr: v, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      // Record any linear consumed by the RHS that the live-set delta shows is
+      // gone but that direct consumption-tracking missed — specifically a linear
+      // laundered through an `if`/`match` EXPRESSION branch, whose consumed-ness
+      // the branch-join drops. Keeping it in the consumed set lets the later
+      // match-site generic-field demotion check (a liveness-independent
+      // classifier) recognise it (e.g. `let w = Mix(gen: if c then f(%p) ...)`).
+      let st1 = lin_record_consumed_since(st: st1_raw, pre_live: lin_state_vars(st))
       let binds_lin = let_binds_linear(
         sigil: sig,
         ann,
