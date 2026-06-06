@@ -7,8 +7,17 @@
  */
 
 import { Option, Some, None } from "std:option"
+import { HirExpr } from "src/ir/hir/types.nx"
 
 // ─── Linearity state ─────────────────────────────────────────────────────────
+
+/** One `let name = ctor-expr` binding recorded for the enclosing function
+ *  body. Lets the match-case linearity check recover the scrutinee's
+ *  CONSTRUCTION expression (the only structural source of generic
+ *  instantiation, since the name-based linearity pass carries no inferred
+ *  type-args). `ctor_env` below is set once at function entry and never
+ *  mutated by the threading helpers — a read-only view of the body's lets. */
+export type CtorBinding = CtorBinding(name: string, value: HirExpr)
 
 /** One snapshot of `vars` at a frame boundary. Wraps a `[string]` so the
  *  surrounding LinState can carry a list of these without nesting list-of-
@@ -46,23 +55,47 @@ export type LinState = LinState(
   consumed: [ string ],
   caught_set: [ string ],
   catch_stack: [ CatchFrame ],
-  cur_fn: string
+  cur_fn: string,
+  ctor_env: [ CtorBinding ]
 )
 
 export let lin_empty = fn () -> LinState do
   return LinState(
     vars: [], frame_stack: [], must_consume: [], consumed: [],
-    caught_set: [], catch_stack: [], cur_fn: ""
+    caught_set: [], catch_stack: [], cur_fn: "", ctor_env: []
   )
 end
 
 export let lin_get_cur_fn = fn (st: LinState) -> string do
-  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: _, caught_set: _, catch_stack: _, cur_fn: f) = st
+  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: _, caught_set: _, catch_stack: _, cur_fn: f, ctor_env: _) = st
   return f
 end
 
+/** Set the read-only ctor-binding env for the enclosing function body.
+ *  Called once at function entry; the threading helpers preserve it. */
+export let lin_set_ctor_env = fn (st: LinState, env: [ CtorBinding ]) -> LinState do
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: _) = st
+  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: env)
+end
+
+/** Look up the construction expression bound to `name` in the function body,
+ *  if any. None when `name` is not a let-bound ctor/record/etc. binding. */
+export let lin_lookup_ctor = fn (st: LinState, name: string) -> Option<HirExpr> do
+  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: _, caught_set: _, catch_stack: _, cur_fn: _, ctor_env: ce) = st
+  return lin_ctor_env_find(env: ce, name)
+end
+
+let lin_ctor_env_find = fn (env: [ CtorBinding ], name: string) -> Option<HirExpr> do
+  match env do
+    | [] -> return None
+    | CtorBinding(name: n, value: v) :: rest ->
+      if n == name then return Some(val: v) end
+      return lin_ctor_env_find(env: rest, name)
+  end
+end
+
 export let lin_add = fn (st: LinState, name: string) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf) = st
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: ce) = st
   // Remove from consumed when a new binding shadows a previously consumed name.
   return LinState(
     vars: name :: vs,
@@ -71,7 +104,8 @@ export let lin_add = fn (st: LinState, name: string) -> LinState do
     consumed: remove_one(xs: co, target: name),
     caught_set: cs,
     catch_stack: ks,
-    cur_fn: cf
+    cur_fn: cf,
+    ctor_env: ce
   )
 end
 
@@ -80,7 +114,7 @@ end
  *  old consumed entry does not falsely trigger LinearReuse in the new scope.
  */
 export let lin_clear_consumed = fn (st: LinState, name: string) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf) = st
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: ce) = st
   return LinState(
     vars: vs,
     frame_stack: fs,
@@ -88,12 +122,13 @@ export let lin_clear_consumed = fn (st: LinState, name: string) -> LinState do
     consumed: remove_one(xs: co, target: name),
     caught_set: cs,
     catch_stack: ks,
-    cur_fn: cf
+    cur_fn: cf,
+    ctor_env: ce
   )
 end
 
 export let lin_remove = fn (st: LinState, name: string) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf) = st
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: ce) = st
   return LinState(
     vars: remove_one(xs: vs, target: name),
     frame_stack: fs,
@@ -101,7 +136,8 @@ export let lin_remove = fn (st: LinState, name: string) -> LinState do
     consumed: name :: co,
     caught_set: cs,
     catch_stack: ks,
-    cur_fn: cf
+    cur_fn: cf,
+    ctor_env: ce
   )
 end
 
@@ -115,13 +151,13 @@ let remove_one = fn (xs: [ string ], target: string) -> [ string ] do
 end
 
 export let lin_member = fn (st: LinState, name: string) -> bool do
-  let LinState(vars: vs, frame_stack: _, must_consume: _, consumed: _, caught_set: _, catch_stack: _, cur_fn: _) = st
+  let LinState(vars: vs, frame_stack: _, must_consume: _, consumed: _, caught_set: _, catch_stack: _, cur_fn: _, ctor_env: _) = st
   return str_member(xs: vs, target: name)
 end
 
 /** True when `name` was a linear binding already consumed on this path. */
 export let lin_consumed_member = fn (st: LinState, name: string) -> bool do
-  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: co, caught_set: _, catch_stack: _, cur_fn: _) = st
+  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: co, caught_set: _, catch_stack: _, cur_fn: _, ctor_env: _) = st
   return str_member(xs: co, target: name)
 end
 
@@ -157,7 +193,7 @@ let all_in = fn (needles: [ string ], haystack: [ string ]) -> bool do
 end
 
 export let lin_push_frame = fn (st: LinState) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf) = st
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: ce) = st
   return LinState(
     vars: vs,
     frame_stack: LinFrame(vars: copy(xs: vs)) :: fs,
@@ -165,20 +201,21 @@ export let lin_push_frame = fn (st: LinState) -> LinState do
     consumed: co,
     caught_set: cs,
     catch_stack: ks,
-    cur_fn: cf
+    cur_fn: cf,
+    ctor_env: ce
   )
 end
 
 export let lin_pop_frame = fn (st: LinState) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf) = st
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: ce) = st
   match fs do
     | [] -> return st
-    | _ :: rest -> return LinState(vars: vs, frame_stack: rest, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf)
+    | _ :: rest -> return LinState(vars: vs, frame_stack: rest, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: ce)
   end
 end
 
 export let lin_top_frame = fn (st: LinState) -> Option<[ string ]> do
-  let LinState(vars: _, frame_stack: fs, must_consume: _, consumed: _, caught_set: _, catch_stack: _, cur_fn: _) = st
+  let LinState(vars: _, frame_stack: fs, must_consume: _, consumed: _, caught_set: _, catch_stack: _, cur_fn: _, ctor_env: _) = st
   match fs do
     | [] -> return None
     | LinFrame(vars: top) :: _ -> return Some(val: top)
@@ -189,27 +226,27 @@ end
 
 /** The program-wide caught_variants(Π). Set once at function-check entry. */
 export let lin_get_caught_set = fn (st: LinState) -> [ string ] do
-  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: _, caught_set: cs, catch_stack: _, cur_fn: _) = st
+  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: _, caught_set: cs, catch_stack: _, cur_fn: _, ctor_env: _) = st
   return cs
 end
 
 export let lin_set_caught_set = fn (st: LinState, cs: [ string ]) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: _, catch_stack: ks, cur_fn: cf) = st
-  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf)
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: _, catch_stack: ks, cur_fn: cf, ctor_env: ce) = st
+  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: ce)
 end
 
 /** Push a local try/catch frame onto the catch-stack. */
 export let lin_push_catch = fn (st: LinState, frame: CatchFrame) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf) = st
-  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: frame :: ks, cur_fn: cf)
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: ce) = st
+  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: frame :: ks, cur_fn: cf, ctor_env: ce)
 end
 
 /** Pop the innermost local try/catch frame. No-op on empty stack. */
 export let lin_pop_catch = fn (st: LinState) -> LinState do
-  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf) = st
+  let LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: ce) = st
   match ks do
     | [] -> return st
-    | _ :: rest -> return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: rest, cur_fn: cf)
+    | _ :: rest -> return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: rest, cur_fn: cf, ctor_env: ce)
   end
 end
 
@@ -219,7 +256,7 @@ end
  *  reconciliation governs linearity — the strict divergent-arm check is
  *  skipped. */
 export let lin_throw_caught_locally = fn (st: LinState, v: string) -> bool do
-  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: _, caught_set: _, catch_stack: ks, cur_fn: _) = st
+  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: _, caught_set: _, catch_stack: ks, cur_fn: _, ctor_env: _) = st
   return catch_stack_covers(frames: ks, v)
 end
 
@@ -257,15 +294,15 @@ let join_inner = fn (xs: [ string ]) -> string do
 end
 
 export let lin_set_vars = fn (st: LinState, vs: [ string ]) -> LinState do
-  let LinState(vars: _, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf) = st
-  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf)
+  let LinState(vars: _, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: ce) = st
+  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cs, catch_stack: ks, cur_fn: cf, ctor_env: ce)
 end
 
 /** Return the set of names that must be consumed on every exit path
  *  (currently seeded only by with-@k cont_binder arms).
  */
 export let lin_get_must_consume = fn (st: LinState) -> [ string ] do
-  let LinState(vars: _, frame_stack: _, must_consume: mc, consumed: _, caught_set: _, catch_stack: _, cur_fn: _) = st
+  let LinState(vars: _, frame_stack: _, must_consume: mc, consumed: _, caught_set: _, catch_stack: _, cur_fn: _, ctor_env: _) = st
   return mc
 end
 
@@ -280,12 +317,12 @@ export let find_live_must_consume = fn (mc: [ string ], live: [ string ]) -> Opt
 end
 
 export let lin_state_vars = fn (st: LinState) -> [ string ] do
-  let LinState(vars: vs, frame_stack: _, must_consume: _, consumed: _, caught_set: _, catch_stack: _, cur_fn: _) = st
+  let LinState(vars: vs, frame_stack: _, must_consume: _, consumed: _, caught_set: _, catch_stack: _, cur_fn: _, ctor_env: _) = st
   return vs
 end
 
 export let lin_state_consumed = fn (st: LinState) -> [ string ] do
-  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: co, caught_set: _, catch_stack: _, cur_fn: _) = st
+  let LinState(vars: _, frame_stack: _, must_consume: _, consumed: co, caught_set: _, catch_stack: _, cur_fn: _, ctor_env: _) = st
   return co
 end
 
@@ -295,8 +332,8 @@ end
  *  the catch arm.
  */
 export let lin_restore_state = fn (st: LinState, vs: [ string ], co: [ string ]) -> LinState do
-  let LinState(vars: _, frame_stack: fs, must_consume: mc, consumed: _, caught_set: cset, catch_stack: ks, cur_fn: cf) = st
-  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cset, catch_stack: ks, cur_fn: cf)
+  let LinState(vars: _, frame_stack: fs, must_consume: mc, consumed: _, caught_set: cset, catch_stack: ks, cur_fn: cf, ctor_env: ce) = st
+  return LinState(vars: vs, frame_stack: fs, must_consume: mc, consumed: co, caught_set: cset, catch_stack: ks, cur_fn: cf, ctor_env: ce)
 end
 
 export let filter_not_in = fn (

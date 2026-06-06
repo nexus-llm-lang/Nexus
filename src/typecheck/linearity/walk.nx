@@ -34,14 +34,15 @@ import { Option, Some, None } from "std:option"
 import { is_auto_droppable, is_linear_binding_type } from "src/ir/shared/type_pred.nx"
 import { SigEntry, sig_lookup, build_sig_map } from "src/typecheck/linearity/sig_map.nx"
 import {
-  LinState, CatchFrame,
+  LinState, CatchFrame, CtorBinding,
   lin_empty, lin_add, lin_remove, lin_member, lin_consumed_member, lin_clear_consumed, str_member,
   vars_equal, lin_push_frame, lin_pop_frame, lin_top_frame,
   join_simple, lin_set_vars, lin_get_must_consume, find_live_must_consume,
   lin_state_vars, lin_state_consumed, lin_restore_state, filter_not_in,
   append_consumed, filter_in,
   lin_get_caught_set, lin_set_caught_set, lin_push_catch, lin_pop_catch,
-  lin_throw_caught_locally, lin_get_cur_fn
+  lin_throw_caught_locally, lin_get_cur_fn,
+  lin_set_ctor_env, lin_lookup_ctor
 } from "src/typecheck/linearity/state.nx"
 import {
   compute_caught_variants, caught_covers, caught_variants_of_try
@@ -68,6 +69,207 @@ import {
   lookup_param_type_by_label, pt_shares_tyvar_with_rt
 } from "src/typecheck/linearity/borrow_types.nx"
 import { check_borrow_escape_form_b } from "src/typecheck/linearity/borrow_escape.nx"
+
+// ─── Construction-env collection (for generic-field instantiation) ──────────
+
+/** Walk a statement list and record every `let name = value` into a flat
+ *  CtorBinding env. Descends into nested blocks (if/while/for/match/try/inject
+ *  bodies and lambda bodies) so a scrutinee constructed in an inner block is
+ *  still recoverable. The env is read-only after construction; shadowing is
+ *  resolved by first-match in `lin_lookup_ctor` (outer-most binding wins),
+ *  which is sound here because the env only ever DEMOTES a conservatively-
+ *  linear classification — a stale/shadowed entry can at worst keep the
+ *  current conservative behavior, never under-track. */
+let collect_ctor_bindings = fn (stmts: [ HirStmt ], acc: [ CtorBinding ]) -> [ CtorBinding ] do
+  match stmts do
+    | [] -> return acc
+    | HirStmt(node: nd, span: _) :: rest ->
+      let acc1 = collect_ctor_bindings_stmt(stmt: nd, acc)
+      return collect_ctor_bindings(stmts: rest, acc: acc1)
+  end
+end
+
+let collect_ctor_bindings_stmt = fn (stmt: HirStmtKind, acc: [ CtorBinding ]) -> [ CtorBinding ] do
+  match stmt do
+    | Let(name: n, sigil: _, typ: _, value: v) ->
+      let acc1 = CtorBinding(name: n, value: v) :: acc
+      return collect_ctor_bindings_expr(expr: v, acc: acc1)
+    | Expr(expr: e) -> return collect_ctor_bindings_expr(expr: e, acc)
+    | Return(expr: e) -> return collect_ctor_bindings_expr(expr: e, acc)
+    | Assign(target: _, value: v) -> return collect_ctor_bindings_expr(expr: v, acc)
+    | Try(body: b, catch_param: _, catch_body: cb) ->
+      let acc1 = collect_ctor_bindings(stmts: b, acc)
+      return collect_ctor_bindings(stmts: cb, acc: acc1)
+    | Inject(handlers: _, body: b) -> return collect_ctor_bindings(stmts: b, acc)
+  end
+end
+
+let collect_ctor_bindings_expr = fn (expr: HirExpr, acc: [ CtorBinding ]) -> [ CtorBinding ] do
+  let HirExpr(node: nd, span: _) = expr
+  match nd do
+    | If(cond: _, then_branch: tb, else_branch: eb) ->
+      let acc1 = collect_ctor_bindings(stmts: tb, acc)
+      match eb do
+        | Some(val: e) -> return collect_ctor_bindings(stmts: e, acc: acc1)
+        | None -> return acc1
+      end
+    | Match(target: _, cases: cs) -> return collect_ctor_bindings_cases(cases: cs, acc)
+    | While(cond: _, body: b) -> return collect_ctor_bindings(stmts: b, acc)
+    | For(var: _, start: _, end_expr: _, body: b) -> return collect_ctor_bindings(stmts: b, acc)
+    | Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: b) ->
+      return collect_ctor_bindings(stmts: b, acc)
+    | _ -> return acc
+  end
+end
+
+let collect_ctor_bindings_cases = fn (cases: [ HirMatchCase ], acc: [ CtorBinding ]) -> [ CtorBinding ] do
+  match cases do
+    | [] -> return acc
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      let acc1 = collect_ctor_bindings(stmts: b, acc)
+      return collect_ctor_bindings_cases(cases: rest, acc: acc1)
+  end
+end
+
+/** For a match scrutinee `target` and the matched `variant`, compute the set
+ *  of field NAMES whose generic (TyVar) slot was instantiated to a NON-linear
+ *  argument at the scrutinee's construction site — i.e. fields that should NOT
+ *  inherit the scrutinee's linearity (approach (a): substitute the variant's
+ *  declared type-parameter against the scrutinee's structural type-args).
+ *
+ *  Only fields filled by a NON-linear construction arg are demoted; a TyVar
+ *  slot filled by a linear arg (e.g. `Mix(payload:%p, gen:%q)`) is left to the
+ *  conservative `lin_field_is_tyvar` inheritance so genuine linear payloads
+ *  routed through generic slots stay tracked (preserves xim2n / 2djm4).
+ *
+ *  Returns [] when the construction expression is unavailable (scrutinee is a
+ *  param, field access, nested expression, …) — falling back to the existing
+ *  conservative behavior, never under-tracking. */
+let compute_demoted_tyvar_fields = fn (
+  target: HirExpr, variant: string, st: LinState, sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> [ string ] do
+  let HirExpr(node: tn, span: _) = target
+  match tn do
+    | Variable(name: m, sigil: _) ->
+      match lin_lookup_ctor(st, name: m) do
+        | None -> return []
+        | Some(val: ce) ->
+          let HirExpr(node: cn, span: _) = ce
+          match cn do
+            | Ctor(variant: cv, args: cargs, labels: clabels, sigil: _) ->
+              // The construction must be for the same constructor we are
+              // matching (otherwise the labels/args don't correspond).
+              if cv != variant then return [] end
+              return collect_nonlinear_ctor_fields(
+                labels: clabels, args: cargs, st, sigs, tdefs, enum_defs, acc: []
+              )
+            | _ -> return []
+          end
+      end
+    | _ -> return []
+  end
+end
+
+/** Pair construction labels with args; a field whose construction arg is
+ *  NON-linear is collected as demotable. */
+let collect_nonlinear_ctor_fields = fn (
+  labels: [ string ], args: [ HirExpr ], st: LinState, sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ], acc: [ string ]
+) -> [ string ] do
+  match labels do
+    | [] -> return acc
+    | lbl :: rest_labels ->
+      match args do
+        | [] -> return acc
+        | a :: rest_args ->
+          let arg_linear = ctor_arg_is_linear(arg: a, st, sigs, tdefs, enum_defs)
+          let acc1 = if arg_linear then acc else lbl :: acc end
+          return collect_nonlinear_ctor_fields(
+            labels: rest_labels, args: rest_args, st, sigs, tdefs, enum_defs, acc: acc1
+          )
+      end
+  end
+end
+
+/** Intrinsic (liveness-independent) linearity of a constructor ARGUMENT
+ *  expression. Unlike `let_binds_linear`'s `Variable` case — which reads the
+ *  CURRENT live set — this classifier must work at the MATCH site, where the
+ *  construction already consumed its linear args (so they are no longer live).
+ *  A linear-/lazy-sigil variable is classified by its SIGIL; a bare variable by
+ *  live-OR-consumed membership; compound args (Ctor/Array/Record) recurse with
+ *  this same liveness-independent classifier (their nested args were also
+ *  consumed by the construction). ANY linear transitive component → linear.
+ *  Calls/other shapes defer to `let_binds_linear`. When uncertain, the
+ *  delegation/recursion errs toward `true`, keeping the field tracked. */
+let ctor_arg_is_linear = fn (
+  arg: HirExpr, st: LinState, sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> bool do
+  let HirExpr(node: an, span: _) = arg
+  match an do
+    | Variable(name: vn, sigil: s) ->
+      match s do
+        | SigilLinear | SigilLazy -> return true
+        | _ ->
+          // A non-sigil variable: linear iff it was a live linear binding at
+          // the match site OR a previously-consumed linear (consumed by the
+          // construction itself). Both shapes mean the slot carried a linear.
+          if lin_member(st, name: vn) then return true end
+          return lin_consumed_member(st, name: vn)
+      end
+    // A borrow `&x` is never an owned linear — it does not transfer ownership.
+    | Borrow(name: _, sigil: _) -> return false
+    | Literal(_) -> return false
+    // Compound args: recurse with the SAME liveness-independent classifier so a
+    // nested linear variable already consumed by the construction (e.g. a list
+    // literal `[b]` desugared to `Cons(Nil(), b)`, or `Some(%b)`) is still
+    // recognised as carrying a linear. Delegating to `let_binds_linear` here is
+    // unsound: its nested `Variable` case reads CURRENT liveness, and the
+    // construction has already consumed those args. ANY linear component makes
+    // the carrier linear (spec §Linearity: transitive linear(τ)).
+    | Ctor(variant: cv, args: cargs, labels: _, sigil: csig) ->
+      match csig do
+        | SigilLinear | SigilLazy -> return true
+        | _ ->
+          if lin_ctor_enum_is_linear(defs: enum_defs, variant: cv) then return true end
+          return any_ctor_arg_is_linear(args: cargs, st, sigs, tdefs, enum_defs)
+      end
+    | Array(elems: es) -> return any_ctor_arg_is_linear(args: es, st, sigs, tdefs, enum_defs)
+    | Record(fields: fs) -> return any_record_field_is_linear(fields: fs, st, sigs, tdefs, enum_defs)
+    | _ ->
+      // Calls / other expressions: defer to the structural classifier. A Call's
+      // linear args are not consumed by THIS construction's argument
+      // expressions, so liveness is still meaningful for them.
+      return let_binds_linear(
+        sigil: SigilImmutable, ann: None, value: arg, sigs, tdefs, enum_defs, pre_st: st
+      )
+  end
+end
+
+let any_ctor_arg_is_linear = fn (
+  args: [ HirExpr ], st: LinState, sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> bool do
+  match args do
+    | [] -> return false
+    | a :: rest ->
+      if ctor_arg_is_linear(arg: a, st, sigs, tdefs, enum_defs) then return true end
+      return any_ctor_arg_is_linear(args: rest, st, sigs, tdefs, enum_defs)
+  end
+end
+
+let any_record_field_is_linear = fn (
+  fields: [ HirNamedExpr ], st: LinState, sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> bool do
+  match fields do
+    | [] -> return false
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      if ctor_arg_is_linear(arg: v, st, sigs, tdefs, enum_defs) then return true end
+      return any_record_field_is_linear(fields: rest, st, sigs, tdefs, enum_defs)
+  end
+end
 
 // ─── Sig-map-aware linearity classification ─────────────────────────────────
 
@@ -429,7 +631,12 @@ let check_function_with_kont = fn (
           consumed: [],
           caught_set,
           catch_stack: [],
-          cur_fn: cur_fn_label
+          cur_fn: cur_fn_label,
+          // Record every `let name = <ctor/record/…>` in the body so a match
+          // on a locally-constructed scrutinee can recover its construction
+          // expression and read off how each generic field was instantiated
+          // (the linearity pass carries no inferred type-args).
+          ctor_env: collect_ctor_bindings(stmts, acc: [])
         )
         let st1 = lin_push_frame(st: st0)
         let st2 = check_stmts(stmts, st: st1, sigs, tdefs, enum_defs)
@@ -1021,7 +1228,10 @@ let check_expr_kind = fn (
       // though x carries no % sigil itself.
       let scrutinee_linear = is_linear_scrutinee(target: t, st)
       let st1 = check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
-      return check_match_cases(cases: cs, st: st1, sigs, tdefs, enum_defs, span, scrutinee_linear)
+      // Thread the scrutinee expression `t` so each PCtor arm can recover the
+      // scrutinee's construction (via st1's ctor_env) and demote generic
+      // (TyVar) fields instantiated to a non-linear arg (approach (a)).
+      return check_match_cases(cases: cs, st: st1, sigs, tdefs, enum_defs, span, scrutinee_linear, scrutinee: t)
     | While(cond: c, body: b) ->
       // T-While (/ spec t9cl.8): the cond expression is
       // evaluated an unbounded number of times (once per iteration plus the
@@ -1132,7 +1342,7 @@ end
 
 let check_match_cases = fn (
   cases: [ HirMatchCase ], st: LinState, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ], span: Span,
-  scrutinee_linear: bool
+  scrutinee_linear: bool, scrutinee: HirExpr
 ) -> LinState throws { TypeError } do
   return check_match_cases_go(
     cases,
@@ -1143,7 +1353,8 @@ let check_match_cases = fn (
     span,
     join_ref: None,
     div_rems: [],
-    scrutinee_linear
+    scrutinee_linear,
+    scrutinee
   )
 end
 
@@ -1186,7 +1397,7 @@ end
 
 let check_match_cases_go = fn (
   cases: [ HirMatchCase ], st: LinState, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ], span: Span,
-  join_ref: Option<[ string ]>, div_rems: [ [ string ] ], scrutinee_linear: bool
+  join_ref: Option<[ string ]>, div_rems: [ [ string ] ], scrutinee_linear: bool, scrutinee: HirExpr
 ) -> LinState throws { TypeError } do
   // `join_ref` = outer-projected remaining agreed upon by non-divergent arms seen so far.
   // `div_rems` = list of outer-projected remainders from divergent arms seen so far.
@@ -1223,12 +1434,26 @@ let check_match_cases_go = fn (
       // the body. scrutinee_linear propagates to bind_pattern_linear so that
       // `| x ->` patterns on a linear scrutinee track x as linear (P-Var).
       let case_state = lin_set_vars(st, vs: outer_vars)
+      // approach (a): for a PCtor arm on a linear scrutinee, recover the
+      // scrutinee's construction and demote generic (TyVar) fields whose
+      // construction arg was non-linear, so they are NOT required to be
+      // consumed. Linear-arg'd generic fields stay tracked (conservative).
+      let demoted = match p do
+        | PCtor(variant: pv, fields: _, sigil: _) ->
+          if scrutinee_linear then
+            compute_demoted_tyvar_fields(target: scrutinee, variant: pv, st, sigs, tdefs, enum_defs)
+          else
+            []
+          end
+        | _ -> []
+      end
       let case_state2 = bind_pattern_linear(
         pat: p,
         st: case_state,
         scrutinee_linear,
         tdefs,
-        enum_defs
+        enum_defs,
+        demoted_fields: demoted
       )
       let case_out = check_stmts(stmts: b, st: case_state2, sigs, tdefs, enum_defs)
       // Every arm (divergent or not) must have consumed all inner-scope linears.
@@ -1255,7 +1480,8 @@ let check_match_cases_go = fn (
           span,
           join_ref,
           div_rems: case_outer_rem :: div_rems,
-          scrutinee_linear
+          scrutinee_linear,
+          scrutinee
         )
       else
         // Non-divergent arm: check equality with any existing join_ref.
@@ -1273,7 +1499,8 @@ let check_match_cases_go = fn (
               span,
               join_ref: Some(val: case_outer_rem),
               div_rems: [],
-              scrutinee_linear
+              scrutinee_linear,
+              scrutinee
             )
           | Some(val: jr) ->
             if !vars_equal(a: jr, b: case_outer_rem) then
@@ -1290,7 +1517,8 @@ let check_match_cases_go = fn (
               span,
               join_ref,
               div_rems: [],
-              scrutinee_linear
+              scrutinee_linear,
+              scrutinee
             )
         end
       end
