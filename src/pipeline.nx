@@ -23,6 +23,7 @@ import { HirProgram } from "src/ir/hir/types.nx"
 import { empty_accum, accum_to_program } from "src/ir/hir/build/accum.nx"
 import { process_defs } from "src/ir/hir/build/defs.nx"
 import * as bb from "std:bytebuffer"
+import * as task from "std:concurrency/task"
 import { Fs } from "std:fs"
 import { Console } from "std:stdio"
 import { IndexOutOfBounds } from "std:list"
@@ -38,6 +39,54 @@ export type HirBuildResult = HirBuildResult(program: HirProgram, import_cache: [
 // funnel through this record so the surrounding driver code reads
 // `caps` / `ok` uniformly.
 export type CapsWriteResult = CapsWriteResult(caps: [ string ], ok: bool)
+
+// ─── Parallel-job capability ──────────────────────────────────────────────────
+//
+// `Job` surfaces "this code forks a parallel worker" in the effect row. The
+// build driver's fork/join (cap-extraction running concurrently with the wasm
+// write) runs under `inject job_worker do ... end`, and the helper that issues
+// the submit/await — `build_caps_and_write` — carries `require { Job }`, so the
+// parallelism is visible in its type rather than buried in a bare
+// `task.host_spawn`/`task.host_join` pair.
+//
+// The cap is monomorphic over `[string]` (the cap-extraction result type): the
+// surface language has no generic capabilities (`cap Job<T>` is a parse error),
+// and this build driver only ever forks one `@[string]` task. The `%Task<[string]>`
+// handle threads through `submit`/`await` linearly — the linearity checker still
+// rejects a submit without a matching await.
+//
+// The handler implements `submit`/`await` directly over `task.host_spawn` /
+// `task.host_join`, so the underlying execution is unchanged: real OS-thread
+// (WASI threads) parallelism, NOT the cooperative single-threaded scheduler.
+// No `with @k` — a fork/join is not a suspension point, so a plain handler is
+// the honest shape.
+export cap Job do
+  fn submit(work: @[ string ]) -> %task.Task<[ string ]>
+  fn await(h: %task.Task<[ string ]>) -> [ string ]
+end
+
+export let job_worker = handler Job do
+  fn submit(work: @[ string ]) -> %task.Task<[ string ]> do
+    return task.host_spawn(a: work)
+  end
+  fn await(h: %task.Task<[ string ]>) -> [ string ] do
+    return task.host_join(handle: h)
+  end
+end
+
+// Fork the cap-extraction thunk onto a worker thread, run the wasm write on
+// this thread in parallel, then join. `require { Job }` makes the parallel
+// dependency part of this fn's type; discharge it with `inject job_worker`.
+export let build_caps_and_write = fn (
+  caps_thunk: @[ string ],
+  wasm_buf: %ByteBuffer,
+  output_path: string
+) -> CapsWriteResult require { Job } do
+  let caps_task = Job.submit(work: caps_thunk)
+  let ok_par = write_emit(%wasm_buf, output_path)
+  let caps_par = Job.await(h: caps_task)
+  return CapsWriteResult(caps: caps_par, ok: ok_par)
+end
 
 export let build_hir = fn (
   prog: Program,
