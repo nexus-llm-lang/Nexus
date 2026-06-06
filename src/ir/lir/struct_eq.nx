@@ -52,7 +52,8 @@
  * - Field/tag heap layout opcodes (see src/backend/codegen.nx, wasm/defs.nx)
  * - Function injection (see src/ir/lir/func_lower.nx — appends the helpers)
  */
-import { TypeExpr, TyRecord, TyUserDefined, TyBool, TyI64, TyString, NamedType,
+import { TypeExpr, TyRecord, TyUserDefined, TyBool, TyI64, TyF64, TyChar,
+         TyString, TyList, TyVar, NamedType,
          EnumDef, RecordDef, VariantDef, VariantField } from "src/types/type_expr.nx"
 import { Span } from "src/types/span.nx"
 import { BinaryOp, OpEq, OpNe, OpAnd } from "src/types/vocab.nx"
@@ -95,6 +96,46 @@ export let struct_eq_helper_name = fn (type_name: string) -> string do
   return "__streq_" ++ type_name
 end
 
+// Canonical key string for a list ELEMENT type. Distinct element types map to
+// distinct keys (so `[i64]` and `[string]` get separate helpers); the SAME
+// element type always maps to the same key, so a recursive `rest: [elem]` field
+// self-calls the right helper. A type-parameter / unknown element erases to the
+// generic key, whose helper bottoms out at an i64 value compare on the element
+// (acceptable per the monomorphic-helper precedent — generic `List<T>` recursion
+// is type-erased). The synthetic helper-bearing type name for `[elem]` is
+// `List$<key(elem)>`, never collidable with a user type (`$` is not a legal
+// identifier char), and shared so the helper recurses on itself.
+let list_elem_key = fn (elem: TypeExpr) -> string do
+  match elem do
+    | TyI64 -> return "i64"
+    | TyBool -> return "bool"
+    | TyF64 -> return "f64"
+    | TyChar -> return "char"
+    | TyString -> return "string"
+    | TyUserDefined(name: n, args: _) -> return n
+    | TyList(elem: inner) -> return "List$" ++ list_elem_key(elem: inner)
+    | _ -> return "T"
+  end
+end
+
+// Synthetic helper-bearing type name for the list type `[elem]`.
+let list_type_name = fn (elem: TypeExpr) -> string do
+  return "List$" ++ list_elem_key(elem)
+end
+
+// The monomorphized `Cons`/`Nil` variant defs for `[elem]`, matching the
+// built-in `List` layout (`Cons(v: elem, rest: [elem])`, `Nil`). Drives the
+// list helper body's structural compare: the `v` field recurses on `elem`
+// (string→string compare, record→its helper, list→its helper); the `rest`
+// field recurses on `[elem]` → a self-call of this list's helper.
+let list_variant_defs = fn (elem: TypeExpr) -> [ VariantDef ] do
+  return [
+    VariantDef(name: "Nil", fields: []),
+    VariantDef(name: "Cons", fields: [
+      VariantField(name: Some(val: "v"), typ: elem),
+      VariantField(name: Some(val: "rest"), typ: TyList(elem)) ]) ]
+end
+
 // ─── Operand-type classification ────────────────────────────────────────────
 
 let resolve_operand_type = fn (t: TypeExpr, ctx: LowerCtx) -> TypeExpr do
@@ -124,6 +165,11 @@ end
 export let should_struct_eq = fn (t: TypeExpr, ctx: LowerCtx) -> bool do
   match resolve_operand_type(t, ctx) do
     | TyRecord(fields: _) -> return true
+    // A `[elem]` list compares structurally (same length AND element-wise equal)
+    // via a generated runtime helper, NOT the heap-pointer identity the legacy
+    // binary path produces. Element structurality is preserved through the
+    // helper keyed on `elem` (strings/records/nested lists recurse correctly).
+    | TyList(elem: _) -> return true
     | TyUserDefined(name: en, args: _) ->
       let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
       match vidx.variants_of_enum(idx: ed, enum_name: en) do
@@ -137,8 +183,55 @@ end
 // `named_aggregate_name`: the helper-bearing type name of `t`, if `t` is a named
 // sum (TyUserDefined with known variants) or a named record alias (TyUserDefined
 // resolving to a TyRecord body). Anonymous TyRecord carries no name → None.
+
+// True iff `elem`'s specific list helper (`__streq_List$<key(elem)>`) is among
+// the generated set, so `[elem]` can route to it (preserving element
+// structurality). Mirrors gen_struct_eq_helpers' coverage: primitives, named
+// aggregates with in-scope structure, and ONE level of list-of-those. Anything
+// else (deeper bare nesting, type vars, opaque enums) is uncovered and routes to
+// the generic `__streq_List$T` helper, whose element compare is the i64 value
+// compare (type-erased precedent).
+let list_elem_covered = fn (elem: TypeExpr, ctx: LowerCtx) -> bool do
+  match elem do
+    | TyI64 | TyString | TyBool | TyF64 | TyChar -> return true
+    | TyUserDefined(name: _, args: _) ->
+      match resolve_operand_type(t: elem, ctx) do
+        | TyRecord(fields: _) -> return true
+        | TyUserDefined(name: en, args: _) ->
+          let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
+          match vidx.variants_of_enum(idx: ed, enum_name: en) do
+            | [] -> return false
+            | _ -> return true
+          end
+        | _ -> return false
+      end
+    // One nesting level: `[[prim]]` / `[[aggregate]]` are generated; deeper not.
+    | TyList(elem: inner) ->
+      match inner do
+        | TyI64 | TyString | TyBool | TyF64 | TyChar -> return true
+        | TyUserDefined(name: _, args: _) -> return list_elem_covered(elem: inner, ctx)
+        | _ -> return false
+      end
+    | _ -> return false
+  end
+end
+
+// Helper-bearing type name for a `[elem]` compare site: the specific element
+// helper when covered, else the generic `List$T` fallback. The recursive `rest`
+// field inside a helper resolves through this same routing on the SAME element
+// type, so it self-calls the right helper consistently.
+let list_site_type_name = fn (elem: TypeExpr, ctx: LowerCtx) -> string do
+  if list_elem_covered(elem, ctx) then return list_type_name(elem)
+  else return list_type_name(elem: TyVar(name: "T"))
+  end
+end
+
 let named_aggregate_name = fn (t: TypeExpr, ctx: LowerCtx) -> Option<string> do
   match t do
+    // `[elem]` routes to the per-element-type generated list helper. Returning a
+    // name here makes `compare_values` emit a CALL (not an inline expansion), so
+    // the recursive `rest` field terminates at run time like recursive sums do.
+    | TyList(elem: et) -> return Some(val: list_site_type_name(elem: et, ctx))
     | TyUserDefined(name: n, args: _) ->
       // Either a record alias or a sum with known variants gets a helper.
       match resolve_operand_type(t, ctx) do
@@ -616,6 +709,33 @@ let make_helper = fn (
   )
 end
 
+// Synthesize the `__streq_List$<key>(l, r) -> bool` helper for the list type
+// `[elem]`. Body = a sum compare over the monomorphized `Nil`/`Cons` variants:
+// equal iff same tag (both Nil, or both Cons) AND, for Cons, the head `v`
+// (type `elem`) and tail `rest` (type `[elem]`) are both structurally equal.
+// The `rest` recursion self-calls this same helper (terminates on finite data);
+// the `v` recursion routes through `elem`'s own compare path so strings, records
+// and nested lists compare structurally rather than by i64 identity.
+let make_list_helper = fn (
+  elem: TypeExpr,
+  enum_defs: VariantIndex
+) -> LirFunction throws { LirError } do
+  let l = LirAtomVar(name: "l", typ: TyI64)
+  let r = LirAtomVar(name: "r", typ: TyI64)
+  let ctx0 = LowerCtx(vars: [], semantic_vars: [], stmts: [], temp_counter: 0, enum_defs)
+  let CmpResult(ctx: ctx1, atom: result) = compare_sum(l, r, variants: list_variant_defs(elem: elem), ctx: ctx0)
+  let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = ctx1
+  return LirFunction(
+    name: struct_eq_helper_name(type_name: list_type_name(elem: elem)),
+    params: [ LirParam(label: "l", name: "l", typ: TyI64),
+              LirParam(label: "r", name: "r", typ: TyI64) ],
+    ret_type: TyBool,
+    body: list.reverse(xs: body_rev),
+    ret: result,
+    span: zero_span
+  )
+end
+
 let make_enum_helpers = fn (
   defs: [ EnumDef ],
   enum_defs: VariantIndex,
@@ -647,9 +767,144 @@ let make_record_helpers = fn (
   end
 end
 
+// ─── List-helper element-type collection ────────────────────────────────────
+//
+// `[elem] == [elem]` lowers to a CALL of `__streq_List$<key(elem)>`. One such
+// helper must be synthesized per distinct element type that any list `==`/`!=`
+// compares. The element type lives at the `==` site (in the MIR/semantic type)
+// and is NOT recovered here, so the set is over-approximated from the program's
+// declared shapes plus the primitive base set: every concrete element type a
+// list literal/value can carry is covered (primitives, every named aggregate,
+// one level of list-of-list per the spec's nested-list requirement). Unused
+// helpers are harmless — they reference only themselves and `elem`'s helper,
+// both of which are generated. An element type outside this set (e.g. an
+// uncommon deeper nesting) falls back to the generic `T`-keyed helper, whose
+// element compare is the i64 value compare (the type-erased precedent).
+
+// Add `e` to `acc` keyed by `list_type_name` (dedup by helper name).
+let push_elem = fn (e: TypeExpr, acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  return push_elem_go(e, key: list_type_name(elem: e), rest: acc, full: acc)
+end
+
+let push_elem_go = fn (e: TypeExpr, key: string, rest: [ TypeExpr ], full: [ TypeExpr ]) -> [ TypeExpr ] do
+  match rest do
+    | [] -> return e :: full
+    | h :: tl ->
+      if list_type_name(elem: h) == key then return full
+      else return push_elem_go(e, key, rest: tl, full)
+      end
+  end
+end
+
+// Harvest the list element types reachable from a field type: a `[e]` field
+// contributes `[e]`, and the recursion into `e` contributes any nested `[[..]]`.
+let harvest_type = fn (t: TypeExpr, acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match t do
+    | TyList(elem: e) ->
+      // record `[e]` itself as a needed helper; recurse into `e` (covers `[[x]]`).
+      let acc1 = push_elem(e, acc)
+      return harvest_type(t: e, acc: acc1)
+    | _ -> return acc
+  end
+end
+
+let enum_field_types = fn (defs: [ EnumDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match defs do
+    | [] -> return acc
+    | EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs, layout_variants: _) :: rest ->
+      return enum_field_types(defs: rest, acc: variant_list_field_types(vs, acc))
+  end
+end
+
+let variant_list_field_types = fn (vs: [ VariantDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match vs do
+    | [] -> return acc
+    | VariantDef(name: _, fields: fs) :: rest ->
+      return variant_list_field_types(vs: rest, acc: variant_field_types_go(fs, acc))
+  end
+end
+
+let variant_field_types_go = fn (fs: [ VariantField ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match fs do
+    | [] -> return acc
+    | VariantField(name: _, typ: t) :: rest -> return variant_field_types_go(fs: rest, acc: harvest_type(t, acc))
+  end
+end
+
+let record_field_types = fn (defs: [ RecordDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match defs do
+    | [] -> return acc
+    | RecordDef(name: _, is_public: _, type_params: _, fields: fs) :: rest ->
+      return record_field_types(defs: rest, acc: record_field_types_go(fs, acc))
+  end
+end
+
+let record_field_types_go = fn (fs: [ NamedType ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match fs do
+    | [] -> return acc
+    | NamedType(name: _, typ: t) :: rest -> return record_field_types_go(fs: rest, acc: harvest_type(t, acc))
+  end
+end
+
+// Element types whose `[elem]` list helper is always synthesized: the primitive
+// base set, every named aggregate (record/enum), and one nested level of
+// list-of-each so a bare `[[1], [2]]` (`[[i64]]`) compare resolves its helper.
+let enum_name_elems = fn (defs: [ EnumDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match defs do
+    | [] -> return acc
+    | EnumDef(name: en, is_public: _, is_opaque: _, type_params: _, variants: vs, layout_variants: _) :: rest ->
+      let acc2 = match vs do
+        | [] -> acc
+        | _ -> push_elem(e: TyUserDefined(name: en, args: []), acc)
+      end
+      return enum_name_elems(defs: rest, acc: acc2)
+  end
+end
+
+let record_name_elems = fn (defs: [ RecordDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match defs do
+    | [] -> return acc
+    | RecordDef(name: rn, is_public: _, type_params: _, fields: _) :: rest ->
+      return record_name_elems(defs: rest, acc: push_elem(e: TyUserDefined(name: rn, args: []), acc))
+  end
+end
+
+let primitive_elems = fn () -> [ TypeExpr ] do
+  return [ TyI64, TyString, TyBool, TyF64, TyChar ]
+end
+
+let seed_elems_into = fn (xs: [ TypeExpr ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match xs do
+    | [] -> return acc
+    | x :: rest -> return seed_elems_into(xs: rest, acc: push_elem(e: x, acc))
+  end
+end
+
+// Add `[base]` as a new element for every base element, so a bare list-of-list
+// (`[[i64]]`) compare has its helper. One nesting level covers the spec's
+// nested-list requirement; deeper nesting falls back to the generic helper.
+let nest_one_level = fn (bases: [ TypeExpr ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match bases do
+    | [] -> return acc
+    | b :: rest -> return nest_one_level(bases: rest, acc: push_elem(e: TyList(elem: b), acc))
+  end
+end
+
+let make_list_helpers = fn (
+  elems: [ TypeExpr ],
+  enum_defs: VariantIndex,
+  acc: [ LirFunction ]
+) -> [ LirFunction ] throws { LirError } do
+  match elems do
+    | [] -> return list.reverse(xs: acc)
+    | e :: rest -> return make_list_helpers(elems: rest, enum_defs, acc: make_list_helper(elem: e, enum_defs) :: acc)
+  end
+end
+
 /** Synthesize the structural-compare helper functions for every named aggregate
  *  type in the program — one per `EnumDef` (with in-scope variants) and one per
- *  record-alias `RecordDef`. Appended to the LirProgram by `lower_mir_to_lir`.
+ *  record-alias `RecordDef` — plus one per distinct list element type
+ *  (`__streq_List$<key>`). Appended to the LirProgram by `lower_mir_to_lir`.
  *  Recursive and mutually-recursive references resolve to the same helper names,
  *  so the emitted wasm recurses at run time and terminates on finite data. */
 export let gen_struct_eq_helpers = fn (
@@ -659,7 +914,21 @@ export let gen_struct_eq_helpers = fn (
 ) -> [ LirFunction ] throws { LirError } do
   let enum_helpers = make_enum_helpers(defs: enum_def_list, enum_defs, acc: [])
   let record_helpers = make_record_helpers(defs: record_defs, enum_defs, acc: [])
-  return list.concat(xs: enum_helpers, ys: record_helpers)
+  // Collect the list element types needing a helper: primitives + named
+  // aggregates + one nested level, plus every list element harvested from the
+  // program's declared record/variant field shapes (any depth). A generic
+  // `T`-keyed helper is always present as the fallback for unrecovered/erased
+  // element types.
+  let base = seed_elems_into(xs: primitive_elems(), acc: [])
+  let base1 = enum_name_elems(defs: enum_def_list, acc: base)
+  let base2 = record_name_elems(defs: record_defs, acc: base1)
+  let nested = nest_one_level(bases: base2, acc: base2)
+  let with_enum_fields = enum_field_types(defs: enum_def_list, acc: nested)
+  let with_rec_fields = record_field_types(defs: record_defs, acc: with_enum_fields)
+  // Generic erased-element fallback helper (`__streq_List$T`).
+  let all_elems = push_elem(e: TyVar(name: "T"), acc: with_rec_fields)
+  let list_helpers = make_list_helpers(elems: all_elems, enum_defs, acc: [])
+  return list.concat(xs: list.concat(xs: enum_helpers, ys: record_helpers), ys: list_helpers)
 end
 
 // ─── Entry point ────────────────────────────────────────────────────────────
