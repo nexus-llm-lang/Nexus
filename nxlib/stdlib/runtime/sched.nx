@@ -1,0 +1,209 @@
+/**
+ * Directory scope — nxlib/stdlib/runtime/:
+ *   runtime/ holds self-host primitives directly hooked into the runtime or
+ *   compiler. Not intended for direct application import; the stable surface is
+ *   one level up under the std:concurrency surface.
+ *
+ * std:runtime/sched: cooperative-scheduler runtime primitives over the
+ * stack-switching (`with @k`) machinery.
+ *
+ * Two layers live here:
+ *
+ *  1. Compiler intrinsics (no real wasm import — codegen inline-emits them):
+ *     - `kont_slot(k)`        — read a `with @k` arm binder `k` as its raw i64
+ *       cont-table slot. A `value_of_i64` pun: at codegen the arm cont-binder
+ *       param ALREADY IS the i64 slot, so this is identity. Lets a handler arm
+ *       name the continuation slot it just captured so it can enqueue it.
+ *     - `sched_set_next(k)`   — `global.set ss_resume_slot`. Tells the inject
+ *       dispatcher which cont-table slot to `resume` on its next loop turn.
+ *     - `__nx_sched_spawn(t)` — turn a `() -> ()` thunk into a fresh fiber:
+ *       push the thunk, `cont.new` the trampoline body into a new cont slot,
+ *       enqueue the slot. Resolves to inline codegen (`emit_sched_spawn`).
+ *
+ *  2. In-wasm queue + trampoline backing the spawn machinery. The three queue
+ *     ops the spawn/dispatcher codegen needs (`sched-push-pending`,
+ *     `sched-enqueue`, `sched-dequeue`) are bound to the Nexus functions below
+ *     (NOT host imports — `wasmtime run` cannot supply custom imports). The
+ *     trampoline `__nx_sched_trampoline_body` is the `() -> ()` function a
+ *     spawned cont starts in; when the dispatcher resumes that cont it pops the
+ *     matching pending thunk and forces it.
+ *
+ * The queue and pending-thunk ring live in linear memory (arena-allocated
+ * cells), reachable from any frame across suspend/resume because they are
+ * top-level globals, not stack-confined.
+ */
+import external "nexus:intrinsic"
+import * as mem from "std:runtime/mem"
+import * as arena from "std:runtime/arena"
+
+// ── Validated slot primitives (compiler intrinsics) ──────────────────────────
+
+/** Read a `with @k` arm binder `k` as its raw i64 cont-table slot. Sound: at
+ *  codegen the arm's cont-binder param already IS the i64 slot. The `<T>` pun
+ *  unifies against the binder's `@`-thunk type cleanly and satisfies once-only
+ *  linearity (k is referenced exactly once). NOTE: this `import external
+ *  "nexus:intrinsic"` block must precede the `nexus:runtime/sched` block so the
+ *  intrinsic is moduled correctly. */
+export external kont_slot = "value_of_i64" : <T>(k: T) -> i64
+
+/** Reinterpret a raw i64 (a closure heap pointer) back as a `() -> unit`
+ *  function value. A pure type-pun (every Nexus value is an i64 at WASM level).
+ *  Used by the trampoline to recover a pushed thunk handle as something it can
+ *  force. */
+export external fn_of_i64 = "value_of_i64" : (a_x: i64) -> ( () -> unit )
+
+/** Reinterpret a `() -> unit` function value as its raw i64 closure pointer. */
+export external fn_to_i64 = "value_of_i64" : (a_x: () -> unit) -> i64
+
+/** Invoke a 0-arg closure given its heap pointer (word 0 = funcref-table index).
+ *  Mirrors the `@`-force op. Returns the closure's i64 value. */
+external force_closure = "force_closure" : (a_p: i64) -> i64
+
+// The two ops below are `nexus:runtime/sched` intrinsics, inline-emitted by the
+// codegen (sched-set-next → global.set ss_resume_slot; sched-spawn →
+// emit_sched_spawn). This `import external` block must follow the intrinsic
+// externals above so they stay moduled under `nexus:intrinsic` (the import
+// module applies to every external declared after it until the next block).
+import external "nexus:runtime/sched"
+
+/** Set the cont-table slot the inject dispatcher will `resume` next. Inline
+ *  `global.set ss_resume_slot`. */
+export external sched_set_next = "sched-set-next" : (k: i64) -> unit
+
+/** Spawn `thunk` as a fresh cooperative fiber: enqueue a new cont (over the
+ *  trampoline) that, when first resumed, forces `thunk`. The thunk is a 0-arg
+ *  `() -> unit` closure; codegen (`emit_sched_spawn`) pushes its closure
+ *  pointer to the pending ring and `cont.new`s the trampoline into a fresh cont
+ *  slot. */
+export external __nx_sched_spawn = "sched-spawn" : (thunk: () -> unit) -> unit
+
+// ── In-wasm run queue + pending-thunk ring (backs the spawn machinery) ───────
+//
+// Two arena-backed ring buffers, lazily allocated on first use:
+//  - the run queue: i64 cont-table slots awaiting resume (sched-enqueue /
+//    sched-dequeue).
+//  - the pending-thunk ring: i64 thunk handles awaiting their trampoline pop
+//    (sched-push-pending / __pop_pending).
+//
+// Each ring is [head:i64, tail:i64, count:i64, slot0, slot1, ...]. FIFO. The
+// capacity is fixed; cooperative schedulers in practice hold only a handful of
+// live fibers, so a small fixed ring suffices and never reallocates (which would
+// move the base pointer out from under a suspended frame).
+
+// Ring constants. Top-level value-`let`s are deferred thunks and cannot be used
+// directly in arithmetic; expose them through parameterless functions so each
+// use forces the value into a local first.
+let ring_cap = fn () -> i64 do return 256 end
+let ring_hdr_bytes = fn () -> i64 do return 24 end       // head, tail, count
+let ring_bytes = fn () -> i64 do
+  let rcap = ring_cap()
+  let hdr = ring_hdr_bytes()
+  return hdr + rcap * 8
+end
+
+// Base-pointer cells at FIXED reserved linear-memory offsets in page 13. A
+// top-level `let cell = arena.alloc_raw(...)` is a NON-memoised deferred thunk —
+// every reference re-runs `alloc_raw` and yields a fresh address, so it cannot
+// name a stable cell. Instead reserve two fixed i64 offsets (literal constants
+// are pure and stable) and lazily allocate the ring backing store once. Page 13
+// (851968) is below the default heap base (page 17 = 1114112) and is otherwise
+// untouched empty real estate (only [0,16) plus pages 14=pow5 / 15=rand /
+// 16=log are reserved), so the cells read back as 0 on first use. `b == 0` is
+// the unallocated sentinel — `alloc_raw` never returns 0 (the heap is far
+// above), so no separate flag cell is needed.
+let runq_base_cell = fn () -> i64 do return 851968 end   // run-queue base pointer
+let pendq_base_cell = fn () -> i64 do return 851976 end  // pending-thunk base pointer
+
+let ring_alloc = fn () -> i64 do
+  let base = arena.alloc_raw(size: ring_bytes())
+  mem.store_i64(addr: base, val: 0)        // head
+  mem.store_i64(addr: base + 8, val: 0)     // tail
+  mem.store_i64(addr: base + 16, val: 0)    // count
+  return base
+end
+
+let runq_base = fn () -> i64 do
+  let cell = runq_base_cell()
+  let b = mem.load_i64(addr: cell)
+  if b == 0 then
+    let nb = ring_alloc()
+    mem.store_i64(addr: cell, val: nb)
+    return nb
+  end
+  return b
+end
+
+let pendq_base = fn () -> i64 do
+  let cell = pendq_base_cell()
+  let b = mem.load_i64(addr: cell)
+  if b == 0 then
+    let nb = ring_alloc()
+    mem.store_i64(addr: cell, val: nb)
+    return nb
+  end
+  return b
+end
+
+let ring_push = fn (base: i64, v: i64) -> unit do
+  let rcap = ring_cap()
+  let hdr = ring_hdr_bytes()
+  let tail = mem.load_i64(addr: base + 8)
+  let count = mem.load_i64(addr: base + 16)
+  let slot_addr = base + hdr + tail * 8
+  mem.store_i64(addr: slot_addr, val: v)
+  let next_tail = if tail + 1 >= rcap then 0 else tail + 1 end
+  mem.store_i64(addr: base + 8, val: next_tail)
+  mem.store_i64(addr: base + 16, val: count + 1)
+  return ()
+end
+
+// Pop the FIFO head, or -1 when empty.
+let ring_pop = fn (base: i64) -> i64 do
+  let rcap = ring_cap()
+  let hdr = ring_hdr_bytes()
+  let count = mem.load_i64(addr: base + 16)
+  if count <= 0 then return -1 end
+  let hd = mem.load_i64(addr: base)
+  let slot_addr = base + hdr + hd * 8
+  let v = mem.load_i64(addr: slot_addr)
+  let next_head = if hd + 1 >= rcap then 0 else hd + 1 end
+  mem.store_i64(addr: base, val: next_head)
+  mem.store_i64(addr: base + 16, val: count - 1)
+  return v
+end
+
+/** sched-enqueue: append a ready cont-table slot to the run queue. Bound by
+ *  codegen as the spawn machinery's enqueue op and usable directly from a
+ *  handler arm to schedule a captured continuation. */
+export let __nx_sched_enqueue = fn (slot: i64) -> unit do
+  return ring_push(base: runq_base(), v: slot)
+end
+
+/** sched-dequeue: pop the next ready cont-table slot (FIFO), or -1 if the run
+ *  queue is empty. The inject dispatcher calls this on a body's normal return to
+ *  drain remaining fibers. */
+export let __nx_sched_dequeue = fn () -> i64 do
+  return ring_pop(base: runq_base())
+end
+
+/** sched-push-pending: stash a spawned thunk handle so the trampoline can pop
+ *  and force it when its cont is first resumed. */
+export let __nx_sched_push_pending = fn (thunk: i64) -> unit do
+  return ring_push(base: pendq_base(), v: thunk)
+end
+
+let __nx_sched_pop_pending = fn () -> i64 do
+  return ring_pop(base: pendq_base())
+end
+
+/** The `() -> ()` body a spawned cont starts in. When the dispatcher first
+ *  resumes the spawned cont, control enters here: pop the matching pending thunk
+ *  and force it. The thunk's own cap calls suspend back into the dispatcher as
+ *  usual, so a spawned fiber participates in the same cooperative round-robin as
+ *  the inject body. */
+export let __nx_sched_trampoline_body = fn () -> unit do
+  let h = __nx_sched_pop_pending()
+  if h < 0 then return () end
+  let _ignored = force_closure(a_p: h)
+  return ()
+end

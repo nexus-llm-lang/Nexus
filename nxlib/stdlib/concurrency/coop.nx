@@ -1,0 +1,79 @@
+/**
+ * std:concurrency/coop: a minimal in-wasm cooperative scheduler built on the
+ * stack-switching (`with @k`) machinery + the in-wasm run queue in
+ * std:runtime/sched.
+ *
+ * A cooperative task is straight-line code that calls `Coop.yield()` at each
+ * cooperative scheduling point. The scheduler handler captures the yielding
+ * task's continuation, enqueues it on the shared run queue, and resumes the next
+ * ready continuation (FIFO). Tasks therefore interleave at their yield points
+ * rather than running to completion one after another.
+ *
+ * ── How the round-robin works ────────────────────────────────────────────────
+ * The inject dispatcher (codegen/emit/inject.nx) owns a single `resume` loop
+ * over one cont table. Each `Coop.yield()` is a stack-switch suspend that lands
+ * in the `with @k` arm below; the arm captures the suspended continuation into a
+ * fresh cont-table slot (`k`), enqueues that slot, and points the dispatcher at
+ * the next dequeued slot via `sched_set_next`. When the arm returns to the loop,
+ * the loop resumes the slot it was pointed at. Because every live task is a slot
+ * in the same cont table and the same loop resumes whichever slot is current,
+ * an arbitrary number of tasks interleave through one dispatcher frame.
+ *
+ * Additional tasks beyond the inject body are introduced with `spawn`, which
+ * uses the `__nx_sched_spawn` intrinsic to `cont.new` a fresh continuation over
+ * the trampoline and enqueue it; the trampoline forces the spawned thunk when
+ * the dispatcher first resumes that continuation.
+ *
+ * ── Monomorphic, unit-valued ─────────────────────────────────────────────────
+ * `yield` carries no value and `@k` resumes with unit (the runtime has no
+ * `@k(v)`); tasks communicate through a shared `~`-mutable accumulator declared
+ * in the driving scope, exactly as generators do.
+ */
+import external "nexus:runtime/sched"
+import { kont_slot, sched_set_next, __nx_sched_dequeue,
+         __nx_sched_enqueue } from "std:runtime/sched"
+
+/** The cooperative-yield capability. A task calls `Coop.yield()` to release the
+ *  CPU to the next ready task. */
+export cap Coop do
+  fn yield() -> unit
+end
+
+/** Spawn intrinsic, declared here (rather than imported from std:runtime/sched)
+ *  with a `require { Coop }` thunk row so a cooperative task — which necessarily
+ *  uses `Coop.yield` — is admitted. The intrinsic itself is cap-agnostic at the
+ *  WASM level (it only `cont.new`s the trampoline over the thunk's closure
+ *  pointer); the require row is purely a typing accommodation discharged by the
+ *  enclosing `scheduler` inject. */
+external __nx_sched_spawn = "sched-spawn" : (thunk: () -> unit require { Coop }) -> unit
+
+/** The cooperative scheduler handler. On each `yield`, capture the running
+ *  task's continuation slot, enqueue it at the tail of the run queue, then point
+ *  the dispatcher at the next ready continuation (FIFO dequeue). Returning to the
+ *  dispatcher loop resumes that continuation, so control round-robins across all
+ *  live tasks at their yield points.
+ *
+ *  If the run queue is empty (`-1`), there is no other ready task; re-point the
+ *  dispatcher at this same continuation so the lone task simply resumes itself. */
+export let scheduler = handler Coop do
+  fn yield() -> unit with @k do
+    // Capture this continuation's cont-table slot exactly once (k is one-shot
+    // linear), enqueue it at the tail, then resume the next ready slot.
+    let self_slot = kont_slot(k: k)
+    __nx_sched_enqueue(slot: self_slot)
+    let next = __nx_sched_dequeue()
+    if next < 0 then
+      // queue unexpectedly empty: resume self (degenerate single-task case).
+      sched_set_next(k: self_slot)
+    else
+      sched_set_next(k: next)
+    end
+  end
+end
+
+/** Spawn `task` as an additional cooperative fiber under the active scheduler
+ *  inject. The task starts running the first time the scheduler resumes its
+ *  freshly-enqueued continuation. Must be called inside a `scheduler` inject. */
+export let spawn = fn (task: () -> unit require { Coop }) -> unit do
+  return __nx_sched_spawn(thunk: task)
+end
