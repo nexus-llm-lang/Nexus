@@ -691,6 +691,53 @@ let emit_inject_value_store = fn (
   return bb.push_uleb128(buf: %body, val: wdefs.ss_inject_value_global_idx)
 end
 
+/** Open the escaped-throw landing pad around a lifted `__inject_N` continuation
+ *  body. wasmtime-44 stack-switching SWALLOWS a `throw` raised inside a resumed
+ *  continuation — it never unwinds across `op_resume` into the dispatcher's
+ *  frame (nexus-uqpe4). So the body catches its OWN escaping throw on its own
+ *  stack and records it (ss_pending_payload + ss_pending_exn flag), returning
+ *  normally; the dispatcher (emit_inject_resume_multi) re-throws on the parent
+ *  stack after the resume returns, where the exception reaches an enclosing
+ *  guest try/catch and honours the declared `throws` row.
+ *
+ *  Frame (mirrors the WASM-EH try/catch layout for LirStmtTryCatch):
+ *    block @after { block @catch_land (result i64) {
+ *      try_table (catch exn @catch_land) { <body> } ; br @after } ; <handler> }
+ *  The catch clause BRANCHES to @catch_land carrying the i64 payload — it does
+ *  not fall through — so @catch_land is a real `(result i64)` block the success
+ *  path skips via `br @after`. No-op when `eh_wrap` is false. */
+let emit_inject_eh_open = fn (body: %ByteBuffer, eh_wrap: bool) -> %ByteBuffer throws { CodegenError } do
+  if !eh_wrap then return %body end
+  let %body = bb.push_bytes(buf: %body, bytes: [ op_block, bt_void ])
+  let %body = bb.push_bytes(buf: %body, bytes: [ op_block, bt_i64 ])
+  let %body = bb.push_bytes(buf: %body, bytes: [ op_try_table, bt_void ])
+  let %body = bb.push_uleb128(buf: %body, val: 1)             // 1 catch clause
+  let %body = bb.push_byte(buf: %body, byte: catch_kind_one)  // catch <tag> -> <label>
+  let %body = bb.push_uleb128(buf: %body, val: heap_global_idx) // exn tag (== 0)
+  return bb.push_uleb128(buf: %body, val: 0)                  // label: @catch_land (depth 0)
+end
+
+/** Close the escaped-throw landing pad opened by emit_inject_eh_open. Normal
+ *  path: close the try_table, then `br @after` (depth 1) over the handler.
+ *  Catch path: the try_table branched to @catch_land leaving the i64 payload on
+ *  the stack at its end; the handler stashes it into ss_pending_payload + sets
+ *  the ss_pending_exn flag, then falls through to @after's end. Either way the
+ *  body returns normally. No-op when `eh_wrap` is false. */
+let emit_inject_eh_close = fn (body: %ByteBuffer, eh_wrap: bool) -> %ByteBuffer throws { CodegenError } do
+  if !eh_wrap then return %body end
+  let %body = bb.push_byte(buf: %body, byte: op_end)       // close try_table
+  let %body = bb.push_byte(buf: %body, byte: op_br)        // normal: skip handler
+  let %body = bb.push_uleb128(buf: %body, val: 1)          //   -> @after
+  let %body = bb.push_byte(buf: %body, byte: op_end)       // close @catch_land (payload on stack)
+  let %body = bb.push_byte(buf: %body, byte: op_global_set) // ss_pending_payload = payload
+  let %body = bb.push_uleb128(buf: %body, val: wdefs.ss_pending_payload_global_idx)
+  let %body = bb.push_byte(buf: %body, byte: op_i64_const)  // ss_pending_exn = 1
+  let %body = bb.push_sleb128(buf: %body, val: 1)
+  let %body = bb.push_byte(buf: %body, byte: op_global_set)
+  let %body = bb.push_uleb128(buf: %body, val: wdefs.ss_pending_exn_global_idx)
+  return bb.push_byte(buf: %body, byte: op_end)            // close @after
+end
+
 let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx,
                                   func_id: i64, coverage_enabled: bool) -> %ByteBuffer throws { CodegenError } do
   let LirFunction(name: fname, params: ps, ret_type: raw_rt, body: b, ret: r, span: _) = func
@@ -736,7 +783,22 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx,
     bb.push_byte(buf: %body, byte: bt_void)
   else %body end
 
-  let %body = emit_stmts(stmts: b, buf: %body, ctx, in_try: false, tcmc)
+  // Escaped-throw landing pad for lifted `__inject_N` continuation bodies.
+  // wasmtime-44 stack-switching SWALLOWS a `throw` raised inside a resumed
+  // continuation — it never unwinds across `op_resume` into the dispatcher's
+  // frame (nexus-uqpe4). So the body catches its OWN escaping throw here, on
+  // its own stack, records the payload in ss_pending_payload + sets the
+  // ss_pending_exn flag, and returns normally; the dispatcher
+  // (emit_inject_resume_multi) re-throws on the parent stack after the resume
+  // returns, where the exception can reach an enclosing guest try/catch and
+  // honour the declared `throws` row. Gated on EH being present (ss_tag_idx==1
+  // iff has_eh for an SS program, since the exn tag occupies tag 0) and on the
+  // body not being TCMC (inject bodies never are; defensive).
+  let CodegenCtx(ss_tag_idx: ss_base_for_eh, _) = ctx
+  let eh_wrap = is_inject_lift(name: fname) && (ss_base_for_eh >= 1) && (!is_tcmc)
+  let %body = emit_inject_eh_open(%body, eh_wrap)
+
+  let %body = emit_stmts(stmts: b, buf: %body, ctx, in_try: eh_wrap, tcmc)
 
   let %body = if is_tcmc then
     bb.push_byte(buf: %body, byte: op_end)
@@ -752,6 +814,8 @@ let compile_function_body = fn (func: LirFunction, ctx: CodegenCtx,
   let %body = if is_inject_lift(name: fname) then
     emit_inject_value_store(%body, r, ctx)
   else %body end
+
+  let %body = emit_inject_eh_close(%body, eh_wrap)
 
   let %body = emit_return_value(%body, rt, r, ctx)
   bb.push_byte(buf: %body, byte: op_end)
@@ -1040,7 +1104,10 @@ export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_d
       // memo_globals_base is the index of the FIRST memo global in the main
       // module's local global namespace. wmerge later applies a glo_off to
       // these instructions when concatenating with the dep stdlib.
-      let memo_globals_base = 3 + (if has_ss then 5 else 0 end)
+      // The SS block is 7 globals (3..9): cont-ref, resume-slot, next-alloc,
+      // resume-value, inject-value, pending-exn, pending-payload. MUST stay in
+      // lockstep with build_global_section's `has_ss` arm in wasm/section.nx.
+      let memo_globals_base = 3 + (if has_ss then 7 else 0 end)
 
       // Global section — needed for bump allocator, cabi_realloc, arena, string
       // literals, or any memo-cache target. G1 (str_base) is always needed

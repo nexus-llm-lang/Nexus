@@ -1,0 +1,76 @@
+// Regression for nexus-uqpe4: a `throw` that escapes a `with @k` inject body
+// must propagate to an ENCLOSING guest `try`/`catch`, not be silently swallowed.
+//
+// wasmtime-44 stack-switching swallows an exception raised inside a resumed
+// continuation — it never unwinds across `op_resume` back into the inject
+// dispatcher's frame. Before the fix the throw below was lost: `gen_throw()`
+// appeared to return normally, the `catch` never fired, and the declared
+// `throws { Exn }` contract was violated. The fix has the lifted `__inject_N`
+// body catch its OWN escaping throw, record it, and return normally; the
+// dispatcher re-throws it on the PARENT stack after the resume returns, where
+// it reaches the enclosing `try`/`catch` here.
+//
+// The catch must fire IN-GUEST (no host-ward unwind), so this test stays on the
+// caught / exit-0 path: `body()` returns the catch-arm sentinel 42 iff the catch
+// fired, otherwise the (never-reached, since gen_throw throws) try-body value.
+// If the throw were swallowed, gen_throw would return its trailing value and
+// `body()` would return that instead of 42 — the assertion would throw and the
+// test would exit non-zero (FAIL). The catch firing yields 42 → assert passes →
+// exit 0 (PASS).
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+
+cap Ev do
+  fn emit() -> unit
+end
+
+// `with @k` around-advice arm: resume the suspended continuation, so the inject
+// body runs past `Ev.emit()` to the `throw` below.
+let ev_h = handler Ev do
+  fn emit() -> unit with @k do
+    @k
+  end
+end
+
+// Kont inject whose body emits an effect and THEN throws. The `inject ev_h`
+// discharges the body's `Ev` requirement internally, so callers need no `Ev`.
+// The throw escapes the inject; without the fix it is swallowed and this
+// function returns normally.
+let gen_throw = fn () -> i64 throws { Exn } do
+  inject ev_h do
+    Ev.emit()
+    throw RuntimeError(val: "escaped from with-@k inject body")
+  end
+end
+
+let assert_i64 = fn (label: string, got: i64, want: i64) -> unit throws { RuntimeError } do
+  if !(got == want) then
+    throw RuntimeError(val: label ++ ": got " ++ str.from_i64(val: got) ++ ", want " ++ str.from_i64(val: want))
+  end
+end
+
+// Enclosing guest try/catch around the kont inject. The catch must FIRE: it
+// returns 42. The try-success path returns gen_throw's i64 result, which is only
+// reached if the throw was (incorrectly) swallowed. (`try`/`catch` is a
+// statement here, not an expression — each branch ends in `return`.)
+let body = fn () -> i64 throws { RuntimeError } do
+  try
+    let produced = gen_throw()
+    return produced
+  catch _ ->
+    return 42
+  end
+end
+
+let run = fn () -> unit require { Console } throws { RuntimeError } do
+  let result = body()
+  assert_i64(label: "outer-catch-fires-on-escaped-kont-inject-throw", got: result, want: 42)
+  Console.println(val: "ok")
+end
+
+let main = fn () -> unit require { PermConsole } throws { RuntimeError } do
+  inject stdio.system_handler do
+    run()
+  end
+end

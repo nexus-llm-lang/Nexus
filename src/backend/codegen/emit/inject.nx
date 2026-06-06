@@ -163,6 +163,12 @@ export let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm
 
   let %buf = bb.push_byte(%buf, byte: op_end)  // close @loop
   let %buf = bb.push_byte(%buf, byte: op_end)  // close @outer
+
+  // Re-throw any pending escaped throw on the parent stack (see
+  // emit_pending_exn_rethrow). Gated on EH being present.
+  let CodegenCtx(ss_tag_idx: ss_base_eh, _) = ctx
+  let %buf = emit_pending_exn_rethrow(%buf, has_eh: ss_base_eh >= 1)
+
   // Value-producing inject: the body stored its trailing value
   // into ss_inject_value before its `() -> ()` continuation returned. Read it
   // back here so the inject expression leaves the body's value on the stack.
@@ -170,6 +176,38 @@ export let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm
   if wdefs.is_unit(typ: result_typ) then return %buf end
   let %buf = bb.push_byte(%buf, byte: op_global_get)
   return bb.push_uleb128(%buf, val: wdefs.ss_inject_value_global_idx)
+end
+
+/** Re-throw a throw that escaped the resumed `__inject_N` body, on the parent
+ *  (dispatcher) stack. wasmtime-44 stack-switching SWALLOWS an exception raised
+ *  inside a resumed continuation — it never unwinds across `op_resume` into
+ *  this frame (nexus-uqpe4). The body's own landing pad (compile_function_body)
+ *  instead caught it, set ss_pending_exn, and stashed the payload in
+ *  ss_pending_payload, then returned normally. We are now back on the parent
+ *  stack (the resume frame exited); if the flag is set, clear it and re-throw
+ *  the payload via the exn tag, where it propagates normally to any enclosing
+ *  guest try/catch and honours the declared `throws` row. The original throw's
+ *  backtrace snapshot is preserved (no re-snapshot). Emits:
+ *    if ss_pending_exn != 0 { ss_pending_exn = 0; throw ss_pending_payload }
+ *  No-op when `has_eh` is false (no exn tag exists to throw). */
+let emit_pending_exn_rethrow = fn (buf: %ByteBuffer, has_eh: bool) -> %ByteBuffer throws { CodegenError } do
+  if !has_eh then return %buf end
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_pending_exn_global_idx)
+  let %buf = bb.push_byte(%buf, byte: op_i64_const)
+  let %buf = bb.push_sleb128(%buf, val: 0)
+  let %buf = bb.push_bytes(%buf, bytes: [ wdefs.op_i64_ne, wdefs.op_if, bt_void ])
+  // clear the flag so a later inject in the same function starts clean
+  let %buf = bb.push_byte(%buf, byte: op_i64_const)
+  let %buf = bb.push_sleb128(%buf, val: 0)
+  let %buf = bb.push_byte(%buf, byte: op_global_set)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_pending_exn_global_idx)
+  // push payload, re-throw on the parent stack via the exn tag
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_pending_payload_global_idx)
+  let %buf = bb.push_byte(%buf, byte: wdefs.op_throw)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.heap_global_idx)
+  return bb.push_byte(%buf, byte: op_end)  // close if
 end
 
 let open_nested_arm_blocks = fn (
