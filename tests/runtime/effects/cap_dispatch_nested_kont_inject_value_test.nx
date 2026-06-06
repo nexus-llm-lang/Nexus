@@ -1,0 +1,82 @@
+// Regression: a VALUE-yielding `with @k` (kont) inject nested directly inside
+// an OUTER plain inject for the SAME 2-handler cap must surface the inner
+// inject's trailing value — it was dropped (returned 0) before the fix.
+//
+// Two handlers for the same cap (`plain_ev` + `kont_ev`) force the runtime
+// dispatcher. The outer plain inject lowers through `wrap_inject_register`; the
+// inner value-yielding kont inject lowers through `wrap_inject_resume_register`,
+// which leaves its `inject_resume` as the body's TRAILING statement so its
+// value (delivered out-of-band via the ss_inject_value global) is surfaced by
+// `lir_lower_stmts`. The bug: the OUTER wrap saw the body end in a
+// `MirStmtInjectResume` (not a bare expr), fell to its value-dropping `try`
+// branch, and buried the resume — discarding the value (0 instead of 60).
+//
+// The fix teaches `wrap_inject_register` to keep a trailing value-yielding
+// nested `inject_resume` OUT of the restore-`try`, mirroring how
+// `wrap_inject_resume_register` keeps a value-yielding inject_resume trailing.
+// The slot restore is handled by the enclosing inject's wrap (the same
+// invariant the kont-path value branch relies on).
+//
+// twyov constraint (upstream wasmtime, nexus-twyov): a `resume` followed by any
+// host-ward unwind (uncaught throw / trap / proc_exit) crashes the runtime. So
+// the success path must NOT throw after a resume. The inject value is read back
+// AFTER the resume frame has fully exited (`nested()` has returned), so the
+// assert runs outside any resume frame. With the fix the value is correct, the
+// assert does not throw, and the test exits 0. (A regression would surface as a
+// non-zero exit, which `nexus test` treats as failure.)
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+
+cap Ev do
+  fn emit() -> i64
+end
+
+// First-declared handler for Ev: plain arm. Two handlers force the runtime
+// dispatcher. Injected as the OUTER scope.
+let plain_ev = handler Ev do
+  fn emit() -> i64 do
+    return 0
+  end
+end
+
+// Second handler for Ev: `with @k` arm, injected dynamically-INNERMOST. `@k`
+// resumes the suspended body so it continues to the next statement.
+let kont_ev = handler Ev do
+  fn emit() -> i64 with @k do
+    @k
+  end
+end
+
+// OUTER plain inject, INNER value-yielding kont inject for the SAME cap. The
+// inner inject's trailing value is accumulated across three suspend/resume
+// boundaries (10 + 20 + 30 = 60) and must surface as the nested injects' value.
+let nested = fn () -> i64 do
+  inject plain_ev do
+    inject kont_ev do
+      let _a = Ev.emit()
+      let s1 = 10
+      let _b = Ev.emit()
+      let s2 = s1 + 20
+      let _c = Ev.emit()
+      let total = s2 + 30
+      total
+    end
+  end
+end
+
+let assert_i64 = fn (label: string, got: i64, want: i64) -> unit throws { RuntimeError } do
+  if !(got == want) then
+    throw RuntimeError(val: label ++ ": got " ++ str.from_i64(val: got) ++ ", want " ++ str.from_i64(val: want))
+  end
+end
+
+let main = fn () -> unit require { PermConsole } throws { RuntimeError } do
+  inject stdio.system_handler do
+    // Resume frame has fully exited by the time nested() returns, so this
+    // assert runs outside any resume frame (twyov-safe).
+    let n = nested()
+    assert_i64(label: "nested-kont-inject-value", got: n, want: 60)
+    Console.println(val: "ok")
+  end
+end
