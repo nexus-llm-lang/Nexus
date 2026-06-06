@@ -1,0 +1,151 @@
+/**
+ * typecheck/linearity/residual_escape: T-TryCatch ρ_residual escape detection.
+ *
+ * Determines whether a `try … catch …` body contains a throw point (a
+ * throwable call or a literal `raise Ctor`) whose thrown variant(s) ESCAPE the
+ * try's catch arm — i.e. ρ_residual ≠ ∅. When true, there is an execution path
+ * that exits the try (and the enclosing function) WITHOUT running any catch
+ * arm, so outer linears not consumed before that escape point leak.
+ *
+ * The linearity walker (`walk.nx`) consults `try_body_has_residual_escape`
+ * when checking a `Try` statement: on a residual-escape path the only outer
+ * linears reclaimed are those consumed BEFORE the escape, so any outer linear
+ * still live there is a leak.
+ *
+ * Conservative on direction: a call whose throws-row this pass cannot pin to
+ * concrete constructors (poly tail / missing sig) contributes nothing — the
+ * same leniency `row_is_throwable`/`scan_stmts_until_throw` already adopt, so
+ * this never introduces a false-positive over the existing throwable-call
+ * machinery. Only structurally-evident escapes (a concrete uncaught ctor in a
+ * callee row, or a literal `raise Ctor` of an uncaught variant) drive the
+ * strict all-divergent try-body-consumption clause.
+ */
+
+import {
+  TypeExpr,
+  TyUserDefined,
+  TyRow
+} from "src/types/type_expr.nx"
+import {
+  HirStmt, HirStmtKind, HirExpr
+} from "src/ir/hir/types.nx"
+import { str_member } from "src/typecheck/linearity/state.nx"
+import { SigEntry, sig_lookup } from "src/typecheck/linearity/sig_map.nx"
+import { Option, Some, None } from "std:option"
+
+/** Extract the exception-constructor names named by a throws-row `TyRow`.
+ *  Each row entry for a concrete exception is a `TyUserDefined(name, _)`;
+ *  a `TyVar`/poly tail contributes nothing concrete. The catch-all sentinel
+ *  is never produced here (rows name constructors, not catch-alls). */
+let row_variant_names = fn (eff_row: TypeExpr, acc: [ string ]) -> [ string ] do
+  match eff_row do
+    | TyRow(types: ts, rest: _) -> return row_variant_names_list(ts, acc)
+    | _ -> return acc
+  end
+end
+
+let row_variant_names_list = fn (ts: [ TypeExpr ], acc: [ string ]) -> [ string ] do
+  match ts do
+    | [] -> return acc
+    | t :: rest ->
+      let acc1 = match t do
+        | TyUserDefined(name: n, args: _) -> n :: acc
+        | _ -> acc
+      end
+      return row_variant_names_list(ts: rest, acc: acc1)
+  end
+end
+
+/** True when any variant in `variants` is NOT covered by `local_caught` — i.e.
+ *  it would propagate past this try's catch arm (contributes to ρ_residual).
+ *  A catch-all `"Exn"` in `local_caught` covers everything → no escape. */
+let any_variant_escapes = fn (variants: [ string ], local_caught: [ string ]) -> bool do
+  if str_member(xs: local_caught, target: "Exn") then return false end
+  return any_variant_escapes_go(variants, local_caught)
+end
+
+let any_variant_escapes_go = fn (variants: [ string ], local_caught: [ string ]) -> bool do
+  match variants do
+    | [] -> return false
+    | v :: rest ->
+      if !str_member(xs: local_caught, target: v) then return true end
+      return any_variant_escapes_go(variants: rest, local_caught)
+  end
+end
+
+/** does the try-body `stmts` contain a throw point (throwable
+ *  call or `raise V`) whose thrown variant(s) ESCAPE this try's catch arm —
+ *  i.e. ρ_residual ≠ ∅? When true, there is an execution path that exits the
+ *  try (and the enclosing function) without running any catch arm, so outer
+ *  linears not consumed before that escape point leak.
+ *
+ *  Conservative on direction: a call whose throws-row this pass cannot pin to
+ *  concrete constructors (poly tail / missing sig) contributes nothing — the
+ *  same leniency `row_is_throwable`/`scan_stmts_until_throw` already adopt, so
+ *  this never introduces a false-positive over the existing throwable-call
+ *  machinery. Only structurally-evident escapes (concrete uncaught ctor in a
+ *  callee row, or a literal `raise Ctor` of an uncaught variant) drive the
+ *  strict all-divergent try-body-consumption clause. */
+export let try_body_has_residual_escape = fn (
+  stmts: [ HirStmt ], local_caught: [ string ], sigs: [ SigEntry ]
+) -> bool do
+  match stmts do
+    | [] -> return false
+    | HirStmt(node: nd, span: _) :: rest ->
+      if stmt_has_residual_escape(stmt: nd, local_caught, sigs) then return true end
+      return try_body_has_residual_escape(stmts: rest, local_caught, sigs)
+  end
+end
+
+let stmt_has_residual_escape = fn (
+  stmt: HirStmtKind, local_caught: [ string ], sigs: [ SigEntry ]
+) -> bool do
+  match stmt do
+    | Let(
+      name: _,
+      sigil: _,
+      typ: _,
+      value: e
+    ) -> return expr_has_residual_escape(expr: e, local_caught, sigs)
+    | Expr(expr: e) -> return expr_has_residual_escape(expr: e, local_caught, sigs)
+    | Return(expr: e) -> return expr_has_residual_escape(expr: e, local_caught, sigs)
+    | Assign(target: t, value: v) ->
+      if expr_has_residual_escape(expr: t, local_caught, sigs) then return true end
+      return expr_has_residual_escape(expr: v, local_caught, sigs)
+    // A NESTED try/catch handles its own residual locally; do not descend — a
+    // throw it doesn't catch surfaces here as the call/raise that wraps it.
+    | Try(body: _, catch_param: _, catch_body: _) -> return false
+    | Inject(
+      handlers: _,
+      body: b
+    ) -> return try_body_has_residual_escape(stmts: b, local_caught, sigs)
+  end
+end
+
+let expr_has_residual_escape = fn (
+  expr: HirExpr, local_caught: [ string ], sigs: [ SigEntry ]
+) -> bool do
+  let HirExpr(node: nd, span: _) = expr
+  match nd do
+    | Call(func: f, args: _) ->
+      match sig_lookup(sigs, name: f) do
+        | None -> return false
+        | Some(val: SigEntry(name: _, type_params: _, param_labels: _, param_types: _, ret_type: _, throw_row: tw)) ->
+          return any_variant_escapes(
+            variants: row_variant_names(eff_row: tw, acc: []),
+            local_caught
+          )
+      end
+    | Raise(expr: rv) ->
+      let HirExpr(node: rn, span: _) = rv
+      match rn do
+        // A literal `raise Ctor(...)` of a variant the catch does not cover
+        // escapes; a computed/re-raised value is conservatively Exn-typed and
+        // treated as covered by the local catch reconciliation (no escape).
+        | Ctor(variant: v, args: _, labels: _, sigil: _) ->
+          return any_variant_escapes(variants: v :: [], local_caught)
+        | _ -> return false
+      end
+    | _ -> return false
+  end
+end
