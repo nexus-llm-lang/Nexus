@@ -40,6 +40,44 @@ import { lint_program, format_finding } from "src/lint/lint.nx"
 import { apply_suppressions } from "src/lint/suppress.nx"
 import { lint_design_authority } from "src/lint/rules/design_authority.nx"
 
+/**
+ * `Trace` is a minimal, build-time diagnostic capability for the lint hook.
+ * It exists to route the lint pass's scattered debug output through an effect
+ * handler rather than a bare `Console.eprintln`, so the verbose-vs-quiet choice
+ * is a handler swap at the inject site instead of an `if verbose` guard at each
+ * emit point.
+ *
+ * The two handlers below are deliberately written in the continuation-binder
+ * (`with @k`) "around-advice" form: each `event` arm gets the suspended
+ * continuation `@k` of the lint pass and decides whether to act *around* it.
+ * The verbose handler logs a framed line and *then* resumes `@k`
+ * (log-then-continue around-advice); the no-op handler resumes `@k` immediately
+ * with no emission, so the default build path is byte-for-byte unchanged.
+ */
+export cap Trace do
+  fn event(msg: string) -> unit
+end
+
+/** Verbose `Trace` handler: around-advice that frames the message with a
+ *  `[lint-trace]` prefix on stderr and then resumes the lint pass via `@k`.
+ *  The `with @k` form is what makes this "around" the call rather than a
+ *  replacement: the emit happens, control returns to the suspended pass. */
+export let trace_verbose_handler = handler Trace require { Console } do
+  fn event(msg: string) -> unit with @k do
+    Console.eprintln(val: "[lint-trace] " ++ msg)
+    @k
+  end
+end
+
+/** No-op `Trace` handler (production/default): resumes `@k` without emitting,
+ *  so wiring `Trace.event(...)` into the lint path costs nothing on a normal
+ *  build. */
+export let trace_noop_handler = handler Trace do
+  fn event(msg: string) -> unit with @k do
+    @k
+  end
+end
+
 /** Escalation policy for lint findings on the build path. */
 export type LintBuildPolicy = LintBuildPolicy(
   enabled: bool,
@@ -185,14 +223,47 @@ export let run_lint_on_build = fn (
   src: string,
   file: string,
   policy: LintBuildPolicy
-) -> i64 require { Console } do
+) -> i64 require { Console, Trace } do
   let LintBuildPolicy(enabled, level_error: _, deny_codes: _) = policy
   if !enabled then return 0 end
   let ast_findings = lint_program(prog)
   let src_findings = lint_design_authority(src)
+  // Route the lint pass's debug diagnostics through the `Trace` around-advice
+  // cap. The caller injects the verbose handler (frames each event on stderr,
+  // then resumes `@k`) under a debug/verbose toggle, or the no-op handler
+  // (resumes `@k` silently) by default — so a normal build is unchanged.
+  Trace.event(msg: file ++ ": " ++ str.from_i64(val: list.length(xs: ast_findings))
+    ++ " AST finding(s), " ++ str.from_i64(val: list.length(xs: src_findings))
+    ++ " source finding(s)")
   let raw = list.concat(xs: ast_findings, ys: src_findings)
   let suppressed = apply_suppressions(src, findings: raw)
   let promoted = apply_policy(findings: suppressed, policy, acc: [])
+  let errors = count_errors(findings: promoted)
+  Trace.event(msg: file ++ ": " ++ str.from_i64(val: errors)
+    ++ " finding(s) promoted to errors")
   emit_findings(file, findings: promoted)
-  return count_errors(findings: promoted)
+  return errors
+end
+
+/** Build-path entry: select the `Trace` around-advice handler from the build's
+ *  verbose toggle and run the lint pass under a single injected handler. The
+ *  verbose handler frames each `Trace.event` on stderr then resumes `@k`; the
+ *  no-op handler resumes silently, so a normal (non-verbose) build emits no new
+ *  output. One inject per build keeps the continuation frame shallow. */
+export let run_lint_on_build_traced = fn (
+  prog: Program,
+  src: string,
+  file: string,
+  policy: LintBuildPolicy,
+  verbose: bool
+) -> i64 require { Console } do
+  if verbose then
+    inject trace_verbose_handler do
+      run_lint_on_build(prog, src, file, policy)
+    end
+  else
+    inject trace_noop_handler do
+      run_lint_on_build(prog, src, file, policy)
+    end
+  end
 end

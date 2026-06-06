@@ -1,0 +1,93 @@
+// Pilot adoption of `with @k` (continuation-binder "around-advice") in real
+// compiler code: the lint hook's `Trace` capability. This test exercises the
+// SAME cap + two handler shapes that src/cli/lint_on_build.nx wires into the
+// build-time lint pass, end-to-end and assert-based.
+//
+// `Trace.event(msg)` is an around-advice point: each call SUSPENDS into the
+// active handler arm, the arm decides whether to act, then `@k` RESUMES the
+// suspended pass so it continues to the next statement.
+//
+//   - The verbose handler logs a framed line on stderr and then resumes `@k`
+//     (log-then-continue). Because it resumes, the body runs to completion and
+//     its running accumulator threads ACROSS every suspend/resume boundary.
+//   - The no-op handler resumes `@k` without emitting, so the body still runs
+//     to completion but nothing is logged (the default-build invariant).
+//
+// The test asserts the body's accumulator arrives in order under BOTH handlers
+// (proving the round-trip in each), and that the verbose run and the no-op run
+// compute the identical value (proving the handler swap changes only the
+// emission side-channel, not control flow). A regression would trap on an
+// unhandled suspend, fail to resume (wrong/short accumulator), or diverge
+// between the two handlers.
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+
+// Mirror of the lint hook's pilot cap.
+cap Trace do
+  fn event(msg: string) -> unit
+end
+
+// Verbose around-advice: frame on stderr, then resume `@k`.
+let trace_verbose = handler Trace require { Console } do
+  fn event(msg: string) -> unit with @k do
+    Console.eprintln(val: "[lint-trace] " ++ msg)
+    @k
+  end
+end
+
+// No-op: resume `@k` with no emission (production default).
+let trace_noop = handler Trace do
+  fn event(msg: string) -> unit with @k do
+    @k
+  end
+end
+
+let assert_i64 = fn (label: string, got: i64, want: i64) -> unit throws { RuntimeError } do
+  if !(got == want) then
+    throw RuntimeError(val: label ++ ": got " ++ str.from_i64(val: got) ++ ", want " ++ str.from_i64(val: want))
+  end
+end
+
+// A "lint pass": three Trace.event around-advice points, each followed by a
+// step that adds to a running sum. Each event must suspend into the active
+// handler and resume so the next addend runs. Final sum = 1+2+3 = 6.
+let traced_pass = fn () -> i64 require { Trace } do
+  Trace.event(msg: "begin")
+  let s1 = 1
+  Trace.event(msg: "after-1")
+  let s2 = s1 + 2
+  Trace.event(msg: "after-2")
+  let s3 = s2 + 3
+  Trace.event(msg: "end")
+  return s3
+end
+
+// Verbose handler: logs four framed lines on stderr AND resumes each time, so
+// the pass runs to completion and surfaces its trailing value.
+let run_verbose = fn () -> i64 require { Console } do
+  inject trace_verbose do
+    traced_pass()
+  end
+end
+
+// No-op handler: emits nothing, still resumes, so the pass surfaces the
+// identical trailing value — the handler swap is emission-only.
+let run_noop = fn () -> i64 do
+  inject trace_noop do
+    traced_pass()
+  end
+end
+
+let main = fn () -> unit require { PermConsole } throws { RuntimeError } do
+  inject stdio.system_handler do
+    let v = run_verbose()
+    assert_i64(label: "verbose-round-trip", got: v, want: 6)
+
+    let n = run_noop()
+    assert_i64(label: "noop-round-trip", got: n, want: 6)
+
+    assert_i64(label: "handlers-agree", got: v, want: n)
+    Console.println(val: "ok")
+  end
+end

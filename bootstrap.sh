@@ -132,7 +132,11 @@ ok "Stage 2 complete: $STAGE2 ($(wc -c < "$STAGE2" | tr -d ' ') bytes)"
 
 # Validate stage2 as a well-formed wasm module. wasmtime run exit 0 only means
 # stage1 ran to completion; it does not check the bytes stage1 emitted.
-if ! wasm-tools validate "$STAGE2" 2>&1; then
+# Enable the stack-switching proposal: the compiler emits `cont` types for
+# `with @k` continuation handlers (now used in compiler code, e.g. the lint
+# hook's Trace cap), and stack-switching is below wasm-tools' default phase-4
+# feature floor. This mirrors the WASMTIME_FLAGS the staged modules run under.
+if ! wasm-tools validate --features stack-switching "$STAGE2" 2>&1; then
   fail "Stage 2 failed validation — src produced an ill-formed wasm module."
 fi
 ok "Stage 2 passes wasm-tools validate"
