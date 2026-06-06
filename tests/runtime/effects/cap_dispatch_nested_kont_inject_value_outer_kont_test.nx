@@ -1,0 +1,88 @@
+// Regression (nexus-spffk): a VALUE-yielding `with @k` (kont) inject nested
+// directly inside an OUTER `with @k` (kont) inject for the SAME 2-handler cap
+// must surface the inner inject's trailing value — it was dropped (returned 0)
+// before the fix. This is the OUTER-KONT sibling of
+// `cap_dispatch_nested_kont_inject_value_test.nx` (which covers OUTER-PLAIN,
+// fixed by commit d64385b2).
+//
+// Two handlers for the same cap (`kont_outer` + `kont_inner`) force the runtime
+// dispatcher. Because the OUTER inject is itself a `with @k` inject, its body
+// (which contains the inner inject) is LIFTED to a separate `__inject_N`
+// function and the outer inject becomes a single `MirStmtInjectResume`. The
+// outer inject's value channel is classified by `mir_inject_result_type` over
+// that lifted body. The bug: when the lifted body's TRAILING statement was the
+// inner value-yielding `MirStmtInjectResume`, `mir_inject_result_type` had no
+// `MirStmtInjectResume` case and fell to `| _ -> TyUnit`, so the outer inject
+// was classified unit. Its `MirStmtInjectResume.ret_type` was then TyUnit, so
+// `wrap_inject_resume_register` buried the resume in a value-dropping `try` and
+// `lir_lower_stmts` dropped the trailing value — yielding 0 instead of 60.
+//
+// The fix teaches `mir_inject_result_type` to inherit a trailing nested
+// `MirStmtInjectResume`'s value channel, so a value-yielding inner inject makes
+// the enclosing inject value-yielding too. Then the wrap's existing value
+// branch keeps `inject_resume` trailing and `lir_lower_stmts` surfaces it.
+//
+// twyov constraint (upstream wasmtime, nexus-twyov): a `resume` followed by any
+// host-ward unwind (uncaught throw / trap / proc_exit) crashes the runtime. So
+// the success path must NOT throw after a resume. The inject value is read back
+// AFTER the resume frame has fully exited (`nested()` has returned), so the
+// assert runs outside any resume frame. With the fix the value is correct, the
+// assert does not throw, and the test exits 0. (A regression would surface as a
+// non-zero exit, which `nexus test` treats as failure.)
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+
+cap Ev do
+  fn emit() -> i64
+end
+
+// First-declared handler for Ev: `with @k` arm, injected as the OUTER scope.
+// Two handlers force the runtime dispatcher.
+let kont_outer = handler Ev do
+  fn emit() -> i64 with @k do
+    @k
+  end
+end
+
+// Second handler for Ev: `with @k` arm, injected dynamically-INNERMOST. `@k`
+// resumes the suspended body so it continues to the next statement.
+let kont_inner = handler Ev do
+  fn emit() -> i64 with @k do
+    @k
+  end
+end
+
+// OUTER value-yielding kont inject, INNER value-yielding kont inject for the
+// SAME cap. The inner inject's trailing value is accumulated across three
+// suspend/resume boundaries (10 + 20 + 30 = 60) and must surface as the nested
+// injects' value out through the OUTER kont inject.
+let nested = fn () -> i64 do
+  inject kont_outer do
+    inject kont_inner do
+      let _a = Ev.emit()
+      let s1 = 10
+      let _b = Ev.emit()
+      let s2 = s1 + 20
+      let _c = Ev.emit()
+      let total = s2 + 30
+      total
+    end
+  end
+end
+
+let assert_i64 = fn (label: string, got: i64, want: i64) -> unit throws { RuntimeError } do
+  if !(got == want) then
+    throw RuntimeError(val: label ++ ": got " ++ str.from_i64(val: got) ++ ", want " ++ str.from_i64(val: want))
+  end
+end
+
+let main = fn () -> unit require { PermConsole } throws { RuntimeError } do
+  inject stdio.system_handler do
+    // Resume frame has fully exited by the time nested() returns, so this
+    // assert runs outside any resume frame (twyov-safe).
+    let n = nested()
+    assert_i64(label: "nested-kont-inject-value-outer-kont", got: n, want: 60)
+    Console.println(val: "ok")
+  end
+end
