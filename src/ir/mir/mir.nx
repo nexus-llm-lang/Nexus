@@ -333,8 +333,6 @@ let lower_stmt = fn (
             value_binding_names: vbns2,
             thunk_param_names: tpn2
           ) = ctx2
-          let restored = MirCtx(scope, cap_layouts: pl2, handler_cap_names: hpn2,
-                                all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc2, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
           // Build the env object from the captured enclosing variables (in scope
           // here at the inject site) and hand it off through the fixed inject-env
           // cell right before the resume frame runs; `__inject_N` reads it back.
@@ -348,9 +346,35 @@ let lower_stmt = fn (
             args: [ MirCallArg(label: "env", value: env_obj) ],
             ret_type: TyUnit
           ))
+          let inject_resume = MirStmtInjectResume(body_fn: bfn, handler_arm_fns: arm_fns, handler_arm_tags: arm_tags, ret_type: inj_rt)
+          // For each injected handler whose cap dispatches dynamically (>=2
+          // handler bindings program-wide), push its handler id onto the cap's
+          // register slot for the dynamic extent of the resume frame and restore
+          // it on exit — EXACTLY as the non-kont inject path does via
+          // `wrap_inject_register`. Without this, a `with @k` inject leaves the
+          // cap's `__hreg` slot holding an enclosing (e.g. outer plain) handler's
+          // id, so a same-cap call inside the body dispatches to the WRONG
+          // handler, violating inner-shadows-outer. The runtime dispatcher's
+          // with-kont arm only fires when the slot holds THIS kont handler's id.
+          let runtime_hs = runtime_dispatch_handlers(
+            handler_names: hs,
+            handler_cap_names: hpn2,
+            cap_layouts: pl2,
+            bindings: ah2
+          )
+          let wrapped = wrap_inject_resume_register(
+            runtime_hs,
+            env_set,
+            inject_resume,
+            ret_type: inj_rt,
+            uniq: cc2
+          )
+          let cc3 = match runtime_hs do | [] -> cc2 | _ -> cc2 + 1 end
+          let restored3 = MirCtx(scope, cap_layouts: pl2, handler_cap_names: hpn2,
+                                 all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc3, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
           return MirStmtsResult(
-            ctx: restored,
-            stmts: [ env_set, MirStmtInjectResume(body_fn: bfn, handler_arm_fns: arm_fns, handler_arm_tags: arm_tags, ret_type: inj_rt) ]
+            ctx: restored3,
+            stmts: wrapped
           )
       end
       // No with-kont arms: existing behaviour — inline body under injected scope.
@@ -677,6 +701,60 @@ let build_restores = fn (
         ret_type: TyUnit
       ))
       return build_restores(runtime_hs: rest, uniq, idx: idx + 1, acc: stmt :: acc)
+  end
+end
+
+/** Wrap a `with @k` inject's `[env_set, inject_resume]` so each runtime-dispatch
+ *  cap's register slot holds its injected handler's id for the dynamic extent of
+ *  the resume frame, then is restored on exit. This is the kont-arm analogue of
+ *  `wrap_inject_register` (non-kont path). It is required so that a same-cap call
+ *  reached inside the body dispatches to THIS injected handler — without it the
+ *  slot keeps an enclosing (e.g. outer plain) handler's id and the dispatcher
+ *  forwards to the wrong handler, violating inner-shadows-outer.
+ *
+ *  - With no runtime handlers (single-handler caps), returns the pair unchanged.
+ *  - For a unit-yielding inject, wraps in `saves; sets; try { env_set;
+ *    inject_resume; restores } catch e { restores; throw e }` so the slot is
+ *    restored on normal AND exceptional exit.
+ *  - For a value-yielding inject, `inject_resume` must remain the trailing
+ *    statement for `lir_lower_stmts` to surface the body's value (delivered
+ *    out-of-band via the ss_inject_value global). We therefore emit
+ *    `saves; sets; env_set; inject_resume` and rely on the enclosing inject's
+ *    own wrap to restore the slot: a trailing value-inject is the function's
+ *    last statement, so any later same-cap call in the dynamic scope occurs in
+ *    an OUTER inject whose wrap restores the slot. Burying inject_resume inside
+ *    a try would drop its value (try bodies do not capture trailing exprs). */
+let wrap_inject_resume_register = fn (
+  runtime_hs: [ RuntimeHandler ],
+  env_set: MirStmt,
+  inject_resume: MirStmt,
+  ret_type: TypeExpr,
+  uniq: i64
+) -> [ MirStmt ] do
+  match runtime_hs do
+    | [] -> return [ env_set, inject_resume ]
+    | _ ->
+      let saves = build_saves(runtime_hs, uniq, idx: 0, acc: [])
+      let sets = build_sets(runtime_hs, acc: [])
+      let restores = build_restores(runtime_hs, uniq, idx: 0, acc: [])
+      match ret_type do
+        | TyUnit ->
+          let exn_name = "__hexn_" ++ i64_to_str(uniq)
+          let try_body = concat_mir_stmts(
+            a: [ env_set, inject_resume ],
+            b: restores
+          )
+          let catch_body = concat_mir_stmts(
+            a: restores,
+            b: [ MirStmtExpr(expr: MirRaise(expr: MirVariable(name: exn_name))) ]
+          )
+          let try_stmt = MirStmtTry(body: try_body, catch_param: exn_name, catch_body)
+          return concat_mir_stmts(a: saves, b: concat_mir_stmts(a: sets, b: [ try_stmt ]))
+        | _ ->
+          // Value-yielding: keep inject_resume trailing so its out-of-band value
+          // is captured; enclosing inject's wrap restores the slot (see above).
+          return concat_mir_stmts(a: saves, b: concat_mir_stmts(a: sets, b: [ env_set, inject_resume ]))
+      end
   end
 end
 
