@@ -221,45 +221,89 @@ export let infer_stmt_impl = fn (
         infer_stmts_fn
       )
     | Inject(handlers, body) ->
-      // Step 1: verify all handler names are bound and not thunks.
-      match check_handlers_bound(state, handlers, span) do
-        | InferExprErr(message: m, span: esp) -> return InferExprErr(message: m, span: esp)
-        | InferExprOk(_) ->
-          // Step 2: T-Inject ∀i≠j. P_i ≠ P_j — injection uniqueness.
-          // Each cap may appear at most once in an inject site.
-          check_inject_uniqueness(state, handlers, seen: [], span)
-          // Step 3: T-Inject ∀i. ρ_i ⊆ ρ_q — handler require ⊆ ambient.
-          // Each handler's declared require row must be a subset of the
-          // enclosing function's ambient require row.
-          let ambient_req = tctypes.state_require_row(state)
-          check_inject_require_subset(state, handlers, ambient: ambient_req, span)
-          // T-Inject: ρ_q' = merge(ρ_q, {P̄}) — extend the ambient require_row
-          // with the injected cap names so that nested inject sites inside
-          // the body see them as available capabilities.
-          let body_req = extend_require_row(state, handlers, ambient: ambient_req)
-          let body_state0 = tctypes.state_with_require_row(state, require_row: body_req)
-          // Generic-cap soundness: inside this inject, shadow each injected
-          // generic-cap handler's `<cap>.<method>` call-site scheme with the
-          // CONCRETE instantiation recorded for that specific handler binding
-          // (its arm signature). A call at one element type under a handler for
-          // a different element type then fails to unify and is rejected, instead
-          // of silently type-confusing through the free `forall T` poly scheme
-          // (which would miscompile to an OOB memory access). Monomorphic-cap
-          // handlers have no `__handlerinst::` entries → this is a no-op for them.
-          let shadowed_env = apply_injected_handler_instances(
-            env: tctypes.state_env(body_state0), handler_names: handlers)
-          let body_state = tctypes.state_with_env(state: body_state0, env: shadowed_env)
-          // T-Inject: close the block scope — bindings introduced
-          // inside the inject body must not leak past `end`. Mirrors the env
-          // pop in infer_match_cases/infer_try.
-          match infer_stmts_fn(state: body_state, stmts: body, ret_type) do
-            | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
-            | InferExprOk(state: st1, subst: s1, typ: t) ->
-              let st2 = tctypes.state_with_env(state: st1, env: tctypes.state_env(state))
-              return InferExprOk(state: st2, subst: s1, typ: t)
-          end
+      // Statement-position inject: type the body via the shared T-Inject helper.
+      // The body's trailing-value type is computed but discarded at statement
+      // position (a statement has no value). The EXPRESSION form
+      // (`infer_inject_expr`) calls the SAME helper and keeps that type.
+      return infer_inject_body(state, handlers, body, ret_type, span, infer_stmts_fn)
+  end
+end
+
+/** Shared T-Inject body typing for BOTH the statement form (Inject member of
+ *  HirStmtKind) and the expression form (Inject member of HirExprKind). Runs
+ *  the T-Inject premise checks (handlers bound, ∀i≠j. P_i ≠ P_j, ∀i. ρ_i ⊆ ρ_q),
+ *  extends the ambient require row with the injected caps, shadows generic-cap
+ *  call-site schemes with their concrete handler instantiations, types the body,
+ *  and closes the block scope. Returns the body's trailing-value type as `typ`;
+ *  the statement arm ignores it, the expression form surfaces it. */
+export let infer_inject_body = fn (
+  state: CheckState,
+  handlers: [ string ],
+  body: [ HirStmt ],
+  ret_type: TypeExpr,
+  span: Span,
+  infer_stmts_fn: (
+    state: CheckState,
+    stmts: [ HirStmt ],
+    ret_type: TypeExpr
+  ) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  // Step 1: verify all handler names are bound and not thunks.
+  match check_handlers_bound(state, handlers, span) do
+    | InferExprErr(message: m, span: esp) -> return InferExprErr(message: m, span: esp)
+    | InferExprOk(_) ->
+      // Step 2: T-Inject ∀i≠j. P_i ≠ P_j — injection uniqueness.
+      // Each cap may appear at most once in an inject site.
+      check_inject_uniqueness(state, handlers, seen: [], span)
+      // Step 3: T-Inject ∀i. ρ_i ⊆ ρ_q — handler require ⊆ ambient.
+      // Each handler's declared require row must be a subset of the
+      // enclosing function's ambient require row.
+      let ambient_req = tctypes.state_require_row(state)
+      check_inject_require_subset(state, handlers, ambient: ambient_req, span)
+      // T-Inject: ρ_q' = merge(ρ_q, {P̄}) — extend the ambient require_row
+      // with the injected cap names so that nested inject sites inside
+      // the body see them as available capabilities.
+      let body_req = extend_require_row(state, handlers, ambient: ambient_req)
+      let body_state0 = tctypes.state_with_require_row(state, require_row: body_req)
+      // Generic-cap soundness: inside this inject, shadow each injected
+      // generic-cap handler's `<cap>.<method>` call-site scheme with the
+      // CONCRETE instantiation recorded for that specific handler binding
+      // (its arm signature). A call at one element type under a handler for
+      // a different element type then fails to unify and is rejected, instead
+      // of silently type-confusing through the free `forall T` poly scheme
+      // (which would miscompile to an OOB memory access). Monomorphic-cap
+      // handlers have no `__handlerinst::` entries → this is a no-op for them.
+      let shadowed_env = apply_injected_handler_instances(
+        env: tctypes.state_env(body_state0), handler_names: handlers)
+      let body_state = tctypes.state_with_env(state: body_state0, env: shadowed_env)
+      // T-Inject: close the block scope — bindings introduced
+      // inside the inject body must not leak past `end`. Mirrors the env
+      // pop in infer_match_cases/infer_try.
+      match infer_stmts_fn(state: body_state, stmts: body, ret_type) do
+        | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
+        | InferExprOk(state: st1, subst: s1, typ: t) ->
+          let st2 = tctypes.state_with_env(state: st1, env: tctypes.state_env(state))
+          return InferExprOk(state: st2, subst: s1, typ: t)
       end
   end
+end
+
+/** Expression-form inject: type as the body's trailing-value type. Reuses the
+ *  shared T-Inject body typing; the returned `typ` is the inject expression's
+ *  type (usable in `let x = inject …`, `return inject …`, argument position). */
+export let infer_inject_expr = fn (
+  state: CheckState,
+  handlers: [ string ],
+  body: [ HirStmt ],
+  ret_type: TypeExpr,
+  span: Span,
+  infer_stmts_fn: (
+    state: CheckState,
+    stmts: [ HirStmt ],
+    ret_type: TypeExpr
+  ) -> InferExprResult throws { TypeError }
+) -> InferExprResult throws { TypeError } do
+  return infer_inject_body(state, handlers, body, ret_type, span, infer_stmts_fn)
 end
 
 export let infer_let_impl = fn (

@@ -308,6 +308,41 @@ let lower_stmt = fn (
           )
 
     | Inject(handlers: hs, body: b) ->
+      // Statement-position inject: emit the inject statement sequence directly.
+      // The expression form (lower_expr's Inject arm) calls the SAME builder and
+      // wraps its output in MirInjectValue so the trailing value can be captured.
+      // The value channel type is discarded here (a statement has no value).
+      let InjectBuildResult(ctx: ctx2, stmts: inj_stmts, ret_type: _) = build_inject_stmts(
+        handlers: hs, body: b, span, ctx)
+      return MirStmtsResult(ctx: ctx2, stmts: inj_stmts)
+  end
+end
+
+/** Result of build_inject_stmts: the inject's lowered statement sequence plus
+ *  the body's trailing-value channel type (TyUnit for value-less bodies). The
+ *  statement form discards `ret_type`; the expression form (MirInjectValue)
+ *  uses it to type the captured value. */
+type InjectBuildResult = InjectBuildResult(ctx: MirCtx, stmts: [ MirStmt ], ret_type: TypeExpr)
+
+/** Build the MIR statement sequence for an inject, given its handler names and
+ *  body. Shared by the statement form (the Inject arm of lower_stmt above) and
+ *  the expression form (the Inject arm of lower_expr, via MirInjectValue). The
+ *  produced sequence carries the body's trailing value through the existing
+ *  inject value-channel — the trailing `MirStmtExpr(__hval_N)` (plain path) or
+ *  trailing `MirStmtInjectResume` (with-@k path) — so a value context can read
+ *  it back via `lir_lower_stmts`. `ret_type` records that channel's type,
+ *  computed from the PRE-wrap body exactly as the inject statement path does
+ *  (kont: from `lift_inject_body`; plain: `mir_inject_result_type` of the
+ *  inlined body), so a unit-valued plain inject under runtime dispatch is not
+ *  mis-typed by the `__hval_N` slot. */
+let build_inject_stmts = fn (
+  handlers: [ string ],
+  body: [ HirStmt ],
+  span: Span,
+  ctx: MirCtx
+) -> InjectBuildResult throws { MirError } do
+  let hs = handlers
+  let b = body
       let MirCtx(
         scope,
         cap_layouts: pl,
@@ -390,9 +425,10 @@ let lower_stmt = fn (
           let cc3 = match runtime_hs do | [] -> cc2 | _ -> cc2 + 1 end
           let restored3 = MirCtx(scope, cap_layouts: pl2, handler_cap_names: hpn2,
                                  all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc3, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
-          return MirStmtsResult(
+          return InjectBuildResult(
             ctx: restored3,
-            stmts: wrapped
+            stmts: wrapped,
+            ret_type: inj_rt
           )
       end
       // No with-kont arms: existing behaviour — inline body under injected scope.
@@ -425,8 +461,11 @@ let lower_stmt = fn (
         let cc3 = match runtime_hs do | [] -> cc2 | _ -> cc2 + 1 end
         let restored = MirCtx(scope, cap_layouts: pl2, handler_cap_names: hpn2,
                               all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc3, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
-        return MirStmtsResult(ctx: restored, stmts: wrapped)
-  end
+        // Classify the value channel from the PRE-wrap inlined body (the wrap only
+        // threads that trailing value through the __hval_N slot; it does not change
+        // its type). A value-less body → TyUnit, so the expression form yields unit.
+        let inj_rt = mir_inject_result_type(stmts: lowered)
+        return InjectBuildResult(ctx: restored, stmts: wrapped, ret_type: inj_rt)
 end
 
 /** A runtime-dispatch handler activation in an inject: the cap's register slot
@@ -669,6 +708,13 @@ let rewrite_returns_in_expr = fn (
     | MirBlock(stmts: ss) ->
       let ss2 = rewrite_returns_in_stmts(stmts: ss, restores, ret_tmp)
       return MirBlock(stmts: ss2)
+    | MirInjectValue(stmts: ss, ret_type: rt) ->
+      // A nested inject-expression's statements are inlined into THIS function
+      // (not separately lifted, unlike MirStmtInjectResume), so a `return` inside
+      // its body returns from the enclosing function — it must get the same
+      // restore-before-return rewrite as any other inline return.
+      let ss2 = rewrite_returns_in_stmts(stmts: ss, restores, ret_tmp)
+      return MirInjectValue(stmts: ss2, ret_type: rt)
     | _ -> return expr
   end
 end
@@ -868,6 +914,7 @@ let mir_inject_result_type = fn (stmts: [ MirStmt ]) -> TypeExpr do
             | MirResume(cont_var: _, value: _, ret_type: rt) -> return mir_value_channel(rt)
             | MirWhile(cond: _, body: _) -> return TyUnit
             | MirBlock(stmts: _) -> return TyUnit
+            | MirInjectValue(stmts: _, ret_type: rt) -> return mir_value_channel(rt)
             | _ -> return TyI64
           end
         | MirStmtInjectResume(body_fn: _, handler_arm_fns: _, handler_arm_tags: _, ret_type: inner_rt, handler_arm_cont_binders: _) ->
@@ -932,6 +979,11 @@ let mir_expr_has_value_return = fn (expr: MirExpr) -> bool do
     | MirMatch(target: _, cases: cs) -> return mir_cases_have_value_return(cases: cs)
     | MirWhile(cond: _, body: b) -> return mir_stmts_have_value_return(stmts: b)
     | MirBlock(stmts: ss) -> return mir_stmts_have_value_return(stmts: ss)
+    | MirInjectValue(stmts: ss, ret_type: _) ->
+      // A nested inject-expression is inlined; a value-`return` inside its body
+      // exits the enclosing function with a value, so it counts for the enclosing
+      // inject's value-channel classification (same as MirBlock).
+      return mir_stmts_have_value_return(stmts: ss)
     | _ -> return false
   end
 end
@@ -1275,6 +1327,18 @@ let lower_expr = fn (expr: HirExpr, ctx: MirCtx) -> MirExprResult throws { MirEr
       return MirExprResult(ctx, expr: MirVariable(name: sym))
     | Handler(_) ->
       return MirExprResult(ctx, expr: MirLiteral(lit: LitUnit))
+    | Inject(handlers: hs, body: b) ->
+      // inject in EXPRESSION position. Build the SAME statement sequence the
+      // inject statement produces (handler register save/set/restore + body),
+      // then wrap it in a value-carrying MirInjectValue so the body's trailing
+      // value — surfaced by the existing inject value-channel — becomes this
+      // expression's value. `mir_inject_result_type` classifies that channel's
+      // type (TyUnit for value-less bodies). No new runtime mechanism: this just
+      // routes the channel into expression position.
+      let HirExpr(node: _, span: isp) = expr
+      let InjectBuildResult(ctx: ctx2, stmts: inj_stmts, ret_type: inj_rt) = build_inject_stmts(
+        handlers: hs, body: b, span: isp, ctx)
+      return MirExprResult(ctx: ctx2, expr: MirInjectValue(stmts: inj_stmts, ret_type: inj_rt))
   end
 end
 
