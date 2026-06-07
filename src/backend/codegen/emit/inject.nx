@@ -129,12 +129,22 @@ export let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm
   // br back to @loop so the fibers drain. The dequeue op resolves to the in-wasm
   // Nexus function in nxlib/stdlib/runtime/sched.nx (located by suffix), so no
   // host import is required.
+  //
+  // The drain must be emitted ONLY for THIS dispatcher when it is the
+  // cooperative SCHEDULER — i.e. one of its `with @k` arms enqueues/dequeues the
+  // shared run queue (std:concurrency/coop). A NESTED generator dispatcher
+  // (collector arm = bare `@k`) or a plain inject must NOT drain, or it would
+  // drain the ENCLOSING scheduler's queue and steal/reorder its ready tasks
+  // (nexus-5eqzh). Gating only on the module-global existence of
+  // `__nx_sched_dequeue` is too coarse: it fires the drain in every dispatcher
+  // whenever a coop scheduler appears anywhere in the module.
   let CodegenCtx(functions: disp_fns, internal_func_map: disp_ifm, _) = ctx
   let dequeue_idx = find_func_idx_by_suffix(
     suffix: "__nx_sched_dequeue",
     funcs: disp_fns,
     internal_func_map: &disp_ifm)
-  let %buf = if dequeue_idx >= 0 then
+  let is_scheduler = any_arm_drains_run_queue(arm_fns, ctx)
+  let %buf = if dequeue_idx >= 0 && is_scheduler then
     let tmp_local = ctx_temps_base(ctx) + 5
     let %b = bb.push_byte(%buf, byte: op_call)
     let %b = bb.push_uleb128(buf: %b, val: dequeue_idx)
@@ -151,9 +161,11 @@ export let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm
     let %b = bb.push_byte(buf: %b, byte: op_br)
     bb.push_uleb128(buf: %b, val: n_arms)
   else
-    // No sched runtime imported (e.g., handler_with_kont_resume which uses
-    // a hand-rolled handler with no global queue). Fall back to the simple
-    // exit-on-normal-return path.
+    // Not the scheduler dispatcher: either no sched runtime is imported (e.g.
+    // handler_with_kont_resume, a hand-rolled handler with no global queue), or
+    // this is a generator / plain inject whose arms do not own the run queue.
+    // Fall back to the simple exit-on-normal-return path — draining here would
+    // steal the enclosing scheduler's ready fibers (nexus-5eqzh).
     let %b = bb.push_byte(%buf, byte: op_br)
     bb.push_uleb128(buf: %b, val: n_arms + 1)
   end
@@ -176,6 +188,28 @@ export let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm
   if wdefs.is_unit(typ: result_typ) then return %buf end
   let %buf = bb.push_byte(%buf, byte: op_global_get)
   return bb.push_uleb128(%buf, val: wdefs.ss_inject_value_global_idx)
+end
+
+/** True iff THIS dispatcher is the cooperative scheduler — i.e. any of its
+ *  `with @k` arm functions calls a sched run-queue intrinsic
+ *  (`__nx_sched_enqueue` / `__nx_sched_dequeue`). The coop scheduler arm
+ *  (std:concurrency/coop) enqueues the suspended task and dequeues the next
+ *  ready one; a generator collector arm just `@k`-resumes (no queue ops), and a
+ *  plain inject has no arm. Only the scheduler may drain the run queue on a
+ *  body's normal return — a nested generator dispatcher draining it would steal
+ *  the enclosing scheduler's ready fibers (nexus-5eqzh). Arms whose function
+ *  body is not found (defensive) are treated as non-scheduler. */
+let any_arm_drains_run_queue = fn (arm_fns: [ string ], ctx: CodegenCtx) -> bool do
+  match arm_fns do
+    | [] -> return false
+    | arm :: rest ->
+      let drains = match ctx_lookup_function(ctx, name: arm) do
+        | Some(val: f) -> wcollect.function_calls_sched_queue(f: f)
+        | None -> false
+      end
+      if drains then return true end
+      return any_arm_drains_run_queue(arm_fns: rest, ctx)
+  end
 end
 
 /** Re-throw a throw that escaped the resumed `__inject_N` body, on the parent

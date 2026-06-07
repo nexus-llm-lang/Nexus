@@ -1,0 +1,148 @@
+// Acceptance: a value-yielding `with @k` generator inject nested inside an
+// active multi-fiber `std:concurrency/coop` task must NOT corrupt the enclosing
+// scheduler's run queue. The two cooperative tasks must complete in FIFO task
+// order, and each task's own generator sum must be correct.
+//
+// Regression (nexus-5eqzh): the inject dispatcher's normal-return dequeue-DRAIN
+// (codegen/emit/inject.nx) was emitted into EVERY inject dispatcher whenever the
+// sched run-queue intrinsics existed ANYWHERE in the module. A nested generator
+// dispatcher therefore ran the drain on its body's normal return and drained the
+// ENCLOSING coop scheduler's shared run queue, stealing/reordering its ready
+// tasks. The interleave came out reordered ([1, 2, 230, 130]) even though each
+// task's own generator sum (130 / 230) was correct. After the fix only the
+// scheduler dispatcher drains, so completions stay FIFO ([1, 2, 130, 230]).
+//
+// Each task records its start marker (A1=1 / B1=2), yields once (so the two
+// tasks interleave through the single scheduler frame), then runs a value-
+// yielding generator (sum of an emitted range) and records a completion marker
+// derived from that sum (A=130 / B=230). A1 and B1 establish the interleave; the
+// completion markers must follow in FIFO task order. The shared trace lives at a
+// fixed reserved linear-memory offset (a top-level `let = alloc_raw` is a
+// non-memoised thunk, so only a literal constant offset is a stable shared
+// address across spawned/yielded continuations). Exit 0 means the order held.
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+import * as list from "std:list"
+import { Coop, scheduler, spawn } from "std:concurrency/coop"
+import { Yield, collector } from "std:concurrency/generator"
+import * as mem from "std:runtime/mem"
+
+// Shared trace buffer at a fixed reserved offset (page 13, clear of the heap and
+// of the scheduler's own page-13 cells): [count:i64, e0, e1, ...].
+let trace_base = fn () -> i64 do return 854016 end
+
+let trace_init = fn () -> unit do
+  mem.store_i64(addr: trace_base(), val: 0)
+  return ()
+end
+
+let trace_push = fn (v: i64) -> unit do
+  let b = trace_base()
+  let n = mem.load_i64(addr: b)
+  mem.store_i64(addr: b + 8 + n * 8, val: v)
+  mem.store_i64(addr: b, val: n + 1)
+  return ()
+end
+
+let trace_get = fn (i: i64) -> i64 do
+  let b = trace_base()
+  return mem.load_i64(addr: b + 8 + i * 8)
+end
+
+let trace_len = fn () -> i64 do
+  return mem.load_i64(addr: trace_base())
+end
+
+// A value-yielding generator nested inside a coop task: emit 1..n, accumulate
+// into a `~`-mutable list returned as the inject's trailing value. This is the
+// inject whose dispatcher must NOT drain the coop run queue. The inject must be
+// the function's trailing statement (its value is the body's trailing value; an
+// `inject` cannot be bound with `let x = inject`).
+let range_gen = fn (n: i64) -> [ i64 ] throws { Exn } do
+  inject collector do
+    let ~acc = list.empty()
+    for i = 1 to n + 1 do
+      Yield.emit(v: i)
+      ~acc <- list.cons(x: i, xs: ~acc)
+    end
+    list.reverse(xs: ~acc)
+  end
+end
+
+// Sum the generated range. Keeps the generator inject one call-frame below the
+// coop task body so the nested-dispatcher drain bug is exercised.
+let range_sum = fn (n: i64) -> i64 throws { Exn } do
+  let xs = range_gen(n: n)
+  return list.fold_left(xs: xs, init: 0, f: fn (a: i64, b: i64) -> i64 do return a + b end)
+end
+
+// Task A: records 1 (A1), yields, runs a generator summing 1..4 (= 10),
+// records the completion marker 130 = 120 + 10.
+let task_a = fn () -> unit require { Coop } throws { Exn } do
+  trace_push(v: 1)
+  Coop.yield()
+  let s = range_sum(n: 4)
+  trace_push(v: 120 + s)
+  return ()
+end
+
+// Task B: records 2 (B1), yields, runs a generator summing 1..5 (= 15),
+// records the completion marker 230 = 215 + 15.
+let task_b = fn () -> unit require { Coop } throws { Exn } do
+  trace_push(v: 2)
+  Coop.yield()
+  let s = range_sum(n: 5)
+  trace_push(v: 215 + s)
+  return ()
+end
+
+let assert_i64 = fn (label: string, got: i64, want: i64) -> unit throws { Exn } do
+  if !(got == want) then
+    throw RuntimeError(val: label ++ ": got " ++ str.from_i64(val: got) ++ ", want " ++ str.from_i64(val: want))
+  end
+end
+
+let body = fn () -> unit throws { Exn } do
+  trace_init()
+  inject scheduler do
+    spawn(task: task_b)
+    task_a()
+  end
+  // Task A starts first (inject body), records A1=1, yields; task B is resumed
+  // next, records B1=2, yields; then A resumes, runs its generator, completes
+  // (130); then B resumes, runs its generator, completes (230). FIFO completion
+  // order: [1, 2, 130, 230]. A nested-generator drain corrupting the run queue
+  // reorders the completion markers (e.g. [1, 2, 230, 130]).
+  assert_i64(label: "len", got: trace_len(), want: 4)
+  assert_i64(label: "A1", got: trace_get(i: 0), want: 1)
+  assert_i64(label: "B1", got: trace_get(i: 1), want: 2)
+  assert_i64(label: "A-done", got: trace_get(i: 2), want: 130)
+  assert_i64(label: "B-done", got: trace_get(i: 3), want: 230)
+  return ()
+end
+
+// Exit 0 only if every assertion passes (twyov-safe: the assert throws are
+// caught here, never unwinding host-ward after a resume).
+let safe_run = fn () -> i64 do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } throws { Exn } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    if ok == 1 then
+      Console.println(val: "gen-in-coop-interleave-ok")
+    else
+      Console.println(val: "FAILED")
+    end
+    // Trap (divide-by-zero) on failure so the test runner sees a non-zero exit.
+    let _guard = 1 / ok
+    return ()
+  end
+end

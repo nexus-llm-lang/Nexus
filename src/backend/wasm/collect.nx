@@ -385,6 +385,85 @@ export let program_needs_stack_switching = fn (funcs: [ LirFunction ]) -> bool d
   end
 end
 
+/** True iff `name` ends with `suffix` (mangled function names carry a module
+ *  path prefix, so the sched-queue intrinsics are matched by suffix — the same
+ *  convention as codegen/intrinsics/sched.nx::find_func_idx_by_suffix). */
+let name_has_suffix = fn (name: string, suffix: string) -> bool do
+  let nlen = str.length(s: name)
+  let slen = str.length(s: suffix)
+  if nlen < slen then return false end
+  return str.substring(s: name, start: nlen - slen, len: slen) == suffix
+end
+
+/** True iff `func` names a sched RUN-QUEUE intrinsic (`__nx_sched_enqueue` /
+ *  `__nx_sched_dequeue`). These are the ops that read/write the shared run queue
+ *  in std:runtime/sched; a handler arm that calls them owns the queue and is the
+ *  cooperative SCHEDULER (std:concurrency/coop), as opposed to a generator
+ *  collector arm (which only `@k`-resumes) or a plain inject (no kont arm). */
+let is_sched_queue_func = fn (func: string) -> bool do
+  return name_has_suffix(name: func, suffix: "__nx_sched_enqueue")
+    || name_has_suffix(name: func, suffix: "__nx_sched_dequeue")
+end
+
+let expr_calls_sched_queue = fn (expr: LirExpr) -> bool do
+  match expr do
+    | LirExprCall(func: f, args: _, typ: _) | LirExprTailCall(func: f, args: _, typ: _) ->
+      return is_sched_queue_func(func: f)
+    | _ -> return false
+  end
+end
+
+let stmt_calls_sched_queue = fn (stmt: LirStmt) -> bool do
+  match stmt do
+    | LirStmtLet(name: _, typ: _, expr: e) -> return expr_calls_sched_queue(expr: e)
+    | LirStmtIf(cond: _, then_body: tb, else_body: eb)
+    | LirStmtIfReturn(
+      cond: _,
+      then_body: tb,
+      then_ret: _,
+      else_body: eb,
+      else_ret: _,
+      ret_type: _
+    ) ->
+      if stmts_call_sched_queue(stmts: tb) then return true end
+      return stmts_call_sched_queue(stmts: eb)
+    | LirStmtLoop(cond_stmts: cs, cond: _, body: b) ->
+      if stmts_call_sched_queue(stmts: cs) then return true end
+      return stmts_call_sched_queue(stmts: b)
+    | LirStmtTryCatch(
+      body: b,
+      body_ret: _,
+      catch_param: _,
+      catch_param_typ: _,
+      catch_body: cb,
+      catch_ret: _
+    ) ->
+      if stmts_call_sched_queue(stmts: b) then return true end
+      return stmts_call_sched_queue(stmts: cb)
+  end
+end
+
+let stmts_call_sched_queue = fn (stmts: [ LirStmt ]) -> bool do
+  match stmts do
+    | [] -> return false
+    | s :: rest ->
+      if stmt_calls_sched_queue(stmt: s) then return true end
+      return stmts_call_sched_queue(stmts: rest)
+  end
+end
+
+/** True iff `f`'s body calls a sched run-queue intrinsic (`__nx_sched_enqueue` /
+ *  `__nx_sched_dequeue`). The inject dispatcher uses this on its `with @k` arm
+ *  functions to decide whether to drain the shared run queue on a body's normal
+ *  return: ONLY the cooperative scheduler (whose arm enqueues/dequeues the
+ *  queue) should drain. A nested generator dispatcher (collector arm = bare
+ *  `@k`) must NOT drain, or it steals/reorders the enclosing scheduler's ready
+ *  tasks (nexus-5eqzh). */
+export let function_calls_sched_queue = fn (f: LirFunction) -> bool do
+  let LirFunction(name: _, params: _, ret_type: _, body: b, ret: _, span: _) = f
+  return stmts_call_sched_queue(stmts: b)
+end
+
 //
 // Each `MirSuspend(tag_name)` and `LirExprInjectResume.arm_tags` entry in the
 // program identifies a `<cap>::<method>` cap method. We allocate one wasm
