@@ -24,6 +24,7 @@ import { TypeExpr, TyUserDefined, TyLazy, TyArrow, TyRecord, TyList, TyArray, Ty
 import * as list from "std:list"
 import { LirError } from "src/ir/lir/errors.nx"
 import { Some, None } from "std:option"
+import { BinaryOp } from "src/types/vocab.nx"
 import { MirExpr, MirStmt, MirCallArg, MirMatchCase, MirNamedExpr } from "src/ir/mir/types.nx"
 import { LirAtom, LirStmt, LirCallArg, LirNamedAtom } from "src/ir/lir/types.nx"
 import {
@@ -105,6 +106,62 @@ import {
   lower_struct_eq
 } from "src/ir/lir/struct_eq.nx"
 
+/** Override an inferred wide arith result type with the binding's declared
+ *  NARROW width when the two are the matching wide↔narrow pair. Mirrors
+ *  `preferred_let_width`: a binary whose declared `let`-result is `i32`/`f32`
+ *  but whose operand-inferred result fell to the wide `i64`/`f64` (the
+ *  all-inline-LITERAL case — both operands default to `TyI64`/`TyF64`, so
+ *  `int_arith_result`/`float_arith_result` never sees a narrow operand) must
+ *  carry the narrow type ON THE BINARY NODE, not just on the bound local.
+ *  Without this, `let p: i32 = 65536 * 65536` types its product node `i64`,
+ *  so (a) the folder evaluates it in i64 and `wrap_to_decl_width` skips the
+ *  i32 truncation (folds to `4294967296` not `0`), and (b) a non-folded
+ *  `let s: i32 = 1 << 31` emits `i64.shl` and the value flows wide into the
+ *  i32 consumer (nexus-c7pst). Only the literal-default (declared narrow,
+ *  inferred wide) pair is rewritten — comparison ops infer `TyBool` and are
+ *  untouched; a node with a genuinely narrow operand already infers narrow. */
+let narrow_binary_result = fn (hint: Option<TypeExpr>, inferred: TypeExpr) -> TypeExpr do
+  match hint do
+    | Some(val: h) -> return preferred_let_width(declared: h, inferred)
+    | None -> return inferred
+  end
+end
+
+/** Lower a `MirBinaryOp`. `result_hint` carries the enclosing `let`'s declared
+ *  type so an all-literal narrow arithmetic binding (`let _: i32 = a OP b`)
+ *  types its binary node at the narrow width (see `narrow_binary_result`);
+ *  the recursive operand lowerings and the generic-expression call site pass
+ *  `None`. */
+let lower_binary_op = fn (
+  lhs: MirExpr,
+  op: BinaryOp,
+  rhs: MirExpr,
+  result_hint: Option<TypeExpr>,
+  ctx: LowerCtx
+) -> BindResult throws { LirError } do
+  let BindResult(ctx: ctx2, atom: la) = lower_expr_to_atom(expr: lhs, ctx)
+  let BindResult(ctx: ctx3, atom: ra) = lower_expr_to_atom(expr: rhs, ctx: ctx2)
+  let sem_lhs = infer_semantic_type(expr: lhs, ctx)
+  let sem_rhs = infer_semantic_type(expr: rhs, ctx)
+  // `==` / `!=` on a record or sum operand demands STRUCTURAL equality
+  // (spec § T-Cmp), not the pointer-identity a plain LirExprBinary on the
+  // i32 heap pointer would emit. Recover the operand's structural type
+  // from either side's semantic type (one side may be TyI64-erased) and
+  // emit a recursive value compare. Primitives / strings / unknown types
+  // fall through to the legacy binary path unchanged.
+  if is_struct_eq_op(op) && (should_struct_eq(t: sem_lhs, ctx: ctx3) || should_struct_eq(t: sem_rhs, ctx: ctx3)) then
+    let struct_sem = if should_struct_eq(t: sem_lhs, ctx: ctx3) then sem_lhs else sem_rhs end
+    return lower_struct_eq(op, lhs: la, rhs: ra, sem_type: struct_sem, ctx: ctx3)
+  end
+  let lhs_for_infer = if is_semantic_string(t: sem_lhs) then TyString else atom_type(atom: la) end
+  let rhs_for_infer = if is_semantic_string(t: sem_rhs) then TyString else atom_type(atom: ra) end
+  let inferred_type = infer_binary_type(op, lhs_type: lhs_for_infer, rhs_type: rhs_for_infer)
+  let result_type = narrow_binary_result(hint: result_hint, inferred: inferred_type)
+  return bind_expr_to_temp(ctx: ctx3,
+    expr: LirExprBinary(op, lhs: la, rhs: ra, typ: result_type),
+    typ: result_type)
+end
+
 let lower_expr_to_atom = fn (expr: MirExpr, ctx: LowerCtx) -> BindResult throws { LirError } do
   match expr do
     | MirLiteral(lit: l) -> return BindResult(ctx, atom: literal_to_atom(lit: l))
@@ -124,26 +181,7 @@ let lower_expr_to_atom = fn (expr: MirExpr, ctx: LowerCtx) -> BindResult throws 
         return BindResult(ctx, atom: LirAtomVar(name: n, typ))
 
     | MirBinaryOp(left: lhs, op, right: rhs) ->
-      let BindResult(ctx: ctx2, atom: la) = lower_expr_to_atom(expr: lhs, ctx)
-      let BindResult(ctx: ctx3, atom: ra) = lower_expr_to_atom(expr: rhs, ctx: ctx2)
-      let sem_lhs = infer_semantic_type(expr: lhs, ctx)
-          let sem_rhs = infer_semantic_type(expr: rhs, ctx)
-          // `==` / `!=` on a record or sum operand demands STRUCTURAL equality
-          // (spec § T-Cmp), not the pointer-identity a plain LirExprBinary on the
-          // i32 heap pointer would emit. Recover the operand's structural type
-          // from either side's semantic type (one side may be TyI64-erased) and
-          // emit a recursive value compare. Primitives / strings / unknown types
-          // fall through to the legacy binary path unchanged.
-          if is_struct_eq_op(op) && (should_struct_eq(t: sem_lhs, ctx: ctx3) || should_struct_eq(t: sem_rhs, ctx: ctx3)) then
-            let struct_sem = if should_struct_eq(t: sem_lhs, ctx: ctx3) then sem_lhs else sem_rhs end
-            return lower_struct_eq(op, lhs: la, rhs: ra, sem_type: struct_sem, ctx: ctx3)
-          end
-          let lhs_for_infer = if is_semantic_string(t: sem_lhs) then TyString else atom_type(atom: la) end
-          let rhs_for_infer = if is_semantic_string(t: sem_rhs) then TyString else atom_type(atom: ra) end
-          let result_type = infer_binary_type(op, lhs_type: lhs_for_infer, rhs_type: rhs_for_infer)
-          return bind_expr_to_temp(ctx: ctx3,
-            expr: LirExprBinary(op, lhs: la, rhs: ra, typ: result_type),
-            typ: result_type)
+      return lower_binary_op(lhs, op, rhs, result_hint: None, ctx)
 
     | MirCall(func: f, args, ret_type: rt) ->
       let LowerCallArgsResult(ctx: ctx2, lir_args: la) = lir_lower_call_args(args, ctx)
@@ -707,7 +745,17 @@ let lower_stmt_inner = fn (
   match stmt do
     | MirStmtLet(name: n, typ: t, expr: e) ->
       let sem_type = infer_semantic_type(expr: e, ctx)
-      let BindResult(ctx: ctx2, atom: a) = lower_expr_to_atom(expr: e, ctx)
+      // Pass the declared `let` type as a width hint when the RHS is a binary
+      // op, so an all-inline-literal narrow arithmetic binding types its binary
+      // node at the declared `i32`/`f32` width (see `narrow_binary_result`) —
+      // otherwise the product/sum/shift node defaults to i64/f64 and the value
+      // is computed (and folded) wide before it ever reaches the narrow slot
+      // (nexus-c7pst). Non-binary RHS lowering is unchanged.
+      let BindResult(ctx: ctx2, atom: a) = match e do
+        | MirBinaryOp(left: blhs, op: bop, right: brhs) ->
+          lower_binary_op(lhs: blhs, op: bop, rhs: brhs, result_hint: Some(val: t), ctx)
+        | _ -> lower_expr_to_atom(expr: e, ctx)
+      end
       // A narrow (`i32`/`f32`) annotation overrides the atom's wide default so a
       // literal-RHS let binds a narrow local (see `preferred_let_width`).
       let inferred = preferred_let_width(declared: t, inferred: atom_type(atom: a))
