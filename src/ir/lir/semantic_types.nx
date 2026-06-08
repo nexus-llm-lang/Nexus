@@ -60,7 +60,13 @@ export let infer_semantic_type = fn (
           | Some(val: t) -> return t
           | None -> return TyI64
         end
-      | MirCall(func: _, args: _, ret_type: rt) -> return rt
+      | MirCall(func: f, args: cargs, ret_type: rt) ->
+        // A generic callee returns a bare type variable (or a `TyVar`-bearing
+        // shape); recover the concrete instantiation from the argument types so
+        // the result binding carries the real record/sum layout (else a
+        // downstream destructure / `.field` reads offset 0 / aborts E6002).
+        // No-op for non-generic returns.
+        return recover_generic_call_type(callee: f, args: cargs, sem_rt: rt, ctx)
       | MirLiteral(lit: l) ->
         match l do
           | LitInt(_) -> return TyI64
@@ -151,6 +157,217 @@ export let resolve_closure_ret_type = fn (
       end
   else
     return fallback
+  end
+end
+
+/** Sentinel key under which a function's full SEMANTIC signature
+ *  (`TyArrow(params, ret, …)`, with named-record params/ret resolved to
+ *  `TyRecord`) is registered in every function's `semantic_vars`. Kept
+ *  distinct from the plain `<name>` return-type entry (used by
+ *  `MirVariable`/`MirCall` lookups) so overloading the bare name does not turn
+ *  a zero-arg constant reference into a `TyArrow`. Consumed by
+ *  `recover_generic_call_type` to instantiate a generic callee's bare-`TyVar`
+ *  return type from the call's argument semantic types. */
+export let fnsig_sentinel = fn (name: string) -> string throws { LirError } do
+  return "#FNSIG#" ++ name
+end
+
+/** True iff `t` is — or structurally contains — a bare type variable
+ *  (`TyVar`). Used to gate the (otherwise no-op) generic-return recovery so it
+ *  only fires for a callee whose resolved return type is still polymorphic. */
+let type_has_tyvar = fn (t: TypeExpr) -> bool throws { LirError } do
+  match t do
+    | TyVar(name: _) -> return true
+    | TyList(elem: e) -> return type_has_tyvar(t: e)
+    | TyUserDefined(name: _, args: ats) -> return type_args_have_tyvar(ts: ats)
+    | TyRecord(fields: fs) -> return named_types_have_tyvar(nts: fs)
+    | _ -> return false
+  end
+end
+
+let type_args_have_tyvar = fn (ts: [ TypeExpr ]) -> bool throws { LirError } do
+  match ts do
+    | [] -> return false
+    | t :: rest -> if type_has_tyvar(t) then return true else return type_args_have_tyvar(ts: rest) end
+  end
+end
+
+let named_types_have_tyvar = fn (nts: [ NamedType ]) -> bool throws { LirError } do
+  match nts do
+    | [] -> return false
+    | NamedType(name: _, typ: t) :: rest ->
+      if type_has_tyvar(t) then return true else return named_types_have_tyvar(nts: rest) end
+  end
+end
+
+/** Structurally match a callee PARAMETER type (which may mention type
+ *  variables) against the corresponding ARGUMENT's inferred semantic type,
+ *  binding each `TyVar(name)` it encounters to the concrete sub-type at the
+ *  same position. Bindings accumulate as `NamedType(name → concrete)` entries
+ *  (later read by `subst_type_vars`). Mirrors a one-shot, structural
+ *  unification — only the shapes that carry record/sum layout matter
+ *  (`T`, `[T]`, `K<…,T,…>`), so anything else simply contributes no binding. */
+let collect_tyvar_bindings = fn (
+  param_ty: TypeExpr,
+  arg_ty: TypeExpr,
+  acc: [ NamedType ]
+) -> [ NamedType ] throws { LirError } do
+  match param_ty do
+    | TyVar(name: pv) -> return NamedType(name: pv, typ: arg_ty) :: acc
+    | TyList(elem: pe) ->
+      // `[T]` arg ⇒ recover `T` from the argument's element type. A
+      // `Cons`-headed local already carries `TyList(elem)` (see the
+      // `MirConstructor("Cons", …)` arm), so this threads `list.head(xs:[R])`'s
+      // `T := R` through.
+      match arg_ty do
+        | TyList(elem: ae) -> return collect_tyvar_bindings(param_ty: pe, arg_ty: ae, acc)
+        | _ -> return acc
+      end
+    | TyUserDefined(name: pn, args: pas) ->
+      // `K<…>` arg (`Option<T>`, `Result<T,E>`, …) ⇒ recover each type
+      // argument positionally from a same-head user-defined arg type.
+      match arg_ty do
+        | TyUserDefined(name: an, args: aargs) ->
+          if pn == an then return collect_tyvar_bindings_list(ps: pas, ats: aargs, acc) else return acc end
+        | _ -> return acc
+      end
+    | _ -> return acc
+  end
+end
+
+let collect_tyvar_bindings_list = fn (
+  ps: [ TypeExpr ],
+  ats: [ TypeExpr ],
+  acc: [ NamedType ]
+) -> [ NamedType ] throws { LirError } do
+  match ps do
+    | [] -> return acc
+    | p :: prest ->
+      match ats do
+        | [] -> return acc
+        | a :: arest ->
+          let acc2 = collect_tyvar_bindings(param_ty: p, arg_ty: a, acc)
+          return collect_tyvar_bindings_list(ps: prest, ats: arest, acc: acc2)
+      end
+  end
+end
+
+/** Substitute every `TyVar(name)` in `t` with its binding from `subst`
+ *  (recovered by `collect_tyvar_bindings`). Unbound type variables are left
+ *  intact (the recovery then declines, see `recover_generic_call_type`).
+ *  Recurses through `[T]` / `K<…>` / record fields so a return type like
+ *  `[R]` or `Option<R>` is instantiated, not only a bare `T`. */
+let subst_type_vars = fn (t: TypeExpr, subst: [ NamedType ]) -> TypeExpr throws { LirError } do
+  match t do
+    | TyVar(name: n) ->
+      match lookup_named_type_opt(target: n, fields: subst) do
+        | Some(val: bound) -> return bound
+        | None -> return t
+      end
+    | TyList(elem: e) -> return TyList(elem: subst_type_vars(t: e, subst))
+    | TyUserDefined(name: n, args: ats) ->
+      return TyUserDefined(name: n, args: subst_type_vars_list(ts: ats, subst))
+    | TyRecord(fields: fs) -> return TyRecord(fields: subst_named_types(nts: fs, subst))
+    | _ -> return t
+  end
+end
+
+let subst_type_vars_list = fn (ts: [ TypeExpr ], subst: [ NamedType ]) -> [ TypeExpr ] throws { LirError } do
+  match ts do
+    | [] -> return []
+    | t :: rest -> return subst_type_vars(t, subst) :: subst_type_vars_list(ts: rest, subst)
+  end
+end
+
+let subst_named_types = fn (nts: [ NamedType ], subst: [ NamedType ]) -> [ NamedType ] throws { LirError } do
+  match nts do
+    | [] -> return []
+    | NamedType(name: n, typ: t) :: rest ->
+      return NamedType(name: n, typ: subst_type_vars(t, subst)) :: subst_named_types(nts: rest, subst)
+  end
+end
+
+let lookup_named_type_opt = fn (
+  target: string,
+  fields: [ NamedType ]
+) -> Option<TypeExpr> throws { LirError } do
+  match fields do
+    | [] -> return None
+    | NamedType(name: n, typ: t) :: rest ->
+      if n == target then return Some(val: t) else return lookup_named_type_opt(target, fields: rest) end
+  end
+end
+
+/** Recover a generic callee's CONCRETE return type at a call site.
+ *
+ *  `sem_rt` is the callee's resolved semantic return type (from
+ *  `sem_func_types`); for a generic fn it is still a bare `TyVar` (or a
+ *  `TyVar`-bearing shape like `[T]`). This looks up the callee's full
+ *  signature under `#FNSIG#<callee>`, unifies each parameter type against the
+ *  matching call argument's inferred semantic type to bind the type
+ *  variables, then substitutes them into `sem_rt`. So `idg<T>(x:T)->T` called
+ *  with a record arg returns that record's `TyRecord`; `list.head(xs:[T])->T`
+ *  on a `[R]` arg returns `R`. This is what lets a downstream
+ *  record-destructure / `.field` on the result resolve field offsets instead
+ *  of defaulting every projection to offset 0 (or aborting E6002).
+ *
+ *  Returns `sem_rt` UNCHANGED when: the return type carries no `TyVar` (not
+ *  generic), no signature is registered, or the recovered type still carries
+ *  an unbound `TyVar` (couldn't instantiate) — never widening or corrupting a
+ *  type it can't confidently recover. */
+export let recover_generic_call_type = fn (
+  callee: string,
+  args: [ MirCallArg ],
+  sem_rt: TypeExpr,
+  ctx: LowerCtx
+) -> TypeExpr throws { LirError } do
+  let LowerCtx(vars: _, semantic_vars: sv, stmts: _, temp_counter: _, enum_defs: _) = ctx
+  match lir_lookup_type(name: fnsig_sentinel(name: callee), entries: sv) do
+    | Some(val: TyArrow(params: ps, ret: sig_ret, requires: _, throw_row: _)) ->
+      // Use the signature's NORMALIZED return type (generic params marked
+      // `TyVar`) — uniform across both call sites regardless of the passed
+      // `sem_rt`'s normalization state. Non-generic returns carry no `TyVar`,
+      // so this is a no-op (returns `sig_ret`, equal to `sem_rt` in shape).
+      if !type_has_tyvar(t: sig_ret) then return sem_rt end
+      let subst = collect_call_bindings(params: ps, args, ctx, acc: [])
+      let recovered = subst_type_vars(t: sig_ret, subst)
+      // Decline if anything remained polymorphic — a partially-substituted
+      // type would mis-resolve worse than the conservative bare-`TyVar`
+      // default; falling back to `sem_rt` keeps prior (offset-0) behavior.
+      if type_has_tyvar(t: recovered) then return sem_rt else return recovered end
+    | _ -> return sem_rt
+  end
+end
+
+/** Walk the callee's (labeled) parameter types alongside the call's arguments,
+ *  matched BY LABEL (both are labeled; MIR arg order need not equal the
+ *  declared param order), accumulating type-variable bindings. */
+let collect_call_bindings = fn (
+  params: [ NamedType ],
+  args: [ MirCallArg ],
+  ctx: LowerCtx,
+  acc: [ NamedType ]
+) -> [ NamedType ] throws { LirError } do
+  match params do
+    | [] -> return acc
+    | NamedType(name: plabel, typ: pty) :: prest ->
+      let acc2 = match find_arg_by_label(label: plabel, args) do
+          | Some(val: aexpr) ->
+            collect_tyvar_bindings(param_ty: pty, arg_ty: infer_semantic_type(expr: aexpr, ctx), acc)
+          | None -> acc
+        end
+      return collect_call_bindings(params: prest, args, ctx, acc: acc2)
+  end
+end
+
+let find_arg_by_label = fn (
+  label: string,
+  args: [ MirCallArg ]
+) -> Option<MirExpr> throws { LirError } do
+  match args do
+    | [] -> return None
+    | MirCallArg(label: l, value: v) :: rest ->
+      if l == label then return Some(val: v) else return find_arg_by_label(label, args: rest) end
   end
 end
 

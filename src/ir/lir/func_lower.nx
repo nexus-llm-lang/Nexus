@@ -25,6 +25,7 @@ import {
   TypeExpr,
   TyUserDefined,
   TyRecord,
+  TyArrow,
   NamedType,
   EnumDef,
   VariantDef,
@@ -80,7 +81,12 @@ import { LirProgram, LirFunction, LirExternal, LirParam } from "src/ir/lir/types
 import { LowerCtx, TypeEntry, wasm_type, insert_type, default_atom } from "src/ir/lir/context.nx"
 import { VariantIndex }, * as vidx from "src/ir/support/variant_index.nx"
 import { lir_lower_stmts, LowerStmtsResult } from "src/ir/lir/lir.nx"
-import { lir_str_less_than, sort_mir_params, env_slot_sentinel } from "src/ir/lir/semantic_types.nx"
+import {
+  lir_str_less_than,
+  sort_mir_params,
+  env_slot_sentinel,
+  fnsig_sentinel
+} from "src/ir/lir/semantic_types.nx"
 import { gen_struct_eq_helpers } from "src/ir/lir/struct_eq.nx"
 
 let lir_lower_function = fn (
@@ -205,6 +211,95 @@ let resolve_typedef = fn (
     end
   else
     return typ
+  end
+end
+
+// Normalize a SIGNATURE type for generic-return recovery: resolve named
+// records to `TyRecord` (so layout is visible), and rewrite every remaining
+// `TyUserDefined(name, …)` whose `name` is NOT a known concrete type (record
+// or enum) into `TyVar(name)` — i.e. a type PARAMETER. At MIR a generic `T`
+// is carried as `TyUserDefined("T", [])`, indistinguishable by shape from a
+// real named type; the known-names set is what disambiguates it. Recurses
+// through `[T]`, `K<…>` args, and record fields so `Option<T>` / `[T]` get
+// their inner type parameters marked too. `recover_generic_call_type` then
+// treats the marked `TyVar`s uniformly (guard / unify / substitute).
+let normalize_type_params = fn (
+  typ: TypeExpr,
+  type_defs: [ RecordDef ],
+  known_names: [ string ]
+) -> TypeExpr throws { LirError } do
+  match typ do
+    | TyUserDefined(name: n, args: ats) ->
+      match lookup_record_def(name: n, defs: type_defs) do
+        | Some(val: RecordDef(name: _, is_public: _, type_params: _, fields)) -> return TyRecord(fields)
+        | None ->
+          if str_list_contains(xs: known_names, s: n) then
+            return TyUserDefined(name: n, args: normalize_type_params_list(ts: ats, type_defs, known_names))
+          else
+            // Not a record, not a known enum ⇒ a type parameter.
+            return TyVar(name: n)
+          end
+      end
+    | TyList(elem: e) -> return TyList(elem: normalize_type_params(typ: e, type_defs, known_names))
+    | TyRecord(fields: fs) -> return TyRecord(fields: normalize_named_type_params(nts: fs, type_defs, known_names))
+    | _ -> return typ
+  end
+end
+
+let normalize_type_params_list = fn (
+  ts: [ TypeExpr ],
+  type_defs: [ RecordDef ],
+  known_names: [ string ]
+) -> [ TypeExpr ] throws { LirError } do
+  match ts do
+    | [] -> return []
+    | t :: rest ->
+      return normalize_type_params(typ: t, type_defs, known_names) :: normalize_type_params_list(ts: rest, type_defs, known_names)
+  end
+end
+
+let normalize_named_type_params = fn (
+  nts: [ NamedType ],
+  type_defs: [ RecordDef ],
+  known_names: [ string ]
+) -> [ NamedType ] throws { LirError } do
+  match nts do
+    | [] -> return []
+    | NamedType(name: n, typ: t) :: rest ->
+      return NamedType(name: n, typ: normalize_type_params(typ: t, type_defs, known_names)) :: normalize_named_type_params(nts: rest, type_defs, known_names)
+  end
+end
+
+let str_list_contains = fn (xs: [ string ], s: string) -> bool throws { LirError } do
+  match xs do
+    | [] -> return false
+    | x :: rest -> if x == s then return true else return str_list_contains(xs: rest, s) end
+  end
+end
+
+// Known concrete type names = every enum name (incl. builtins) ∪ every record
+// name. Used by `normalize_type_params` to tell a type parameter apart from a
+// real named type.
+let collect_type_names = fn (
+  enum_defs: [ EnumDef ],
+  type_defs: [ RecordDef ]
+) -> [ string ] throws { LirError } do
+  return collect_enum_names(enum_defs, acc: collect_record_names(type_defs, acc: []))
+end
+
+let collect_enum_names = fn (enum_defs: [ EnumDef ], acc: [ string ]) -> [ string ] throws { LirError } do
+  match enum_defs do
+    | [] -> return acc
+    | EnumDef(name: n, is_public: _, is_opaque: _, type_params: _, variants: _, layout_variants: _) :: rest ->
+      return collect_enum_names(enum_defs: rest, acc: n :: acc)
+  end
+end
+
+let collect_record_names = fn (type_defs: [ RecordDef ], acc: [ string ]) -> [ string ] throws { LirError } do
+  match type_defs do
+    | [] -> return acc
+    | RecordDef(name: n, is_public: _, type_params: _, fields: _) :: rest ->
+      return collect_record_names(type_defs: rest, acc: n :: acc)
   end
 end
 
@@ -370,24 +465,90 @@ end
 // (e.g. `type Trip = { a, b, c }`) instead of the raw TyUserDefined.
 let build_func_semantic_type_entries = fn (
   funcs: [ MirFunction ],
-  type_defs: [ RecordDef ]
+  type_defs: [ RecordDef ],
+  known_names: [ string ]
 ) -> [ TypeEntry ] throws { LirError } do
-  return build_func_semantic_type_entries_go(funcs, type_defs, acc: [])
+  return build_func_semantic_type_entries_go(funcs, type_defs, known_names, acc: [])
 end
 
 let build_func_semantic_type_entries_go = fn (
   funcs: [ MirFunction ],
   type_defs: [ RecordDef ],
+  known_names: [ string ],
   acc: [ TypeEntry ]
 ) -> [ TypeEntry ] throws { LirError } do
   match funcs do
     | [] -> return list.reverse(xs: acc)
     | MirFunction(name: n, params: _, ret_type: rt, body: _, span: _) :: rest ->
-      let sem_rt = resolve_typedef(typ: rt, type_defs)
+      // Mark a generic return's type parameter (`TyUserDefined("T",[])`) as a
+      // `TyVar` so the MirCall recovery's guard fires; concrete record/sum
+      // returns are resolved/kept unchanged.
+      let sem_rt = normalize_type_params(typ: rt, type_defs, known_names)
       return build_func_semantic_type_entries_go(
         funcs: rest,
         type_defs,
+        known_names,
         acc: TypeEntry(name: n, typ: sem_rt) :: acc
+      )
+  end
+end
+
+// Build full SEMANTIC signature entries for every function, keyed
+// `#FNSIG#<name>` → `TyArrow(params, ret)`. Parameter and return types are
+// resolved (`TyUserDefined` record → `TyRecord`) but type VARIABLES are
+// preserved, so a generic callee's `(x: T) -> T` / `(xs: [T]) -> T` keeps the
+// `TyVar`s that `recover_generic_call_type` unifies against the call's
+// argument types to instantiate the result's record/sum layout. The
+// `requires`/`throw_row` slots carry `TyUnit` placeholders — the consumer
+// reads only `params` and (indirectly) the return type. Kept under a sentinel
+// key so it does not shadow the plain `<name>` return-type entry that
+// `MirVariable`/`MirCall` lookups depend on.
+let build_func_sig_entries = fn (
+  funcs: [ MirFunction ],
+  type_defs: [ RecordDef ],
+  known_names: [ string ]
+) -> [ TypeEntry ] throws { LirError } do
+  return build_func_sig_entries_go(funcs, type_defs, known_names, acc: [])
+end
+
+let build_func_sig_entries_go = fn (
+  funcs: [ MirFunction ],
+  type_defs: [ RecordDef ],
+  known_names: [ string ],
+  acc: [ TypeEntry ]
+) -> [ TypeEntry ] throws { LirError } do
+  match funcs do
+    | [] -> return list.reverse(xs: acc)
+    | MirFunction(name: n, params: ps, ret_type: rt, body: _, span: _) :: rest ->
+      let sig = TyArrow(
+          params: build_sig_param_types(params: ps, type_defs, known_names, acc: []),
+          ret: normalize_type_params(typ: rt, type_defs, known_names),
+          requires: TyUnit,
+          throw_row: TyUnit
+        )
+      return build_func_sig_entries_go(
+        funcs: rest,
+        type_defs,
+        known_names,
+        acc: TypeEntry(name: fnsig_sentinel(name: n), typ: sig) :: acc
+      )
+  end
+end
+
+let build_sig_param_types = fn (
+  params: [ MirParam ],
+  type_defs: [ RecordDef ],
+  known_names: [ string ],
+  acc: [ NamedType ]
+) -> [ NamedType ] throws { LirError } do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | MirParam(label: l, name: _, typ: t) :: rest ->
+      return build_sig_param_types(
+        params: rest,
+        type_defs,
+        known_names,
+        acc: NamedType(name: l, typ: normalize_type_params(typ: t, type_defs, known_names)) :: acc
       )
   end
 end
@@ -791,7 +952,19 @@ export let lower_mir_to_lir = fn (
   let variant_idx = vidx.with_record_defs(idx: vidx.build_variant_index(defs: all_defs), record_defs: type_defs)
   let MirProgram(functions: fs, externals: exts) = mir
   let func_types = build_func_type_entries(funcs: fs)
-  let sem_func_types = build_func_semantic_type_entries(funcs: fs, type_defs)
+  // Names of all concrete types (every enum incl. builtins ∪ every record).
+  // Lets `normalize_type_params` tell a generic type PARAMETER
+  // (`TyUserDefined("T",[])`, no matching def) from a real named type.
+  let known_names = collect_type_names(enum_defs: all_defs, type_defs)
+  // sem_func_types maps each function's bare name → resolved return type (with
+  // generic type params marked `TyVar`). We also register its FULL signature
+  // under the `#FNSIG#<name>` sentinel key (distinct namespace, no shadowing)
+  // so `recover_generic_call_type` can instantiate a generic callee's
+  // `TyVar`-bearing return type from the call's argument semantic types.
+  let sem_func_types = prepend_type_entries(
+      xs: build_func_sig_entries(funcs: fs, type_defs, known_names),
+      ys: build_func_semantic_type_entries(funcs: fs, type_defs, known_names)
+    )
   // Captured-record env types: a SEPARATE, small registry (only
   // closures that capture a record contribute) — kept out of sem_func_types so
   // it does not bloat every function's semantic_vars. Threaded alongside.
