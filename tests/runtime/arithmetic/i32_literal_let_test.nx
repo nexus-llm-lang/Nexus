@@ -1,0 +1,85 @@
+// Regression: nexus-iap3b -- a narrow (`i32`) `let`-binding whose RHS is an
+// integer LITERAL must keep its declared width so downstream arithmetic wraps
+// in 32 bits. This is the residual of qjejm (which fixed narrow operand-opcode
+// dispatch + cast intrinsics) on the LET-FROM-LITERAL path:
+//
+//   * `let x: i32 = <lit>` bound an i64 LOCAL, because the binding's LIR type
+//     came from `atom_type(<int literal atom>)` = TyI64 in lir.nx -- the
+//     declared `i32` annotation was dropped. Every later op on `x` then ran in
+//     64-bit (`65536 * 65536` gave 4294967296 instead of 0).
+//   * even once the LIR carried i32, the constant folder (lir/opt/folding.nx)
+//     evaluated `65536 * 65536` in full i64 precision (it dropped the binary
+//     node's `typ`), folding to 4294967296 before codegen ran.
+//   * after propagation rewrote two narrow `let`s back into i64 literals,
+//     `binary_operand_type` (codegen/emit/binop.nx) chose the i64 opcode for a
+//     declared-i32 op (`1 << 31` -> `i64.shl`), leaking an i64 into the i32
+//     consumer -> invalid wasm.
+//
+// The function-PARAMETER i32 path already worked (qjejm), so the fix mirrors
+// it: preserve the declared narrow type for a literal-RHS let, wrap folded i32
+// arithmetic to 32 bits, and route declared-i32 ops to the i32 opcode.
+//
+// i32 sign cannot be observed through `cast.i64_of` (an UNSIGNED zero-extend),
+// so the wrap is asserted in the i32 domain via `==` / `<` against i32 values.
+import * as test_assert from "std:test/assert"
+
+// Opaque i32 identity: blocks constant folding so the SAME arithmetic is also
+// exercised on the runtime (un-folded) codegen path, not only in the folder.
+let noopt = fn (n: i32) -> i32 do return n end
+
+let body = fn () -> unit throws { Exn } do
+  let zero: i32 = 0
+
+  // ── multiply wraps to 0 (65536 * 65536 = 2^32, i32-wraps to 0) ──
+  // folded path: both operands are literal-lets the optimizer can see.
+  let a: i32 = 65536
+  let b: i32 = 65536
+  let p: i32 = a * b
+  test_assert.assert_true(cond: p == zero, label: "folded i32 65536 * 65536 wraps to 0")
+  // runtime path: operands laundered through noopt() so the folder can't fire.
+  let rp: i32 = noopt(n: 65536) * noopt(n: 65536)
+  test_assert.assert_true(cond: rp == zero, label: "runtime i32 65536 * 65536 wraps to 0")
+
+  // ── INT_MAX + 1 overflows to the most-negative i32 (sign bit set) ──
+  // (i32 INT_MIN, -2147483648, cannot be written as a positive literal -- it
+  // is out of i32 range before the unary minus -- so the exact wrap value is
+  // pinned by cross-checking the two overflow forms against each other below.)
+  let imax: i32 = 2147483647
+  let one: i32 = 1
+  let ov: i32 = imax + one
+  test_assert.assert_true(cond: ov < zero, label: "folded i32 INT_MAX + 1 is negative")
+  let rov: i32 = noopt(n: 2147483647) + noopt(n: 1)
+  test_assert.assert_true(cond: rov < zero, label: "runtime i32 INT_MAX + 1 is negative")
+
+  // ── 1 << 31 sets the sign bit (shift is not constant-folded) ──
+  let sh: i32 = one << 31
+  test_assert.assert_true(cond: sh < zero, label: "i32 1 << 31 sets the sign bit")
+  let rsh: i32 = noopt(n: 1) << 31
+  test_assert.assert_true(cond: rsh < zero, label: "runtime i32 1 << 31 sets the sign bit")
+
+  // INT_MAX + 1 and 1 << 31 both equal i32 INT_MIN -- pin the exact wrap value
+  // by cross-checking the four forms agree (folded + runtime, add + shift).
+  test_assert.assert_true(cond: ov == sh, label: "i32 INT_MAX+1 == 1<<31 (both INT_MIN)")
+  test_assert.assert_true(cond: rov == rsh, label: "runtime i32 INT_MAX+1 == 1<<31")
+  test_assert.assert_true(cond: ov == rov, label: "i32 folded INT_MIN == runtime INT_MIN")
+
+  // ── in-range i32 arithmetic still computes the ordinary value ──
+  let c: i32 = 40000
+  let d: i32 = 2
+  let sum: i32 = c * d
+  let expect: i32 = 80000
+  test_assert.assert_true(cond: sum == expect, label: "i32 40000 * 2 = 80000 (no wrap)")
+
+  // ── i64 lets are UNAFFECTED: the same product stays 4294967296 ──
+  let la: i64 = 65536
+  let lb: i64 = 65536
+  let lp: i64 = la * lb
+  test_assert.assert_eq_i64(actual: lp, expected: 4294967296, label: "i64 65536 * 65536 unchanged")
+
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end

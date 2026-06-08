@@ -20,7 +20,7 @@
  *   (see src/ir/lir/lower_helpers.nx)
  * - LIR-level optimization passes (see src/ir/lir/opt.nx)
  */
-import { TypeExpr, TyUserDefined, TyLazy, TyArrow, TyRecord, TyList, TyArray } from "src/types/type_expr.nx"
+import { TypeExpr, TyUserDefined, TyLazy, TyArrow, TyRecord, TyList, TyArray, TyI32, TyI64, TyF32, TyF64 } from "src/types/type_expr.nx"
 import * as list from "std:list"
 import { LirError } from "src/ir/lir/errors.nx"
 import { Some, None } from "std:option"
@@ -666,6 +666,31 @@ let prefer_annotation_sem = fn (annot: TypeExpr, atom_sem: TypeExpr) -> bool do
   end
 end
 
+/** Recover a `let`-binding's narrow width (`i32`/`f32`) from its declared type
+ *  when the lowered RHS atom defaulted to the wide counterpart. Integer/float
+ *  literals are atom-typed `TyI64`/`TyF64` everywhere in LIR (`atom_type`
+ *  carries no width on `LirAtomInt`/`LirAtomFloat`), so `let x: i32 = <lit>`
+ *  would otherwise bind an i64 local — every downstream op on `x` then runs in
+ *  64-bit, losing the i32/f32 wraparound that the typechecker accepted. The
+ *  declared annotation `t` is authoritative for the slot width: when it is a
+ *  narrow numeric type and the RHS-inferred width is the matching wide type,
+ *  prefer the annotation. The `LirStmtLet` codegen already coerces the wide
+ *  literal down to the declared width (`i32.wrap_i64` / `f32.demote_f64`), so
+ *  the i64/f64 literal materialises correctly into the narrow slot.
+ *
+ *  Only the literal-default case (declared narrow, inferred wide) is rewritten:
+ *  a non-literal RHS already carries its real width through `atom_type`
+ *  (a function-PARAMETER `i32` stays i32 via `LirAtomVar`), and a non-narrow
+ *  declared type (incl. `TyUnit` for an unannotated `let`) is left untouched.
+ */
+let preferred_let_width = fn (declared: TypeExpr, inferred: TypeExpr) -> TypeExpr do
+  match declared do
+    | TyI32 -> match inferred do | TyI64 -> return TyI32 | _ -> return inferred end
+    | TyF32 -> match inferred do | TyF64 -> return TyF32 | _ -> return inferred end
+    | _ -> return inferred
+  end
+end
+
 let lower_stmt_inner = fn (
   stmt: MirStmt,
   ret_type: TypeExpr,
@@ -675,7 +700,9 @@ let lower_stmt_inner = fn (
     | MirStmtLet(name: n, typ: t, expr: e) ->
       let sem_type = infer_semantic_type(expr: e, ctx)
       let BindResult(ctx: ctx2, atom: a) = lower_expr_to_atom(expr: e, ctx)
-      let inferred = atom_type(atom: a)
+      // A narrow (`i32`/`f32`) annotation overrides the atom's wide default so a
+      // literal-RHS let binds a narrow local (see `preferred_let_width`).
+      let inferred = preferred_let_width(declared: t, inferred: atom_type(atom: a))
         // Prefer semantic type from lowered atom if available
         let atom_sem = match a do
           | LirAtomVar(name: vn, typ: _) ->
@@ -693,11 +720,17 @@ let lower_stmt_inner = fn (
         // collection annotation (`let xs: [R] = ...`), prefer it so the bound
         // list carries `TyList(R)` — without this the cons-pattern binder's
         // `.field` aborts LIR with E6002 for the empty-tail case.
-        let actual_sem = if prefer_annotation_sem(annot: t, atom_sem) then
+        let actual_sem0 = if prefer_annotation_sem(annot: t, atom_sem) then
           t
         else
           atom_sem
         end
+        // A variable read (`MirVariable`) recovers its width from semantic_vars
+        // FIRST, so a narrow literal-let must record its declared `i32`/`f32`
+        // here too — otherwise `infer_semantic_type(<lit>) = TyI64/TyF64` shadows
+        // the narrow `vars` entry and downstream arithmetic on the binding runs
+        // wide (the actual nexus-iap3b miscompile: `x * y` lowered to `i64.mul`).
+        let actual_sem = preferred_let_width(declared: t, inferred: actual_sem0)
         let LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) = ctx2
         let ctx3 = LowerCtx(
             vars: insert_type(name: n, typ: inferred, entries: v),
