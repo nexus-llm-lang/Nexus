@@ -100,9 +100,49 @@ import {
 import * as hpat from "src/ir/hir/pattern.nx"
 
 /** Convert an AST expression (SpannedExpr) to HIR. */
+/** Public entry point. Converts a standalone expression with NO enclosing
+ *  local-binding scope (outer_locals = []). Internal recursive conversion uses
+ *  `convert_expr_go`, which threads the set of local names bound in strictly
+ *  enclosing blocks so that a `let`/for-var that shadows one of them is
+ *  alpha-renamed to a fresh unique name (see convert_stmts_go). This keeps
+ *  codegen's name→wasm-slot allocation in agreement with the typechecker's
+ *  lexical scoping (nexus-i7alf): without it a nested-block shadow reused the
+ *  outer binding's slot and clobbered it. */
 export let convert_expr = fn (
   expr: SpannedExpr,
   entries: [ RenameEntry ]
+) -> HirExpr throws { HirError } do
+  return convert_expr_go(expr, entries, outer_locals: [])
+end
+
+/** Count the occurrences of `name` in `xs`. Used as the shadow DEPTH when
+ *  minting a fresh name for a shadowing binding: the enclosing-locals list is a
+ *  MULTISET (one entry per shadowing nesting level), so the count strictly
+ *  increases with each live nested shadow of the same name, guaranteeing
+ *  `name#depth` is unique along any straight-line scope path. Sibling blocks at
+ *  the same depth reuse the same suffix, which is sound because their bindings
+ *  have disjoint lifetimes (and so may share a wasm slot). */
+let count_str_occ = fn (name: string, xs: [ string ]) -> i64 do
+  match xs do
+    | [] -> return 0
+    | x :: rest ->
+      if x == name then return 1 + count_str_occ(name, xs: rest)
+      else return count_str_occ(name, xs: rest)
+      end
+  end
+end
+
+/** Mint the alpha-renamed name for a binding `name` that shadows an enclosing
+ *  binding. `#` is the internal qualifier separator and is not a legal source
+ *  identifier character, so the result can never collide with a user name. */
+let shadow_rename = fn (name: string, outer_locals: [ string ]) -> string do
+  return name ++ "#" ++ str.from_i64(val: count_str_occ(name, xs: outer_locals))
+end
+
+let convert_expr_go = fn (
+  expr: SpannedExpr,
+  entries: [ RenameEntry ],
+  outer_locals: [ string ]
 ) -> HirExpr throws { HirError } do
   let SpannedExpr(node, span: sp) = expr
   let hir = match node do
@@ -124,8 +164,8 @@ export let convert_expr = fn (
       // Bitwise OpBitAnd / OpBitOr remain as BinOp (always eager, no desugar).
       match op do
         | OpAnd ->
-          let hir_cond = convert_expr(expr: l, entries)
-          let hir_rhs = convert_expr(expr: r, entries)
+          let hir_cond = convert_expr_go(expr: l, entries, outer_locals)
+          let hir_rhs = convert_expr_go(expr: r, entries, outer_locals)
           let hir_false = HirExpr(node: Literal(lit: LitBool(val: false)), span: sp)
           If(
             cond: hir_cond,
@@ -133,8 +173,8 @@ export let convert_expr = fn (
             else_branch: Some(val: [ HirStmt(node: hir.Expr(expr: hir_false), span: sp) ])
           )
         | OpOr ->
-          let hir_cond = convert_expr(expr: l, entries)
-          let hir_rhs = convert_expr(expr: r, entries)
+          let hir_cond = convert_expr_go(expr: l, entries, outer_locals)
+          let hir_rhs = convert_expr_go(expr: r, entries, outer_locals)
           let hir_true = HirExpr(node: Literal(lit: LitBool(val: true)), span: sp)
           If(
             cond: hir_cond,
@@ -142,10 +182,14 @@ export let convert_expr = fn (
             else_branch: Some(val: [ HirStmt(node: hir.Expr(expr: hir_rhs), span: sp) ])
           )
         | _ ->
-          BinOp(left: convert_expr(expr: l, entries), op, right: convert_expr(expr: r, entries))
+          BinOp(
+            left: convert_expr_go(expr: l, entries, outer_locals),
+            op,
+            right: convert_expr_go(expr: r, entries, outer_locals)
+          )
       end
     | ExprUnaryOp(op, operand: o) ->
-      UnOp(op, operand: convert_expr(expr: o, entries))
+      UnOp(op, operand: convert_expr_go(expr: o, entries, outer_locals))
     | ExprBorrow(name, sigil: sig) ->
       Borrow(name: symtab.rename(name, entries), sigil: sig)
     | ExprCall(func: f, args) ->
@@ -171,26 +215,32 @@ export let convert_expr = fn (
           ),
           span: sp
         )
-        CallExpr(callee, args: convert_call_args(args, entries))
+        CallExpr(callee, args: convert_call_args(args, entries, outer_locals))
       else
-        Call(func: renamed, args: convert_call_args(args, entries))
+        Call(func: renamed, args: convert_call_args(args, entries, outer_locals))
       end
     | ExprCallExpr(callee: c, args) ->
       // Postfix-call on an arbitrary expression: (expr)(args).
-      CallExpr(callee: convert_expr(expr: c, entries), args: convert_call_args(args, entries))
+      CallExpr(
+        callee: convert_expr_go(expr: c, entries, outer_locals),
+        args: convert_call_args(args, entries, outer_locals)
+      )
     | ExprConstructor(name: v, args, sigil: sig) ->
-      let HirCtorResult(labels: ctor_labels, args: ctor_args) = convert_ctor_args(args, entries)
+      let HirCtorResult(labels: ctor_labels, args: ctor_args) = convert_ctor_args(args, entries, outer_locals)
       // route the ctor occurrence through the import-binding rename
       // map. Bare `MkV` (selective/own) matches a bare entry; `m.MkV` (wildcard)
       // matches the `alias.Ctor` entry. Builtins (Cons/Nil/Some/None) and any
       // unmapped ctor stay bare (rename is identity on miss).
       Ctor(variant: symtab.rename_ctor(name: v, entries), args: ctor_args, labels: ctor_labels, sigil: sig)
     | ExprRecord(fields: fs) ->
-      Record(fields: convert_named_exprs(exprs: fs, entries))
+      Record(fields: convert_named_exprs(exprs: fs, entries, outer_locals))
     | ExprArray(elements: es) ->
-      Array(elems: convert_expr_list(exprs: es, entries))
+      Array(elems: convert_expr_list(exprs: es, entries, outer_locals))
     | ExprIndex(target: t, index: i) ->
-      Index(target: convert_expr(expr: t, entries), index: convert_expr(expr: i, entries))
+      Index(
+        target: convert_expr_go(expr: t, entries, outer_locals),
+        index: convert_expr_go(expr: i, entries, outer_locals)
+      )
     | ExprFieldAccess(target: t, field: f) ->
       // Module-qualified value access: `mod.name` in value position parses as
       // FieldAccess(Variable("mod"), "name"). If "mod.name" has a rename
@@ -205,32 +255,52 @@ export let convert_expr = fn (
           if symtab.rename_has(name: qualified_key, entries) then
             Variable(name: symtab.rename(name: qualified_key, entries), sigil: SigilImmutable)
           else
-            FieldAccess(target: convert_expr(expr: t, entries), field: f)
+            FieldAccess(target: convert_expr_go(expr: t, entries, outer_locals), field: f)
           end
         | _ ->
-          FieldAccess(target: convert_expr(expr: t, entries), field: f)
+          FieldAccess(target: convert_expr_go(expr: t, entries, outer_locals), field: f)
       end
     | ExprIf(cond: c, then_branch: tb, else_branch: eb) ->
+      // The branch bodies are child scopes; `outer_locals` already carries the
+      // names live at this `if` (convert_stmts_go augmented it before descending
+      // here), so a `let` in a branch that shadows one is renamed.
       let hir_else = match eb do
         | [] -> None
-        | _ :: _ -> Some(val: convert_stmts(stmts: eb, entries))
+        | _ :: _ -> Some(val: convert_stmts_scoped(stmts: eb, entries, outer_locals))
       end
       If(
-        cond: convert_expr(expr: c, entries),
-        then_branch: convert_stmts(stmts: tb, entries),
+        cond: convert_expr_go(expr: c, entries, outer_locals),
+        then_branch: convert_stmts_scoped(stmts: tb, entries, outer_locals),
         else_branch: hir_else
       )
     | ExprMatch(target: t, cases: cs) ->
-      Match(target: convert_expr(expr: t, entries), cases: convert_match_cases(cases: cs, entries))
+      Match(
+        target: convert_expr_go(expr: t, entries, outer_locals),
+        cases: convert_match_cases(cases: cs, entries, outer_locals)
+      )
     | ExprWhile(cond: c, body: b) ->
-      While(cond: convert_expr(expr: c, entries), body: convert_stmts(stmts: b, entries))
+      While(
+        cond: convert_expr_go(expr: c, entries, outer_locals),
+        body: convert_stmts_scoped(stmts: b, entries, outer_locals)
+      )
     | ExprFor(var: v, start: s, end_expr: e, body: b) ->
-      let body_entries = symtab.rename_drop(entries, name: v)
+      // The loop variable `v` is bound in the for-body scope. If it shadows an
+      // enclosing binding, rename it to a fresh name and route references inside
+      // the body to it; otherwise drop any top-level rename so `v` stays bare.
+      // The for-var is also an enclosing binding for the body, so it joins
+      // `outer_locals` when converting the body (a nested `let v` then shadows).
+      let shadows_for = count_str_occ(name: v, xs: outer_locals) > 0
+      let for_var = if shadows_for then shadow_rename(name: v, outer_locals) else v end
+      let body_entries = if shadows_for then
+        symtab.rename_add(entries: symtab.rename_drop(entries, name: v), original: v, qualified: for_var)
+      else
+        symtab.rename_drop(entries, name: v)
+      end
       For(
-        var: v,
-        start: convert_expr(expr: s, entries),
-        end_expr: convert_expr(expr: e, entries),
-        body: convert_stmts(stmts: b, entries: body_entries)
+        var: for_var,
+        start: convert_expr_go(expr: s, entries, outer_locals),
+        end_expr: convert_expr_go(expr: e, entries, outer_locals),
+        body: convert_stmts_scoped(stmts: b, entries: body_entries, outer_locals: v :: outer_locals)
       )
     | ExprLambda(
       type_params: tps,
@@ -243,26 +313,35 @@ export let convert_expr = fn (
       // Lexical shadowing: drop rename entries whose `original` matches a
       // parameter name so references inside the body resolve to the local
       // (parameter) at codegen instead of any toplevel of the same name.
-      let inner_entries = symtab.rename_drop_many(entries, names: param_names_of_params(params: ps))
+      // The body's enclosing-locals set keeps `outer_locals` (the captured
+      // enclosing locals, which closure conversion lifts into params of the
+      // lifted function) plus this lambda's own params, so a `let` in the body
+      // that shadows either is renamed to a fresh slot.
+      let pnames = param_names_of_params(params: ps)
+      let inner_entries = symtab.rename_drop_many(entries, names: pnames)
       Lambda(
         type_params: tps,
         params: convert_params(params: ps),
         ret_type: rt,
         requires: req,
         throw_row: tw,
-        body: convert_stmts(stmts: b, entries: inner_entries)
+        body: convert_stmts_scoped(
+          stmts: b,
+          entries: inner_entries,
+          outer_locals: list.concat(xs: pnames, ys: outer_locals)
+        )
       )
     | ExprRaise(value: e) ->
-      Raise(expr: convert_expr(expr: e, entries))
+      Raise(expr: convert_expr_go(expr: e, entries, outer_locals))
     | ExprForce(value: e) ->
-      Force(expr: convert_expr(expr: e, entries))
+      Force(expr: convert_expr_go(expr: e, entries, outer_locals))
     | ExprExternal(symbol: sym, type_params: tps, arg_names: names, typ: t) ->
       ExternalRef(symbol: sym, type_params: tps, arg_names: names, typ: t)
     | ExprHandler(coeffect_name: pname, requires: req, arms) ->
       Handler(
         cap_name: symtab.rename(name: pname, entries),
         requires: req,
-        arms: convert_handler_arms(arms, entries)
+        arms: convert_handler_arms(arms, entries, outer_locals)
       )
     | ExprInject(handlers: hs, body: b) ->
       // Mirror the StmtInject conversion (convert_stmts_go): resolve the dotted
@@ -273,11 +352,11 @@ export let convert_expr = fn (
       let qualified_handlers = rename_strings(names: handler_names, entries)
       Inject(
         handlers: qualified_handlers,
-        body: convert_stmts(stmts: b, entries)
+        body: convert_stmts_scoped(stmts: b, entries, outer_locals)
       )
     | ExprList(elements: es) ->
       // Extract inner node from desugar_list result — span comes from outer wrapping
-      let HirExpr(node: desugared, span: _) = desugar_list(elems: es, entries, span: sp)
+      let HirExpr(node: desugared, span: _) = desugar_list(elems: es, entries, span: sp, outer_locals)
       desugared
   end
   return HirExpr(node: hir, span: sp)
@@ -322,10 +401,11 @@ end
 let desugar_list = fn (
   elems: [ SpannedExpr ],
   entries: [ RenameEntry ],
-  span: Span
+  span: Span,
+  outer_locals: [ string ]
 ) -> HirExpr throws { HirError } do
   let reversed = list.reverse(xs: elems)
-  let inner = desugar_list_go(elems: reversed, entries,
+  let inner = desugar_list_go(elems: reversed, entries, outer_locals,
     acc: HirExpr(node: Ctor(variant: "Nil", args: [], labels: [], sigil: SigilImmutable), span))
   let HirExpr(node: result_node, span: _) = inner
   return HirExpr(node: result_node, span)
@@ -334,14 +414,15 @@ end
 let desugar_list_go = fn (
   elems: [ SpannedExpr ],
   entries: [ RenameEntry ],
+  outer_locals: [ string ],
   acc: HirExpr
 ) -> HirExpr throws { HirError } do
   match elems do
     | [] -> return acc
     | e :: rest ->
       let SpannedExpr(node: _, span: head_sp) = e
-      let head = convert_expr(expr: e, entries)
-      return desugar_list_go(elems: rest, entries,
+      let head = convert_expr_go(expr: e, entries, outer_locals)
+      return desugar_list_go(elems: rest, entries, outer_locals,
         acc: HirExpr(
           node: Ctor(variant: "Cons", args: [ acc, head ], labels: [], sigil: SigilImmutable),
           span: head_sp
@@ -351,14 +432,16 @@ end
 
 let convert_call_args = fn (
   args: [ CallArg ],
-  entries: [ RenameEntry ]
+  entries: [ RenameEntry ],
+  outer_locals: [ string ]
 ) -> [ HirCallArg ] throws { HirError } do
-  return convert_call_args_go(args, entries, acc: [])
+  return convert_call_args_go(args, entries, outer_locals, acc: [])
 end
 
 let convert_call_args_go = fn (
   args: [ CallArg ],
   entries: [ RenameEntry ],
+  outer_locals: [ string ],
   acc: [ HirCallArg ]
 ) -> [ HirCallArg ] throws { HirError } do
   match args do
@@ -367,7 +450,8 @@ let convert_call_args_go = fn (
       return convert_call_args_go(
         args: rest,
         entries,
-        acc: HirCallArg(label: l, value: convert_expr(expr: v, entries)) :: acc
+        outer_locals,
+        acc: HirCallArg(label: l, value: convert_expr_go(expr: v, entries, outer_locals)) :: acc
       )
   end
 end
@@ -433,20 +517,26 @@ type HirCtorResult = HirCtorResult(labels: [ string ], args: [ HirExpr ])
 
 let convert_ctor_args = fn (
   args: [ CtorArg ],
-  entries: [ RenameEntry ]
+  entries: [ RenameEntry ],
+  outer_locals: [ string ]
 ) -> HirCtorResult throws { HirError } do
-  return convert_ctor_args_inner(args: sort_ctor_args(args), entries)
+  return convert_ctor_args_inner(args: sort_ctor_args(args), entries, outer_locals)
 end
 
 let convert_ctor_args_inner = fn (
   args: [ CtorArg ],
-  entries: [ RenameEntry ]
+  entries: [ RenameEntry ],
+  outer_locals: [ string ]
 ) -> HirCtorResult throws { HirError } do
-  return convert_ctor_args_inner_go(args, entries, acc_labels: [], acc_exprs: [])
+  return convert_ctor_args_inner_go(args, entries, outer_locals, acc_labels: [], acc_exprs: [])
 end
 
 let convert_ctor_args_inner_go = fn (
-  args: [ CtorArg ], entries: [ RenameEntry ], acc_labels: [ string ], acc_exprs: [ HirExpr ]
+  args: [ CtorArg ],
+  entries: [ RenameEntry ],
+  outer_locals: [ string ],
+  acc_labels: [ string ],
+  acc_exprs: [ HirExpr ]
 ) -> HirCtorResult throws { HirError } do
   match args do
     | [] ->
@@ -455,22 +545,25 @@ let convert_ctor_args_inner_go = fn (
       return convert_ctor_args_inner_go(
         args: rest,
         entries,
+        outer_locals,
         acc_labels: n :: acc_labels,
-        acc_exprs: convert_expr(expr: v, entries) :: acc_exprs
+        acc_exprs: convert_expr_go(expr: v, entries, outer_locals) :: acc_exprs
       )
   end
 end
 
 let convert_named_exprs = fn (
   exprs: [ NamedExpr ],
-  entries: [ RenameEntry ]
+  entries: [ RenameEntry ],
+  outer_locals: [ string ]
 ) -> [ HirNamedExpr ] throws { HirError } do
-  return convert_named_exprs_go(exprs, entries, acc: [])
+  return convert_named_exprs_go(exprs, entries, outer_locals, acc: [])
 end
 
 let convert_named_exprs_go = fn (
   exprs: [ NamedExpr ],
   entries: [ RenameEntry ],
+  outer_locals: [ string ],
   acc: [ HirNamedExpr ]
 ) -> [ HirNamedExpr ] throws { HirError } do
   match exprs do
@@ -479,36 +572,58 @@ let convert_named_exprs_go = fn (
       return convert_named_exprs_go(
         exprs: rest,
         entries,
-        acc: HirNamedExpr(name: n, value: convert_expr(expr: v, entries)) :: acc
+        outer_locals,
+        acc: HirNamedExpr(name: n, value: convert_expr_go(expr: v, entries, outer_locals)) :: acc
       )
   end
 end
 
 let convert_expr_list = fn (
   exprs: [ SpannedExpr ],
-  entries: [ RenameEntry ]
+  entries: [ RenameEntry ],
+  outer_locals: [ string ]
 ) -> [ HirExpr ] throws { HirError } do
-  return convert_expr_list_go(exprs, entries, acc: [])
+  return convert_expr_list_go(exprs, entries, outer_locals, acc: [])
 end
 
 let convert_expr_list_go = fn (
   exprs: [ SpannedExpr ],
   entries: [ RenameEntry ],
+  outer_locals: [ string ],
   acc: [ HirExpr ]
 ) -> [ HirExpr ] throws { HirError } do
   match exprs do
     | [] -> return list.reverse(xs: acc)
     | e :: rest ->
-      return convert_expr_list_go(exprs: rest, entries, acc: convert_expr(expr: e, entries) :: acc)
+      return convert_expr_list_go(
+        exprs: rest,
+        entries,
+        outer_locals,
+        acc: convert_expr_go(expr: e, entries, outer_locals) :: acc
+      )
   end
 end
 
-/** Convert AST statements to HIR statements. */
+/** Convert AST statements to HIR statements with NO enclosing local-binding
+ *  scope. Used by callers that begin a fresh scope chain. */
 let convert_stmts = fn (
   stmts: [ SpannedStmt ],
   entries: [ RenameEntry ]
 ) -> [ HirStmt ] throws { HirError } do
-  return convert_stmts_go(stmts, entries, acc: [])
+  return convert_stmts_scoped(stmts, entries, outer_locals: [])
+end
+
+/** Convert a child statement block whose strictly-enclosing local names are
+ *  `outer_locals`. The block starts with an empty current-block accumulator;
+ *  any `let`/for-var whose name appears in `outer_locals` is alpha-renamed to a
+ *  fresh slot, so it cannot clobber the enclosing binding's slot (nexus-i7alf).
+ */
+let convert_stmts_scoped = fn (
+  stmts: [ SpannedStmt ],
+  entries: [ RenameEntry ],
+  outer_locals: [ string ]
+) -> [ HirStmt ] throws { HirError } do
+  return convert_stmts_go(stmts, entries, acc: [], outer_locals, block_locals: [])
 end
 
 /**
@@ -705,16 +820,38 @@ end
 let convert_stmts_go = fn (
   stmts: [ SpannedStmt ],
   entries: [ RenameEntry ],
-  acc: [ HirStmt ]
+  acc: [ HirStmt ],
+  outer_locals: [ string ],
+  block_locals: [ string ]
 ) -> [ HirStmt ] throws { HirError } do
+  // The MULTISET of local names visible to any CHILD block opened from a
+  // sub-expression of the current statement: the strictly-enclosing locals
+  // (`outer_locals`) plus everything bound so far in THIS block
+  // (`block_locals`). A `let`/for-var in a child block whose name is in this
+  // set shadows an enclosing binding and is alpha-renamed (nexus-i7alf).
+  let enclosing = list.concat(xs: block_locals, ys: outer_locals)
   match stmts do
     | [] -> return list.reverse(xs: acc)
     | SpannedStmt(node: StmtLet(name: n, sigil: sig, typ: t, value: v), span: sp) :: rest ->
       let SpannedExpr(node: v_node, span: vsp) = v
-      // Lexical shadowing: subsequent statements see entries with `n` dropped
-      // so references resolve to the local binding, not any toplevel of the
-      // same name.
-      let inner_entries = symtab.rename_drop(entries, name: n)
+      // A `let n` whose name is bound in a STRICTLY-ENCLOSING block (n ∈
+      // outer_locals) shadows that binding. Codegen keys wasm local slots by
+      // name, so leaving both as `n` reuses the outer slot and the inner write
+      // clobbers the outer value (nexus-i7alf). Rename the inner binding to a
+      // fresh `n#depth` and route references in the rest of this block to it;
+      // the enclosing binding keeps name `n` (its own slot) and survives the
+      // block. A same-block re-`let` (n ∈ block_locals only) is an intended
+      // rebind and KEEPS its name so it shares the slot (flat-rebind semantics).
+      let shadows = count_str_occ(name: n, xs: outer_locals) > 0
+      let bind_name = if shadows then shadow_rename(name: n, outer_locals) else n end
+      // References after this `let` (in the rest of this block) resolve to the
+      // bound name: the fresh `bind_name` for a shadow, else bare `n` (with any
+      // top-level rename for `n` dropped so it does not re-qualify).
+      let inner_entries = if shadows then
+        symtab.rename_add(entries: symtab.rename_drop(entries, name: n), original: n, qualified: bind_name)
+      else
+        symtab.rename_drop(entries, name: n)
+      end
       // A `let n = fn (...)` is a (possibly mutually) recursive local closure
       // (types.md:236 / the d33l7 lift_lambda_self path): the body may refer
       // to `n` to recurse, and to forward SIBLING local-let lambdas to
@@ -734,48 +871,70 @@ let convert_stmts_go = fn (
       // top-level canonical.
       //
       // Non-lambda RHS keeps the outer entries: a non-recursive `let n = E`
-      // does not bring the block locals into scope within E.
+      // does not bring the block locals into scope within E. When this binding
+      // is a SHADOW, a recursive lambda's self/sibling references must target
+      // the RENAMED binding, so map `n → bind_name` in the lambda's RHS env.
       let rhs_entries = match v_node do
         | ExprLambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: lam_body) ->
-          symtab.rename_drop_many(
+          let dropped = symtab.rename_drop_many(
             entries,
             names: n :: collect_mutual_sibling_names(rest, self_name: n, self_body: lam_body)
           )
+          if shadows then
+            symtab.rename_add(entries: dropped, original: n, qualified: bind_name)
+          else
+            dropped
+          end
         | _ -> entries
       end
+      // RHS is evaluated in the current scope (enclosing), where any nested
+      // block it contains sees the names live up to this point.
       let hir_val = match sig do
         | SigilLazy ->
-          HirExpr(node: Thunk(body: convert_expr(expr: v, entries: rhs_entries)), span: vsp)
+          HirExpr(node: Thunk(body: convert_expr_go(expr: v, entries: rhs_entries, outer_locals: enclosing)), span: vsp)
         | _ ->
-          convert_expr(expr: v, entries: rhs_entries)
+          convert_expr_go(expr: v, entries: rhs_entries, outer_locals: enclosing)
       end
       return convert_stmts_go(
         stmts: rest,
         entries: inner_entries,
-        acc: HirStmt(node: Let(name: n, sigil: sig, typ: t, value: hir_val), span: sp) :: acc
+        acc: HirStmt(node: Let(name: bind_name, sigil: sig, typ: t, value: hir_val), span: sp) :: acc,
+        outer_locals,
+        block_locals: n :: block_locals
       )
     | SpannedStmt(node: StmtLetPattern(pattern: pat, value: v), span: sp) :: rest ->
       // Desugar: let Pattern = expr; rest → match expr do case Pattern -> rest end
       // The remaining stmts form the case body and must see entries with every
-      // pattern-bound variable dropped (lexical shadowing).
-      let body_entries = symtab.rename_drop_many(entries, names: hpat.pattern_binders(pat))
-      let case_body = convert_stmts(stmts: rest, entries: body_entries)
+      // pattern-bound variable dropped (lexical shadowing). The case body is a
+      // child scope whose enclosing locals are everything bound so far plus the
+      // pattern binders, so a deeper `let` shadowing any of them is renamed.
+      let binders = hpat.pattern_binders(pat)
+      let body_entries = symtab.rename_drop_many(entries, names: binders)
+      let case_body = convert_stmts_scoped(
+        stmts: rest,
+        entries: body_entries,
+        outer_locals: list.concat(xs: binders, ys: enclosing)
+      )
       let match_case = HirMatchCase(pattern: hpat.convert_pattern(pat, entries), body: case_body)
       return list.concat(xs: list.reverse(xs: acc), ys: [ HirStmt(node: Expr(expr: HirExpr(node: Match(
-          target: convert_expr(expr: v, entries),
+          target: convert_expr_go(expr: v, entries, outer_locals: enclosing),
           cases: [ match_case ]
         ), span: sp)), span: sp) ])
     | SpannedStmt(node: StmtExpr(expr: e), span: sp) :: rest ->
       return convert_stmts_go(
         stmts: rest,
         entries,
-        acc: HirStmt(node: Expr(expr: convert_expr(expr: e, entries)), span: sp) :: acc
+        acc: HirStmt(node: Expr(expr: convert_expr_go(expr: e, entries, outer_locals: enclosing)), span: sp) :: acc,
+        outer_locals,
+        block_locals
       )
     | SpannedStmt(node: StmtReturn(value: e), span: sp) :: rest ->
       return convert_stmts_go(
         stmts: rest,
         entries,
-        acc: HirStmt(node: Return(expr: convert_expr(expr: e, entries)), span: sp) :: acc
+        acc: HirStmt(node: Return(expr: convert_expr_go(expr: e, entries, outer_locals: enclosing)), span: sp) :: acc,
+        outer_locals,
+        block_locals
       )
     | SpannedStmt(node: StmtAssign(target: t, value: v), span: sp) :: rest ->
       // Synthetic Variable target inherits the assignment statement span so
@@ -785,19 +944,19 @@ let convert_stmts_go = fn (
             node: Variable(name: symtab.rename(name: t, entries), sigil: SigilMutable),
             span: sp
           ),
-          value: convert_expr(expr: v, entries)
-        ), span: sp) :: acc)
+          value: convert_expr_go(expr: v, entries, outer_locals: enclosing)
+        ), span: sp) :: acc, outer_locals, block_locals)
     | SpannedStmt(node: StmtIndexAssign(target: arr, index: idx, value: v), span: sp) :: rest ->
       // Indexed assignment `arr[idx] <- val`: convert to HIR
       // Assign with an Index target. HIR Assign already takes HirExpr, so
       // downstream IR / typecheck see a uniform shape.
-      let arr_hir = convert_expr(expr: arr, entries)
-      let idx_hir = convert_expr(expr: idx, entries)
-      let v_hir = convert_expr(expr: v, entries)
+      let arr_hir = convert_expr_go(expr: arr, entries, outer_locals: enclosing)
+      let idx_hir = convert_expr_go(expr: idx, entries, outer_locals: enclosing)
+      let v_hir = convert_expr_go(expr: v, entries, outer_locals: enclosing)
       return convert_stmts_go(stmts: rest, entries, acc: HirStmt(node: Assign(
           target: HirExpr(node: Index(target: arr_hir, index: idx_hir), span: sp),
           value: v_hir
-        ), span: sp) :: acc)
+        ), span: sp) :: acc, outer_locals, block_locals)
     | SpannedStmt(
       node: StmtTry(
         body: b,
@@ -808,13 +967,15 @@ let convert_stmts_go = fn (
       ),
       span: sp
     ) :: rest ->
-      // Legacy single-arm variable catch: catch param -> body
+      // Legacy single-arm variable catch: catch param -> body. The try body and
+      // catch body are child scopes; the catch param `n` is bound in the catch
+      // body, so it joins that body's enclosing locals.
       let cb_entries = symtab.rename_drop(entries, name: n)
       return convert_stmts_go(stmts: rest, entries, acc: HirStmt(node: Try(
-          body: convert_stmts(stmts: b, entries),
+          body: convert_stmts_scoped(stmts: b, entries, outer_locals: enclosing),
           catch_param: n,
-          catch_body: convert_stmts(stmts: cb, entries: cb_entries)
-        ), span: sp) :: acc)
+          catch_body: convert_stmts_scoped(stmts: cb, entries: cb_entries, outer_locals: n :: enclosing)
+        ), span: sp) :: acc, outer_locals, block_locals)
     | SpannedStmt(node: StmtTry(body: b, catch_arms: arms), span: sp) :: rest ->
       // Multi-arm or non-variable: desugar to catch __exn -> match __exn do ... end
       // Append a synthetic catch-all re-throw arm `| __exn_v -> throw __exn_v` so
@@ -823,7 +984,7 @@ let convert_stmts_go = fn (
       // reading a foreign payload). This also makes the synthesized match
       // exhaustive over `Exn`, so the exhaustiveness check passes without any
       // catch-body suppression hack.
-      let user_cases = convert_catch_arms_to_match_cases(arms, entries)
+      let user_cases = convert_catch_arms_to_match_cases(arms, entries, outer_locals: enclosing)
       // Only append the synthetic re-throw arm when the user arms don't already
       // include an irrefutable catch-all (a bare variable/wildcard pattern). If
       // they do, the user's own arm handles every variant and appending would
@@ -851,17 +1012,17 @@ let convert_stmts_go = fn (
         cases: mir_cases
       )
       return convert_stmts_go(stmts: rest, entries, acc: HirStmt(node: Try(
-          body: convert_stmts(stmts: b, entries),
+          body: convert_stmts_scoped(stmts: b, entries, outer_locals: enclosing),
           catch_param: "__exn",
           catch_body: [ HirStmt(node: hir.Expr(expr: HirExpr(node: match_expr, span: sp)), span: sp) ]
-        ), span: sp) :: acc)
+        ), span: sp) :: acc, outer_locals, block_locals)
     | SpannedStmt(node: StmtInject(handlers: hs, body: b), span: sp) :: rest ->
       let handler_names = extract_handler_names(exprs: hs)
       let qualified_handlers = rename_strings(names: handler_names, entries)
       return convert_stmts_go(stmts: rest, entries, acc: HirStmt(node: Inject(
           handlers: qualified_handlers,
-          body: convert_stmts(stmts: b, entries)
-        ), span: sp) :: acc)
+          body: convert_stmts_scoped(stmts: b, entries, outer_locals: enclosing)
+        ), span: sp) :: acc, outer_locals, block_locals)
   end
 end
 
@@ -934,14 +1095,16 @@ end
 /** Convert match cases to HIR. */
 let convert_match_cases = fn (
   cases: [ MatchCase ],
-  entries: [ RenameEntry ]
+  entries: [ RenameEntry ],
+  outer_locals: [ string ]
 ) -> [ HirMatchCase ] throws { HirError } do
-  return convert_match_cases_go(cases, entries, acc: [])
+  return convert_match_cases_go(cases, entries, outer_locals, acc: [])
 end
 
 let convert_match_cases_go = fn (
   cases: [ MatchCase ],
   entries: [ RenameEntry ],
+  outer_locals: [ string ],
   acc: [ HirMatchCase ]
 ) -> [ HirMatchCase ] throws { HirError } do
   match cases do
@@ -949,20 +1112,28 @@ let convert_match_cases_go = fn (
     | MatchCase(pattern: p, body: b) :: rest ->
       // Lexical shadowing: the case body sees rename entries with every
       // pattern-bound variable name dropped, so PatVariable bindings shadow
-      // any toplevel of the same name within the arm.
-      let body_entries = symtab.rename_drop_many(entries, names: hpat.pattern_binders(pat: p))
-      return convert_match_cases_go(cases: rest, entries, acc: HirMatchCase(
+      // any toplevel of the same name within the arm. The arm body is a child
+      // scope whose enclosing locals are `outer_locals` plus the arm's pattern
+      // binders, so a `let` in the body that shadows either is renamed.
+      let binders = hpat.pattern_binders(pat: p)
+      let body_entries = symtab.rename_drop_many(entries, names: binders)
+      return convert_match_cases_go(cases: rest, entries, outer_locals, acc: HirMatchCase(
           pattern: hpat.convert_pattern(pat: p, entries),
-          body: convert_stmts(stmts: b, entries: body_entries)
+          body: convert_stmts_scoped(
+            stmts: b,
+            entries: body_entries,
+            outer_locals: list.concat(xs: binders, ys: outer_locals)
+          )
         ) :: acc)
   end
 end
 
 let convert_catch_arms_to_match_cases = fn (
   arms: [ CatchArm ],
-  entries: [ RenameEntry ]
+  entries: [ RenameEntry ],
+  outer_locals: [ string ]
 ) -> [ HirMatchCase ] throws { HirError } do
-  return convert_catch_arms_go(arms, entries, acc: [])
+  return convert_catch_arms_go(arms, entries, outer_locals, acc: [])
 end
 
 /** True when any case is an irrefutable catch-all (bare variable / wildcard,
@@ -998,17 +1169,22 @@ end
 let convert_catch_arms_go = fn (
   arms: [ CatchArm ],
   entries: [ RenameEntry ],
+  outer_locals: [ string ],
   acc: [ HirMatchCase ]
 ) -> [ HirMatchCase ] throws { HirError } do
   match arms do
     | [] -> return list.reverse(xs: acc)
     | CatchArm(pattern: p, body: b) :: rest ->
-      let body_entries = symtab.rename_drop_many(entries, names: hpat.pattern_binders(pat: p))
-      let mc = HirMatchCase(
-        pattern: hpat.convert_pattern(pat: p, entries),
-        body: convert_stmts(stmts: b, entries: body_entries)
-      )
-      return convert_catch_arms_go(arms: rest, entries, acc: mc :: acc)
+      let binders = hpat.pattern_binders(pat: p)
+      let body_entries = symtab.rename_drop_many(entries, names: binders)
+      return convert_catch_arms_go(arms: rest, entries, outer_locals, acc: HirMatchCase(
+          pattern: hpat.convert_pattern(pat: p, entries),
+          body: convert_stmts_scoped(
+            stmts: b,
+            entries: body_entries,
+            outer_locals: list.concat(xs: binders, ys: outer_locals)
+          )
+        ) :: acc)
   end
 end
 
@@ -1048,14 +1224,16 @@ end
  */
 let convert_handler_arms = fn (
   arms: [ HandlerArm ],
-  entries: [ RenameEntry ]
+  entries: [ RenameEntry ],
+  outer_locals: [ string ]
 ) -> [ HirHandlerArm ] throws { HirError } do
-  return convert_handler_arms_go(arms, entries, acc: [])
+  return convert_handler_arms_go(arms, entries, outer_locals, acc: [])
 end
 
 let convert_handler_arms_go = fn (
   arms: [ HandlerArm ],
   entries: [ RenameEntry ],
+  outer_locals: [ string ],
   acc: [ HirHandlerArm ]
 ) -> [ HirHandlerArm ] throws { HirError } do
   match arms do
@@ -1071,10 +1249,11 @@ let convert_handler_arms_go = fn (
         | Some(val: k) -> symtab.rename_drop(entries, name: k)
         | None -> entries
       end
-      let hir_fn = convert_one_function(func: f, entries: arm_entries)
+      let hir_fn = convert_one_function(func: f, entries: arm_entries, outer_locals)
       return convert_handler_arms_go(
         arms: rest,
         entries,
+        outer_locals,
         acc: HirHandlerArm(arm: hir_fn, cont_binder: kb) :: acc
       )
   end
@@ -1092,7 +1271,8 @@ end
  */
 let convert_one_function = fn (
   func: Function,
-  entries: [ RenameEntry ]
+  entries: [ RenameEntry ],
+  outer_locals: [ string ]
 ) -> HirFunction throws { HirError } do
   let Function(
     name: n,
@@ -1106,14 +1286,22 @@ let convert_one_function = fn (
     span: sp
   ) = func
   // Lexical shadowing: parameter names hide any toplevel rename inside the body.
-  let inner_entries = symtab.rename_drop_many(entries, names: param_names_of_params(params: ps))
+  // The body's enclosing locals carry the inject-site captures (`outer_locals`)
+  // plus this arm function's own params, so a `let` in the body that shadows
+  // either is renamed to a fresh slot.
+  let pnames = param_names_of_params(params: ps)
+  let inner_entries = symtab.rename_drop_many(entries, names: pnames)
   return HirFunction(
     name: n,
     type_params: tps,
     params: convert_params(params: ps),
     ret_type: rt,
     throw_row: tw,
-    body: EagerBody(stmts: convert_stmts(stmts: b, entries: inner_entries)),
+    body: EagerBody(stmts: convert_stmts_scoped(
+      stmts: b,
+      entries: inner_entries,
+      outer_locals: list.concat(xs: pnames, ys: outer_locals)
+    )),
     span: sp,
     file: "",
     // Preserve the source-level require row for typecheck-time wfCap
