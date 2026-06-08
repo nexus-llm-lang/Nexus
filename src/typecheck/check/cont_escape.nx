@@ -1,0 +1,269 @@
+/**
+ * typecheck/check/cont_escape: `with @k` continuation-binder escape walker.
+ *
+ * A `with @k` continuation binder is a control-flow handle, not an ordinary
+ * value. Only a syntactically-direct force `@k` (or `@kk` where `kk` is a bare
+ * `let`-alias of `k`) lowers to `op_resume`; any other use flows the binder's
+ * i64 table-slot index somewhere the MIR resume-lowering cannot follow and
+ * would crash at runtime. `check_cont_no_escape_stmts` walks a function/arm
+ * body and rejects every such escape with a `TypeMismatch` diagnostic so the
+ * miscompile can never reach codegen.
+ */
+
+import {
+  HirStmt,
+  HirStmtKind,
+  HirExpr,
+  HirExprKind,
+  HirCallArg,
+  HirMatchCase,
+  HirNamedExpr
+} from "src/ir/hir/types.nx"
+import {
+  TypeError,
+  TypeMismatch
+} from "src/typecheck/errors.nx"
+import { str_list_contains } from "src/typecheck/check/occurs.nx"
+
+// A `with @k` continuation binder is a control-flow handle, not an ordinary
+// value: only a syntactically-direct force `@k` (or `@kk` where `kk` is a bare
+// `let`-alias of `k`) lowers to `op_resume`. Most OTHER uses of the binder —
+// storing it in a constructor/record field, assigning it, returning or yielding
+// it, capturing it in a lambda, or passing it to a function that can FORCE it —
+// flow the binder's i64 table-slot index somewhere the MIR lowering cannot
+// rewrite to a resume; it would later be force-derefed as a heap pointer and
+// SIGSEGV at runtime (typecheck accepts, build succeeds, crash).
+//
+// Two indirect forms ARE supported end-to-end and therefore allowed:
+//   1. the let-alias `let kk = k; @kk` — MIR tracks the alias and lowers `@kk`
+//      to resume, so we extend the binder set across such a `let`;
+//   2. passing the binder as a VALUE to a slot-reading intrinsic (an external
+//      whose wasm symbol is `value_of_i64`, e.g. std:runtime/sched's
+//      `kont_slot(k: k)`). Such an intrinsic is a pure bitcast — it reinterprets
+//      the binder's bits as a raw i64 and NEVER forces it, so no resume-lowering
+//      is needed and there is no crash. The cooperative scheduler depends on
+//      this to read the continuation's cont-table slot for the run queue.
+// `safe_callees` is the set of those slot-reading external names (built once in
+// check_program from the program's externals). Everything else is rejected here
+// with a clear diagnostic so the miscompile can never reach codegen.
+let cont_escape_detail = fn (name: string) -> string do
+  return "continuation binder `" ++ name
+    ++ "` may only be forced directly as `@" ++ name
+    ++ "` (or bound by a bare `let`-alias and forced there); apart from a slot-reading intrinsic such as `kont_slot`, it cannot be passed as an argument, stored in a field, assigned, or returned as a value (it would miscompile to a thunk force and crash at runtime)"
+end
+
+// Walk an expression and reject any bare reference to a cont binder that is NOT
+// the direct operand of a force (or of a known slot-reading intrinsic call).
+// `binders` is the current alias set; `safe_callees` is the slot-reading
+// external allowlist.
+let check_cont_no_escape = fn (
+  expr: HirExpr,
+  binders: [ string ],
+  safe_callees: [ string ],
+  fname: string
+) -> unit throws { TypeError } do
+  let HirExpr(node: n, span: sp) = expr
+  match n do
+    | Variable(name: vn, sigil: _) ->
+      if str_list_contains(xs: binders, s: vn) then
+        throw TypeMismatch(func_name: fname, detail: cont_escape_detail(name: vn), span: sp)
+      end
+      return ()
+    | Borrow(name: vn, sigil: _) ->
+      if str_list_contains(xs: binders, s: vn) then
+        throw TypeMismatch(func_name: fname, detail: cont_escape_detail(name: vn), span: sp)
+      end
+      return ()
+    | Force(expr: inner) ->
+      // `@k` (or `@kk` aliased) — the allowed direct force. The forced
+      // sub-expression is permitted to be a bare cont-binder variable; for any
+      // OTHER force target (e.g. `@(f(k))`) keep walking so a nested escape is
+      // still caught.
+      let HirExpr(node: inner_n, span: _) = inner
+      match inner_n do
+        | Variable(name: _, sigil: _) -> return ()
+        | _ -> return check_cont_no_escape(expr: inner, binders, safe_callees, fname)
+      end
+    | BinOp(left: l, op: _, right: r) ->
+      check_cont_no_escape(expr: l, binders, safe_callees, fname)
+      return check_cont_no_escape(expr: r, binders, safe_callees, fname)
+    | UnOp(op: _, operand: o) -> return check_cont_no_escape(expr: o, binders, safe_callees, fname)
+    | Call(func: callee, args) ->
+      // The binder may appear directly as an argument ONLY when the callee is a
+      // slot-reading intrinsic (a `value_of_i64` external) that cannot force it.
+      // Otherwise (a user function or any other external) a binder argument is an
+      // escape: the callee can `@`-force its thunk-typed parameter, which lowers
+      // to a generic thunk force over the slot index and SIGSEGVs.
+      let callee_is_slot_reader = str_list_contains(xs: safe_callees, s: callee)
+      return check_cont_call_args(args, binders, safe_callees, fname, callee_safe: callee_is_slot_reader)
+    | CallExpr(callee: c, args) ->
+      // Indirect callee (`(expr)(args)`): we cannot identify it as a slot reader,
+      // so a binder argument is always an escape (callee_safe = false).
+      check_cont_no_escape(expr: c, binders, safe_callees, fname)
+      return check_cont_call_args(args, binders, safe_callees, fname, callee_safe: false)
+    | Ctor(variant: _, args, labels: _, sigil: _) ->
+      return check_cont_no_escape_exprs(exprs: args, binders, safe_callees, fname)
+    | Record(fields) -> return check_cont_no_escape_fields(fields, binders, safe_callees, fname)
+    | Array(elems) -> return check_cont_no_escape_exprs(exprs: elems, binders, safe_callees, fname)
+    | Index(target: t, index: i) ->
+      check_cont_no_escape(expr: t, binders, safe_callees, fname)
+      return check_cont_no_escape(expr: i, binders, safe_callees, fname)
+    | FieldAccess(target: t, field: _) -> return check_cont_no_escape(expr: t, binders, safe_callees, fname)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      check_cont_no_escape(expr: c, binders, safe_callees, fname)
+      check_cont_no_escape_stmts(stmts: tb, binders, safe_callees, fname)
+      match eb do
+        | Some(val: es) -> return check_cont_no_escape_stmts(stmts: es, binders, safe_callees, fname)
+        | None -> return ()
+      end
+    | Match(target: t, cases) ->
+      check_cont_no_escape(expr: t, binders, safe_callees, fname)
+      return check_cont_no_escape_cases(cases, binders, safe_callees, fname)
+    | While(cond: c, body: b) ->
+      check_cont_no_escape(expr: c, binders, safe_callees, fname)
+      return check_cont_no_escape_stmts(stmts: b, binders, safe_callees, fname)
+    | For(var: _, start: s, end_expr: e, body: b) ->
+      check_cont_no_escape(expr: s, binders, safe_callees, fname)
+      check_cont_no_escape(expr: e, binders, safe_callees, fname)
+      return check_cont_no_escape_stmts(stmts: b, binders, safe_callees, fname)
+    | Raise(expr: e) -> return check_cont_no_escape(expr: e, binders, safe_callees, fname)
+    | Thunk(body: b) -> return check_cont_no_escape(expr: b, binders, safe_callees, fname)
+    | Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: lb) ->
+      // A lambda that captures the cont binder would carry it across a closure
+      // boundary the MIR resume-lowering cannot follow → treat any reference
+      // inside as an escape.
+      return check_cont_no_escape_stmts(stmts: lb, binders, safe_callees, fname)
+    | Inject(handlers: _, body: b) ->
+      // inject in expression position: walk its body for cont-binder escapes
+      // exactly as the Inject statement does.
+      return check_cont_no_escape_stmts(stmts: b, binders, safe_callees, fname)
+    | _ -> return ()
+  end
+end
+
+// Validate the arguments of a call. An argument that is DIRECTLY the cont binder
+// (a bare `Variable`/`Borrow` of a current binder) is allowed only when the
+// callee is a slot-reading intrinsic (`callee_safe`); otherwise it is rejected.
+// Any non-binder argument expression is still walked for a nested escape.
+let check_cont_call_args = fn (
+  args: [ HirCallArg ],
+  binders: [ string ],
+  safe_callees: [ string ],
+  fname: string,
+  callee_safe: bool
+) -> unit throws { TypeError } do
+  match args do
+    | [] -> return ()
+    | HirCallArg(label: _, value: v) :: rest ->
+      let HirExpr(node: v_node, span: v_sp) = v
+      let is_direct_binder = match v_node do
+        | Variable(name: vn, sigil: _) -> str_list_contains(xs: binders, s: vn)
+        | Borrow(name: vn, sigil: _) -> str_list_contains(xs: binders, s: vn)
+        | _ -> false
+      end
+      if is_direct_binder then
+        // A slot-reading intrinsic consumes the binder as raw i64 without
+        // forcing it (safe); anything else can force it (escape).
+        if !callee_safe then
+          let bn = match v_node do
+            | Variable(name: vn, sigil: _) -> vn
+            | Borrow(name: vn, sigil: _) -> vn
+            | _ -> ""
+          end
+          throw TypeMismatch(func_name: fname, detail: cont_escape_detail(name: bn), span: v_sp)
+        end
+        return check_cont_call_args(args: rest, binders, safe_callees, fname, callee_safe)
+      end
+      check_cont_no_escape(expr: v, binders, safe_callees, fname)
+      return check_cont_call_args(args: rest, binders, safe_callees, fname, callee_safe)
+  end
+end
+
+let check_cont_no_escape_exprs = fn (
+  exprs: [ HirExpr ],
+  binders: [ string ],
+  safe_callees: [ string ],
+  fname: string
+) -> unit throws { TypeError } do
+  match exprs do
+    | [] -> return ()
+    | e :: rest ->
+      check_cont_no_escape(expr: e, binders, safe_callees, fname)
+      return check_cont_no_escape_exprs(exprs: rest, binders, safe_callees, fname)
+  end
+end
+
+let check_cont_no_escape_fields = fn (
+  fields: [ HirNamedExpr ],
+  binders: [ string ],
+  safe_callees: [ string ],
+  fname: string
+) -> unit throws { TypeError } do
+  match fields do
+    | [] -> return ()
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      check_cont_no_escape(expr: v, binders, safe_callees, fname)
+      return check_cont_no_escape_fields(fields: rest, binders, safe_callees, fname)
+  end
+end
+
+let check_cont_no_escape_cases = fn (
+  cases: [ HirMatchCase ],
+  binders: [ string ],
+  safe_callees: [ string ],
+  fname: string
+) -> unit throws { TypeError } do
+  match cases do
+    | [] -> return ()
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      check_cont_no_escape_stmts(stmts: b, binders, safe_callees, fname)
+      return check_cont_no_escape_cases(cases: rest, binders, safe_callees, fname)
+  end
+end
+
+// Walk a statement sequence, threading the cont-binder alias set. A bare
+// `let kk = k` (RHS is exactly a current binder) extends the set for the rest of
+// the block (option-A let-alias, lowered to resume in MIR). Every other use is
+// validated through check_cont_no_escape.
+export let check_cont_no_escape_stmts = fn (
+  stmts: [ HirStmt ],
+  binders: [ string ],
+  safe_callees: [ string ],
+  fname: string
+) -> unit throws { TypeError } do
+  match stmts do
+    | [] -> return ()
+    | HirStmt(node: s, span: _) :: rest ->
+      match s do
+        | Let(name: ln, sigil: _, typ: _, value: v) ->
+          let HirExpr(node: v_node, span: _) = v
+          let is_alias = match v_node do
+            | Variable(name: rhs, sigil: _) -> str_list_contains(xs: binders, s: rhs)
+            | _ -> false
+          end
+          if is_alias then
+            // Allowed alias: do NOT flag the RHS; extend the binder set.
+            return check_cont_no_escape_stmts(stmts: rest, binders: ln :: binders, safe_callees, fname)
+          end
+          check_cont_no_escape(expr: v, binders, safe_callees, fname)
+          return check_cont_no_escape_stmts(stmts: rest, binders, safe_callees, fname)
+        | Expr(expr: e) ->
+          check_cont_no_escape(expr: e, binders, safe_callees, fname)
+          return check_cont_no_escape_stmts(stmts: rest, binders, safe_callees, fname)
+        | Return(expr: e) ->
+          check_cont_no_escape(expr: e, binders, safe_callees, fname)
+          return check_cont_no_escape_stmts(stmts: rest, binders, safe_callees, fname)
+        | Assign(target: t, value: v) ->
+          check_cont_no_escape(expr: t, binders, safe_callees, fname)
+          check_cont_no_escape(expr: v, binders, safe_callees, fname)
+          return check_cont_no_escape_stmts(stmts: rest, binders, safe_callees, fname)
+        | Try(body: b, catch_param: _, catch_body: cb) ->
+          check_cont_no_escape_stmts(stmts: b, binders, safe_callees, fname)
+          check_cont_no_escape_stmts(stmts: cb, binders, safe_callees, fname)
+          return check_cont_no_escape_stmts(stmts: rest, binders, safe_callees, fname)
+        | Inject(handlers: _, body: b) ->
+          check_cont_no_escape_stmts(stmts: b, binders, safe_callees, fname)
+          return check_cont_no_escape_stmts(stmts: rest, binders, safe_callees, fname)
+      end
+  end
+end
