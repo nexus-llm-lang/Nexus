@@ -349,9 +349,17 @@ let emit_arm_call_args = fn (
     | [] -> return %buf
     | LirParam(label: _, name: pn, typ: pt) :: rest ->
       let %buf = if pn == cont_binder then
-        // Cont-binder parameter: the resume-slot value (i64).
+        // Cont-binder parameter: the reserved resume-slot value (i64). The
+        // dispatcher (emit_arm_dispatch) bumps ss_next_alloc BEFORE this call so
+        // that an arm body which itself performs another stack-switching effect
+        // gets a FRESH slot rather than clobbering the one reified for this arm
+        // (nexus-jmvqp). The live cursor is therefore one PAST the reified slot,
+        // so the binder is ss_next_alloc - 1.
         let %b = bb.push_byte(%buf, byte: op_global_get)
-        bb.push_uleb128(buf: %b, val: wdefs.ss_next_alloc_global_idx)
+        let %b = bb.push_uleb128(buf: %b, val: wdefs.ss_next_alloc_global_idx)
+        let %b = bb.push_byte(buf: %b, byte: op_i64_const)
+        let %b = bb.push_sleb128(buf: %b, val: 1)
+        bb.push_byte(buf: %b, byte: wdefs.op_i64_sub)
       else
         // Payload parameter: read off the i64 channel, narrow to native type.
         let %b = bb.push_byte(%buf, byte: op_local_get)
@@ -388,16 +396,25 @@ let emit_arm_dispatch = fn (
   let %buf = bb.push_byte(%buf, byte: op_table_set)
   let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_table_idx)
 
-  // Push the arm's arguments in label-sorted parameter order: the resume slot
-  // to the cont-binder param, the (narrowed) payload to the cap-method param.
-  let %buf = emit_arm_call_args(%buf, params, cont_binder, temp_idx, ctx)
-  let %buf = bb.push_byte(%buf, byte: op_call)
-  let %buf = bb.push_uleb128(%buf, val: arm_idx)
-
+  // Reserve the slot by bumping the alloc cursor BEFORE calling the arm. The
+  // increment is stack-neutral, so moving it ahead of the call cannot change
+  // validation; what it changes is timing: if the arm body itself performs
+  // another stack-switching effect (nexus-jmvqp), the nested dispatcher now
+  // allocates into a FRESH slot instead of the one we just reified — so the
+  // enclosing continuation is not clobbered (with one inner suspend the body's
+  // tail was silently dropped; with two it SIGSEGV'd on the corrupted slot).
+  // The arm's cont-binder reads the reserved slot back as ss_next_alloc - 1
+  // (see emit_arm_call_args).
   let %buf = bb.push_byte(%buf, byte: op_global_get)
   let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
   let %buf = bb.push_byte(%buf, byte: op_i64_const)
   let %buf = bb.push_sleb128(%buf, val: 1)
   let %buf = bb.push_bytes(%buf, bytes: [ op_i64_add, op_global_set ])
-  return bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+
+  // Push the arm's arguments in label-sorted parameter order: the reserved slot
+  // to the cont-binder param, the (narrowed) payload to the cap-method param.
+  let %buf = emit_arm_call_args(%buf, params, cont_binder, temp_idx, ctx)
+  let %buf = bb.push_byte(%buf, byte: op_call)
+  return bb.push_uleb128(%buf, val: arm_idx)
 end

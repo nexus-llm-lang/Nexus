@@ -1,0 +1,89 @@
+// Regression (nexus-jmvqp): a `with @k` handler arm whose body performs ANOTHER
+// stack-switching effect BEFORE forcing its own `@k` must still resume the
+// enclosing continuation correctly. The dispatcher reifies the suspended
+// continuation into a cont-table slot and used to bump the alloc cursor only
+// AFTER the arm call returned; an inner suspend from within the arm then ran a
+// nested dispatcher that allocated into the SAME, not-yet-bumped slot and
+// clobbered the outer continuation. With one inner suspend the enclosing body's
+// tail was silently dropped (wrong value, 0 instead of 105); with two it
+// SIGSEGV'd resuming the corrupted slot. The fix reserves the slot (bumps the
+// cursor) BEFORE the arm call, so a nested suspend gets a fresh slot.
+//
+// `A.opa()`'s arm calls `B.opb()` N times (each a real stack-switching suspend
+// into the outer `b_h` handler) before `@k`; the body's tail (100 + 5) must
+// survive all of them. N = 1, 2, 3 are checked. twyov-safe: the verifying trap
+// fires on the normal exit-0 path after every inject has fully returned.
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+import * as mem from "std:runtime/mem"
+
+cap A do fn opa() -> i64 end
+cap B do fn opb() -> i64 end
+
+let b_h = handler B do fn opb() -> i64 with @k do @k end end
+
+// One inner suspend before @k.
+let a_h1 = handler A require { B } do
+  fn opa() -> i64 with @k do
+    let _x = B.opb()
+    @k
+  end
+end
+// Two inner suspends before @k (former SIGSEGV).
+let a_h2 = handler A require { B } do
+  fn opa() -> i64 with @k do
+    let _x = B.opb()
+    let _y = B.opb()
+    @k
+  end
+end
+// Three inner suspends before @k.
+let a_h3 = handler A require { B } do
+  fn opa() -> i64 with @k do
+    let _x = B.opb()
+    let _y = B.opb()
+    let _z = B.opb()
+    @k
+  end
+end
+
+let body = fn () -> i64 require { A } do
+  let _a = A.opa()
+  return 100 + 5
+end
+
+// Three reserved scratch cells (page 13, clear of the heap) for the resumed
+// values — refs don't survive across the suspend/resume lift, so a fixed
+// linear-memory offset is the stable channel.
+let c1 = fn () -> i64 do return 854016 end
+let c2 = fn () -> i64 do return 854024 end
+let c3 = fn () -> i64 do return 854032 end
+
+let run1 = fn () -> unit do
+  inject b_h do inject a_h1 do mem.store_i64(addr: c1(), val: body()) end end
+end
+let run2 = fn () -> unit do
+  inject b_h do inject a_h2 do mem.store_i64(addr: c2(), val: body()) end end
+end
+let run3 = fn () -> unit do
+  inject b_h do inject a_h3 do mem.store_i64(addr: c3(), val: body()) end end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    run1()
+    run2()
+    run3()
+    let g1 = mem.load_i64(addr: c1())
+    let g2 = mem.load_i64(addr: c2())
+    let g3 = mem.load_i64(addr: c3())
+    Console.println(val: "one=" ++ str.from_i64(val: g1)
+      ++ " two=" ++ str.from_i64(val: g2)
+      ++ " three=" ++ str.from_i64(val: g3))
+    // All three must resume the body and return 100 + 5 = 105.
+    let ok = if g1 == 105 && g2 == 105 && g3 == 105 then 1 else 0 end
+    let _guard = 1 / ok
+  end
+  return ()
+end
