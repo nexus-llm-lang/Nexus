@@ -35,36 +35,59 @@ import * as list from "std:list"
 import { HirPatternKind, HirPatternField, HirRecordPatField }, * as hir from "src/ir/hir/types.nx"
 import { str_in_list } from "src/ir/hir/reachability.nx"
 
-/** Convert a pattern to HIR pattern. */
-export let convert_pattern = fn (pat: SpannedPattern, entries: [ RenameEntry ]) -> HirPatternKind do
+/** Convert a pattern to HIR pattern.
+ *
+ *  `binder_renames` carries the alpha-renames for pattern BINDERS that shadow a
+ *  strictly-enclosing local (nexus-x9uw0, the pattern-binder sibling of the
+ *  i7alf nested-`let` fix). A binder `b` that reuses an enclosing local's name
+ *  would, at codegen, reuse that local's wasm slot (slots are keyed by name) and
+ *  the arm's bind would clobber the surviving outer value. The caller computes a
+ *  fresh `b#depth` for each such binder and passes the `b → b#depth` map here so
+ *  the BINDER occurrence in the pattern is rewritten; the same map is added to
+ *  the arm body's rename entries so references inside the arm follow the binder.
+ *  Non-shadowing binders are absent from the map and pass through unchanged, so
+ *  this is a no-op for the common case (and `binder_renames = []`).
+ *
+ *  `binder_renames` is applied ONLY to PatVariable names — never to constructor,
+ *  record-field, or type names — because a binder is a fresh local introduction,
+ *  not a reference; routing it through the general `entries` import-rename map
+ *  would wrongly re-qualify a binder that happens to collide with an import. */
+export let convert_pattern = fn (
+  pat: SpannedPattern,
+  entries: [ RenameEntry ],
+  binder_renames: [ RenameEntry ]
+) -> HirPatternKind do
   match pat do
     | SpannedPattern(node: PatLiteral(lit), span: _) ->
       return hir.PLit(lit)
     | SpannedPattern(node: PatVariable(name, sigil: sig), span: _) ->
-      return hir.PVar(name, sigil: sig)
+      // Rewrite the binder to its fresh shadow name when it shadows an enclosing
+      // local; identity (passthrough) for a non-shadowing binder.
+      return hir.PVar(name: symtab.rename(name, entries: binder_renames), sigil: sig)
     | SpannedPattern(node: PatConstructor(name: v, fields: fs, sigil: sig), span: _) ->
       // P-Ctor must resolve through the same import-binding rename
       // map as the construction site so both agree on the canonical ctor name
       // the runtime tag is hashed from.
       return hir.PCtor(
         variant: symtab.rename_ctor(name: v, entries),
-        fields: convert_pattern_fields(fs, entries),
+        fields: convert_pattern_fields(fs, entries, binder_renames),
         sigil: sig
       )
     | SpannedPattern(node: PatConstructorWildcard(name: v, sigil: sig), span: _) ->
       return hir.PCtor(variant: symtab.rename_ctor(name: v, entries), fields: [], sigil: sig)
     | SpannedPattern(node: PatRecord(fields: fs, has_wildcard: p), span: _) ->
-      return hir.PRec(fields: convert_record_pat_fields(fs, entries), is_partial: p)
+      return hir.PRec(fields: convert_record_pat_fields(fs, entries, binder_renames), is_partial: p)
     | SpannedPattern(node: PatWildcard, span: _) ->
       return hir.PWild
     | SpannedPattern(node: PatOr(alts), span: _) ->
-      return hir.POr(alts: convert_or_alts(alts, entries, acc: []))
+      return hir.POr(alts: convert_or_alts(alts, entries, binder_renames, acc: []))
   end
 end
 
 let convert_or_alts = fn (
   alts: [ SpannedPattern ],
   entries: [ RenameEntry ],
+  binder_renames: [ RenameEntry ],
   acc: [ HirPatternKind ]
 ) -> [ HirPatternKind ] do
   match alts do
@@ -72,7 +95,8 @@ let convert_or_alts = fn (
     | a :: rest -> return convert_or_alts(
       alts: rest,
       entries,
-      acc: convert_pattern(pat: a, entries) :: acc
+      binder_renames,
+      acc: convert_pattern(pat: a, entries, binder_renames) :: acc
     )
   end
 end
@@ -164,14 +188,16 @@ end
 
 let convert_pattern_fields = fn (
   fs: [ CtorPatternField ],
-  entries: [ RenameEntry ]
+  entries: [ RenameEntry ],
+  binder_renames: [ RenameEntry ]
 ) -> [ HirPatternField ] do
-  return convert_pattern_fields_go(fs, entries, acc: [])
+  return convert_pattern_fields_go(fs, entries, binder_renames, acc: [])
 end
 
 let convert_pattern_fields_go = fn (
   fs: [ CtorPatternField ],
   entries: [ RenameEntry ],
+  binder_renames: [ RenameEntry ],
   acc: [ HirPatternField ]
 ) -> [ HirPatternField ] do
   match fs do
@@ -180,21 +206,27 @@ let convert_pattern_fields_go = fn (
       return convert_pattern_fields_go(
         fs: rest,
         entries,
-        acc: HirPatternField(name: Some(val: n), pattern: convert_pattern(pat: p, entries)) :: acc
+        binder_renames,
+        acc: HirPatternField(
+          name: Some(val: n),
+          pattern: convert_pattern(pat: p, entries, binder_renames)
+        ) :: acc
       )
   end
 end
 
 let convert_record_pat_fields = fn (
   fs: [ RecordPatField ],
-  entries: [ RenameEntry ]
+  entries: [ RenameEntry ],
+  binder_renames: [ RenameEntry ]
 ) -> [ HirRecordPatField ] do
-  return convert_record_pat_fields_go(fs, entries, acc: [])
+  return convert_record_pat_fields_go(fs, entries, binder_renames, acc: [])
 end
 
 let convert_record_pat_fields_go = fn (
   fs: [ RecordPatField ],
   entries: [ RenameEntry ],
+  binder_renames: [ RenameEntry ],
   acc: [ HirRecordPatField ]
 ) -> [ HirRecordPatField ] do
   match fs do
@@ -203,7 +235,11 @@ let convert_record_pat_fields_go = fn (
       return convert_record_pat_fields_go(
         fs: rest,
         entries,
-        acc: HirRecordPatField(name: n, pattern: convert_pattern(pat: p, entries)) :: acc
+        binder_renames,
+        acc: HirRecordPatField(
+          name: n,
+          pattern: convert_pattern(pat: p, entries, binder_renames)
+        ) :: acc
       )
   end
 end

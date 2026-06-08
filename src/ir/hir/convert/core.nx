@@ -139,6 +139,64 @@ let shadow_rename = fn (name: string, outer_locals: [ string ]) -> string do
   return name ++ "#" ++ str.from_i64(val: count_str_occ(name, xs: outer_locals))
 end
 
+/** Build the alpha-rename map for the BINDERS of a match-arm / catch / let-pattern
+ *  whose name shadows a strictly-enclosing local (nexus-x9uw0, the pattern-binder
+ *  sibling of i7alf). For each binder `b` in `binders` that appears in
+ *  `outer_locals`, add `b → shadow_rename(b)` so (1) the binder occurrence in the
+ *  pattern is rewritten to a fresh slot name and (2) references to it inside the
+ *  arm body resolve to that fresh name. A binder that does NOT shadow is absent
+ *  from the result and keeps its source name (so it still shares no slot with any
+ *  enclosing binding — its name was unique to begin with). The depth is taken
+ *  against the SAME `outer_locals` for every binder of the arm: sibling arms at
+ *  the same nesting depth that bind the same name therefore reuse the same suffix,
+ *  which is sound because only one arm runs (disjoint lifetimes — see i7alf). */
+let pattern_binder_renames = fn (
+  binders: [ string ],
+  outer_locals: [ string ]
+) -> [ RenameEntry ] do
+  return pattern_binder_renames_go(binders, outer_locals, acc: [])
+end
+
+let pattern_binder_renames_go = fn (
+  binders: [ string ],
+  outer_locals: [ string ],
+  acc: [ RenameEntry ]
+) -> [ RenameEntry ] do
+  match binders do
+    | [] -> return acc
+    | b :: rest ->
+      if count_str_occ(name: b, xs: outer_locals) > 0 then
+        return pattern_binder_renames_go(
+          binders: rest,
+          outer_locals,
+          acc: symtab.rename_add(entries: acc, original: b, qualified: shadow_rename(name: b, outer_locals))
+        )
+      else
+        return pattern_binder_renames_go(binders: rest, outer_locals, acc)
+      end
+  end
+end
+
+/** Prepend each shadow binder-rename onto the arm body's rename entries so a
+ *  reference to a renamed binder inside the arm resolves to the fresh slot name.
+ *  Caller passes `entries` with every binder already dropped (rename_drop_many);
+ *  re-adding only the shadowing ones on top leaves non-shadowing binders bare
+ *  while routing shadowing ones to `b#depth`. Prepended so they win first-match
+ *  resolution over any surviving lower-priority entry for the same bare name. */
+let merge_binder_renames = fn (
+  entries: [ RenameEntry ],
+  binder_renames: [ RenameEntry ]
+) -> [ RenameEntry ] do
+  match binder_renames do
+    | [] -> return entries
+    | RenameEntry(original: o, qualified: q) :: rest ->
+      return merge_binder_renames(
+        entries: symtab.rename_add(entries, original: o, qualified: q),
+        binder_renames: rest
+      )
+  end
+end
+
 let convert_expr_go = fn (
   expr: SpannedExpr,
   entries: [ RenameEntry ],
@@ -908,14 +966,23 @@ let convert_stmts_go = fn (
       // pattern-bound variable dropped (lexical shadowing). The case body is a
       // child scope whose enclosing locals are everything bound so far plus the
       // pattern binders, so a deeper `let` shadowing any of them is renamed.
+      //
+      // A binder of THIS let-pattern that shadows an enclosing local (b ∈
+      // enclosing) is alpha-renamed to a fresh slot, mirroring match/catch arms
+      // (nexus-x9uw0): the case body here is the rest of the block, so a binder
+      // reusing an enclosing name would clobber that slot for the remainder.
       let binders = hpat.pattern_binders(pat)
-      let body_entries = symtab.rename_drop_many(entries, names: binders)
+      let binder_renames = pattern_binder_renames(binders, outer_locals: enclosing)
+      let body_entries = merge_binder_renames(
+        entries: symtab.rename_drop_many(entries, names: binders),
+        binder_renames
+      )
       let case_body = convert_stmts_scoped(
         stmts: rest,
         entries: body_entries,
         outer_locals: list.concat(xs: binders, ys: enclosing)
       )
-      let match_case = HirMatchCase(pattern: hpat.convert_pattern(pat, entries), body: case_body)
+      let match_case = HirMatchCase(pattern: hpat.convert_pattern(pat, entries, binder_renames), body: case_body)
       return list.concat(xs: list.reverse(xs: acc), ys: [ HirStmt(node: Expr(expr: HirExpr(node: Match(
           target: convert_expr_go(expr: v, entries, outer_locals: enclosing),
           cases: [ match_case ]
@@ -969,11 +1036,23 @@ let convert_stmts_go = fn (
     ) :: rest ->
       // Legacy single-arm variable catch: catch param -> body. The try body and
       // catch body are child scopes; the catch param `n` is bound in the catch
-      // body, so it joins that body's enclosing locals.
-      let cb_entries = symtab.rename_drop(entries, name: n)
+      // body, so it joins that body's enclosing locals. If `n` shadows an
+      // enclosing local it is alpha-renamed to a fresh slot (nexus-x9uw0):
+      // codegen keys the catch-param wasm local by name, so reusing `n` would
+      // share — and on entry clobber — the enclosing binding's slot. References
+      // to it inside the catch body route to the fresh name via cb_entries; the
+      // body's enclosing locals keep the ORIGINAL `n` so a deeper `let n` is
+      // renamed past both slots.
+      let catch_shadows = count_str_occ(name: n, xs: enclosing) > 0
+      let catch_name = if catch_shadows then shadow_rename(name: n, outer_locals: enclosing) else n end
+      let cb_entries = if catch_shadows then
+        symtab.rename_add(entries: symtab.rename_drop(entries, name: n), original: n, qualified: catch_name)
+      else
+        symtab.rename_drop(entries, name: n)
+      end
       return convert_stmts_go(stmts: rest, entries, acc: HirStmt(node: Try(
           body: convert_stmts_scoped(stmts: b, entries, outer_locals: enclosing),
-          catch_param: n,
+          catch_param: catch_name,
           catch_body: convert_stmts_scoped(stmts: cb, entries: cb_entries, outer_locals: n :: enclosing)
         ), span: sp) :: acc, outer_locals, block_locals)
     | SpannedStmt(node: StmtTry(body: b, catch_arms: arms), span: sp) :: rest ->
@@ -1115,10 +1194,23 @@ let convert_match_cases_go = fn (
       // any toplevel of the same name within the arm. The arm body is a child
       // scope whose enclosing locals are `outer_locals` plus the arm's pattern
       // binders, so a `let` in the body that shadows either is renamed.
+      //
+      // A pattern BINDER whose name is itself in `outer_locals` shadows an
+      // enclosing local; codegen keys wasm slots by name, so leaving it as `b`
+      // would reuse the enclosing binding's slot and the arm's bind would
+      // clobber the surviving outer value (nexus-x9uw0). Rename such binders to
+      // a fresh `b#depth` in the pattern and route references in the arm body to
+      // it; non-shadowing binders keep their name. The body's enclosing-locals
+      // multiset keeps the ORIGINAL binder names so a deeper `let b` in the body
+      // is renamed PAST both the enclosing `b` slot and this arm's `b#depth`.
       let binders = hpat.pattern_binders(pat: p)
-      let body_entries = symtab.rename_drop_many(entries, names: binders)
+      let binder_renames = pattern_binder_renames(binders, outer_locals)
+      let body_entries = merge_binder_renames(
+        entries: symtab.rename_drop_many(entries, names: binders),
+        binder_renames
+      )
       return convert_match_cases_go(cases: rest, entries, outer_locals, acc: HirMatchCase(
-          pattern: hpat.convert_pattern(pat: p, entries),
+          pattern: hpat.convert_pattern(pat: p, entries, binder_renames),
           body: convert_stmts_scoped(
             stmts: b,
             entries: body_entries,
@@ -1175,10 +1267,17 @@ let convert_catch_arms_go = fn (
   match arms do
     | [] -> return list.reverse(xs: acc)
     | CatchArm(pattern: p, body: b) :: rest ->
+      // A catch-arm pattern binder (including the bare catch-param of a
+      // selective catch) that shadows an enclosing local is alpha-renamed to a
+      // fresh slot, mirroring match arms (nexus-x9uw0).
       let binders = hpat.pattern_binders(pat: p)
-      let body_entries = symtab.rename_drop_many(entries, names: binders)
+      let binder_renames = pattern_binder_renames(binders, outer_locals)
+      let body_entries = merge_binder_renames(
+        entries: symtab.rename_drop_many(entries, names: binders),
+        binder_renames
+      )
       return convert_catch_arms_go(arms: rest, entries, outer_locals, acc: HirMatchCase(
-          pattern: hpat.convert_pattern(pat: p, entries),
+          pattern: hpat.convert_pattern(pat: p, entries, binder_renames),
           body: convert_stmts_scoped(
             stmts: b,
             entries: body_entries,

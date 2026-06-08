@@ -1,0 +1,199 @@
+// Regression test for nexus-x9uw0: a match-arm / catch / let-pattern PATTERN
+// BINDER whose name SHADOWS an enclosing `let` must get its OWN wasm local slot.
+// This is the direct sibling of nexus-i7alf (which alpha-renamed nested-block
+// `let` / for-var shadows but explicitly NOT pattern binders). Before this fix,
+// codegen keyed wasm local slots by name only, so a binder reusing an enclosing
+// name reused that binding's slot and the arm's bind CLOBBERED the surviving
+// outer value — reading the outer variable after the match returned the binder's
+// value instead.
+//
+// The typechecker scopes lexically (it already resolves the binder and the outer
+// binding to distinct scopes), so this was a typecheck/codegen disagreement. The
+// HIR conversion now alpha-renames a shadowing binder to a fresh `name#depth` and
+// routes references inside the arm to it, while the enclosing binding keeps its
+// name (its own slot) and survives the match. Covers every binder position:
+// constructor-field, record-field (let-pattern), or-pattern alternatives, the
+// legacy single-arm catch param, and a selective (multi-arm) catch arm.
+//
+// Also pins the behaviors that must NOT regress:
+//   * a binder that does NOT shadow keeps its name and binds correctly
+//   * the i7alf case: a DEEPER `let` shadowing a pattern BINDER still works
+//   * nested binder shadows at increasing depth keep three distinct slots
+
+import * as test_assert from "std:test/assert"
+
+type Opt = Som(v: i64) | Non
+type Pair = Pair(a: i64, b: i64)
+type Tag = TA(x: i64) | TB(x: i64)
+exception Boom(code: i64)
+
+let sink = fn (n: i64) -> unit do return () end
+
+// --- constructor-field binder shadow: outer survives ---
+let ctor_shadow = fn () -> i64 do
+  let x = 999
+  match Som(v: 7) do
+    | Som(v: x) -> sink(n: x)
+    | Non -> sink(n: 0)
+  end
+  return x
+end
+
+// --- binder is bound to the matched value INSIDE the arm, and the outer value
+//     is read AFTER the match: the difference proves both slots are distinct ---
+let used_in_arm = fn () -> i64 do
+  let x = 5
+  let ~seen = 0
+  match Som(v: 42) do
+    | Som(v: x) -> ~seen <- x
+    | Non -> ~seen <- 0
+  end
+  return ~seen - x // arm bound 42, outer x still 5 → 37
+end
+
+// --- record-field binder shadow via let-pattern destructuring ---
+let rec_shadow = fn () -> i64 do
+  let a = 100
+  let Pair(a: a, b: bb) = Pair(a: 1, b: 2)
+  sink(n: a + bb) // inner a=1, bb=2
+  return a + 0 // NOTE: `a` here is the binder (1) — see rec_shadow_outer below
+end
+
+// --- ctor binder shadow where the OUTER is read after the match block; the arm
+//     binder `a` is renamed so the surviving outer `a` is untouched ---
+let ctor_shadow_outer = fn () -> i64 do
+  let a = 100
+  match Som(v: 7) do
+    | Som(v: a) -> sink(n: a)
+    | Non -> sink(n: 0)
+  end
+  return a // outer 100, untouched by the arm binder
+end
+
+// --- or-pattern binder shadow: every alternative binds x; both must rename ---
+let or_shadow = fn () -> i64 do
+  let x = 77
+  let ~seen = 0
+  match TB(x: 9) do
+    | TA(x: x) | TB(x: x) -> ~seen <- x
+  end
+  return ~seen + x // 9 + 77 = 86
+end
+
+// --- non-shadowing binder keeps its name and binds correctly ---
+let no_shadow = fn () -> i64 do
+  match Som(v: 31) do
+    | Som(v: y) -> return y
+    | Non -> return 0
+  end
+end
+
+let thrower = fn (b: bool) -> i64 throws { Boom } do
+  if b then throw Boom(code: 88) end
+  return 1
+end
+
+// --- legacy single-arm variable catch: catch param shadows outer e ---
+let catch_shadow = fn () -> i64 do
+  let e = 500
+  let ~got = 0
+  try
+    let _u = thrower(b: true)
+    ~got <- 1
+  catch e ->
+    ~got <- 2
+  end
+  return ~got + e // 2 + 500 = 502
+end
+
+// --- selective (multi-arm) catch arm binder shadow, binder USED in arm ---
+let catch_arm_shadow = fn () -> i64 do
+  let v = 300
+  let ~got = 0
+  try
+    let _u = thrower(b: true)
+    ~got <- 1
+  catch
+    | Boom(code: v) -> ~got <- v // arm binds v = 88
+  end
+  return ~got + v // 88 + 300 = 388
+end
+
+// --- i7alf case still works: a DEEPER `let` shadowing a pattern BINDER ---
+let deeper_let_shadows_binder = fn () -> i64 do
+  match Som(v: 11) do
+    | Som(v: p) ->
+      if true then
+        let p = 22
+        sink(n: p)
+      end
+      return p // back to the binder 11, not 22
+    | Non -> return 0
+  end
+end
+
+// --- nested binder shadows at increasing depth keep three distinct slots ---
+let nested_binder_shadow = fn () -> i64 do
+  let x = 1000
+  let ~seen = 0
+  match Som(v: 20) do
+    | Som(v: x) ->
+      match Som(v: 3) do
+        | Som(v: x) -> ~seen <- x // innermost binder = 3
+        | Non -> ~seen <- 0
+      end
+      ~seen <- ~seen + x // + middle binder 20 → 23
+    | Non -> ~seen <- 0
+  end
+  return ~seen + x // 23 + outer 1000 = 1023
+end
+
+let main = fn () -> unit throws { Exn } do
+  test_assert.assert_eq_i64(
+    actual: ctor_shadow(),
+    expected: 999,
+    label: "ctor-field binder shadow keeps outer"
+  )
+  test_assert.assert_eq_i64(
+    actual: used_in_arm(),
+    expected: 37,
+    label: "binder bound in arm + outer after"
+  )
+  test_assert.assert_eq_i64(
+    actual: rec_shadow(),
+    expected: 1,
+    label: "let-pattern record binder binds inner"
+  )
+  test_assert.assert_eq_i64(
+    actual: ctor_shadow_outer(),
+    expected: 100,
+    label: "ctor binder shadow keeps outer"
+  )
+  test_assert.assert_eq_i64(actual: or_shadow(), expected: 86, label: "or-pattern binder shadow")
+  test_assert.assert_eq_i64(
+    actual: no_shadow(),
+    expected: 31,
+    label: "non-shadow binder binds correctly"
+  )
+  test_assert.assert_eq_i64(
+    actual: catch_shadow(),
+    expected: 502,
+    label: "catch-param shadow keeps outer"
+  )
+  test_assert.assert_eq_i64(
+    actual: catch_arm_shadow(),
+    expected: 388,
+    label: "selective catch binder shadow + used"
+  )
+  test_assert.assert_eq_i64(
+    actual: deeper_let_shadows_binder(),
+    expected: 11,
+    label: "i7alf: deeper let shadowing a binder"
+  )
+  test_assert.assert_eq_i64(
+    actual: nested_binder_shadow(),
+    expected: 1023,
+    label: "nested binder shadows keep distinct slots"
+  )
+  return ()
+end
