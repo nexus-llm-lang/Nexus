@@ -66,6 +66,9 @@ import { Pair } from "std:tuple"
 import { Option, Some, None } from "std:option"
 import * as list from "std:list"
 import * as str from "std:str"
+import * as mem from "std:runtime/mem"
+import * as arena from "std:runtime/arena"
+import { Coop, scheduler, spawn } from "std:concurrency/coop"
 
 // ─── PRNG (pure xorshift64) ─────────────────────────────────────────────────
 //
@@ -522,16 +525,24 @@ end
 Trial-count and seed knobs for `forall_with`. `trials <= 0` is normalised
 to the default (100). `seed = None` picks the deterministic default seed
 (42) so a fixture's "no opts" path is still reproducible.
-*/
-export type PropOpts = PropOpts(trials: i64, seed: Option<i64>)
 
-/** Build a `PropOpts` with default trials and seed. */
+`coop_progress` opts into a cooperative-progress run (see `run_forall_coop`):
+the trials run under a `std:concurrency/coop` scheduler with a spawned reporter
+task that prints live progress between trials. It is `false` by default, so a
+normal `forall_with` is byte-for-byte unchanged and stays deterministic. The
+property and generator are pure (`(T) -> bool` / seedable), so no exception ever
+crosses a `resume` — the run stays on the exit-0 path the upstream
+stack-switching constraint (wasmtime#13584) requires.
+*/
+export type PropOpts = PropOpts(trials: i64, seed: Option<i64>, coop_progress: bool)
+
+/** Build a `PropOpts` with default trials and seed; cooperative progress off. */
 export let default_opts = fn () -> PropOpts do
-  return PropOpts(trials: default_trials, seed: None)
+  return PropOpts(trials: default_trials, seed: None, coop_progress: false)
 end
 
 let resolve_opts = fn (opts: PropOpts) -> Pair<i64, i64> do
-  let PropOpts(trials, seed) = opts
+  let PropOpts(trials, seed, coop_progress: _) = opts
   let t = if trials <= 0 then default_trials else trials end
   let s = match seed do
     | Some(val: v) -> v
@@ -540,9 +551,106 @@ let resolve_opts = fn (opts: PropOpts) -> Pair<i64, i64> do
   return Pair(left: t, right: s)
 end
 
+// ─── Cooperative-progress runner (opt-in via PropOpts.coop_progress) ──────────
+//
+// Runs the trial loop under a `std:concurrency/coop` scheduler with a spawned
+// reporter task that prints live progress between trials. twyov-safe by
+// construction: the property and generator are pure, so no exception ever
+// unwinds across the `resume` (which the upstream stack-switching bug
+// wasmtime#13584 would turn into a process abort); the whole run stays exit-0.
+//
+// Coordination uses a single arena-allocated cell (a LOCAL `let`, evaluated
+// once → a stable address) closed over by both the trial loop and the reporter.
+// A fixed mem offset is deliberately avoided so concurrent/nested coop users
+// never collide. Layout (i64 each): [0]=trials-done, [8]=done-flag,
+// [16]=found-flag, [24]=failing-seed. Only i64s cross the coop boundary; the
+// generic witness of type `T` is re-derived from the failing seed AFTER the
+// scheduler block exits, so nothing of type `T` is ever stashed in raw memory.
+
+let cell_count = 0
+let cell_done = 8
+let cell_found = 16
+let cell_fail_seed = 24
+
+// Reporter fiber: print a progress line each time the trial loop yields, then
+// suspend. Throttled to ~10% steps so a 100-trial run prints ~10 lines, not 100.
+// `last_tenth` lives in the fiber's own frame (survives its yields), so no extra
+// shared state is needed for throttling. Terminates when the done-flag is set —
+// the scheduler's end-of-run drain resumes it once more and it returns.
+let coop_reporter = fn (cell: i64, n: i64, last_tenth: i64) -> unit require { Coop } do
+  if mem.load_i64(addr: cell + cell_done) != 0 then return () end
+  let done_count = mem.load_i64(addr: cell + cell_count)
+  let tenth = if n <= 0 then 10 else done_count * 10 / n end
+  if tenth > last_tenth then
+    Console.println(val: "pbt: progress " ++ str.from_i64(val: done_count)
+      ++ "/" ++ str.from_i64(val: n))
+    Coop.yield()
+    return coop_reporter(cell: cell, n: n, last_tenth: tenth)
+  end
+  Coop.yield()
+  return coop_reporter(cell: cell, n: n, last_tenth: last_tenth)
+end
+
+// Trial fiber: draw a sample, bump the progress counter, yield (so the reporter
+// advances), then test. On the first failing sample record its INPUT seed +
+// the found-flag and stop; the witness is re-derived outside the coop block.
+let coop_trials = fn <T>(
+  g: Gen<T>,
+  prop: (x: T) -> bool,
+  trials_left: i64,
+  seed: i64,
+  cell: i64
+) -> unit require { Coop } do
+  if trials_left <= 0 then return () end
+  let Gen(run: g_run, shrink: _, render: _) = g
+  let Pair(left: v, right: s1) = g_run(seed)
+  mem.store_i64(addr: cell + cell_count, val: mem.load_i64(addr: cell + cell_count) + 1)
+  Coop.yield()
+  if prop(v) then
+    return coop_trials(g: g, prop: prop, trials_left: trials_left - 1, seed: s1, cell: cell)
+  end
+  mem.store_i64(addr: cell + cell_fail_seed, val: seed)
+  mem.store_i64(addr: cell + cell_found, val: 1)
+  return ()
+end
+
+let run_forall_coop = fn <T>(
+  g: Gen<T>,
+  prop: (x: T) -> bool,
+  n: i64,
+  seed: i64
+) -> TestResult<T> require { Console } do
+  // One stable cell shared by both fibers (local `let` → allocated once).
+  let cell = arena.alloc_raw(size: 32)
+  mem.store_i64(addr: cell + cell_count, val: 0)
+  mem.store_i64(addr: cell + cell_done, val: 0)
+  mem.store_i64(addr: cell + cell_found, val: 0)
+  mem.store_i64(addr: cell + cell_fail_seed, val: 0)
+  inject scheduler do
+    spawn(task: fn () -> unit require { Coop } do
+      return coop_reporter(cell: cell, n: n, last_tenth: 0 - 1)
+    end)
+    coop_trials(g: g, prop: prop, trials_left: n, seed: seed, cell: cell)
+    // Signal the reporter to stop; the scheduler's end-of-run drain resumes it
+    // once more and it returns on the done-flag (no host-ward unwind).
+    mem.store_i64(addr: cell + cell_done, val: 1)
+  end
+  // Outside the coop block: re-derive the typed result from the i64 cell.
+  if mem.load_i64(addr: cell + cell_found) == 0 then return Pass end
+  let Gen(run: g_run, shrink: shrink_fn, render: render_fn) = g
+  let fail_seed = mem.load_i64(addr: cell + cell_fail_seed)
+  let Pair(left: original, right: _) = g_run(fail_seed)
+  let shrunk = shrink_loop(cur: original, shrink_fn, prop)
+  Console.println(val: "pbt: forall FAIL witness=" ++ render_fn(original) ++ " shrunk=" ++ render_fn(shrunk))
+  return Fail(witness: original, shrunk: shrunk)
+end
+
 /**
 Like `forall`, but trial-count and start seed come from `opts`. Use this
 when you need reproducible runs (fixed seed) or a non-default trial count.
+With `opts.coop_progress = true` the trials run under a cooperative scheduler
+that prints live progress (see `run_forall_coop`); the default `false` path is
+unchanged and deterministic.
 
 The `Console` effect is used to print a one-line report on failure.
 */
@@ -551,7 +659,11 @@ export let forall_with = fn <T>(
   prop: (x: T) -> bool,
   opts: PropOpts
 ) -> TestResult<T> require { Console } do
+  let PropOpts(trials: _, seed: _, coop_progress) = opts
   let Pair(left: n, right: seed) = resolve_opts(opts)
+  if coop_progress then
+    return run_forall_coop(g, prop, n, seed)
+  end
   return run_forall(g, prop, n, seed)
 end
 
