@@ -16,11 +16,15 @@
  * Extracted from src/typecheck/infer.nx.
  */
 
-import { HirHandlerArm, HirFunction, EagerBody, LazyBody, EnvEntry } from "src/ir/hir/types.nx"
-import { TypeExpr, TyRow, TyUserDefined, TyHandler } from "src/types/type_expr.nx"
-import { CheckState, Scheme }, * as tctypes from "src/typecheck/types.nx"
+import { HirHandlerArm, HirFunction, HirCap, HirCapMethod, EagerBody, LazyBody, EnvEntry } from "src/ir/hir/types.nx"
+import { TypeExpr, TyRow, TyArrow, TyVar, TyUserDefined, TyHandler, NamedType } from "src/types/type_expr.nx"
+import { CheckState, Scheme, SubstEntry }, * as tctypes from "src/typecheck/types.nx"
 import * as capture from "src/typecheck/capture.nx"
 import { base_name_of } from "src/typecheck/tcwf.nx"
+import { hir_params_to_named_types } from "src/typecheck/check/registration.nx"
+import { handler_instance_key_prefix } from "src/typecheck/check/handler_validation.nx"
+import { convert_named_types } from "src/typecheck/check/occurs.nx"
+import * as bb from "std:bytebuffer"
 import { Option, Some, None } from "std:option"
 import * as list from "std:list"
 
@@ -151,14 +155,134 @@ let inject_cap_entries_acc = fn (
               // "nxlib_...#Console" added by the outer inject, producing a
               // false E2016 (T-Inject: ρ_i ⊄ ρ_q).
               let bare = base_name_of(qualified: pname)
+              // Generic-cap soundness (nexus-3ibql): when this handler is for a
+              // GENERIC cap, carry its CONCRETE element instantiation as args on
+              // the ambient entry (`Box<string>`). The instantiation is read off
+              // the handler binding's per-arm concrete signature (recorded under
+              // `__handlerinst::<h>::`). The call-site coverage (T-CapCall x ∈
+              // ρ_q) then unifies a called function's `Box<i64>` requirement
+              // against this `Box<string>` and rejects the mismatch — the spec's
+              // forward-pointer "T-CapCall reads σ̄ off the injected handler"
+              // (type-system-formal §T-CapCall). Monomorphic caps / handlers
+              // whose instantiation cannot be recovered keep the bare entry.
+              let elem_args = handler_cap_args(state, handler_name: h, cap_qname: pname, bare)
               return inject_cap_entries_acc(
                 state,
                 handlers: rest,
-                acc: TyUserDefined(name: bare, args: []) :: acc
+                acc: TyUserDefined(name: bare, args: elem_args) :: acc
               )
             | _ -> return inject_cap_entries_acc(state, handlers: rest, acc)
           end
       end
+  end
+end
+
+// ─── Generic-cap handler instantiation recovery (nexus-3ibql) ───────────────
+//
+// Recover the element-type instantiation (one TypeExpr per cap type param) of a
+// GENERIC-cap handler binding, read off its per-arm concrete signature stored
+// under `__handlerinst::<h>::<cap>.<method>` (handler_validation). Returns [] for
+// monomorphic caps or when the instantiation cannot be recovered (→ bare entry).
+
+let handler_cap_args = fn (
+  state: CheckState, handler_name: string, cap_qname: string, bare: string
+) -> [ TypeExpr ] do
+  match lookup_cap_decl(caps: tctypes.state_caps(state), bare) do
+    | None -> return []
+    | Some(val: HirCap(name: _, type_params: cap_tps, methods)) ->
+      match cap_tps do
+        | [] -> return []
+        | _ -> return recover_handler_instantiation(state, handler_name, cap_qname, cap_tps, methods)
+      end
+  end
+end
+
+let lookup_cap_decl = fn (caps: [ HirCap ], bare: string) -> Option<HirCap> do
+  match caps do
+    | [] -> return None
+    | HirCap(name: cn, type_params: tps, methods) :: rest ->
+      if base_name_of(qualified: cn) == bare then return Some(val: HirCap(name: cn, type_params: tps, methods)) end
+      return lookup_cap_decl(caps: rest, bare)
+  end
+end
+
+/** Find the first cap method whose `__handlerinst::<h>::<cap>.<method>` scheme is
+ *  bound, then match its CONCRETE arm param types against the cap method's
+ *  declared params (cap type params → TyVar) to bind the cap type params. Returns
+ *  the per-cap-param arg-type list iff every cap type param is bound. */
+let recover_handler_instantiation = fn (
+  state: CheckState,
+  handler_name: string,
+  cap_qname: string,
+  cap_tps: [ string ],
+  methods: [ HirCapMethod ]
+) -> [ TypeExpr ] do
+  let prefix = handler_instance_key_prefix(handler_name)
+  match first_inst_binding(state, prefix, cap_qname, cap_tps, methods) do
+    | Some(val: args) -> return args
+    | None -> return []
+  end
+end
+
+let first_inst_binding = fn (
+  state: CheckState,
+  prefix: string,
+  cap_qname: string,
+  cap_tps: [ string ],
+  methods: [ HirCapMethod ]
+) -> Option<[ TypeExpr ]> do
+  match methods do
+    | [] -> return None
+    | HirCapMethod(name: mname, requires: _, span: _, throw_row: _, typ_params: mparams, typ_ret: _) :: rest ->
+      let key = bb.concat(parts: [ prefix, cap_qname, ".", mname ])
+      match tctypes.env_lookup(env: tctypes.state_env(state), name: key) do
+        | Some(val: Scheme(vars: _, typ: TyArrow(params: arm_params, ret: _, requires: _, throw_row: _))) ->
+          let decl_nts = convert_named_types(nts: hir_params_to_named_types(params: mparams), vars: cap_tps)
+          let bindings = match_nts(pats: decl_nts, concretes: arm_params, acc: [])
+          match all_bound(cap_tps, bindings, acc: []) do
+            | Some(val: args) -> return Some(val: args)
+            | None -> return first_inst_binding(state, prefix, cap_qname, cap_tps, methods: rest)
+          end
+        | _ -> return first_inst_binding(state, prefix, cap_qname, cap_tps, methods: rest)
+      end
+  end
+end
+
+/** Match two parallel NamedType lists (cap-method-decl pattern vs concrete arm),
+ *  collecting `cap-type-param TyVar → concrete` bindings. Only the direct
+ *  `TyVar` pattern positions contribute, sufficient for `wrap(x: T)`. */
+let match_nts = fn (
+  pats: [ NamedType ], concretes: [ NamedType ], acc: [ SubstEntry ]
+) -> [ SubstEntry ] do
+  match pats do
+    | [] -> return acc
+    | NamedType(name: _, typ: pt) :: prest ->
+      match concretes do
+        | [] -> return acc
+        | NamedType(name: _, typ: ct) :: crest ->
+          let acc1 = if let TyVar(name: nm) = pt then SubstEntry(var: nm, typ: ct) :: acc else acc end
+          return match_nts(pats: prest, concretes: crest, acc: acc1)
+      end
+  end
+end
+
+let all_bound = fn (cap_tps: [ string ], bindings: [ SubstEntry ], acc: [ TypeExpr ]) -> Option<[ TypeExpr ]> do
+  match cap_tps do
+    | [] -> return Some(val: list.reverse(xs: acc))
+    | t :: rest ->
+      match lookup_subst(bindings, var: t) do
+        | None -> return None
+        | Some(val: ty) -> return all_bound(cap_tps: rest, bindings, acc: ty :: acc)
+      end
+  end
+end
+
+let lookup_subst = fn (bindings: [ SubstEntry ], var: string) -> Option<TypeExpr> do
+  match bindings do
+    | [] -> return None
+    | SubstEntry(var: v, typ: t) :: rest ->
+      if v == var then return Some(val: t) end
+      return lookup_subst(bindings: rest, var)
   end
 end
 

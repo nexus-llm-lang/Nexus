@@ -15,11 +15,19 @@
 
 import * as list from "std:list"
 import * as bb from "std:bytebuffer"
+import * as str from "std:str"
+import { Option, Some, None } from "std:option"
 import {
   TypeExpr,
   TyArrow,
   TyRow,
   TyUserDefined,
+  TyVar,
+  TyI64,
+  TyF64,
+  TyBool,
+  TyChar,
+  TyString,
   NamedType,
   RecordDef
 } from "src/types/type_expr.nx"
@@ -29,14 +37,20 @@ import {
   HirExternal,
   HirCap,
   HirCapMethod,
+  HirCallArg,
   ExceptionGroupEntry,
   EagerBody,
   HirStmt,
-  HirExpr
+  HirStmtKind,
+  HirExpr,
+  HirExprKind,
+  HirNamedExpr,
+  HirMatchCase
 } from "src/ir/hir/types.nx"
+import { Literal, LitInt, LitFloat, LitBool, LitChar, LitString } from "src/types/vocab.nx"
 import { Span } from "src/types/span.nx"
 import { TypeError, DuplicateTopLevelBinding } from "src/typecheck/errors.nx"
-import { CheckState, Scheme } from "src/typecheck/types.nx"
+import { CheckState, Scheme, SubstEntry } from "src/typecheck/types.nx"
 import * as tctypes from "src/typecheck/types.nx"
 import * as tcwf from "src/typecheck/tcwf.nx"
 import {
@@ -153,7 +167,7 @@ let register_functions_go = fn (
       params,
       ret_type: ret,
       throw_row: tw,
-      body: _,
+      body: fbody,
       span: sp,
       file: _,
       requires: req
@@ -192,10 +206,26 @@ let register_functions_go = fn (
       // are accounted for.
       let parts = tw :: (ret :: (req :: named_type_typs(nts: param_types)))
       enforce_kindof_quantifiers(tps, parts, func_name: n, span: sp)
+      // Generic-cap soundness (nexus-3ibql): pin each generic-cap entry of this
+      // function's require row to the element type it COMMITS to in its body. A
+      // bare `require { Box }` whose body calls `Box.wrap(x: n)` with `n: i64`
+      // is using Box at i64 — its published contract must say `Box<i64>` so that
+      // a caller under a `Box<string>` handler is rejected (the call-site
+      // coverage unifies the entry's args). When the element type is itself one
+      // of the function's type params (a generic helper `fn <T> ... Box.wrap(x:
+      // x)`), the entry becomes `Box<T>`, staying polymorphic so each call
+      // instantiates it to the handler in scope. convert_ud_to_var below maps
+      // those param args to TyVars. Bodies whose generic-cap argument types
+      // cannot be resolved syntactically (complex expressions) keep the bare
+      // `Box` entry (element-agnostic, conservatively accepted), so this never
+      // over-rejects existing programs.
+      let body_stmts = match fbody do | EagerBody(stmts: s) -> s | _ -> [] end
+      let req_pinned = refine_require_generic_caps(
+        req, body: body_stmts, params, caps, fn_tps: tps)
       let arrow = TyArrow(
         params: convert_named_types(nts: param_types, vars: tps),
         ret: convert_ud_to_var(typ: ret, vars: tps),
-        requires: convert_ud_to_var(typ: req, vars: tps),
+        requires: convert_ud_to_var(typ: req_pinned, vars: tps),
         throw_row: convert_ud_to_var(typ: tw, vars: tps)
       )
       let env = tctypes.env_insert(
@@ -281,7 +311,16 @@ let register_cap_method_schemes = fn (
       // identifier (T-Inject extends ρ_q with bare cap names), so strip the
       // qualifier before adding the row entry.
       let bare_cap = tcwf.base_name_of(qualified: cap_qname)
-      let method_requires = build_method_requires(bare_cap, alpha: mreq)
+      // Generic-cap soundness (nexus-3ibql): carry the cap's type params as
+      // args on the require-row entry (`Box<T>`), so a `Box.wrap(x:n)` call
+      // instantiates the row to `Box<i64>`. convert_ud_to_var below turns the
+      // param args into TyVars, and the call-site coverage (T-CapCall x ∈ ρ_q)
+      // unifies them against the ambient generic-cap row — pinning the element
+      // type a function commits to onto its require contract. Without the args,
+      // a function laundering a generic-cap call through `require { Box }`
+      // escapes the handler-instantiation check (the tzvf9 shadow only reaches
+      // the inject body's DIRECT scope, not a called helper typed standalone).
+      let method_requires = build_method_requires(bare_cap, alpha: mreq, tps)
       let param_nts = hir_params_to_named_types(params: mparams)
       let arrow = TyArrow(
         params: convert_named_types(nts: param_nts, vars: tps),
@@ -303,14 +342,429 @@ let register_cap_method_schemes = fn (
 end
 
 // Build {bare_cap} ∪ α as a require row (α = method's declared require row).
-let build_method_requires = fn (bare_cap: string, alpha: TypeExpr) -> TypeExpr do
-  let cap_entry = TyUserDefined(name: bare_cap, args: [])
+// For a generic cap, the cap entry carries the cap's type params as args
+// (`Box<T>`); `convert_ud_to_var(..., vars: tps)` at the caller then rewrites
+// those args to TyVars. Monomorphic caps (tps == []) keep `Box` with no args.
+let build_method_requires = fn (bare_cap: string, alpha: TypeExpr, tps: [ string ]) -> TypeExpr do
+  let cap_entry = TyUserDefined(name: bare_cap, args: tps_as_ud_args(tps))
   match alpha do
     | TyRow(types: ts, rest: tail) ->
       if row_contains_cap(name: bare_cap, ts) then return alpha end
       return TyRow(types: cap_entry :: ts, rest: tail)
     | _ -> return TyRow(types: [ cap_entry ], rest: None)
   end
+end
+
+// Render a cap's type-param names as positional `TyUserDefined(name, args: [])`
+// type args. convert_ud_to_var(..., vars: tps) later rewrites each to TyVar.
+let tps_as_ud_args = fn (tps: [ string ]) -> [ TypeExpr ] do
+  match tps do
+    | [] -> return []
+    | t :: rest -> return TyUserDefined(name: t, args: []) :: tps_as_ud_args(tps: rest)
+  end
+end
+
+// ─── Generic-cap require-row instantiation pinning (nexus-3ibql) ─────────────
+//
+// A function declaring `require { Box }` for a GENERIC cap `Box<T>` commits, in
+// its body, to a specific element type wherever it calls a `Box.method(...)`.
+// `Box.wrap(x: n)` with `n: i64` uses Box at i64; the published require contract
+// must therefore say `Box<i64>` so the call-site coverage (T-CapCall x ∈ ρ_q)
+// can reject a caller running under a `Box<string>` handler — the laundering
+// path the inject-body shadow (handler_validation.apply_injected_handler_instances)
+// does NOT cover because a helper is type-checked standalone, decoupled from any
+// inject. When the committed element type is itself one of the function's own
+// type params (a generic helper `fn <T> ... Box.wrap(x: x)` with `x: T`), the
+// entry becomes `Box<T>` and stays polymorphic, so each call instantiates it to
+// the handler actually in scope. Element types that cannot be resolved from the
+// body syntactically (cap-call arg is a complex expression) leave the entry
+// element-agnostic (`Box`), conservatively accepted — never an over-rejection.
+
+/** Refine each generic-cap entry of a function's require row by reading the
+ *  element type the body commits to. `req` is the RAW declared row (cap type
+ *  params still as `TyUserDefined name`); the caller applies convert_ud_to_var
+ *  afterwards, so a derived `Box<T>` (T a fn type param) becomes `Box<TyVar T>`. */
+let refine_require_generic_caps = fn (
+  req: TypeExpr,
+  body: [ HirStmt ],
+  params: [ HirParam ],
+  caps: [ HirCap ],
+  fn_tps: [ string ]
+) -> TypeExpr do
+  match req do
+    | TyRow(types: ts, rest: tail) ->
+      let ts1 = refine_cap_entries(ts, body, params, caps)
+      return TyRow(types: ts1, rest: tail)
+    | _ -> return req
+  end
+end
+
+let refine_cap_entries = fn (
+  ts: [ TypeExpr ],
+  body: [ HirStmt ],
+  params: [ HirParam ],
+  caps: [ HirCap ]
+) -> [ TypeExpr ] do
+  match ts do
+    | [] -> return []
+    | TyUserDefined(name: cname, args: []) :: rest ->
+      let cap_tps = cap_generic_tps(caps, bare: tcwf.base_name_of(qualified: cname))
+      let refined = match cap_tps do
+        | [] -> TyUserDefined(name: cname, args: [])
+        | _ ->
+          match derive_cap_instantiation(
+            bare: tcwf.base_name_of(qualified: cname), cap_tps, body, params, caps) do
+            | Some(val: arg_types) -> TyUserDefined(name: cname, args: arg_types)
+            | None -> TyUserDefined(name: cname, args: [])
+          end
+      end
+      return refined :: refine_cap_entries(ts: rest, body, params, caps)
+    | other :: rest -> return other :: refine_cap_entries(ts: rest, body, params, caps)
+  end
+end
+
+/** type_params of a generic cap matched by BARE name (base_name_of). Empty for
+ *  monomorphic caps or names not matching a declared cap. */
+let cap_generic_tps = fn (caps: [ HirCap ], bare: string) -> [ string ] do
+  match caps do
+    | [] -> return []
+    | HirCap(name: cn, type_params: tps, methods: _) :: rest ->
+      if tcwf.base_name_of(qualified: cn) == bare then return tps end
+      return cap_generic_tps(caps: rest, bare)
+  end
+end
+
+/** Derive the cap's type-param instantiation (one TypeExpr per cap type param)
+ *  from the first body call to one of this cap's methods whose argument types
+ *  resolve, binding the cap type params against the call's argument types.
+ *  Returns None when no body call pins all the cap's type params. */
+let derive_cap_instantiation = fn (
+  bare: string,
+  cap_tps: [ string ],
+  body: [ HirStmt ],
+  params: [ HirParam ],
+  caps: [ HirCap ]
+) -> Option<[ TypeExpr ]> do
+  let methods = cap_methods_of(caps, bare)
+  // Collect ALL call sites with a SINGLE-accumulator walk (mirrors the
+  // known-good shape of reachability.collect_calls_*), then filter for this
+  // cap's methods afterwards — keeping the recursive walk minimal so the
+  // self-hosting seed compiles it correctly.
+  let all_calls = collect_all_calls_stmts(stmts: body, acc: [])
+  let cap_calls = filter_cap_calls(all_calls, bare, methods, acc: [])
+  return first_full_binding(cap_calls, cap_tps, methods, params)
+end
+
+/** Keep only call sites whose func resolves to a method of THIS cap, as
+ *  (method-name, args) pairs. */
+let filter_cap_calls = fn (
+  all: [ AllCall ], bare: string, methods: [ HirCapMethod ], acc: [ CapCall ]
+) -> [ CapCall ] do
+  match all do
+    | [] -> return list.reverse(xs: acc)
+    | AllCall(func: f, args) :: rest ->
+      match cap_method_of_call(f, bare, methods) do
+        | Some(val: mname) -> return filter_cap_calls(all: rest, bare, methods, acc: CapCall(method: mname, args) :: acc)
+        | None -> return filter_cap_calls(all: rest, bare, methods, acc)
+      end
+  end
+end
+
+/** Walk the call sites collected for this cap and return the first that binds
+ *  every cap type param (so the entry is fully concrete / fully polymorphic). */
+let first_full_binding = fn (
+  calls: [ CapCall ],
+  cap_tps: [ string ],
+  methods: [ HirCapMethod ],
+  params: [ HirParam ]
+) -> Option<[ TypeExpr ]> do
+  match calls do
+    | [] -> return None
+    | CapCall(method: m, args) :: rest ->
+      match lookup_method(methods, name: m) do
+        | None -> return first_full_binding(calls: rest, cap_tps, methods, params)
+        | Some(val: meth) ->
+          let bindings = bindings_from_call(meth, args, cap_tps, params)
+          match all_tps_bound(cap_tps, bindings) do
+            | Some(val: arg_types) -> return Some(val: arg_types)
+            | None -> return first_full_binding(calls: rest, cap_tps, methods, params)
+          end
+      end
+  end
+end
+
+/** Bind cap type params against a single call's argument types. The method's
+ *  declared param types carry the cap type params as `TyUserDefined name`; we
+ *  convert them to TyVar, then structurally match each against the resolved
+ *  argument type (param ref → its declared type, literal → its primitive type).
+ *  Unresolvable arguments contribute no binding. */
+let bindings_from_call = fn (
+  meth: HirCapMethod,
+  args: [ HirCallArg ],
+  cap_tps: [ string ],
+  params: [ HirParam ]
+) -> [ SubstEntry ] do
+  let HirCapMethod(name: _, requires: _, span: _, throw_row: _, typ_params: mparams, typ_ret: _) = meth
+  let mnts = convert_named_types(nts: hir_params_to_named_types(params: mparams), vars: cap_tps)
+  return match_args_to_params(mnts, args, params, acc: [])
+end
+
+let match_args_to_params = fn (
+  mnts: [ NamedType ],
+  args: [ HirCallArg ],
+  params: [ HirParam ],
+  acc: [ SubstEntry ]
+) -> [ SubstEntry ] do
+  match mnts do
+    | [] -> return acc
+    | NamedType(name: plabel, typ: ptype) :: mrest ->
+      match find_arg_by_label(args, label: plabel) do
+        | None -> return match_args_to_params(mnts: mrest, args, params, acc)
+        | Some(val: arg_expr) ->
+          match resolve_arg_type(arg_expr, params) do
+            | None -> return match_args_to_params(mnts: mrest, args, params, acc)
+            | Some(val: at) ->
+              let acc1 = match_type_pat(pat: ptype, concrete: at, acc)
+              return match_args_to_params(mnts: mrest, args, params, acc: acc1)
+          end
+      end
+  end
+end
+
+/** Structurally collect `TyVar name → concrete` bindings (cap type param → arg
+ *  type). Mirrors handler_validation.collect_tp_bindings; kept local to avoid a
+ *  cross-module export churn. */
+let match_type_pat = fn (pat: TypeExpr, concrete: TypeExpr, acc: [ SubstEntry ]) -> [ SubstEntry ] do
+  match pat do
+    | TyVar(name: nm) -> return SubstEntry(var: nm, typ: concrete) :: acc
+    | _ -> return acc
+  end
+end
+
+let find_arg_by_label = fn (args: [ HirCallArg ], label: string) -> Option<HirExpr> do
+  match args do
+    | [] -> return None
+    | HirCallArg(label: l, value: v) :: rest ->
+      if l == label then return Some(val: v) end
+      return find_arg_by_label(args: rest, label)
+  end
+end
+
+/** Resolve a cap-call argument expression to a type usable for binding the cap
+ *  element. Only the unambiguous cases: a reference to one of the function's
+ *  params (→ its declared type) and a literal (→ its defaulted primitive type).
+ *  Anything else is left unresolved (→ None → element-agnostic entry). */
+let resolve_arg_type = fn (arg: HirExpr, params: [ HirParam ]) -> Option<TypeExpr> do
+  let HirExpr(node: k, span: _) = arg
+  match k do
+    | Variable(name: vn, sigil: _) -> return param_type(params, name: vn)
+    | Borrow(name: vn, sigil: _) -> return param_type(params, name: vn)
+    | Literal(lit: l) -> return Some(val: literal_type(l))
+    | _ -> return None
+  end
+end
+
+let param_type = fn (params: [ HirParam ], name: string) -> Option<TypeExpr> do
+  match params do
+    | [] -> return None
+    | HirParam(label: _, name: pn, sigil: _, typ: t) :: rest ->
+      if pn == name then return Some(val: t) end
+      return param_type(params: rest, name)
+  end
+end
+
+let literal_type = fn (l: Literal) -> TypeExpr do
+  match l do
+    | LitInt(_) -> return TyI64
+    | LitFloat(_) -> return TyF64
+    | LitBool(_) -> return TyBool
+    | LitChar(_) -> return TyChar
+    | LitString(_) -> return TyString
+    | _ -> return TyI64
+  end
+end
+
+/** Apply the collected bindings to the cap's type params, in declaration order.
+ *  Returns the per-param arg-type list iff every cap type param is bound. */
+let all_tps_bound = fn (cap_tps: [ string ], bindings: [ SubstEntry ]) -> Option<[ TypeExpr ]> do
+  return all_tps_bound_go(cap_tps, bindings, acc: [])
+end
+
+let all_tps_bound_go = fn (
+  cap_tps: [ string ],
+  bindings: [ SubstEntry ],
+  acc: [ TypeExpr ]
+) -> Option<[ TypeExpr ]> do
+  match cap_tps do
+    | [] -> return Some(val: list.reverse(xs: acc))
+    | t :: rest ->
+      match lookup_binding(bindings, var: t) do
+        | None -> return None
+        | Some(val: ty) -> return all_tps_bound_go(cap_tps: rest, bindings, acc: ty :: acc)
+      end
+  end
+end
+
+let lookup_binding = fn (bindings: [ SubstEntry ], var: string) -> Option<TypeExpr> do
+  match bindings do
+    | [] -> return None
+    | SubstEntry(var: v, typ: t) :: rest ->
+      if v == var then return Some(val: t) end
+      return lookup_binding(bindings: rest, var)
+  end
+end
+
+let cap_methods_of = fn (caps: [ HirCap ], bare: string) -> [ HirCapMethod ] do
+  match caps do
+    | [] -> return []
+    | HirCap(name: cn, type_params: _, methods) :: rest ->
+      if tcwf.base_name_of(qualified: cn) == bare then return methods end
+      return cap_methods_of(caps: rest, bare)
+  end
+end
+
+let lookup_method = fn (methods: [ HirCapMethod ], name: string) -> Option<HirCapMethod> do
+  match methods do
+    | [] -> return None
+    | HirCapMethod(name: n, requires: r, span: sp, throw_row: tw, typ_params: tp, typ_ret: tr) :: rest ->
+      if n == name then return Some(val: HirCapMethod(name: n, requires: r, span: sp, throw_row: tw, typ_params: tp, typ_ret: tr)) end
+      return lookup_method(methods: rest, name)
+  end
+end
+
+// ─── Cap-call site collection (body walk) ───────────────────────────────────
+// A `Box.wrap(...)` call is a plain `Call(func: "<cap-qualified>.wrap", args)`.
+// We collect the (method-name, args) pairs for calls whose func name resolves
+// to one of this generic cap's methods, walking the full statement/expr tree so
+// a cap call nested in a let-rhs / if / match is found.
+
+type CapCall = CapCall(method: string, args: [ HirCallArg ])
+
+// All call sites of a body as (func-name, args) pairs. A single-accumulator
+// walk (only `acc` threaded) mirrors reachability.collect_calls_* so the
+// self-hosting seed compiles the mutual recursion correctly.
+type AllCall = AllCall(func: string, args: [ HirCallArg ])
+
+let collect_all_calls_stmts = fn (stmts: [ HirStmt ], acc: [ AllCall ]) -> [ AllCall ] do
+  match stmts do
+    | [] -> return acc
+    | HirStmt(node: s, span: _) :: rest ->
+      return collect_all_calls_stmts(stmts: rest, acc: collect_all_calls_stmt_kind(s, acc))
+  end
+end
+
+let collect_all_calls_stmt_kind = fn (s: HirStmtKind, acc: [ AllCall ]) -> [ AllCall ] do
+  match s do
+    | Let(name: _, sigil: _, typ: _, value: v) -> return collect_all_calls_expr(v, acc)
+    | Expr(expr: e) | Return(expr: e) -> return collect_all_calls_expr(e, acc)
+    | Assign(target: t, value: v) ->
+      return collect_all_calls_expr(t, acc: collect_all_calls_expr(v, acc))
+    | Try(body: b, catch_param: _, catch_body: cb) ->
+      return collect_all_calls_stmts(stmts: b, acc: collect_all_calls_stmts(stmts: cb, acc))
+  end
+end
+
+let collect_all_calls_expr = fn (e: HirExpr, acc: [ AllCall ]) -> [ AllCall ] do
+  let HirExpr(node: k, span: _) = e
+  match k do
+    | Literal(_) | Variable(_) | Borrow(_) | ExternalRef(_) -> return acc
+    | BinOp(left: l, op: _, right: r) ->
+      return collect_all_calls_expr(l, acc: collect_all_calls_expr(r, acc))
+    | UnOp(op: _, operand: o) -> return collect_all_calls_expr(o, acc)
+    | Call(func: f, args) ->
+      return AllCall(func: f, args) :: collect_all_calls_args(args, acc)
+    | CallExpr(callee: c, args) ->
+      return collect_all_calls_expr(c, acc: collect_all_calls_args(args, acc))
+    | Ctor(variant: _, args, labels: _, sigil: _) -> return collect_all_calls_expr_list(args, acc)
+    | Record(fields: fs) -> return collect_all_calls_named(fs, acc)
+    | Array(elems: es) -> return collect_all_calls_expr_list(es, acc)
+    | Index(target: t, index: i) ->
+      return collect_all_calls_expr(t, acc: collect_all_calls_expr(i, acc))
+    | FieldAccess(target: t, field: _) -> return collect_all_calls_expr(t, acc)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      let a1 = collect_all_calls_stmts(stmts: tb, acc)
+      let a2 = match eb do | Some(val: ss) -> collect_all_calls_stmts(stmts: ss, acc: a1) | None -> a1 end
+      return collect_all_calls_expr(c, acc: a2)
+    | Match(target: t, cases: cs) ->
+      return collect_all_calls_expr(t, acc: collect_all_calls_cases(cs, acc))
+    | While(cond: c, body: b) ->
+      return collect_all_calls_expr(c, acc: collect_all_calls_stmts(stmts: b, acc))
+    | For(var: _, start: s, end_expr: en, body: b) ->
+      return collect_all_calls_expr(s, acc: collect_all_calls_expr(en, acc: collect_all_calls_stmts(stmts: b, acc)))
+    | Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: _) ->
+      // A lambda body opens a fresh scope whose bindings are not in this
+      // function's param env; skip (conservative: agnostic for the enclosing fn).
+      return acc
+    | Raise(expr: e2) | Force(expr: e2) -> return collect_all_calls_expr(e2, acc)
+    | Thunk(body: b) -> return collect_all_calls_expr(b, acc)
+    | Handler(cap_name: _, requires: _, arms: _) -> return acc
+    | Inject(handlers: _, body: b) -> return collect_all_calls_stmts(stmts: b, acc)
+  end
+end
+
+let collect_all_calls_args = fn (args: [ HirCallArg ], acc: [ AllCall ]) -> [ AllCall ] do
+  match args do
+    | [] -> return acc
+    | HirCallArg(label: _, value: v) :: rest ->
+      return collect_all_calls_args(args: rest, acc: collect_all_calls_expr(v, acc))
+  end
+end
+
+let collect_all_calls_named = fn (fs: [ HirNamedExpr ], acc: [ AllCall ]) -> [ AllCall ] do
+  match fs do
+    | [] -> return acc
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      return collect_all_calls_named(fs: rest, acc: collect_all_calls_expr(v, acc))
+  end
+end
+
+let collect_all_calls_expr_list = fn (es: [ HirExpr ], acc: [ AllCall ]) -> [ AllCall ] do
+  match es do
+    | [] -> return acc
+    | e :: rest -> return collect_all_calls_expr_list(es: rest, acc: collect_all_calls_expr(e, acc))
+  end
+end
+
+let collect_all_calls_cases = fn (cs: [ HirMatchCase ], acc: [ AllCall ]) -> [ AllCall ] do
+  match cs do
+    | [] -> return acc
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      return collect_all_calls_cases(cs: rest, acc: collect_all_calls_stmts(stmts: b, acc))
+  end
+end
+
+/** If a call's func name is `<X>.<method>` where the dotted suffix is a method
+ *  of THIS cap and the prefix's bare name equals the cap's bare name, return the
+ *  method name. Cap call funcs are stored qualified (`<cap-qualified>.wrap`). */
+let cap_method_of_call = fn (func: string, bare: string, methods: [ HirCapMethod ]) -> Option<string> do
+  match last_dot_split(func) do
+    | None -> return None
+    | Some(val: DotSplit(prefix: pre, suffix: meth)) ->
+      if tcwf.base_name_of(qualified: pre) != bare then return None end
+      match lookup_method(methods, name: meth) do
+        | Some(_) -> return Some(val: meth)
+        | None -> return None
+      end
+  end
+end
+
+type DotSplit = DotSplit(prefix: string, suffix: string)
+
+/** Split a dotted name at its LAST '.'. None when there is no '.'. */
+let last_dot_split = fn (s: string) -> Option<DotSplit> do
+  let n = str.length(s)
+  let idx = last_index_of_dot(s, i: n - 1)
+  if idx < 0 then return None end
+  let pre = str.substring(s, start: 0, len: idx)
+  let suf = str.substring(s, start: idx + 1, len: n - idx - 1)
+  return Some(val: DotSplit(prefix: pre, suffix: suf))
+end
+
+// 46 = ASCII '.'
+let last_index_of_dot = fn (s: string, i: i64) -> i64 do
+  if i < 0 then return 0 - 1 end
+  if str.char_code(s, idx: i) == 46 then return i end
+  return last_index_of_dot(s, i: i - 1)
 end
 
 let row_contains_cap = fn (name: string, ts: [ TypeExpr ]) -> bool do

@@ -27,9 +27,11 @@ import {
 } from "src/ir/hir/types.nx"
 import {
   CheckState, InferExprResult, InferExprOk, InferExprErr, Scheme,
+  TypeDefEntry, UnifyOk, UnifyErr,
   find_variant, state_variant_index, EnumVariantInfo
 }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
+import * as unify from "src/typecheck/unify.nx"
 import { TypeError, DuplicateInjectCap, HandlerRequireNotSubset } from "src/typecheck/errors.nx"
 import { Option, Some, None } from "std:option"
 import * as list from "std:list"
@@ -428,6 +430,97 @@ export let check_force_require_row = fn (
   ambient_require_row: TypeExpr
 ) -> Option<string> do
   return first_missing_cap(handler_row: thunk_require_row, ambient_row: ambient_require_row)
+end
+
+/** Result of the generic-cap argument coverage check (nexus-3ibql). */
+export type CapArgResult = CapArgOk | CapArgMismatch(cap_name: string, message: string)
+
+/** T-CapCall generic-cap soundness: for every cap entry of the CALLEE require
+ *  row that carries concrete element-type args (`Box<i64>`), find the same-named
+ *  entry of the AMBIENT require row and, when it ALSO carries args (`Box<string>`
+ *  from an inject providing a concrete handler), UNIFY them. A failure means the
+ *  function commits the cap to a different element type than the handler in
+ *  scope — the laundered generic-cap type confusion — and is rejected. Either
+ *  side carrying no args is element-agnostic and admitted (the cap was required
+ *  bare, or the handler instantiation could not be recovered). */
+export let check_cap_args_covered = fn (
+  callee_row: TypeExpr,
+  ambient_row: TypeExpr,
+  tdefs: [ TypeDefEntry ]
+) -> CapArgResult do
+  match callee_row do
+    | TyRow(types: ts, rest: _) -> return cap_args_go(ts, ambient_row, tdefs)
+    | _ -> return CapArgOk
+  end
+end
+
+let cap_args_go = fn (
+  ts: [ TypeExpr ], ambient_row: TypeExpr, tdefs: [ TypeDefEntry ]
+) -> CapArgResult do
+  match ts do
+    | [] -> return CapArgOk
+    | TyUserDefined(name: cname, args: cargs) :: rest ->
+      match cargs do
+        | [] -> return cap_args_go(ts: rest, ambient_row, tdefs)
+        | _ ->
+          match ambient_cap_args(name: cname, row: ambient_row) do
+            | None -> return cap_args_go(ts: rest, ambient_row, tdefs)
+            | Some(val: aargs) ->
+              match aargs do
+                | [] -> return cap_args_go(ts: rest, ambient_row, tdefs)
+                | _ ->
+                  match unify_arg_lists(cargs, aargs, tdefs) do
+                    | UnifyErr(message: m) ->
+                      return CapArgMismatch(
+                        cap_name: cname,
+                        message: "capability '" ++ cname
+                          ++ "' is used at an element type incompatible with the handler in scope: "
+                          ++ m
+                      )
+                    | UnifyOk(_) -> return cap_args_go(ts: rest, ambient_row, tdefs)
+                  end
+              end
+          end
+      end
+    | _ :: rest -> return cap_args_go(ts: rest, ambient_row, tdefs)
+  end
+end
+
+/** Args of the first same-named cap entry in the ambient row, or None. */
+let ambient_cap_args = fn (name: string, row: TypeExpr) -> Option<[ TypeExpr ]> do
+  match row do
+    | TyRow(types: ts, rest: _) -> return ambient_cap_args_in(name, ts)
+    | _ -> return None
+  end
+end
+
+let ambient_cap_args_in = fn (name: string, ts: [ TypeExpr ]) -> Option<[ TypeExpr ]> do
+  match ts do
+    | [] -> return None
+    | TyUserDefined(name: n, args: a) :: rest ->
+      if n == name then return Some(val: a) end
+      return ambient_cap_args_in(name, ts: rest)
+    | _ :: rest -> return ambient_cap_args_in(name, ts: rest)
+  end
+end
+
+/** Unify two parallel type-arg lists; first failure short-circuits. Arity
+ *  mismatch is treated as a failure (different cap instantiations). */
+let unify_arg_lists = fn (
+  a: [ TypeExpr ], b: [ TypeExpr ], tdefs: [ TypeDefEntry ]
+) -> tctypes.UnifyResult do
+  match a do
+    | [] -> return if let [] = b then UnifyOk(subst: subst.subst_empty()) else UnifyErr(message: "cap type-argument count mismatch") end
+    | at :: arest ->
+      match b do
+        | [] -> return UnifyErr(message: "cap type-argument count mismatch")
+        | bt :: brest ->
+          match unify.unify(t1: at, t2: bt, tdefs) do
+            | UnifyErr(message: m) -> return UnifyErr(message: m)
+            | UnifyOk(_) -> return unify_arg_lists(a: arest, b: brest, tdefs)
+          end
+      end
+  end
 end
 
 /** Check that each handler's require row is a subset of the ambient require row.
