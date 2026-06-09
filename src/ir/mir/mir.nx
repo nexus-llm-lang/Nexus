@@ -449,7 +449,10 @@ let build_inject_stmts = fn (
           bindings: ah2
         )
         let wrapped = wrap_inject_register(runtime_hs, body: lowered, uniq: cc2)
-        let cc3 = match runtime_hs do | [] -> cc2 | _ -> cc2 + 1 end
+        // Advance the uniquifier in both branches: the single-handler (`[]`) path
+        // now also consumes `__hval_<cc2>` when it threads a trailing if/match
+        // value channel (nexus-hteqm), so the next inject must not reuse cc2.
+        let cc3 = cc2 + 1
         let restored = MirCtx(scope, cap_layouts: pl2, handler_cap_names: hpn2,
                               all_funcs: af2, all_handlers: ah2, all_exts: ae2, closure_counter: cc3, lifted_funcs: lf2, cont_binders: cb2, value_binding_names: vbns2, thunk_param_names: tpn2)
         // Classify the value channel from the PRE-wrap inlined body (the wrap only
@@ -496,7 +499,43 @@ let wrap_inject_register = fn (
   uniq: i64
 ) -> [ MirStmt ] throws { MirError } do
   match runtime_hs do
-    | [] -> return body
+    | [] ->
+      // Single-handler inject (static dispatch): no register save/restore is
+      // needed, BUT the body's trailing value channel still needs threading when
+      // it is a CONTROL-FLOW expr (if/match). LIR's trailing-bare-expr capture
+      // takes a trailing binop as the block value, but lowers a trailing if/match
+      // as a value-DROPPING statement — so an expression-position single-handler
+      // inject with a trailing if/match drops its value / emits invalid WASM
+      // (nexus-hteqm). Bind the trailing if/match to a slot (an assignment whose
+      // RHS is an if/match EXPRESSION lowers correctly) and yield the slot as a
+      // trailing bare variable the caller can capture. Anything else (binop,
+      // call, unit, value-returning body) is left unchanged.
+      match list.reverse(xs: body) do
+        | MirStmtExpr(expr: trailing_e) :: rest_rev ->
+          let needs_thread = match trailing_e do
+            | MirIf(cond: _, then_body: _, else_body: _) -> true
+            | MirMatch(target: _, cases: _) -> true
+            | _ -> false
+          end
+          if !needs_thread then return body end
+          let hval_tmp = "__hval_" ++ i64_to_str(uniq)
+          let prefix = list.reverse(xs: rest_rev)
+          let init_stmt = MirStmtLet(
+            name: hval_tmp,
+            typ: TyI64,
+            expr: MirLiteral(lit: LitInt(val: 0))
+          )
+          let assign_stmt = MirStmtAssign(
+            target: MirVariable(name: hval_tmp),
+            value: trailing_e
+          )
+          let result_stmt = MirStmtExpr(expr: MirVariable(name: hval_tmp))
+          return concat_mir_stmts(
+            a: [ init_stmt ],
+            b: concat_mir_stmts(a: prefix, b: concat_mir_stmts(a: [ assign_stmt ], b: [ result_stmt ]))
+          )
+        | _ -> return body
+      end
     | _ ->
       let saves = build_saves(runtime_hs, uniq, idx: 0, acc: [])
       let sets = build_sets(runtime_hs, acc: [])
