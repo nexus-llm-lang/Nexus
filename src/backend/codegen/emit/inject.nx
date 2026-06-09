@@ -109,12 +109,26 @@ export let emit_inject_resume_multi = fn (buf: %ByteBuffer, body_fn: string, arm
   // @loop
   let %buf = bb.push_bytes(%buf, bytes: [ op_loop, bt_void ])
 
+  // Snapshot the slot to resume into the per-frame `cur_slot` local. The global
+  // ss_resume_slot is the arm→loop handoff; pinning it to a LOCAL de-globalizes
+  // the resume target so (a) a nested suspend cannot clobber which slot THIS
+  // frame resumes, and (b) the arm can reuse this exact slot — which the resume
+  // is about to CONSUME (continuations are one-shot) — for its suspend reify,
+  // instead of bump-allocating a fresh one. That bounds the cont table by the
+  // number of live fibers rather than the cumulative suspend count, so a long-
+  // running coop loop (generator / scheduler) no longer exhausts the 64 slots.
+  let cur_slot = ctx_temps_base(ctx) + 17
+  let %buf = bb.push_byte(%buf, byte: op_global_get)
+  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_resume_slot_global_idx)
+  let %buf = bb.push_byte(%buf, byte: op_local_set)
+  let %buf = bb.push_uleb128(%buf, val: cur_slot)
+
   // N nested arm blocks (outermost first)
   let %buf = open_nested_arm_blocks(%buf, dispatch_t_idx, n: n_arms)
 
-  // resume + on-clauses
-  let %buf = bb.push_byte(%buf, byte: op_global_get)
-  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_resume_slot_global_idx)
+  // resume table[cur_slot] + on-clauses
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: cur_slot)
   let %buf = bb.push_bytes(%buf, bytes: [ op_i32_wrap_i64, op_table_get ])
   let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_table_idx)
   let %buf = bb.push_byte(%buf, byte: op_resume)
@@ -349,17 +363,11 @@ let emit_arm_call_args = fn (
     | [] -> return %buf
     | LirParam(label: _, name: pn, typ: pt) :: rest ->
       let %buf = if pn == cont_binder then
-        // Cont-binder parameter: the reserved resume-slot value (i64). The
-        // dispatcher (emit_arm_dispatch) bumps ss_next_alloc BEFORE this call so
-        // that an arm body which itself performs another stack-switching effect
-        // gets a FRESH slot rather than clobbering the one reified for this arm
-        // (nexus-jmvqp). The live cursor is therefore one PAST the reified slot,
-        // so the binder is ss_next_alloc - 1.
-        let %b = bb.push_byte(%buf, byte: op_global_get)
-        let %b = bb.push_uleb128(buf: %b, val: wdefs.ss_next_alloc_global_idx)
-        let %b = bb.push_byte(buf: %b, byte: op_i64_const)
-        let %b = bb.push_sleb128(buf: %b, val: 1)
-        bb.push_byte(buf: %b, byte: wdefs.op_i64_sub)
+        // Cont-binder parameter: cur_slot (the per-frame local holding the slot
+        // the dispatcher just resumed and reified the suspended continuation back
+        // into). Forcing @k therefore resumes exactly that slot.
+        let %b = bb.push_byte(%buf, byte: op_local_get)
+        bb.push_uleb128(buf: %b, val: ctx_temps_base(ctx) + 17)
       else
         // Payload parameter: read off the i64 channel, narrow to native type.
         let %b = bb.push_byte(%buf, byte: op_local_get)
@@ -389,31 +397,26 @@ let emit_arm_dispatch = fn (
   let %buf = bb.push_byte(%buf, byte: op_local_set)
   let %buf = bb.push_uleb128(%buf, val: temp_idx)
 
-  let %buf = bb.push_byte(%buf, byte: op_global_get)
-  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
+  // Reify the suspended continuation back into the slot the loop just resumed
+  // (cur_slot, the per-frame local). That slot's previous continuation was
+  // consumed by the resume (continuations are one-shot), so reusing it is sound
+  // — and a yield therefore does NOT grow the cont table: a fiber keeps its slot
+  // across suspend/resume, so the table is bounded by the live-fiber count, not
+  // the cumulative suspend count (a long coop loop no longer exhausts 64 slots).
+  // Because cur_slot is a per-frame LOCAL (not the shared ss_next_alloc global),
+  // a nested suspend reifies into ITS OWN frame's slot and cannot clobber this
+  // one — this subsumes the earlier ss_next_alloc reserve-before-call jmvqp fix.
+  let cur_slot = ctx_temps_base(ctx) + 17
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: cur_slot)
   let %buf = bb.push_bytes(%buf, bytes: [ op_i32_wrap_i64, op_global_get ])
   let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_global_idx)
   let %buf = bb.push_byte(%buf, byte: op_table_set)
   let %buf = bb.push_uleb128(%buf, val: wdefs.ss_cont_table_idx)
 
-  // Reserve the slot by bumping the alloc cursor BEFORE calling the arm. The
-  // increment is stack-neutral, so moving it ahead of the call cannot change
-  // validation; what it changes is timing: if the arm body itself performs
-  // another stack-switching effect (nexus-jmvqp), the nested dispatcher now
-  // allocates into a FRESH slot instead of the one we just reified — so the
-  // enclosing continuation is not clobbered (with one inner suspend the body's
-  // tail was silently dropped; with two it SIGSEGV'd on the corrupted slot).
-  // The arm's cont-binder reads the reserved slot back as ss_next_alloc - 1
-  // (see emit_arm_call_args).
-  let %buf = bb.push_byte(%buf, byte: op_global_get)
-  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
-  let %buf = bb.push_byte(%buf, byte: op_i64_const)
-  let %buf = bb.push_sleb128(%buf, val: 1)
-  let %buf = bb.push_bytes(%buf, bytes: [ op_i64_add, op_global_set ])
-  let %buf = bb.push_uleb128(%buf, val: wdefs.ss_next_alloc_global_idx)
-
-  // Push the arm's arguments in label-sorted parameter order: the reserved slot
-  // to the cont-binder param, the (narrowed) payload to the cap-method param.
+  // Push the arm's arguments in label-sorted parameter order: the cont-binder
+  // gets cur_slot (the slot we just reified into), the (narrowed) payload goes
+  // on the i64 channel to the cap-method param.
   let %buf = emit_arm_call_args(%buf, params, cont_binder, temp_idx, ctx)
   let %buf = bb.push_byte(%buf, byte: op_call)
   return bb.push_uleb128(%buf, val: arm_idx)

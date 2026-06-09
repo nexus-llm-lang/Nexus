@@ -1,0 +1,76 @@
+// Regression (nexus-5hsbc infra): a long-running `with @k` loop must not exhaust
+// the continuation table. The inject dispatcher used to BUMP-allocate a fresh
+// cont-table slot on every suspend (ss_next_alloc, never reclaimed), so any coop
+// loop past ~31 suspends overflowed the fixed 64-slot table and trapped. The
+// dispatcher now reifies the suspended continuation back into the per-frame slot
+// it just resumed (cur_slot) — a fiber keeps its slot across suspend/resume — so
+// the table is bounded by live-fiber count, not cumulative suspends.
+//
+// Two shapes, each well past the old 64 limit:
+//   (1) a generator (single inject) that emits a 600-element range — 600 suspends
+//       through one collector frame;
+//   (2) a two-fiber coop scheduler doing 1000 total yields through one scheduler
+//       frame.
+// twyov-safe: pure bodies, exit-0, the verifying trap fires only after both
+// injects have fully returned.
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as mem from "std:runtime/mem"
+import { Yield, collector } from "std:concurrency/generator"
+import { Coop, scheduler, spawn } from "std:concurrency/coop"
+
+// (1) Generator emitting 1..n; the producer suspends once per emit. Returns the
+// count of emitted values (must equal n even for n ≫ 64).
+let gen_count = fn (n: i64) -> i64 throws { Exn } do
+  inject collector do
+    let ~seen = 0
+    for i = 1 to n + 1 do
+      Yield.emit(v: i)
+      ~seen <- ~seen + 1
+    end
+    return ~seen
+  end
+end
+
+// (2) Coop task that yields k times, counting into a shared cell.
+let cnt_cell = fn () -> i64 do return 901120 end
+let yield_k = fn (k: i64) -> unit require { Coop } do
+  if k <= 0 then return () end
+  mem.store_i64(addr: cnt_cell(), val: mem.load_i64(addr: cnt_cell()) + 1)
+  Coop.yield()
+  return yield_k(k: k - 1)
+end
+
+let run_sched = fn () -> i64 do
+  mem.store_i64(addr: cnt_cell(), val: 0)
+  inject scheduler do
+    spawn(task: fn () -> unit require { Coop } do return yield_k(k: 500) end)
+    yield_k(k: 500)
+  end
+  return mem.load_i64(addr: cnt_cell())
+end
+
+let body = fn () -> i64 throws { Exn } do
+  let g = gen_count(n: 600)
+  let s = run_sched()
+  if g == 600 && s == 1000 then return 1 else return 0 end
+end
+
+let safe_run = fn () -> i64 do
+  try
+    return body()
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } throws { Exn } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    Console.println(val: "long-loop ok=" ++ str.from_i64(val: ok))
+    let _g = 1 / ok
+    return ()
+  end
+end
