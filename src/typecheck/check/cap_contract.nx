@@ -51,7 +51,8 @@ import * as occurs from "src/typecheck/check/occurs.nx"
 import { base_name_of } from "src/typecheck/tcwf.nx"
 import { alias_src_name, hir_params_to_named_types } from "src/typecheck/check/registration.nx"
 import * as infer from "src/typecheck/infer.nx"
-import { TypeError } from "src/typecheck/errors.nx"
+import { TypeError, TypeMismatch } from "src/typecheck/errors.nx"
+import { Span } from "src/types/span.nx"
 
 // ─── Entry point ────────────────────────────────────────────────────────────
 
@@ -62,7 +63,7 @@ export let derive_generic_cap_contracts = fn (
   state: CheckState,
   funcs: [ HirFunction ],
   caps: [ HirCap ]
-) -> CheckState do
+) -> CheckState throws { TypeError } do
   let participants = collect_participants(funcs, caps, acc: [])
   if list.is_empty(xs: participants) then return state end
   // Fixpoint bound: each contract only ever moves bare → committed, so it can
@@ -138,7 +139,7 @@ let derive_fixpoint = fn (
   participants: [ HirFunction ],
   caps: [ HirCap ],
   fuel: i64
-) -> CheckState do
+) -> CheckState throws { TypeError } do
   if fuel <= 0 then return state end
   let SweepResult(state: st1, changed) = derive_sweep(state, participants, caps, changed: false)
   if changed then return derive_fixpoint(state: st1, participants, caps, fuel: fuel - 1) end
@@ -152,7 +153,7 @@ let derive_sweep = fn (
   participants: [ HirFunction ],
   caps: [ HirCap ],
   changed: bool
-) -> SweepResult do
+) -> SweepResult throws { TypeError } do
   match participants do
     | [] -> return SweepResult(state, changed)
     | f :: rest ->
@@ -168,10 +169,10 @@ type DeriveOne = DeriveOne(state: CheckState, changed: bool)
  *  fresh-var ambient require row, then re-publish its scheme if the contract
  *  changed. Inference failure ⇒ keep the existing scheme (real error reported by
  *  the body-check pass). */
-let derive_one = fn (state: CheckState, func: HirFunction, caps: [ HirCap ]) -> DeriveOne do
+let derive_one = fn (state: CheckState, func: HirFunction, caps: [ HirCap ]) -> DeriveOne throws { TypeError } do
   let HirFunction(
     name, type_params: tps, params, ret_type: ret, throw_row: tw,
-    body: fbody, span: _, file: _, requires: req
+    body: fbody, span: fn_span, file: _, requires: req
   ) = func
   let body = match fbody do | EagerBody(stmts: s) -> s | LazyBody(_) -> [] end
   // Mirror check_function's body environment / row setup, except the require row
@@ -189,7 +190,30 @@ let derive_one = fn (state: CheckState, func: HirFunction, caps: [ HirCap ]) -> 
   let st_c = tctypes.state_with_throw_row(state: st_b, throw_row: conv_tw)
   let st_d = tctypes.state_with_require_row(state: st_c, require_row: ambient_fresh)
   match try_infer(st_d, body, ret_type: conv_ret) do
-    | None -> return DeriveOne(state, changed: false)
+    | None ->
+      // The fresh-var ambient row inference FAILED. Distinguish a genuine
+      // generic-cap element CONTRADICTION (the function commits the same cap at
+      // two incompatible concrete element types in one require scope — a
+      // soundness violation) from an unrelated body type error
+      // (reported properly by the pass-2 body check). Re-run inference with the
+      // generic-cap entries left BARE (element-agnostic): bare ambient cap args
+      // make every cap call's coverage trivially admitted, so the ONLY failure
+      // the fresh-var run can add over the bare run is the cap-element pinning
+      // contradiction. If the bare run SUCCEEDS, the fresh-var failure was that
+      // contradiction → reject; if it ALSO fails, the body has a real error →
+      // keep the existing scheme and let the body check report it.
+      let st_bare = tctypes.state_with_require_row(state: st_c, require_row: conv_req)
+      match try_infer(st_bare, body, ret_type: conv_ret) do
+        | None -> return DeriveOne(state, changed: false)
+        | Some(val: _) ->
+          throw TypeMismatch(
+            func_name: name,
+            detail: "capability is used at two incompatible element types in the "
+              ++ "same require scope; a generic capability bound bare `require { ... }` "
+              ++ "must commit to a single element type",
+            span: fn_span
+          )
+      end
     | Some(val: s_body) ->
       // The committed contract is the fresh-var ambient row resolved under the
       // body substitution. Reduce each generic-cap entry: concrete arg → keep;
@@ -214,7 +238,10 @@ let try_infer = fn (
   state: CheckState, body: [ HirStmt ], ret_type: TypeExpr
 ) -> Option<[ SubstEntry ]> do
   try
-    match infer.infer_stmts(state, stmts: body, ret_type) do
+    // Thread the ambient require row through the per-statement subst so a cap
+    // element pinned by one statement is enforced against a later commit; a
+    // double-commit at incompatible concrete element types fails here.
+    match infer.infer_stmts_pinning_require(state, stmts: body, ret_type) do
       | InferExprOk(state: _, subst: s_body, typ: _) -> return Some(val: s_body)
       | InferExprErr(message: _, span: _) -> return None
     end
