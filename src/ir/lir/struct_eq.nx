@@ -197,6 +197,87 @@ let list_type_name = fn (elem: TypeExpr) -> string do
   return "List$" ++ list_elem_key(elem)
 end
 
+// ─── Per-instantiation keying (generic-enum-at-concrete payload) ────────────
+//
+// `list_elem_key` ERASES a generic instantiation's type arguments
+// (`TyUserDefined(n, _) -> n`), so `Option<Color>` and `Option<i64>` share the
+// bare `__streq_Option` / `__streq_List$Option` helper (whose type-parameter
+// payload is identity-compared). `inst_key` instead PRESERVES the arguments
+// (`Option<Color>` → `Option$Color`), keying the per-instantiation structural
+// helper whose payload recurses into the concrete type's own compare. Used only
+// on the gen-inst routing path (a `==` site or another per-inst helper body); a
+// BARE helper body keeps `list_elem_key`'s erasure so a never-`==`'d type's
+// concrete generic field (`VariantIndex.by_variant: Map<string, VariantInfo>`)
+// routes to the bare element helper — never dragging in a per-inst closure.
+let inst_key = fn (t: TypeExpr) -> string do
+  match t do
+    | TyI64 -> return "i64"
+    | TyBool -> return "bool"
+    | TyF64 -> return "f64"
+    | TyChar -> return "char"
+    | TyString -> return "string"
+    | TyUserDefined(name: n, args: []) -> return n
+    | TyUserDefined(name: n, args: ats) -> return n ++ "$" ++ inst_key_args(ats, first: true, acc: "")
+    | TyList(elem: inner) -> return "List$" ++ inst_key(t: inner)
+    | TyRecord(fields: fs) -> return "Rec$" ++ anon_record_key(fields: fs)
+    | _ -> return "T"
+  end
+end
+
+let inst_key_args = fn (ats: [ TypeExpr ], first: bool, acc: string) -> string do
+  match ats do
+    | [] -> return acc
+    | a :: rest ->
+      let piece = inst_key(t: a)
+      let acc2 = if first then piece else acc ++ "$" ++ piece end
+      return inst_key_args(ats: rest, first: false, acc: acc2)
+  end
+end
+
+// The per-instantiation enum helper's type-name for `Enum<args>` (e.g.
+// `Option$Color`). Equal to `inst_key(TyUserDefined(enum, args))` so a nested
+// `Option<Option<Color>>` field and the standalone `Option<Color>` `==` site key
+// the SAME `__streq_Option$Color` helper.
+let enum_inst_name = fn (enum: string, args: [ TypeExpr ]) -> string do
+  return inst_key(t: TyUserDefined(name: enum, args))
+end
+
+// True iff `t` is a CONCRETE generic instantiation `K<args>` with at least one
+// argument and no remaining type variable (`TyVar`) — i.e. one for which a
+// per-instantiation helper can be keyed. A bare `K<>` (no args), a primitive, or
+// a `TyVar`-bearing shape is NOT.
+let is_concrete_generic_inst = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyUserDefined(name: _, args: []) -> return false
+    | TyUserDefined(name: _, args: ats) -> return !type_list_has_tyvar(ts: ats)
+    | _ -> return false
+  end
+end
+
+let type_has_tyvar_se = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyVar(name: _) -> return true
+    | TyList(elem: e) -> return type_has_tyvar_se(t: e)
+    | TyUserDefined(name: _, args: ats) -> return type_list_has_tyvar(ts: ats)
+    | TyRecord(fields: fs) -> return named_list_has_tyvar(nts: fs)
+    | _ -> return false
+  end
+end
+
+let type_list_has_tyvar = fn (ts: [ TypeExpr ]) -> bool do
+  match ts do
+    | [] -> return false
+    | t :: rest -> if type_has_tyvar_se(t) then return true else return type_list_has_tyvar(ts: rest) end
+  end
+end
+
+let named_list_has_tyvar = fn (nts: [ NamedType ]) -> bool do
+  match nts do
+    | [] -> return false
+    | NamedType(name: _, typ: t) :: rest -> if type_has_tyvar_se(t) then return true else return named_list_has_tyvar(nts: rest) end
+  end
+end
+
 // The monomorphized `Cons`/`Nil` variant defs for `[elem]`, matching the
 // built-in `List` layout (`Cons(v: elem, rest: [elem])`, `Nil`). Drives the
 // list helper body's structural compare: the `v` field recurses on `elem`
@@ -230,6 +311,27 @@ export let is_struct_eq_op = fn (op: BinaryOp) -> bool do
     | OpEq | OpNe -> return true
     | _ -> return false
   end
+end
+
+/** Pick the better structural-compare type from a `==`/`!=` site's two operand
+ *  semantic types. When BOTH name the same generic enum but only ONE carries the
+ *  concrete instantiation (`a: Option<Color>` vs an erased `b: Option<>` coming
+ *  from a bare `None` / a TyI64-defaulted value), prefer the CONCRETE side so the
+ *  site routes to the per-instantiation structural helper rather than the
+ *  type-erased bare one (which would identity-compare a sum/record payload).
+ *  Otherwise keep the existing left-biased "first that needs a structural
+ *  compare" choice. */
+export let pick_struct_sem = fn (a: TypeExpr, b: TypeExpr, ctx: LowerCtx) -> TypeExpr do
+  let a_ok = should_struct_eq(t: a, ctx)
+  let b_ok = should_struct_eq(t: b, ctx)
+  // If exactly one side is structural, that side is the only choice.
+  if a_ok && !b_ok then return a end
+  if b_ok && !a_ok then return b end
+  // Both structural: prefer a concrete generic instantiation over an erased one.
+  if is_concrete_generic_inst(t: a) && !is_concrete_generic_inst(t: b) then return a end
+  if is_concrete_generic_inst(t: b) && !is_concrete_generic_inst(t: a) then return b end
+  // Neither (or both) concrete: keep the prior left-biased choice.
+  if a_ok then return a else return b end
 end
 
 /** True iff `==`/`!=` on an operand of semantic type `t` needs a structural
@@ -301,18 +403,32 @@ end
 // helper when covered, else the generic `List$T` fallback. The recursive `rest`
 // field inside a helper resolves through this same routing on the SAME element
 // type, so it self-calls the right helper consistently.
-let list_site_type_name = fn (elem: TypeExpr, ctx: LowerCtx) -> string do
-  if list_elem_covered(elem, ctx) then return list_type_name(elem)
+//
+// `gen_inst` selects the element KEY: on the gen-inst path (a `==` site / a
+// per-instantiation helper body) a concrete generic element `Option<Color>` keys
+// the per-instantiation list helper `List$Option$Color` (whose `v` recurses into
+// `__streq_Option$Color`); a BARE helper body (`gen_inst = false`) erases the
+// element's args so `[Option<i64>]` routes to the bare `List$Option` (today's
+// type-erased behavior). The worklist guarantees every `gen_inst`-keyed list
+// helper is actually synthesized.
+let list_site_type_name = fn (elem: TypeExpr, gen_inst: bool, ctx: LowerCtx) -> string do
+  if list_elem_covered(elem, ctx) then
+    if gen_inst then return "List$" ++ inst_key(t: elem) else return list_type_name(elem) end
   else return list_type_name(elem: TyVar(name: "T"))
   end
 end
 
-let named_aggregate_name = fn (t: TypeExpr, ctx: LowerCtx) -> Option<string> do
+// `named_aggregate_name`: the helper-bearing type name of `t`. On the `gen_inst`
+// path a concrete generic-enum instantiation `Enum<args>` routes to its
+// per-instantiation helper `Enum$args` (structural payload compare); off it
+// (a bare helper body) the args are erased to the bare `Enum` so a never-`==`'d
+// type's concrete generic field never requests an un-generated per-inst helper.
+let named_aggregate_name = fn (t: TypeExpr, gen_inst: bool, ctx: LowerCtx) -> Option<string> do
   match t do
     // `[elem]` routes to the per-element-type generated list helper. Returning a
     // name here makes `compare_values` emit a CALL (not an inline expansion), so
     // the recursive `rest` field terminates at run time like recursive sums do.
-    | TyList(elem: et) -> return Some(val: list_site_type_name(elem: et, ctx))
+    | TyList(elem: et) -> return Some(val: list_site_type_name(elem: et, gen_inst, ctx))
     | TyUserDefined(name: n, args: _) ->
       // Either a record alias or a sum with known variants gets a helper.
       match resolve_operand_type(t, ctx) do
@@ -321,11 +437,22 @@ let named_aggregate_name = fn (t: TypeExpr, ctx: LowerCtx) -> Option<string> do
           let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
           match vidx.variants_of_enum(idx: ed, enum_name: en) do
             | [] -> return None
-            | _ -> return Some(val: en)
+            | _ ->
+              // Per-instantiation helper on the gen-inst path for a concrete
+              // generic enum; bare helper otherwise.
+              if gen_inst && is_concrete_generic_inst(t) then return Some(val: enum_inst_name(enum: en, args: inst_args_of(t)))
+              else return Some(val: en) end
           end
         | _ -> return None
       end
     | _ -> return None
+  end
+end
+
+let inst_args_of = fn (t: TypeExpr) -> [ TypeExpr ] do
+  match t do
+    | TyUserDefined(name: _, args: ats) -> return ats
+    | _ -> return []
   end
 end
 
@@ -360,12 +487,15 @@ end
 type CmpResult = CmpResult(ctx: LowerCtx, atom: LirAtom)
 
 // Load `parent.field[heap_idx]` (object field at alphabetical index) for both
-// operands and compare them structurally.
+// operands and compare them structurally. `gen_inst` is forwarded so a concrete
+// generic-enum field routes to its per-instantiation helper on the gen-inst path
+// (a `==` site / per-inst helper body) and to the bare/erased helper otherwise.
 let compare_field = fn (
   lhs_parent: LirAtom,
   rhs_parent: LirAtom,
   heap_idx: i64,
   field_type: TypeExpr,
+  gen_inst: bool,
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   // wasm slot type for the field load: strings flow as i64 packed handles but
@@ -386,7 +516,7 @@ let compare_field = fn (
     expr: LirExprObjectField(value: rhs_parent, index: heap_idx, typ: load_wt),
     typ: load_wt
   )
-  return compare_values(l: l_field, r: r_field, sem_type: field_type, ctx: ctx2)
+  return compare_values(l: l_field, r: r_field, sem_type: field_type, gen_inst, ctx: ctx2)
 end
 
 // Compare two already-loaded operand atoms of semantic type `sem_type`,
@@ -395,18 +525,21 @@ end
 // A NAMED aggregate (sum / record alias) routes to a CALL of that type's
 // generated helper — including recursive positions, which terminate at run time.
 // An ANONYMOUS record is expanded inline one level (its aggregate fields recurse
-// through their helpers). Everything else is a single value compare.
+// through their helpers). Everything else is a single value compare. `gen_inst`
+// selects per-instantiation vs bare/erased routing for a concrete generic enum
+// (see `named_aggregate_name`).
 let compare_values = fn (
   l: LirAtom,
   r: LirAtom,
   sem_type: TypeExpr,
+  gen_inst: bool,
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
-  match named_aggregate_name(t: sem_type, ctx) do
+  match named_aggregate_name(t: sem_type, gen_inst, ctx) do
     | Some(val: nm) -> return call_helper(l, r, type_name: nm, ctx)
     | None ->
       match resolve_operand_type(t: sem_type, ctx) do
-        | TyRecord(fields: fs) -> return compare_record(l, r, fields: fs, ctx)
+        | TyRecord(fields: fs) -> return compare_record(l, r, fields: fs, gen_inst, ctx)
         | _ -> return compare_primitive(l, r, ctx)
       end
   end
@@ -462,10 +595,11 @@ let compare_record = fn (
   l: LirAtom,
   r: LirAtom,
   fields: [ NamedType ],
+  gen_inst: bool,
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   let all_names = record_field_names(fields, acc: [])
-  return compare_record_go(l, r, fields, all_names, acc: None, ctx)
+  return compare_record_go(l, r, fields, all_names, acc: None, gen_inst, ctx)
 end
 
 let compare_record_go = fn (
@@ -474,6 +608,7 @@ let compare_record_go = fn (
   fields: [ NamedType ],
   all_names: [ string ],
   acc: Option<LirAtom>,
+  gen_inst: bool,
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   match fields do
@@ -486,7 +621,7 @@ let compare_record_go = fn (
     | NamedType(name: fname, typ: ftyp) :: rest ->
       let heap_idx = heap_index_of(name: fname, all_names)
       let CmpResult(ctx: ctx1, atom: feq) = compare_field(
-        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, ctx
+        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, gen_inst, ctx
       )
       let next_acc = match acc do
         | None -> CmpResult(ctx: ctx1, atom: feq)
@@ -499,7 +634,7 @@ let compare_record_go = fn (
           CmpResult(ctx: ctx2, atom: anded)
       end
       let CmpResult(ctx: ctx3, atom: acc_atom) = next_acc
-      return compare_record_go(l, r, fields: rest, all_names, acc: Some(val: acc_atom), ctx: ctx3)
+      return compare_record_go(l, r, fields: rest, all_names, acc: Some(val: acc_atom), gen_inst, ctx: ctx3)
   end
 end
 
@@ -543,11 +678,12 @@ let compare_variant_payload = fn (
   l: LirAtom,
   r: LirAtom,
   vd: VariantDef,
+  gen_inst: bool,
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   let VariantDef(name: _, fields: fs) = vd
   let all_names = variant_field_names(fs, acc: [])
-  return compare_variant_fields_go(l, r, fields: fs, all_names, acc: None, ctx)
+  return compare_variant_fields_go(l, r, fields: fs, all_names, acc: None, gen_inst, ctx)
 end
 
 let compare_variant_fields_go = fn (
@@ -556,6 +692,7 @@ let compare_variant_fields_go = fn (
   fields: [ VariantField ],
   all_names: [ string ],
   acc: Option<LirAtom>,
+  gen_inst: bool,
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   match fields do
@@ -571,7 +708,7 @@ let compare_variant_fields_go = fn (
       end
       let heap_idx = heap_index_of(name: fname, all_names)
       let CmpResult(ctx: ctx1, atom: feq) = compare_field(
-        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, ctx
+        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, gen_inst, ctx
       )
       let next_acc = match acc do
         | None -> CmpResult(ctx: ctx1, atom: feq)
@@ -585,7 +722,7 @@ let compare_variant_fields_go = fn (
       end
       let CmpResult(ctx: ctx3, atom: acc_atom) = next_acc
       return compare_variant_fields_go(l, r, fields: rest, all_names,
-                                       acc: Some(val: acc_atom), ctx: ctx3)
+                                       acc: Some(val: acc_atom), gen_inst, ctx: ctx3)
   end
 end
 
@@ -599,6 +736,7 @@ let compare_sum = fn (
   l: LirAtom,
   r: LirAtom,
   variants: [ VariantDef ],
+  gen_inst: bool,
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   // tag_l / tag_r
@@ -625,7 +763,7 @@ let compare_sum = fn (
   // into, faulting on garbage. So: `if tags_eq then <dispatch> else payload=false`.
   let LowerCtx(vars: gv, semantic_vars: gsv, stmts: g_saved, temp_counter: gc, enum_defs: ged) = c4
   let then_ctx0 = LowerCtx(vars: gv, semantic_vars: gsv, stmts: [], temp_counter: gc, enum_defs: ged)
-  let then_done = emit_variant_dispatch(l, r, tag_l, variants, payload_name, ctx: then_ctx0)
+  let then_done = emit_variant_dispatch(l, r, tag_l, variants, payload_name, gen_inst, ctx: then_ctx0)
   let LowerCtx(vars: tv, semantic_vars: tsv, stmts: then_rev, temp_counter: tc, enum_defs: ted) = then_done
   let then_stmts = list.reverse(xs: then_rev)
   let else_stmts = [ LirStmtLet(name: payload_name, typ: TyBool, expr: LirExprAtom(atom: LirAtomBool(val: false))) ]
@@ -652,6 +790,7 @@ let emit_variant_dispatch = fn (
   tag_l: LirAtom,
   variants: [ VariantDef ],
   payload_name: string,
+  gen_inst: bool,
   ctx: LowerCtx
 ) -> LowerCtx throws { LirError } do
   match variants do
@@ -667,14 +806,14 @@ let emit_variant_dispatch = fn (
       )
       // THEN branch: compute this variant's payload eq into payload_name.
       let then_stmts = build_branch_stmts(
-        l, r, vd, payload_name, ctx: c1
+        l, r, vd, payload_name, gen_inst, ctx: c1
       )
       // ELSE branch: recurse over the remaining variants, again isolated.
       let LowerCtx(vars: ev, semantic_vars: esv, stmts: saved, temp_counter: ec, enum_defs: eed) = c1
       let else_ctx0 = LowerCtx(vars: ev, semantic_vars: esv, stmts: [],
                                temp_counter: ec, enum_defs: eed)
       let else_done = emit_variant_dispatch(l, r, tag_l, variants: rest,
-                                            payload_name, ctx: else_ctx0)
+                                            payload_name, gen_inst, ctx: else_ctx0)
       let LowerCtx(vars: ev2, semantic_vars: esv2, stmts: else_rev,
                    temp_counter: ec2, enum_defs: eed2) = else_done
       let else_stmts = list.reverse(xs: else_rev)
@@ -696,11 +835,12 @@ let build_branch_stmts = fn (
   r: LirAtom,
   vd: VariantDef,
   payload_name: string,
+  gen_inst: bool,
   ctx: LowerCtx
 ) -> [ LirStmt ] throws { LirError } do
   let LowerCtx(vars: v, semantic_vars: sv, stmts: _, temp_counter: c, enum_defs: ed) = ctx
   let iso = LowerCtx(vars: v, semantic_vars: sv, stmts: [], temp_counter: c, enum_defs: ed)
-  let CmpResult(ctx: iso2, atom: peq) = compare_variant_payload(l, r, vd, ctx: iso)
+  let CmpResult(ctx: iso2, atom: peq) = compare_variant_payload(l, r, vd, gen_inst, ctx: iso)
   let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = iso2
   let assign = LirStmtLet(name: payload_name, typ: TyBool, expr: LirExprAtom(atom: peq))
   return list.reverse(xs: assign :: body_rev)
@@ -718,6 +858,7 @@ let zero_span = Span(offset: 0, line: 0, col: 0)
 // time and always terminates on finite values.
 let build_helper_body = fn (
   sem_type: TypeExpr,
+  gen_inst: bool,
   enum_defs: VariantIndex
 ) -> BindResult throws { LirError } do
   let l = LirAtomVar(name: "l", typ: TyI64)
@@ -726,11 +867,11 @@ let build_helper_body = fn (
   // Dispatch on the type's own shape (NOT named_aggregate_name — that would emit
   // a self-call and never bottom out).
   let CmpResult(ctx: ctx1, atom: result) = match vidx.resolve_record_alias(idx: enum_defs, typ: sem_type) do
-    | TyRecord(fields: fs) -> compare_record(l, r, fields: fs, ctx: ctx0)
+    | TyRecord(fields: fs) -> compare_record(l, r, fields: fs, gen_inst, ctx: ctx0)
     | TyUserDefined(name: en, args: _) ->
       match vidx.variants_of_enum(idx: enum_defs, enum_name: en) do
         | [] -> compare_primitive(l, r, ctx: ctx0)
-        | vs -> compare_sum(l, r, variants: vs, ctx: ctx0)
+        | vs -> compare_sum(l, r, variants: vs, gen_inst, ctx: ctx0)
       end
     | _ -> compare_primitive(l, r, ctx: ctx0)
   end
@@ -738,13 +879,17 @@ let build_helper_body = fn (
   return BindResult(ctx: ctx1, atom: result)
 end
 
-// Synthesize one `__streq_<Name>(l, r) -> bool` helper for a named aggregate.
+// Synthesize one `__streq_<Name>(l, r) -> bool` helper for a named aggregate. The
+// BARE per-named-type helper is built with `gen_inst = false` so a generic field
+// erases to identity (today's behavior); a per-INSTANTIATION helper passes
+// `gen_inst = true` so its (substituted) generic-payload fields recurse.
 let make_helper = fn (
   type_name: string,
   sem_type: TypeExpr,
+  gen_inst: bool,
   enum_defs: VariantIndex
 ) -> LirFunction throws { LirError } do
-  let BindResult(ctx: ctx1, atom: result) = build_helper_body(sem_type, enum_defs)
+  let BindResult(ctx: ctx1, atom: result) = build_helper_body(sem_type, gen_inst, enum_defs)
   let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = ctx1
   // Params labelled "l" < "r" so sort_lir_params keeps [l, r]; call sites emit
   // args in that same order (positional internal-call ABI).
@@ -766,17 +911,23 @@ end
 // The `rest` recursion self-calls this same helper (terminates on finite data);
 // the `v` recursion routes through `elem`'s own compare path so strings, records
 // and nested lists compare structurally rather than by i64 identity.
+// `gen_inst` + `type_name` let a per-INSTANTIATION list helper
+// (`__streq_List$Option$Color`, built with `gen_inst = true`) recurse its head
+// `v: Option<Color>` into the per-inst element helper; the BARE list helper
+// (`__streq_List$Option`, `gen_inst = false`) erases the element's generic args.
 let make_list_helper = fn (
+  type_name: string,
   elem: TypeExpr,
+  gen_inst: bool,
   enum_defs: VariantIndex
 ) -> LirFunction throws { LirError } do
   let l = LirAtomVar(name: "l", typ: TyI64)
   let r = LirAtomVar(name: "r", typ: TyI64)
   let ctx0 = LowerCtx(vars: [], semantic_vars: [], stmts: [], temp_counter: 0, enum_defs)
-  let CmpResult(ctx: ctx1, atom: result) = compare_sum(l, r, variants: list_variant_defs(elem: elem), ctx: ctx0)
+  let CmpResult(ctx: ctx1, atom: result) = compare_sum(l, r, variants: list_variant_defs(elem: elem), gen_inst, ctx: ctx0)
   let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = ctx1
   return LirFunction(
-    name: struct_eq_helper_name(type_name: list_type_name(elem: elem)),
+    name: struct_eq_helper_name(type_name),
     params: [ LirParam(label: "l", name: "l", typ: TyI64),
               LirParam(label: "r", name: "r", typ: TyI64) ],
     ret_type: TyBool,
@@ -798,7 +949,7 @@ let make_enum_helpers = fn (
       // compare; a compare on such a value keeps the legacy i64 path.
       let acc2 = match vs do
         | [] -> acc
-        | _ -> make_helper(type_name: en, sem_type: TyUserDefined(name: en, args: []), enum_defs) :: acc
+        | _ -> make_helper(type_name: en, sem_type: TyUserDefined(name: en, args: []), gen_inst: false, enum_defs) :: acc
       end
       return make_enum_helpers(defs: rest, enum_defs, acc: acc2)
   end
@@ -812,7 +963,7 @@ let make_record_helpers = fn (
   match defs do
     | [] -> return list.reverse(xs: acc)
     | RecordDef(name: rn, is_public: _, type_params: _, fields: fs) :: rest ->
-      let helper = make_helper(type_name: rn, sem_type: TyRecord(fields: fs), enum_defs)
+      let helper = make_helper(type_name: rn, sem_type: TyRecord(fields: fs), gen_inst: false, enum_defs)
       return make_record_helpers(defs: rest, enum_defs, acc: helper :: acc)
   end
 end
@@ -947,7 +1098,7 @@ let make_list_helpers = fn (
 ) -> [ LirFunction ] throws { LirError } do
   match elems do
     | [] -> return list.reverse(xs: acc)
-    | e :: rest -> return make_list_helpers(elems: rest, enum_defs, acc: make_list_helper(elem: e, enum_defs) :: acc)
+    | e :: rest -> return make_list_helpers(elems: rest, enum_defs, acc: make_list_helper(type_name: list_type_name(elem: e), elem: e, gen_inst: false, enum_defs) :: acc)
   end
 end
 
@@ -987,7 +1138,15 @@ let harvest_expr = fn (e: MirExpr, ctx: LowerCtx, acc: [ TypeExpr ]) -> [ TypeEx
       return harvest_exprs(es: cargs, ctx, acc: acc1)
     | MirRecord(fields: fs) -> return harvest_named_exprs(fs, ctx, acc)
     | MirArray(elems: es) -> return harvest_exprs(es, ctx, acc)
-    | MirBinaryOp(left: l, op: _, right: r) -> return harvest_expr(e: r, ctx, acc: harvest_expr(e: l, ctx, acc))
+    | MirBinaryOp(left: l, op, right: r) ->
+      // At a `==` / `!=` SITE, record both operands' recovered semantic types
+      // (wrapped in the `#EQSITE#` marker) so the per-instantiation worklist is
+      // seeded STRICTLY from comparison sites — never from an incidental
+      // `Some(...)` construction elsewhere (worklist rule 1). The marker name
+      // carries `#`, so it can never collide with a real type; the worklist
+      // post-pass (`harvested_eq_site_insts`) unwraps it.
+      let acc_eq = if is_struct_eq_op(op) then eq_site_marker(t: infer_semantic_type(expr: r, ctx)) :: (eq_site_marker(t: infer_semantic_type(expr: l, ctx)) :: acc) else acc end
+      return harvest_expr(e: r, ctx, acc: harvest_expr(e: l, ctx, acc: acc_eq))
     | MirCall(func: _, args: cas, ret_type: _) -> return harvest_call_args(cas, ctx, acc)
     | MirCallClosure(closure: c, args: cas, ret_type: _) -> return harvest_call_args(cas, ctx, acc: harvest_expr(e: c, ctx, acc))
     | MirIndex(target: t, index: i) -> return harvest_expr(e: i, ctx, acc: harvest_expr(e: t, ctx, acc))
@@ -1117,6 +1276,322 @@ let harvested_anon_record_elems = fn (raw: [ TypeExpr ], acc: [ TypeExpr ]) -> [
   end
 end
 
+// ─── Per-instantiation helper worklist (generic-enum-at-concrete payload) ────
+//
+// `==`/`!=` on a generic enum at a concrete structural instantiation
+// (`Some(Red(7)) == Some(Red(7))`, operand type `Option<Color>`) must compare the
+// type-parameter payload STRUCTURALLY (spec § T-Cmp), not by the heap-pointer
+// identity the type-erased bare `__streq_Option` emits. We synthesize a
+// per-instantiation helper `__streq_Option$Color` whose `Some` arm — built from
+// the variant defs with the type params substituted (`T := Color`) — recurses
+// into `__streq_Color`.
+//
+// SCALING (the load-bearing design). The per-instantiation set is seeded STRICTLY
+// from `==`/`!=` SITES (the `#EQSITE#`-marked operand types harvested above),
+// then transitively closed over the generic instantiations those helpers recurse
+// into. It is NOT seeded from arbitrary declared type fields: a never-`==`'d infra
+// type (`VariantIndex { by_variant: Map<string, VariantInfo> }`) would otherwise
+// drag the whole `Map → Node → … → TypeExpr` closure into existence. The matching
+// guarantee is in the ROUTING: a BARE helper body (`gen_inst = false`) erases a
+// concrete generic field to the bare helper, so `__streq_VariantIndex` calls bare
+// `__streq_Map` (never `__streq_Map$string$VariantInfo`) — no per-inst request,
+// no closure. Only a `gen_inst = true` body (a per-inst helper, reached from a
+// `==` site) recurses structurally, and every instantiation it reaches is in the
+// worklist by construction.
+//
+// All shapes are seed-safe: flat `[TypeExpr]` / `[string]` accumulators threaded
+// as separate params (never a rich record through deep recursion), with a
+// fuel-bounded worklist loop mirroring the reachability `collect_calls_*` shape.
+
+// Marker wrapping a `==`-site operand type in the flat harvest accumulator. The
+// `#` in the name guarantees no collision with a real `TyUserDefined` type.
+let eq_site_marker = fn (t: TypeExpr) -> TypeExpr do
+  return TyUserDefined(name: "#EQSITE#", args: [ t ])
+end
+
+// Non-recursive post-pass: unwrap every `#EQSITE#` marker and keep the operand
+// types that name a per-instantiation COMPARE TARGET — a concrete generic-enum
+// instantiation (`Option<Color>`) or a list whose element carries one
+// (`[Option<Color>]`). Everything else (primitives, bare enums, anon records,
+// `==` on non-generic types) contributes no per-inst helper.
+let harvested_eq_site_insts = fn (raw: [ TypeExpr ], enum_defs: VariantIndex, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match raw do
+    | [] -> return acc
+    | TyUserDefined(name: "#EQSITE#", args: [ operand ]) :: rest ->
+      return harvested_eq_site_insts(raw: rest, enum_defs, acc: targets_in_type(t: operand, enum_defs, acc))
+    | _ :: rest -> return harvested_eq_site_insts(raw: rest, enum_defs, acc)
+  end
+end
+
+// Collect, from a single type, every per-instantiation compare TARGET it
+// contains: a concrete generic-enum instantiation `Enum<concrete>` (one for which
+// a `__streq_Enum$args` helper is keyed) and, for a `[elem]`, the list itself when
+// its element carries a target plus the element's own targets. Walks the finite
+// TypeExpr structure, threading a single flat accumulator (dedup by helper name
+// via `push_inst`).
+let targets_in_type = fn (t: TypeExpr, enum_defs: VariantIndex, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match t do
+    | TyUserDefined(name: en, args: ats) ->
+      if is_concrete_generic_inst(t) then
+        match vidx.variants_of_enum(idx: enum_defs, enum_name: en) do
+          // Only a generic ENUM (known in-scope variants) gets a per-inst helper;
+          // a generic RECORD/struct instantiation (e.g. `Map<…>`) is left to its
+          // bare helper (its declared fields are not `==`-seeded).
+          | [] -> return targets_in_type_list(ts: ats, enum_defs, acc)
+          | _ -> return targets_in_type_list(ts: ats, enum_defs, acc: push_inst(e: t, acc))
+        end
+      else
+        return targets_in_type_list(ts: ats, enum_defs, acc)
+      end
+    | TyList(elem: el) ->
+      // A list whose element carries a target needs its OWN per-inst list helper
+      // (`__streq_List$Option$Color`); recurse into the element for nested targets.
+      let acc1 = if type_carries_inst_target(t: el, enum_defs) then push_inst(e: t, acc) else acc end
+      return targets_in_type(t: el, enum_defs, acc: acc1)
+    | _ -> return acc
+  end
+end
+
+let targets_in_type_list = fn (ts: [ TypeExpr ], enum_defs: VariantIndex, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match ts do
+    | [] -> return acc
+    | x :: rest -> return targets_in_type_list(ts: rest, enum_defs, acc: targets_in_type(t: x, enum_defs, acc))
+  end
+end
+
+// True iff `t` (a list element) contains a per-instantiation target anywhere, so
+// the enclosing `[t]` warrants a per-inst list helper rather than the bare one.
+let type_carries_inst_target = fn (t: TypeExpr, enum_defs: VariantIndex) -> bool throws { LirError } do
+  match targets_in_type(t, enum_defs, acc: []) do
+    | [] -> return false
+    | _ -> return true
+  end
+end
+
+// Dedup-push a target by its per-instantiation helper-bearing name (`inst_key`).
+let push_inst = fn (e: TypeExpr, acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  return push_inst_go(e, key: inst_key(t: e), rest: acc, full: acc)
+end
+
+let push_inst_go = fn (e: TypeExpr, key: string, rest: [ TypeExpr ], full: [ TypeExpr ]) -> [ TypeExpr ] do
+  match rest do
+    | [] -> return e :: full
+    | h :: tl -> if inst_key(t: h) == key then return full else return push_inst_go(e, key, rest: tl, full) end
+  end
+end
+
+// ─── Worklist transitive closure ────────────────────────────────────────────
+
+let lookup_enum_def = fn (defs: [ EnumDef ], name: string) -> Option<EnumDef> do
+  match defs do
+    | [] -> return None
+    | EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: vs, layout_variants: lvs) :: rest ->
+      if n == name then return Some(val: EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: vs, layout_variants: lvs))
+      else return lookup_enum_def(defs: rest, name) end
+  end
+end
+
+// Build a param-name → concrete-arg map (positional) for an enum instantiation.
+let zip_params_args = fn (params: [ string ], args: [ TypeExpr ], acc: [ NamedType ]) -> [ NamedType ] do
+  match params do
+    | [] -> return acc
+    | p :: prest ->
+      match args do
+        | [] -> return acc
+        | a :: arest -> return zip_params_args(params: prest, args: arest, acc: NamedType(name: p, typ: a) :: acc)
+      end
+  end
+end
+
+// Substitute a declared variant-field type's type parameters with the
+// instantiation's concrete args. A type parameter `p` arrives EITHER as
+// `TyVar("p")` (the builtin enums List / Option / Result declare their params as
+// `TyVar`) OR as `TyUserDefined("p", [])` (a USER generic enum's params are
+// shape-identical to a named type at MIR) — both are substituted. Recurses
+// through `[T]` / `K<…>` / records.
+let subst_param_type = fn (t: TypeExpr, subst: [ NamedType ]) -> TypeExpr do
+  match t do
+    | TyVar(name: n) ->
+      match lookup_nt(target: n, fields: subst) do
+        | Some(val: bound) -> return bound
+        | None -> return t
+      end
+    | TyUserDefined(name: n, args: []) ->
+      match lookup_nt(target: n, fields: subst) do
+        | Some(val: bound) -> return bound
+        | None -> return t
+      end
+    | TyUserDefined(name: n, args: ats) -> return TyUserDefined(name: n, args: subst_param_type_list(ts: ats, subst))
+    | TyList(elem: e) -> return TyList(elem: subst_param_type(t: e, subst))
+    | TyRecord(fields: fs) -> return TyRecord(fields: subst_param_named(nts: fs, subst))
+    | _ -> return t
+  end
+end
+
+let subst_param_type_list = fn (ts: [ TypeExpr ], subst: [ NamedType ]) -> [ TypeExpr ] do
+  match ts do
+    | [] -> return []
+    | x :: rest -> return subst_param_type(t: x, subst) :: subst_param_type_list(ts: rest, subst)
+  end
+end
+
+let subst_param_named = fn (nts: [ NamedType ], subst: [ NamedType ]) -> [ NamedType ] do
+  match nts do
+    | [] -> return []
+    | NamedType(name: n, typ: t) :: rest -> return NamedType(name: n, typ: subst_param_type(t, subst)) :: subst_param_named(nts: rest, subst)
+  end
+end
+
+let lookup_nt = fn (target: string, fields: [ NamedType ]) -> Option<TypeExpr> do
+  match fields do
+    | [] -> return None
+    | NamedType(name: n, typ: t) :: rest -> if n == target then return Some(val: t) else return lookup_nt(target, fields: rest) end
+  end
+end
+
+// The CHILD instantiation targets a per-inst helper for `t` recurses into: the
+// generic instantiations appearing in its (substituted) variant-field /
+// list-element types. A named non-generic payload (`Color`) uses its bare helper
+// and contributes no child.
+let inst_children = fn (t: TypeExpr, enum_def_list: [ EnumDef ], enum_defs: VariantIndex) -> [ TypeExpr ] throws { LirError } do
+  match t do
+    | TyList(elem: el) -> return targets_in_type(t: el, enum_defs, acc: [])
+    | TyUserDefined(name: en, args: ats) ->
+      match lookup_enum_def(defs: enum_def_list, name: en) do
+        | None -> return []
+        | Some(val: EnumDef(name: _, is_public: _, is_opaque: _, type_params: tps, variants: vs, layout_variants: _)) ->
+          let subst = zip_params_args(params: tps, args: ats, acc: [])
+          return variant_targets(vs, subst, enum_defs, acc: [])
+      end
+    | _ -> return []
+  end
+end
+
+let variant_targets = fn (vs: [ VariantDef ], subst: [ NamedType ], enum_defs: VariantIndex, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match vs do
+    | [] -> return acc
+    | VariantDef(name: _, fields: fs) :: rest -> return variant_targets(vs: rest, subst, enum_defs, acc: variant_field_targets(fs, subst, enum_defs, acc))
+  end
+end
+
+let variant_field_targets = fn (fs: [ VariantField ], subst: [ NamedType ], enum_defs: VariantIndex, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match fs do
+    | [] -> return acc
+    | VariantField(name: _, typ: t) :: rest ->
+      let acc1 = targets_in_type(t: subst_param_type(t, subst), enum_defs, acc)
+      return variant_field_targets(fs: rest, subst, enum_defs, acc: acc1)
+  end
+end
+
+// Fuel-bounded worklist closure: process each pending target once (dedup by
+// `inst_key` via the `seen` name list), append its child targets, accumulate the
+// full target list. Separate flat `pending` / `seen` / `result` params (no rich
+// record threaded) mirror the seed-safe reachability shape. The `seen` set makes
+// this terminate on finite distinct instantiations; `fuel` is a hard safety bound.
+let close_worklist = fn (
+  pending: [ TypeExpr ],
+  seen: [ string ],
+  result: [ TypeExpr ],
+  fuel: i64,
+  enum_def_list: [ EnumDef ],
+  enum_defs: VariantIndex
+) -> [ TypeExpr ] throws { LirError } do
+  if fuel <= 0 then return result end
+  match pending do
+    | [] -> return result
+    | t :: rest ->
+      let key = inst_key(t)
+      if str_list_contains_se(xs: seen, s: key) then
+        return close_worklist(pending: rest, seen, result, fuel: fuel - 1, enum_def_list, enum_defs)
+      else
+        let children = inst_children(t, enum_def_list, enum_defs)
+        return close_worklist(
+          pending: list.concat(xs: children, ys: rest),
+          seen: key :: seen,
+          result: t :: result,
+          fuel: fuel - 1,
+          enum_def_list, enum_defs
+        )
+      end
+  end
+end
+
+let str_list_contains_se = fn (xs: [ string ], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest -> if x == s then return true else return str_list_contains_se(xs: rest, s) end
+  end
+end
+
+// ─── Per-instantiation helper synthesis ─────────────────────────────────────
+
+// Build one per-instantiation helper for a target. An enum instantiation
+// `Option<Color>` yields `__streq_Option$Color` whose variant defs are the enum's
+// with type params substituted (so the `Some` payload field is `Color`, routed
+// `gen_inst = true` into `__streq_Color`). A list-of-generic `[Option<Color>]`
+// yields `__streq_List$Option$Color` whose `Cons.v` is `Option<Color>` (routed
+// into `__streq_Option$Color`).
+let make_inst_helper = fn (t: TypeExpr, enum_def_list: [ EnumDef ], enum_defs: VariantIndex) -> Option<LirFunction> throws { LirError } do
+  match t do
+    | TyList(elem: el) ->
+      return Some(val: make_list_helper(type_name: "List$" ++ inst_key(t: el), elem: el, gen_inst: true, enum_defs))
+    | TyUserDefined(name: en, args: ats) ->
+      match lookup_enum_def(defs: enum_def_list, name: en) do
+        | None -> return None
+        | Some(val: EnumDef(name: _, is_public: _, is_opaque: _, type_params: tps, variants: vs, layout_variants: _)) ->
+          let subst = zip_params_args(params: tps, args: ats, acc: [])
+          let inst_variants = subst_variant_defs(vs, subst)
+          return Some(val: make_inst_enum_helper(type_name: enum_inst_name(enum: en, args: ats), variants: inst_variants, enum_defs))
+      end
+    | _ -> return None
+  end
+end
+
+let subst_variant_defs = fn (vs: [ VariantDef ], subst: [ NamedType ]) -> [ VariantDef ] do
+  match vs do
+    | [] -> return []
+    | VariantDef(name: vn, fields: fs) :: rest -> return VariantDef(name: vn, fields: subst_variant_fields(fs, subst)) :: subst_variant_defs(vs: rest, subst)
+  end
+end
+
+let subst_variant_fields = fn (fs: [ VariantField ], subst: [ NamedType ]) -> [ VariantField ] do
+  match fs do
+    | [] -> return []
+    | VariantField(name: n, typ: t) :: rest -> return VariantField(name: n, typ: subst_param_type(t, subst)) :: subst_variant_fields(fs: rest, subst)
+  end
+end
+
+// Synthesize `__streq_<type_name>(l, r) -> bool` for an enum instantiation from
+// its SUBSTITUTED variant defs (a sum compare, `gen_inst = true`).
+let make_inst_enum_helper = fn (type_name: string, variants: [ VariantDef ], enum_defs: VariantIndex) -> LirFunction throws { LirError } do
+  let l = LirAtomVar(name: "l", typ: TyI64)
+  let r = LirAtomVar(name: "r", typ: TyI64)
+  let ctx0 = LowerCtx(vars: [], semantic_vars: [], stmts: [], temp_counter: 0, enum_defs)
+  let CmpResult(ctx: ctx1, atom: result) = compare_sum(l, r, variants, gen_inst: true, ctx: ctx0)
+  let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = ctx1
+  return LirFunction(
+    name: struct_eq_helper_name(type_name),
+    params: [ LirParam(label: "l", name: "l", typ: TyI64),
+              LirParam(label: "r", name: "r", typ: TyI64) ],
+    ret_type: TyBool,
+    body: list.reverse(xs: body_rev),
+    ret: result,
+    span: zero_span
+  )
+end
+
+let make_inst_helpers = fn (targets: [ TypeExpr ], enum_def_list: [ EnumDef ], enum_defs: VariantIndex, acc: [ LirFunction ]) -> [ LirFunction ] throws { LirError } do
+  match targets do
+    | [] -> return list.reverse(xs: acc)
+    | t :: rest ->
+      let acc2 = match make_inst_helper(t, enum_def_list, enum_defs) do
+        | Some(val: f) -> f :: acc
+        | None -> acc
+      end
+      return make_inst_helpers(targets: rest, enum_def_list, enum_defs, acc: acc2)
+  end
+end
+
 /** Synthesize the structural-compare helper functions for every named aggregate
  *  type in the program — one per `EnumDef` (with in-scope variants) and one per
  *  record-alias `RecordDef` — plus one per distinct list element type
@@ -1157,7 +1632,18 @@ export let gen_struct_eq_helpers = fn (
   // Generic erased-element fallback helper (`__streq_List$T`).
   let all_elems = push_elem(e: TyVar(name: "T"), acc: with_rec_fields)
   let list_helpers = make_list_helpers(elems: all_elems, enum_defs, acc: [])
-  return list.concat(xs: list.concat(xs: enum_helpers, ys: record_helpers), ys: list_helpers)
+  // Per-INSTANTIATION structural helpers for generic enums at concrete payloads
+  // (`Option<Color>`, user `Box<Color>`, `[Option<Color>]`, …) — see worklist note.
+  // Seeded STRICTLY from the `#EQSITE#`-marked `==`/`!=` operand types, then
+  // transitively closed over the generic instantiations those helpers recurse
+  // into. The bare helpers above are UNCHANGED (their generic fields erase via
+  // `gen_inst = false`); only these gen-inst helpers compare a type-parameter
+  // payload structurally. The closure stays tiny for a normal program because it
+  // never grows from arbitrary declared type fields.
+  let eq_seeds = harvested_eq_site_insts(raw: raw_harvest, enum_defs, acc: [])
+  let inst_targets = close_worklist(pending: eq_seeds, seen: [], result: [], fuel: 4096, enum_def_list, enum_defs)
+  let inst_helpers = make_inst_helpers(targets: inst_targets, enum_def_list, enum_defs, acc: [])
+  return list.concat(xs: list.concat(xs: list.concat(xs: enum_helpers, ys: record_helpers), ys: list_helpers), ys: inst_helpers)
 end
 
 // ─── Entry point ────────────────────────────────────────────────────────────
@@ -1174,7 +1660,10 @@ export let lower_struct_eq = fn (
   sem_type: TypeExpr,
   ctx: LowerCtx
 ) -> BindResult throws { LirError } do
-  let CmpResult(ctx: ctx1, atom: eq_atom) = compare_values(l: lhs, r: rhs, sem_type: sem_type, ctx)
+  // A `==`/`!=` SITE is the gen-inst entry: a concrete generic-enum operand
+  // (`Option<Color>`) routes to its per-instantiation structural helper
+  // (`__streq_Option$Color`), which the worklist guarantees was synthesized.
+  let CmpResult(ctx: ctx1, atom: eq_atom) = compare_values(l: lhs, r: rhs, sem_type: sem_type, gen_inst: true, ctx)
   match op do
     | OpNe ->
       // != is `eq == false`.

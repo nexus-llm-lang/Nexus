@@ -16,7 +16,9 @@
  * - Body / statement / function lowering (see src/ir/lir/lir.nx)
  */
 import { BinaryOp } from "src/types/vocab.nx"
-import { TypeExpr, TyRecord, NamedType, TyArrow, TyList, TyUserDefined } from "src/types/type_expr.nx"
+import { TypeExpr, TyRecord, NamedType, TyArrow, TyList, TyUserDefined, TyVar,
+         VariantDef, VariantField } from "src/types/type_expr.nx"
+import { VariantInfo } from "src/ir/support/variant_index.nx"
 import * as list from "std:list"
 import {
   LirError,
@@ -103,8 +105,15 @@ export let infer_semantic_type = fn (
           // structural (per-field/per-tag) compare instead of pointer identity
           // (spec § T-Cmp). Unknown / opaque constructors fall back to TyI64,
           // which routes `==` to the legacy identity compare unchanged.
+          //
+          // For a GENERIC enum (`Option<T>`, user `Box<T>`) also recover the
+          // CONCRETE type arguments from the constructor's payload (`Some(Red(7))`
+          // ⇒ `Option<Color>`). Those args let `==` route to the
+          // per-instantiation structural-compare helper for the type-parameter
+          // payload; they are erased to `[]` (today's behavior) for
+          // a non-generic enum or when the instantiation can't be fully recovered.
           match vidx.enum_name_of_variant(idx: edx, variant: cn) do
-            | Some(val: en) -> return TyUserDefined(name: en, args: [])
+            | Some(val: en) -> return TyUserDefined(name: en, args: recover_ctor_instantiation(ctor: cn, args: cargs, ctx))
             | None -> return TyI64
           end
         end
@@ -336,6 +345,196 @@ export let recover_generic_call_type = fn (
       // default; falling back to `sem_rt` keeps prior (offset-0) behavior.
       if type_has_tyvar(t: recovered) then return sem_rt else return recovered end
     | _ -> return sem_rt
+  end
+end
+
+/** Recover the CONCRETE type-argument instantiation of a generic-enum value from
+ *  one of its constructor applications. `Some(val: Red(7))` (constructor `Some`
+ *  of `Option<T>`) yields `Option<Color>`; `Wrap(v: x)` of `Box<T>` with `x:
+ *  Color` yields `Box<Color>`. The recovered arg list lets the LIR `==`/`!=`
+ *  lowering route to a per-instantiation structural-compare helper instead of
+ *  the type-erased identity compare (spec § T-Cmp), and seeds the per-inst
+ *  helper worklist (see struct_eq.nx).
+ *
+ *  How: the constructor's owning enum carries `type_params` (e.g. `["T"]`) and
+ *  the variant's DECLARED field types (which mention those params as
+ *  `TyUserDefined("T", [])` — at MIR a type parameter is shape-identical to a
+ *  named type, disambiguated here by membership in `type_params`). Aligning the
+ *  variant's fields (alphabetically, matching the MIR's sorted constructor-arg
+ *  order) with the args' inferred semantic types binds each param to a concrete
+ *  type; the enum's `type_params` are then mapped through those bindings.
+ *
+ *  Returns `args: []` (today's erased behavior) when: the constructor is
+ *  unknown/opaque, the enum is non-generic (no params), or any param is left
+ *  unbound or still polymorphic — never a partial/`TyVar`-bearing instantiation,
+ *  which would mis-key the helper. */
+export let recover_ctor_instantiation = fn (
+  ctor: string,
+  args: [ MirExpr ],
+  ctx: LowerCtx
+) -> [ TypeExpr ] throws { LirError } do
+  let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: edx) = ctx
+  match vidx.lookup_variant_info(idx: edx, variant: ctor) do
+    | None -> return []
+    | Some(val: VariantInfo(enum_name: _, type_params: tps, def: vd)) ->
+      match tps do
+        // Non-generic enum: no instantiation to recover.
+        | [] -> return []
+        | _ ->
+          let VariantDef(name: _, fields: fs) = vd
+          // Align declared fields with the MIR's alphabetical constructor-arg
+          // order, then unify field-type-vs-arg-type to bind the params.
+          let subst = unify_ctor_fields(fields: sort_variant_fields(fs), args, params: tps, ctx, acc: [])
+          let recovered = inst_args_from_params(params: tps, subst)
+          // Accept only a fully-concrete instantiation; any remaining `TyVar`
+          // means a param stayed unbound (e.g. a phantom param) → erase.
+          if type_args_have_tyvar(ts: recovered) then return [] else return recovered end
+      end
+  end
+end
+
+// Sort a variant's fields alphabetically by name, matching the MIR's
+// `sort_ctor_args` constructor-arg ordering so a positional zip with the args
+// lines field `i` up with arg `i`. Positional (nameless) fields keep their order.
+let sort_variant_fields = fn (fs: [ VariantField ]) -> [ VariantField ] throws { LirError } do
+  match fs do
+    | [] -> return []
+    | f :: rest -> return insert_variant_field(f, sorted: sort_variant_fields(fs: rest))
+  end
+end
+
+let insert_variant_field = fn (
+  f: VariantField,
+  sorted: [ VariantField ]
+) -> [ VariantField ] throws { LirError } do
+  return insert_variant_field_go(f, sorted, acc: [])
+end
+
+let insert_variant_field_go = fn (
+  f: VariantField,
+  sorted: [ VariantField ],
+  acc: [ VariantField ]
+) -> [ VariantField ] throws { LirError } do
+  match sorted do
+    | [] -> return list.concat(xs: list.reverse(xs: acc), ys: [ f ])
+    | head :: rest ->
+      if lir_str_less_than(a: variant_field_label(f), b: variant_field_label(head)) then
+        return list.concat(xs: list.reverse(xs: acc), ys: f :: sorted)
+      else
+        return insert_variant_field_go(f, sorted: rest, acc: head :: acc)
+      end
+  end
+end
+
+let variant_field_label = fn (vf: VariantField) -> string throws { LirError } do
+  let VariantField(name: n_opt, typ: _) = vf
+  match n_opt do
+    | Some(val: n) -> return n
+    | None -> return ""
+  end
+end
+
+// Walk the (sorted) variant fields alongside the (alphabetically-ordered) MIR
+// args, unifying each declared field type against the arg's inferred semantic
+// type to bind the enum's type params. Threads a single flat `[NamedType]`
+// binding accumulator (param-name → concrete type).
+let unify_ctor_fields = fn (
+  fields: [ VariantField ],
+  args: [ MirExpr ],
+  params: [ string ],
+  ctx: LowerCtx,
+  acc: [ NamedType ]
+) -> [ NamedType ] throws { LirError } do
+  match fields do
+    | [] -> return acc
+    | VariantField(name: _, typ: ftyp) :: frest ->
+      match args do
+        | [] -> return acc
+        | a :: arest ->
+          let acc2 = unify_param_type(decl: ftyp, arg_ty: infer_semantic_type(expr: a, ctx), params, acc)
+          return unify_ctor_fields(fields: frest, args: arest, params, ctx, acc: acc2)
+      end
+  end
+end
+
+// Structurally match a DECLARED field type (which may mention the enum's type
+// params as `TyUserDefined(p, [])`) against an arg's concrete type, binding each
+// param it reaches. A field-name in `params` is the variable; anything else is a
+// concrete shape recursed positionally (`[T]`, `K<…,T,…>`). Mirrors
+// `collect_tyvar_bindings` but treats param-named `TyUserDefined` as the var
+// (the MIR representation of a type parameter), not `TyVar`.
+let unify_param_type = fn (
+  decl: TypeExpr,
+  arg_ty: TypeExpr,
+  params: [ string ],
+  acc: [ NamedType ]
+) -> [ NamedType ] throws { LirError } do
+  match decl do
+    | TyUserDefined(name: dn, args: dargs) ->
+      if str_list_has(xs: params, s: dn) then
+        // `dn` is a type parameter → bind it to the whole arg type.
+        return NamedType(name: dn, typ: arg_ty) :: acc
+      else
+        // Concrete same-head constructor (`Option<T>` field at `Option<Color>`
+        // arg): recurse positionally into the type args.
+        match arg_ty do
+          | TyUserDefined(name: an, args: aargs) ->
+            if dn == an then return unify_param_type_list(ds: dargs, ats: aargs, params, acc) else return acc end
+          | _ -> return acc
+        end
+      end
+    | TyList(elem: de) ->
+      match arg_ty do
+        | TyList(elem: ae) -> return unify_param_type(decl: de, arg_ty: ae, params, acc)
+        | _ -> return acc
+      end
+    | TyVar(name: vn) ->
+      // Defensive: a param already normalized to `TyVar` also binds.
+      if str_list_has(xs: params, s: vn) then return NamedType(name: vn, typ: arg_ty) :: acc else return acc end
+    | _ -> return acc
+  end
+end
+
+let unify_param_type_list = fn (
+  ds: [ TypeExpr ],
+  ats: [ TypeExpr ],
+  params: [ string ],
+  acc: [ NamedType ]
+) -> [ NamedType ] throws { LirError } do
+  match ds do
+    | [] -> return acc
+    | d :: drest ->
+      match ats do
+        | [] -> return acc
+        | a :: arest ->
+          let acc2 = unify_param_type(decl: d, arg_ty: a, params, acc)
+          return unify_param_type_list(ds: drest, ats: arest, params, acc: acc2)
+      end
+  end
+end
+
+// Build the enum's instantiation arg list by mapping each `type_param` through
+// the recovered bindings (an unbound param stays `TyVar(param)`, which the caller
+// rejects as not-fully-concrete).
+let inst_args_from_params = fn (
+  params: [ string ],
+  subst: [ NamedType ]
+) -> [ TypeExpr ] throws { LirError } do
+  match params do
+    | [] -> return []
+    | p :: rest ->
+      let bound = match lookup_named_type_opt(target: p, fields: subst) do
+        | Some(val: t) -> t
+        | None -> TyVar(name: p)
+      end
+      return bound :: inst_args_from_params(params: rest, subst)
+  end
+end
+
+let str_list_has = fn (xs: [ string ], s: string) -> bool throws { LirError } do
+  match xs do
+    | [] -> return false
+    | x :: rest -> if x == s then return true else return str_list_has(xs: rest, s) end
   end
 end
 
