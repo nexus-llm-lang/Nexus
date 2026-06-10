@@ -1,0 +1,106 @@
+// Regression (nexus-faf6q): a SINGLE-handler `with @k` (suspending) inject used
+// as an EXPRESSION whose body's trailing value channel is a bare `if` must
+// thread that value out. This is the SUSPEND-frame sibling of nexus-hteqm (the
+// plain single-handler path).
+//
+// The `with @k` body is lifted to a `() -> ()` `__inject_N` function whose
+// trailing value is delivered to the inject site out-of-band via the
+// ss_inject_value global. LIR's trailing-value capture (lir_lower_stmts) takes a
+// trailing binop/call/variable as the body's value, but lowers a trailing bare
+// `if` as a value-DROPPING `LirStmtIf` — so before the fix the lifted body
+// returned `()`, ss_inject_value was never set, the caller read a stale 0, AND
+// the dropped-value arm-local layout corrupted the resume (SIGSEGV). The fix
+// threads the trailing if/match through a `__hval_<n>` slot inside the lifted
+// body (a slot local to that function) so it returns the real value.
+//
+// A trailing `match` already surfaced its value (its case bodies lower through
+// the trailing-value-capturing path), but is threaded uniformly now and asserted
+// here too. Controls (trailing call / trailing binop / unit-arm if) were already
+// correct and must stay correct.
+//
+// twyov-safe: every case asserts via `1 / ok` where `ok` is 1 only on the
+// correct-value path, so the verifying trap (divide-by-zero) fires ONLY when a
+// value is wrong — never on the normal exit-0 path.
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import * as str from "std:str"
+
+cap Ev do fn emit() -> i64 end
+
+// `@k` resumes the suspended continuation; the body continues after each
+// `Ev.emit()` and its OWN trailing computation is the inject-site value.
+let h = handler Ev do fn emit() -> i64 with @k do @k end end
+
+// Trailing bare `if` value channel (the faf6q crash). emit() suspends; the body
+// resumes and ends in a bare `if` whose value must reach the inject site. The
+// inject EXPRESSION is bound to `r` so the function ends in an explicit `return`.
+let f_if = fn (b: bool) -> i64 require { Ev } do
+  let r = inject h do
+    let x = Ev.emit()
+    let base = 5 + x
+    if base > 3 then base + 1 else base + 2 end
+  end
+  return r
+end
+
+// Trailing bare `match` value channel (already worked; threaded uniformly now).
+let f_match = fn (k: i64) -> i64 require { Ev } do
+  let r = inject h do
+    let x = Ev.emit()
+    let base = 5 + x
+    match k do
+      | 0 -> base + 10
+      | _ -> base + 20
+    end
+  end
+  return r
+end
+
+// Control: trailing CALL value channel — already correct, must stay correct.
+let mk = fn (n: i64) -> i64 do return n + 100 end
+let f_call = fn () -> i64 require { Ev } do
+  let r = inject h do
+    let x = Ev.emit()
+    mk(n: x)
+  end
+  return r
+end
+
+// Control: trailing BINOP value channel — already correct, must stay correct.
+let f_binop = fn () -> i64 require { Ev } do
+  let r = inject h do
+    let x = Ev.emit()
+    x + 42
+  end
+  return r
+end
+
+// Control: trailing `if` with UNIT arms (side-effecting, no value channel) —
+// must still run and yield unit without corrupting the resume.
+let f_unit_if = fn (b: bool) -> unit require { Ev, Console } do
+  inject h do
+    let _x = Ev.emit()
+    if b then Console.println(val: "uif-t") else Console.println(val: "uif-f") end
+  end
+end
+
+let main = fn () -> unit require { PermConsole } throws { Exn } do
+  inject stdio.system_handler do
+    // Each `Ev.emit()` returns 0 (the `@k` resume value is unit/0 today), so
+    // base = 5 + 0 = 5. Each call is wrapped in `inject h` to satisfy the
+    // callee's `require { Ev }` (mirrors the nexus-hteqm test structure).
+    let a = inject h do f_if(b: true) end    // base 5, base>3 ⇒ 5+1 = 6  (faf6q)
+    let b = inject h do f_if(b: false) end   // base 5, base>3 still true ⇒ 6
+    let c = inject h do f_match(k: 0) end    // 5 + 10 = 15
+    let d = inject h do f_match(k: 9) end    // 5 + 20 = 25
+    let e = inject h do f_call() end         // 0 + 100 = 100
+    let g = inject h do f_binop() end        // 0 + 42 = 42
+    inject h do f_unit_if(b: true) end       // side effect, yields unit
+    Console.println(val: "faf6q a=" ++ str.from_i64(val: a) ++ " b=" ++ str.from_i64(val: b)
+      ++ " c=" ++ str.from_i64(val: c) ++ " d=" ++ str.from_i64(val: d)
+      ++ " e=" ++ str.from_i64(val: e) ++ " g=" ++ str.from_i64(val: g))
+    let ok = if a == 6 && b == 6 && c == 15 && d == 25 && e == 100 && g == 42 then 1 else 0 end
+    let _trap = 1 / ok
+    return ()
+  end
+end

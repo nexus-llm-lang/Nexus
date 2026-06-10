@@ -493,6 +493,68 @@ type RuntimeHandler = RuntimeHandler(cap_idx: i64, handler_id: i64)
  *
  *  With no runtime handlers, the body is returned unchanged.
  */
+
+/** Thread an inject body's trailing CONTROL-FLOW value (a bare `if`/`match`
+ *  expression) through a local `__hval_<uniq>` slot so the value is surfaced
+ *  rather than dropped.
+ *
+ *  `lir_lower_stmts` (the function-body lowerer that captures a trailing value)
+ *  takes a trailing binop/call/variable as the body's value, but lowers a
+ *  trailing `if` as a value-DROPPING `LirStmtIf` (and a trailing `match` only
+ *  survives by accident, because its case bodies are lowered via the
+ *  trailing-value-capturing `lir_lower_stmts`). So an inject body whose trailing
+ *  value channel is a bare `if`/`match` loses its value. Rewrite it to:
+ *
+ *    let __hval_<uniq> = 0      // init slot (zero default)
+ *    <prefix stmts>
+ *    __hval_<uniq> = <if/match> // assign — an assignment whose RHS is an
+ *                               // if/match EXPRESSION lowers value-returningly
+ *    __hval_<uniq>              // yield the slot as a trailing bare variable
+ *
+ *  so the trailing statement becomes a bare variable read the lowerer captures.
+ *  Anything else (binop, call, variable, unit, value-returning body) is left
+ *  unchanged — those already surface (or correctly drop) their value.
+ *
+ *  Used by both the single-handler PLAIN inject (`wrap_inject_register | []`,
+ *  nexus-hteqm) and the lifted `with @k` SUSPEND-frame body (`lift_inject_body`,
+ *  nexus-faf6q): in the suspend case the trailing if/match lives inside the
+ *  lifted `__inject_N` function, whose declared `() -> ()` signature makes its
+ *  branch lowering drop the value (and leaves `ss_inject_value` unset, so the
+ *  inject expression reads a stale 0 and the dropped-value arm layout corrupts
+ *  the resume). Threading the slot makes the lifted body return the real value,
+ *  which codegen carries out-of-band via `ss_inject_value`. */
+let thread_trailing_control_flow_value = fn (
+  stmts: [ MirStmt ],
+  uniq: i64
+) -> [ MirStmt ] do
+  match list.reverse(xs: stmts) do
+    | MirStmtExpr(expr: trailing_e) :: rest_rev ->
+      let needs_thread = match trailing_e do
+        | MirIf(cond: _, then_body: _, else_body: _) -> true
+        | MirMatch(target: _, cases: _) -> true
+        | _ -> false
+      end
+      if !needs_thread then return stmts end
+      let hval_tmp = "__hval_" ++ i64_to_str(uniq)
+      let prefix = list.reverse(xs: rest_rev)
+      let init_stmt = MirStmtLet(
+        name: hval_tmp,
+        typ: TyI64,
+        expr: MirLiteral(lit: LitInt(val: 0))
+      )
+      let assign_stmt = MirStmtAssign(
+        target: MirVariable(name: hval_tmp),
+        value: trailing_e
+      )
+      let result_stmt = MirStmtExpr(expr: MirVariable(name: hval_tmp))
+      return concat_mir_stmts(
+        a: [ init_stmt ],
+        b: concat_mir_stmts(a: prefix, b: concat_mir_stmts(a: [ assign_stmt ], b: [ result_stmt ]))
+      )
+    | _ -> return stmts
+  end
+end
+
 let wrap_inject_register = fn (
   runtime_hs: [ RuntimeHandler ],
   body: [ MirStmt ],
@@ -502,40 +564,10 @@ let wrap_inject_register = fn (
     | [] ->
       // Single-handler inject (static dispatch): no register save/restore is
       // needed, BUT the body's trailing value channel still needs threading when
-      // it is a CONTROL-FLOW expr (if/match). LIR's trailing-bare-expr capture
-      // takes a trailing binop as the block value, but lowers a trailing if/match
-      // as a value-DROPPING statement — so an expression-position single-handler
-      // inject with a trailing if/match drops its value / emits invalid WASM
-      // (nexus-hteqm). Bind the trailing if/match to a slot (an assignment whose
-      // RHS is an if/match EXPRESSION lowers correctly) and yield the slot as a
-      // trailing bare variable the caller can capture. Anything else (binop,
+      // it is a CONTROL-FLOW expr (if/match) — see
+      // `thread_trailing_control_flow_value` (nexus-hteqm). Anything else (binop,
       // call, unit, value-returning body) is left unchanged.
-      match list.reverse(xs: body) do
-        | MirStmtExpr(expr: trailing_e) :: rest_rev ->
-          let needs_thread = match trailing_e do
-            | MirIf(cond: _, then_body: _, else_body: _) -> true
-            | MirMatch(target: _, cases: _) -> true
-            | _ -> false
-          end
-          if !needs_thread then return body end
-          let hval_tmp = "__hval_" ++ i64_to_str(uniq)
-          let prefix = list.reverse(xs: rest_rev)
-          let init_stmt = MirStmtLet(
-            name: hval_tmp,
-            typ: TyI64,
-            expr: MirLiteral(lit: LitInt(val: 0))
-          )
-          let assign_stmt = MirStmtAssign(
-            target: MirVariable(name: hval_tmp),
-            value: trailing_e
-          )
-          let result_stmt = MirStmtExpr(expr: MirVariable(name: hval_tmp))
-          return concat_mir_stmts(
-            a: [ init_stmt ],
-            b: concat_mir_stmts(a: prefix, b: concat_mir_stmts(a: [ assign_stmt ], b: [ result_stmt ]))
-          )
-        | _ -> return body
-      end
+      return thread_trailing_control_flow_value(stmts: body, uniq)
     | _ ->
       let saves = build_saves(runtime_hs, uniq, idx: 0, acc: [])
       let sets = build_sets(runtime_hs, acc: [])
@@ -1072,7 +1104,20 @@ let lift_inject_body = fn (
   // are captured.
   let known = build_known_names(ctx: ctx_after_name)
   let captures = collect_hir_free_vars(body: stmts, params: [], known)
-  let MirStmtsResult(ctx: ctx_body, stmts: mir_body_inner) = lower_stmts(stmts, ctx: ctx_after_name)
+  let MirStmtsResult(ctx: ctx_body, stmts: mir_body_inner0) = lower_stmts(stmts, ctx: ctx_after_name)
+  // The lifted `__inject_N` body is emitted as a `() -> ()` function whose
+  // trailing VALUE is delivered to the inject site out-of-band via the
+  // ss_inject_value global. `lir_lower_stmts` (which lowers this body and
+  // captures its trailing value) surfaces a trailing binop/call/variable but
+  // DROPS a trailing bare `if` (lowering it to a value-dropping `LirStmtIf`),
+  // so a `with @k` inject EXPRESSION whose body ends in a bare `if` would leave
+  // ss_inject_value unset — the caller reads a stale 0 and the dropped-value
+  // arm-local layout corrupts the resume (SIGSEGV). Thread that trailing
+  // if/match through a `__hval_<n>` slot (a slot local to this lifted function,
+  // so it cannot collide with other functions' locals) so the body returns the
+  // real value — exactly as the plain single-handler path does (nexus-faf6q,
+  // the `with @k` SUSPEND sibling of nexus-hteqm).
+  let mir_body_inner = thread_trailing_control_flow_value(stmts: mir_body_inner0, uniq: n)
   // Env-load preamble: `let __env = __inject_env_get()` recovers the env object
   // pointer the inject site stored before `resume`; each capture is then read
   // from it by field index, matching the `MirMakeClosure` object layout the
