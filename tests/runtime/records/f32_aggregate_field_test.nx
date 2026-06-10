@@ -1,0 +1,93 @@
+// Regression test for nexus-b9vwt: an f32 record field / sum-variant payload
+// miscompiled to invalid WASM (`type mismatch: expected f32, found i64` at the
+// accessor) or a wrong value.
+//
+// Root cause: emit_typed_field_load / emit_typed_field_store
+// (src/backend/codegen/emit/atom.nx) had no TyF32 arm. A float field lives in
+// its 8-byte heap cell as f64 (the construction store is `f64.store`, since a
+// float literal's atom type is f64); the accessor side correctly resolves the
+// DECLARED field type `f32` but had no codegen arm, so the load fell through to
+// `i64.load` and the f32-typed result slot received an i64. The fix keeps the
+// uniform 8-byte-f64 heap layout and demotes on load / promotes on store at the
+// f32 endpoints, so store (dispatched on the value atom type) and load
+// (dispatched on the declared field type) both converge on 8-byte f64.
+//
+// All assertions check observable runtime values, so passing confirms the
+// store/load widths agree per field across records, sum payloads, lists, mixed
+// field types, runtime-computed (non-folded) f32 values, and monomorphic-f32
+// generic instantiations.
+import * as test_assert from "std:test/assert"
+
+type FR = { zed: f32, alpha: f32 }
+type Wrap = W(f: f32)
+type Mix = { f32v: f32, f64v: f64, i32v: i32, i64v: i64 }
+type SMix = SM(a: f32, b: f64, c: i32, d: i64)
+type Box<T> = Bx(v: T)
+type Pair<A, B> = Pr(fst: A, snd: B)
+
+let get_alpha = fn (r: FR) -> f32 do return r.alpha end
+let get_w = fn (w: Wrap) -> f32 do match w do | W(f: x) -> return x end end
+// Forces a runtime-computed (non-foldable) f32 so the construction store sees a
+// TyF32 atom rather than a constant-folded literal — exercises the TyF32 store
+// arm (`f64.promote_f32; f64.store`), not just the TyF64 literal-store path.
+let bump = fn (x: f32) -> f32 do return x +. 0.25 end
+let unbox = fn (b: Box<f32>) -> f32 do match b do | Bx(v: y) -> return y end end
+
+let body = fn () -> unit throws { Exn } do
+  // ── record literal field, both literal values ──
+  let r: FR = { zed: 123.5, alpha: 678.25 }
+  test_assert.assert_eq_bool(actual: get_alpha(r) ==. 678.25, expected: true, label: "f32 record field via accessor")
+  test_assert.assert_eq_bool(actual: r.zed ==. 123.5, expected: true, label: "f32 record field direct")
+
+  // ── sum-variant payload ──
+  let w: Wrap = W(f: 42.5)
+  test_assert.assert_eq_bool(actual: get_w(w) ==. 42.5, expected: true, label: "f32 sum payload")
+
+  // ── [f32] list element (already f64 in the i64/generic channel) ──
+  let xs: [ f32 ] = [ 1.5, 2.25, 3.75 ]
+  match xs do
+    | a :: _ -> test_assert.assert_eq_bool(actual: a ==. 1.5, expected: true, label: "f32 list elem")
+    | [] -> test_assert.assert_eq_bool(actual: false, expected: true, label: "f32 list non-empty")
+  end
+
+  // ── runtime-computed (non-folded) f32 stored into a field → TyF32 store arm ──
+  let g: f32 = bump(x: 42.25)
+  let w2: Wrap = W(f: g)
+  test_assert.assert_eq_bool(actual: get_w(w: w2) ==. 42.5, expected: true, label: "f32 var sum payload (store arm)")
+  let h: f32 = bump(x: 1.25)
+  let r2: FR = { zed: h, alpha: 3.5 }
+  test_assert.assert_eq_bool(actual: r2.zed ==. 1.5, expected: true, label: "f32 var record field (store arm)")
+  test_assert.assert_eq_bool(actual: r2.alpha ==. 3.5, expected: true, label: "f32 lit record field alongside var")
+
+  // ── mixed f32 / f64 / i32 / i64 fields, record + sum ──
+  let m: Mix = { f32v: 1.5, f64v: 2.5, i32v: 7, i64v: 9 }
+  test_assert.assert_eq_bool(actual: m.f32v ==. 1.5, expected: true, label: "mix record f32")
+  test_assert.assert_eq_bool(actual: m.f64v ==. 2.5, expected: true, label: "mix record f64")
+  test_assert.assert_eq_bool(actual: m.i32v == 7, expected: true, label: "mix record i32")
+  test_assert.assert_eq_bool(actual: m.i64v == 9, expected: true, label: "mix record i64")
+  let s: SMix = SM(a: 3.5, b: 4.5, c: 11, d: 13)
+  let sa = match s do | SM(a: x, b: _, c: _, d: _) -> x end
+  let sb = match s do | SM(a: _, b: y, c: _, d: _) -> y end
+  let sc = match s do | SM(a: _, b: _, c: z, d: _) -> z end
+  let sd = match s do | SM(a: _, b: _, c: _, d: ww) -> ww end
+  test_assert.assert_eq_bool(actual: sa ==. 3.5, expected: true, label: "mix sum f32")
+  test_assert.assert_eq_bool(actual: sb ==. 4.5, expected: true, label: "mix sum f64")
+  test_assert.assert_eq_bool(actual: sc == 11, expected: true, label: "mix sum i32")
+  test_assert.assert_eq_bool(actual: sd == 13, expected: true, label: "mix sum i64")
+
+  // ── generic instantiated at f32 (value goes through the i64 channel) ──
+  let bx: Box<f32> = Bx(v: 7.5)
+  test_assert.assert_eq_bool(actual: unbox(b: bx) ==. 7.5, expected: true, label: "Box<f32> payload")
+  let p: Pair<f32, f32> = Pr(fst: 1.25, snd: 9.75)
+  let pf = match p do | Pr(fst: f, snd: _) -> f end
+  let ps = match p do | Pr(fst: _, snd: ss) -> ss end
+  test_assert.assert_eq_bool(actual: pf ==. 1.25, expected: true, label: "Pair<f32,f32> fst")
+  test_assert.assert_eq_bool(actual: ps ==. 9.75, expected: true, label: "Pair<f32,f32> snd")
+
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end

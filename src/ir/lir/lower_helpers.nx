@@ -14,14 +14,27 @@
  * - Array-element numbering (number_atoms, number_atoms_go)
  */
 import { LitUnit } from "src/types/vocab.nx"
-import { TypeExpr, TyUnit } from "src/types/type_expr.nx"
+import { TypeExpr, TyUnit, TyI64, VariantDef, VariantField } from "src/types/type_expr.nx"
 import * as list from "std:list"
 import { LirError } from "src/ir/lir/errors.nx"
 import { Some, None } from "std:option"
-import { MirExpr, MirStmt, MirMatchCase } from "src/ir/mir/types.nx"
+import {
+  MirExpr,
+  MirVariable,
+  MirStmt,
+  MirMatchCase,
+  MirPattern,
+  MirPatConstructor,
+  MirPatRecord,
+  MirPatVariable,
+  MirPatternField,
+  MirRecordPatField
+} from "src/ir/mir/types.nx"
 import { LirAtom, LirStmt, LirNamedAtom } from "src/ir/lir/types.nx"
 import { LowerCtx, lir_lookup_type, atom_type } from "src/ir/lir/context.nx"
 import { infer_semantic_type } from "src/ir/lir/semantic_types.nx"
+import { VariantIndex } from "src/ir/support/variant_index.nx"
+import * as vidx from "src/ir/support/variant_index.nx"
 import * as str from "std:str"
 
 // ---------------------------------------------------------------------------
@@ -148,17 +161,121 @@ end
 // Match result-type inference
 // ---------------------------------------------------------------------------
 
+// Resolve the declared type of a variant field named `field_name` on
+// constructor `ctor`. Mirrors match_tree/emit.nx::constructor_field_type (kept
+// local to avoid a cross-module import of that private helper); record-alias
+// expansion is not needed here because the result is only consumed as a wasm
+// width hint for the match-result slot.
+let binder_field_type_of_ctor = fn (
+  ctor: string,
+  field_name: string,
+  enum_defs: VariantIndex
+) -> Option<TypeExpr> throws { LirError } do
+  match vidx.lookup_variant_def_in_index(idx: enum_defs, variant: ctor) do
+    | None -> return None
+    | Some(val: VariantDef(name: _, fields: fs)) ->
+      return lookup_named_variant_field(fields: fs, name: field_name)
+  end
+end
+
+let lookup_named_variant_field = fn (
+  fields: [ VariantField ],
+  name: string
+) -> Option<TypeExpr> throws { LirError } do
+  match fields do
+    | [] -> return None
+    | VariantField(name: Some(val: n), typ: t) :: rest ->
+      if n == name then return Some(val: t)
+      else return lookup_named_variant_field(fields: rest, name) end
+    | VariantField(name: None, typ: _) :: rest ->
+      return lookup_named_variant_field(fields: rest, name)
+  end
+end
+
+// Find which constructor/record field of `pattern` binds the variable `binder`
+// and return that field's declared type. Used to recover the type of a match
+// arm that yields a bare pattern binder (`| Ctor(f: x) -> x`) — at result-type
+// inference time the binder is not yet in `semantic_vars`, so without this it
+// defaults to `TyI64`. That default is wrong for an `f32`/`i32` binder: the
+// result slot is then typed i64 and the binder is packed through the i64
+// channel (f32→i32→i64 zero-extend), but a downstream float op unpacks the slot
+// as f64 (`f64.reinterpret_i64`) → garbage. Typing the slot at the binder's
+// real width keeps the value off the i64 channel entirely. Only direct
+// `Ctor(f: x)` / `{f: x}` binders are resolved; nested patterns and other arm
+// shapes fall back to `infer_semantic_type`.
+let binder_type_in_pattern = fn (
+  pattern: MirPattern,
+  binder: string,
+  enum_defs: VariantIndex
+) -> Option<TypeExpr> throws { LirError } do
+  match pattern do
+    | MirPatConstructor(name: ctor, fields: fs) ->
+      return binder_type_in_ctor_fields(ctor, fields: fs, binder, enum_defs)
+    | MirPatRecord(fields: rfs, is_partial: _) ->
+      return binder_type_in_record_fields(fields: rfs, binder, enum_defs)
+    | _ -> return None
+  end
+end
+
+let binder_type_in_ctor_fields = fn (
+  ctor: string,
+  fields: [ MirPatternField ],
+  binder: string,
+  enum_defs: VariantIndex
+) -> Option<TypeExpr> throws { LirError } do
+  match fields do
+    | [] -> return None
+    | MirPatternField(name: Some(val: fname), pattern: MirPatVariable(name: bn, sigil: _)) :: rest ->
+      if bn == binder then return binder_field_type_of_ctor(ctor, field_name: fname, enum_defs)
+      else return binder_type_in_ctor_fields(ctor, fields: rest, binder, enum_defs) end
+    | _ :: rest -> return binder_type_in_ctor_fields(ctor, fields: rest, binder, enum_defs)
+  end
+end
+
+let binder_type_in_record_fields = fn (
+  fields: [ MirRecordPatField ],
+  binder: string,
+  enum_defs: VariantIndex
+) -> Option<TypeExpr> throws { LirError } do
+  match fields do
+    | [] -> return None
+    | MirRecordPatField(name: _, pattern: MirPatVariable(name: bn, sigil: _)) :: rest ->
+      // A record pattern binder's declared field type is not carried on the MIR
+      // record pattern; only ctor-payload binders are recovered here (the f32
+      // sum-payload case). Record `.field`/let-destructure already type the
+      // binder correctly off the record's TyRecord, so this path is a
+      // conservative no-op that defers to `infer_semantic_type`.
+      if bn == binder then return None
+      else return binder_type_in_record_fields(fields: rest, binder, enum_defs) end
+    | _ :: rest -> return binder_type_in_record_fields(fields: rest, binder, enum_defs)
+  end
+end
+
 export let lir_infer_match_result_type = fn (
   cases: [ MirMatchCase ],
   ctx: LowerCtx
 ) -> TypeExpr throws { LirError } do
   match cases do
     | [] -> return TyUnit
-    | MirMatchCase(pattern: _, body) :: rest ->
+    | MirMatchCase(pattern: pat, body) :: rest ->
       match body do
         | [] -> return lir_infer_match_result_type(cases: rest, ctx)
         | _ ->
-          let t = infer_semantic_type(expr: lir_last_mir_expr(body), ctx)
+          let last = lir_last_mir_expr(body)
+          // A bare pattern-binder arm (`-> x`) is not yet in `semantic_vars`, so
+          // `infer_semantic_type` would default it to `TyI64`. Recover the
+          // binder's real type from the arm's pattern first; this is load-bearing
+          // for `f32`/`i32` payload binders (see `binder_type_in_pattern`).
+          let from_binder = match last do
+            | MirVariable(name: vn) ->
+              let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
+              binder_type_in_pattern(pattern: pat, binder: vn, enum_defs: ed)
+            | _ -> None
+          end
+          let t = match from_binder do
+            | Some(val: bt) -> bt
+            | None -> infer_semantic_type(expr: last, ctx)
+          end
           match t do
             | TyUnit -> return lir_infer_match_result_type(cases: rest, ctx)
             | _ -> return t
