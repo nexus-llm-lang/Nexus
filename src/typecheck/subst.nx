@@ -178,20 +178,118 @@ let entry_exists = fn (entries: [ SubstEntry ], var: string) -> bool do
   end
 end
 
-/** Apply a substitution to every scheme body in a type environment. */
+/**
+ * Apply a substitution to every scheme body in a type environment.
+ *
+ * Relevance filter: a substitution only rewrites the TyVar names in its
+ * domain (the `var` fields of its entries). An entry whose body mentions no
+ * domain var is returned byte-identical by `subst_apply`, so the original
+ * `EnvEntry` is shared unchanged (no walk, no allocation). The whole-program
+ * env is ~all fully-generalized schemes that mention no fresh unification var,
+ * so the common case skips with zero allocation. The domain-name set is built
+ * once per call; the per-entry "mentions any domain var" check is an
+ * allocation-free occurs-style walk that short-circuits on first hit.
+ */
 export let subst_apply_env = fn (subst: [ SubstEntry ], env: [ EnvEntry ]) -> [ EnvEntry ] do
-  return subst_apply_env_go(subst, env, acc: [])
+  let domain = subst_domain(subst, acc: [])
+  return subst_apply_env_go(subst, domain, env, acc: [])
 end
 let subst_apply_env_go = fn (
   subst: [ SubstEntry ],
+  domain: [ string ],
   env: [ EnvEntry ],
   acc: [ EnvEntry ]
 ) -> [ EnvEntry ] do
   match env do
     | [] -> return list.reverse(xs: acc)
     | EnvEntry(name: n, scheme: Scheme(vars: vs, typ: t)) :: rest ->
-      return subst_apply_env_go(subst, env: rest,
-        acc: EnvEntry(name: n, scheme: Scheme(vars: vs, typ: subst_apply(subst, typ: t))) :: acc)
+      if type_mentions_any(domain, typ: t) then
+        return subst_apply_env_go(subst, domain, env: rest,
+          acc: EnvEntry(name: n, scheme: Scheme(vars: vs, typ: subst_apply(subst, typ: t))) :: acc)
+      end
+      return subst_apply_env_go(subst, domain, env: rest,
+        acc: EnvEntry(name: n, scheme: Scheme(vars: vs, typ: t)) :: acc)
+  end
+end
+
+/** Collect the domain (the `var` names) of a substitution into a list. */
+let subst_domain = fn (subst: [ SubstEntry ], acc: [ string ]) -> [ string ] do
+  match subst do
+    | [] -> return list.reverse(xs: acc)
+    | SubstEntry(var: v, typ: _) :: rest ->
+      return subst_domain(subst: rest, acc: v :: acc)
+  end
+end
+
+/** True if `name` is in the (small) domain-name list. Allocation-free scan. */
+let name_in_domain = fn (domain: [ string ], name: string) -> bool do
+  match domain do
+    | [] -> return false
+    | d :: rest ->
+      if d == name then
+        return true
+      end
+      return name_in_domain(domain: rest, name)
+  end
+end
+
+/**
+ * True if `typ` mentions any TyVar whose name is in `domain`.
+ * Mirrors `occurs_check`'s structural walk but tests membership in the domain
+ * set instead of equality with a single var; short-circuits on first hit and
+ * allocates nothing. Like `subst_apply`, it does not treat scheme binders
+ * specially (subst-domain vars are fresh and never collide with bound vars).
+ */
+let type_mentions_any = fn (domain: [ string ], typ: TypeExpr) -> bool do
+  match typ do
+    | TyVar(name: n) -> return name_in_domain(domain, name: n)
+    | TyArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      return mentions_in_named_types(domain, nts: ps)
+        || type_mentions_any(domain, typ: r)
+        || type_mentions_any(domain, typ: req)
+        || type_mentions_any(domain, typ: thr)
+    | TyUserDefined(name: _, args) ->
+      return mentions_in_type_list(domain, types: args)
+    | TyRef(inner: i) | TyLinear(inner: i) | TyBorrow(inner: i) ->
+      return type_mentions_any(domain, typ: i)
+    | TyLazy(inner: i, require_row: rq, throw_row: thr) ->
+      return type_mentions_any(domain, typ: i)
+        || type_mentions_any(domain, typ: rq)
+        || type_mentions_any(domain, typ: thr)
+    | TyArray(elem: e) | TyList(elem: e) -> return type_mentions_any(domain, typ: e)
+    | TyRecord(fields: fs) -> return mentions_in_named_types(domain, nts: fs)
+    | TyRow(types: ts, rest: r) ->
+      if mentions_in_type_list(domain, types: ts) then
+        return true
+      end
+      match r do
+        | Some(val: t) -> return type_mentions_any(domain, typ: t)
+        | None -> return false
+      end
+    | TyHandler(name: _, requires: req) -> return type_mentions_any(domain, typ: req)
+    | _ -> return false
+  end
+end
+
+let mentions_in_type_list = fn (domain: [ string ], types: [ TypeExpr ]) -> bool do
+  match types do
+    | [] -> return false
+    | t :: rest ->
+      if type_mentions_any(domain, typ: t) then
+        return true
+      end
+      return mentions_in_type_list(domain, types: rest)
+  end
+end
+
+let mentions_in_named_types = fn (domain: [ string ], nts: [ NamedType ]) -> bool do
+  match nts do
+    | [] -> return false
+    | NamedType(name: _, typ: t) :: rest ->
+      if type_mentions_any(domain, typ: t) then
+        return true
+      end
+      return mentions_in_named_types(domain, nts: rest)
   end
 end
 /** Structural equality on `TypeExpr` (Nexus `==` only compares primitives). */
