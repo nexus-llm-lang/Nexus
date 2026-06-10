@@ -432,8 +432,16 @@ export let check_force_require_row = fn (
   return first_missing_cap(handler_row: thunk_require_row, ambient_row: ambient_require_row)
 end
 
-/** Result of the generic-cap argument coverage check (nexus-3ibql). */
-export type CapArgResult = CapArgOk | CapArgMismatch(cap_name: string, message: string)
+/** Result of the generic-cap argument coverage check (nexus-3ibql). The Ok case
+ *  carries the substitution produced by unifying the callee's concrete cap args
+ *  against the ambient cap args. In the normal checking phase the ambient args
+ *  are concrete, so that subst binds nothing; during the contract-derivation
+ *  pre-pass (cap_contract.nx) the ambient args are fresh type variables, so the
+ *  subst PINS them to the element type the callee commits — that is how the
+ *  function's committed `Box<i64>` is captured by inference. */
+export type CapArgResult =
+  CapArgOk(subst: [ SubstEntry ])
+  | CapArgMismatch(cap_name: string, message: string)
 
 /** T-CapCall generic-cap soundness: for every cap entry of the CALLEE require
  *  row that carries concrete element-type args (`Box<i64>`), find the same-named
@@ -442,34 +450,35 @@ export type CapArgResult = CapArgOk | CapArgMismatch(cap_name: string, message: 
  *  function commits the cap to a different element type than the handler in
  *  scope — the laundered generic-cap type confusion — and is rejected. Either
  *  side carrying no args is element-agnostic and admitted (the cap was required
- *  bare, or the handler instantiation could not be recovered). */
+ *  bare, or the handler instantiation could not be recovered). The unifying
+ *  substitution is accumulated and returned on success. */
 export let check_cap_args_covered = fn (
   callee_row: TypeExpr,
   ambient_row: TypeExpr,
   tdefs: [ TypeDefEntry ]
 ) -> CapArgResult do
   match callee_row do
-    | TyRow(types: ts, rest: _) -> return cap_args_go(ts, ambient_row, tdefs)
-    | _ -> return CapArgOk
+    | TyRow(types: ts, rest: _) -> return cap_args_go(ts, ambient_row, tdefs, acc: subst.subst_empty())
+    | _ -> return CapArgOk(subst: subst.subst_empty())
   end
 end
 
 let cap_args_go = fn (
-  ts: [ TypeExpr ], ambient_row: TypeExpr, tdefs: [ TypeDefEntry ]
+  ts: [ TypeExpr ], ambient_row: TypeExpr, tdefs: [ TypeDefEntry ], acc: [ SubstEntry ]
 ) -> CapArgResult do
   match ts do
-    | [] -> return CapArgOk
+    | [] -> return CapArgOk(subst: acc)
     | TyUserDefined(name: cname, args: cargs) :: rest ->
       match cargs do
-        | [] -> return cap_args_go(ts: rest, ambient_row, tdefs)
+        | [] -> return cap_args_go(ts: rest, ambient_row, tdefs, acc)
         | _ ->
           match ambient_cap_args(name: cname, row: ambient_row) do
-            | None -> return cap_args_go(ts: rest, ambient_row, tdefs)
+            | None -> return cap_args_go(ts: rest, ambient_row, tdefs, acc)
             | Some(val: aargs) ->
               match aargs do
-                | [] -> return cap_args_go(ts: rest, ambient_row, tdefs)
+                | [] -> return cap_args_go(ts: rest, ambient_row, tdefs, acc)
                 | _ ->
-                  match unify_arg_lists(cargs, aargs, tdefs) do
+                  match unify_arg_lists(a: cargs, b: aargs, tdefs) do
                     | UnifyErr(message: m) ->
                       return CapArgMismatch(
                         cap_name: cname,
@@ -477,12 +486,16 @@ let cap_args_go = fn (
                           ++ "' is used at an element type incompatible with the handler in scope: "
                           ++ m
                       )
-                    | UnifyOk(_) -> return cap_args_go(ts: rest, ambient_row, tdefs)
+                    | UnifyOk(subst: s) ->
+                      return cap_args_go(
+                        ts: rest, ambient_row, tdefs,
+                        acc: subst.subst_compose(s1: acc, s2: s)
+                      )
                   end
               end
           end
       end
-    | _ :: rest -> return cap_args_go(ts: rest, ambient_row, tdefs)
+    | _ :: rest -> return cap_args_go(ts: rest, ambient_row, tdefs, acc)
   end
 end
 
@@ -505,7 +518,9 @@ let ambient_cap_args_in = fn (name: string, ts: [ TypeExpr ]) -> Option<[ TypeEx
 end
 
 /** Unify two parallel type-arg lists; first failure short-circuits. Arity
- *  mismatch is treated as a failure (different cap instantiations). */
+ *  mismatch is treated as a failure (different cap instantiations). The
+ *  substitutions of each position are composed so the full pinning is returned
+ *  (load-bearing for the contract-derivation pass capturing a fresh ambient var). */
 let unify_arg_lists = fn (
   a: [ TypeExpr ], b: [ TypeExpr ], tdefs: [ TypeDefEntry ]
 ) -> tctypes.UnifyResult do
@@ -517,7 +532,15 @@ let unify_arg_lists = fn (
         | bt :: brest ->
           match unify.unify(t1: at, t2: bt, tdefs) do
             | UnifyErr(message: m) -> return UnifyErr(message: m)
-            | UnifyOk(_) -> return unify_arg_lists(a: arest, b: brest, tdefs)
+            | UnifyOk(subst: s_head) ->
+              match unify_arg_lists(
+                a: subst.subst_apply_each(subst: s_head, typs: arest),
+                b: subst.subst_apply_each(subst: s_head, typs: brest),
+                tdefs
+              ) do
+                | UnifyErr(message: m) -> return UnifyErr(message: m)
+                | UnifyOk(subst: s_rest) -> return UnifyOk(subst: subst.subst_compose(s1: s_head, s2: s_rest))
+              end
           end
       end
   end

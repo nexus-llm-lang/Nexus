@@ -1,0 +1,359 @@
+/**
+ * typecheck/check/cap_contract: generic-cap require-contract derivation (3ibql).
+ *
+ * A function declaring a bare `require { Box }` for a GENERIC cap `Box<T>`
+ * COMMITS, in its body, to a specific element type — at every `Box.method(arg)`
+ * cap call and at every call to another function whose published contract
+ * already pins `Box<...>`. That committed element type must be PUBLISHED onto the
+ * function's require contract (`require { Box<i64> }`) so the call-site coverage
+ * (T-CapCall, infer/control_flow.check_cap_args_covered) can reject a caller that
+ * runs the function under a mismatched handler (`Box<string>`) — the laundered
+ * generic-cap type confusion (memory-unsafety, P1).
+ *
+ * The element type is derived by REAL TYPE INFERENCE, not a syntactic scan:
+ *   - The body is inferred (infer.infer_stmts) with the function's ambient
+ *     require row set to its declared row but with each generic-cap entry given a
+ *     FRESH type variable as its element argument (`Box<?a>`).
+ *   - The cap-call coverage unifies a called function's instantiated `Box<i64>`
+ *     against that ambient `Box<?a>`, PINNING `?a` to the committed element type;
+ *     the unifier subst flows back through the body substitution.
+ *   - After inference, the ambient row resolved under that substitution is the
+ *     committed contract: `Box<i64>` (concrete), `Box<T>` (T a function type
+ *     param — a polymorphic helper, stays polymorphic), or bare `Box` (never
+ *     committed → element-agnostic, conservatively accepted).
+ *
+ * Transitive laundering (`forwarder` calls `leaf` which commits Box<i64>) is
+ * handled by ORDERING: callee contracts must be finalised before their callers
+ * are derived. Rather than topologically sort, the pass iterates to a FIXPOINT
+ * over the env (mirroring backend/effect_analysis), re-deriving every
+ * participating function until no contract changes — forward references and
+ * recursion converge because each entry only moves from bare → committed.
+ *
+ * The pass runs AFTER register_caps (cap-method schemes in env) and BEFORE body
+ * checking. It is best-effort: a body that fails inference (its real error is
+ * reported by the pass-2 body check) simply keeps its existing scheme. Only
+ * functions whose declared row mentions a generic cap participate, so for a
+ * program with no generic caps (the compiler itself) the pass is a no-op.
+ */
+
+import * as list from "std:list"
+import { Option, Some, None } from "std:option"
+import {
+  TypeExpr, TyArrow, TyRow, TyVar, TyUserDefined, TyUnit, NamedType
+} from "src/types/type_expr.nx"
+import { HirFunction, HirParam, HirCap, EagerBody, LazyBody, HirStmt } from "src/ir/hir/types.nx"
+import {
+  CheckState, Scheme, EnvEntry, SubstEntry, InferExprOk, InferExprErr
+} from "src/typecheck/types.nx"
+import * as tctypes from "src/typecheck/types.nx"
+import * as subst from "src/typecheck/subst.nx"
+import * as occurs from "src/typecheck/check/occurs.nx"
+import { base_name_of } from "src/typecheck/tcwf.nx"
+import { alias_src_name, hir_params_to_named_types } from "src/typecheck/check/registration.nx"
+import * as infer from "src/typecheck/infer.nx"
+import { TypeError } from "src/typecheck/errors.nx"
+
+// ─── Entry point ────────────────────────────────────────────────────────────
+
+/** Derive and publish each generic-cap-requiring function's committed element
+ *  contract, re-registering its env scheme. Returns the state with refined
+ *  schemes; functions with no generic-cap requirement are untouched. */
+export let derive_generic_cap_contracts = fn (
+  state: CheckState,
+  funcs: [ HirFunction ],
+  caps: [ HirCap ]
+) -> CheckState do
+  let participants = collect_participants(funcs, caps, acc: [])
+  if list.is_empty(xs: participants) then return state end
+  // Fixpoint bound: each contract only ever moves bare → committed, so it can
+  // change at most once per generic-cap entry; 2× participant count + a slack
+  // term is a generous linear safety net (mirrors effect_analysis's fuel).
+  let n = list.length(xs: participants)
+  return derive_fixpoint(state, participants, caps, fuel: 2 * n + 4)
+end
+
+/** Functions eligible for contract derivation: an eager body whose declared
+ *  require row names at least one GENERIC cap, excluding alias-pattern functions
+ *  (their contract is inherited from the source binding, not derived here). */
+let collect_participants = fn (
+  funcs: [ HirFunction ], caps: [ HirCap ], acc: [ HirFunction ]
+) -> [ HirFunction ] do
+  match funcs do
+    | [] -> return list.reverse(xs: acc)
+    | f :: rest ->
+      let keep = is_participant(f, caps)
+      let acc1 = if keep then f :: acc else acc end
+      return collect_participants(funcs: rest, caps, acc: acc1)
+  end
+end
+
+let is_participant = fn (f: HirFunction, caps: [ HirCap ]) -> bool do
+  let HirFunction(
+    name: _, type_params: _, params: _, ret_type: _, throw_row: _,
+    body: fbody, span: _, file: _, requires: req
+  ) = f
+  // Alias-pattern functions inherit their source's scheme; skip.
+  match alias_src_name(func: f) do | Some(_) -> return false | None -> () end
+  match fbody do
+    | EagerBody(stmts: _) -> return row_mentions_generic_cap(row: req, caps)
+    | LazyBody(_) -> return false
+  end
+end
+
+let row_mentions_generic_cap = fn (row: TypeExpr, caps: [ HirCap ]) -> bool do
+  match row do
+    | TyRow(types: ts, rest: _) -> return any_generic_cap(ts, caps)
+    | _ -> return false
+  end
+end
+
+let any_generic_cap = fn (ts: [ TypeExpr ], caps: [ HirCap ]) -> bool do
+  match ts do
+    | [] -> return false
+    | TyUserDefined(name: cn, args: _) :: rest ->
+      if generic_cap_tps(caps, bare: base_name_of(qualified: cn)) > 0 then return true end
+      return any_generic_cap(ts: rest, caps)
+    | _ :: rest -> return any_generic_cap(ts: rest, caps)
+  end
+end
+
+/** Number of type params of the cap matched by bare name; 0 for monomorphic
+ *  caps or names that are not caps. */
+let generic_cap_tps = fn (caps: [ HirCap ], bare: string) -> i64 do
+  match caps do
+    | [] -> return 0
+    | HirCap(name: cn, type_params: tps, methods: _) :: rest ->
+      if base_name_of(qualified: cn) == bare then return list.length(xs: tps) end
+      return generic_cap_tps(caps: rest, bare)
+  end
+end
+
+// ─── Fixpoint over the call graph ────────────────────────────────────────────
+
+/** One sweep updates every participant's scheme from the CURRENT env (which
+ *  carries the previous sweep's contracts). Repeat until a sweep changes
+ *  nothing. `fuel` bounds iterations as a non-termination safety net. */
+let derive_fixpoint = fn (
+  state: CheckState,
+  participants: [ HirFunction ],
+  caps: [ HirCap ],
+  fuel: i64
+) -> CheckState do
+  if fuel <= 0 then return state end
+  let SweepResult(state: st1, changed) = derive_sweep(state, participants, caps, changed: false)
+  if changed then return derive_fixpoint(state: st1, participants, caps, fuel: fuel - 1) end
+  return st1
+end
+
+type SweepResult = SweepResult(state: CheckState, changed: bool)
+
+let derive_sweep = fn (
+  state: CheckState,
+  participants: [ HirFunction ],
+  caps: [ HirCap ],
+  changed: bool
+) -> SweepResult do
+  match participants do
+    | [] -> return SweepResult(state, changed)
+    | f :: rest ->
+      let DeriveOne(state: st1, changed: c1) = derive_one(state, func: f, caps)
+      let now = if c1 then true else changed end
+      return derive_sweep(state: st1, participants: rest, caps, changed: now)
+  end
+end
+
+type DeriveOne = DeriveOne(state: CheckState, changed: bool)
+
+/** Derive one function's committed contract by inferring its body against a
+ *  fresh-var ambient require row, then re-publish its scheme if the contract
+ *  changed. Inference failure ⇒ keep the existing scheme (real error reported by
+ *  the body-check pass). */
+let derive_one = fn (state: CheckState, func: HirFunction, caps: [ HirCap ]) -> DeriveOne do
+  let HirFunction(
+    name, type_params: tps, params, ret_type: ret, throw_row: tw,
+    body: fbody, span: _, file: _, requires: req
+  ) = func
+  let body = match fbody do | EagerBody(stmts: s) -> s | LazyBody(_) -> [] end
+  // Mirror check_function's body environment / row setup, except the require row
+  // carries a fresh type var per generic-cap element arg so cap-call coverage
+  // can pin it (the laundered element type is captured by the body subst).
+  let body_params = occurs.convert_hir_params(params, vars: tps)
+  let arrow_params = occurs.convert_named_types(nts: hir_params_to_named_types(params), vars: tps)
+  let conv_ret = occurs.convert_ud_to_var(typ: ret, vars: tps)
+  let conv_tw = occurs.convert_ud_to_var(typ: tw, vars: tps)
+  let conv_req = occurs.convert_ud_to_var(typ: req, vars: tps)
+  let AmbientRow(state: st_a, row: ambient_fresh) =
+    fresh_cap_arg_row(state, row: conv_req, caps)
+  let body_env = add_params(env: tctypes.state_env(st_a), params: body_params)
+  let st_b = tctypes.state_with_env(st_a, env: body_env)
+  let st_c = tctypes.state_with_throw_row(state: st_b, throw_row: conv_tw)
+  let st_d = tctypes.state_with_require_row(state: st_c, require_row: ambient_fresh)
+  match try_infer(st_d, body, ret_type: conv_ret) do
+    | None -> return DeriveOne(state, changed: false)
+    | Some(val: s_body) ->
+      // The committed contract is the fresh-var ambient row resolved under the
+      // body substitution. Reduce each generic-cap entry: concrete arg → keep;
+      // arg == one of this fn's own type params → keep (polymorphic helper);
+      // arg still a fresh `?` var → uncommitted → bare entry.
+      let resolved = subst.subst_apply(subst: s_body, typ: ambient_fresh)
+      let new_row = finalize_row(row: resolved, fn_tps: tps, caps)
+      // Compare against the contract currently published for this function.
+      let cur_row = current_contract_row(state, name)
+      if rows_equal(a: cur_row, b: new_row) then return DeriveOne(state, changed: false) end
+      let new_scheme = Scheme(
+        vars: tps,
+        typ: TyArrow(params: arrow_params, ret: conv_ret, requires: new_row, throw_row: conv_tw)
+      )
+      let env1 = tctypes.env_insert(env: tctypes.state_env(state), name, scheme: new_scheme)
+      return DeriveOne(state: tctypes.state_with_env(state, env: env1), changed: true)
+  end
+end
+
+/** Run body inference, swallowing any TypeError (best-effort derivation). */
+let try_infer = fn (
+  state: CheckState, body: [ HirStmt ], ret_type: TypeExpr
+) -> Option<[ SubstEntry ]> do
+  try
+    match infer.infer_stmts(state, stmts: body, ret_type) do
+      | InferExprOk(state: _, subst: s_body, typ: _) -> return Some(val: s_body)
+      | InferExprErr(message: _, span: _) -> return None
+    end
+  catch
+    | _ -> return None
+  end
+end
+
+// ─── Require-row shaping ──────────────────────────────────────────────────────
+
+type AmbientRow = AmbientRow(state: CheckState, row: TypeExpr)
+
+/** Replace each generic-cap entry's element args with FRESH type vars so the
+ *  cap-call coverage can pin them during body inference. Monomorphic-cap and
+ *  non-cap entries are left unchanged. Already-argful entries are re-freshened
+ *  (the declared row never carries concrete args, but this is safe regardless). */
+let fresh_cap_arg_row = fn (state: CheckState, row: TypeExpr, caps: [ HirCap ]) -> AmbientRow do
+  match row do
+    | TyRow(types: ts, rest: tail) ->
+      let FreshEntries(state: st1, entries) = fresh_entries(state, ts, caps, acc: [])
+      return AmbientRow(state: st1, row: TyRow(types: entries, rest: tail))
+    | _ -> return AmbientRow(state, row)
+  end
+end
+
+type FreshEntries = FreshEntries(state: CheckState, entries: [ TypeExpr ])
+
+let fresh_entries = fn (
+  state: CheckState, ts: [ TypeExpr ], caps: [ HirCap ], acc: [ TypeExpr ]
+) -> FreshEntries do
+  match ts do
+    | [] -> return FreshEntries(state, entries: list.reverse(xs: acc))
+    | TyUserDefined(name: cn, args: _) :: rest ->
+      let arity = generic_cap_tps(caps, bare: base_name_of(qualified: cn))
+      if arity <= 0 then
+        return fresh_entries(state, ts: rest, caps, acc: TyUserDefined(name: cn, args: []) :: acc)
+      end
+      let FreshArgs(state: st1, args: fresh_args) = make_fresh_args(state, count: arity, acc: [])
+      return fresh_entries(
+        state: st1,
+        ts: rest,
+        caps,
+        acc: TyUserDefined(name: cn, args: fresh_args) :: acc
+      )
+    | other :: rest -> return fresh_entries(state, ts: rest, caps, acc: other :: acc)
+  end
+end
+
+type FreshArgs = FreshArgs(state: CheckState, args: [ TypeExpr ])
+
+let make_fresh_args = fn (state: CheckState, count: i64, acc: [ TypeExpr ]) -> FreshArgs do
+  if count <= 0 then return FreshArgs(state, args: list.reverse(xs: acc)) end
+  let tctypes.FreshResult(state: st1, typ: fv) = tctypes.tc_fresh_var(state)
+  return make_fresh_args(state: st1, count: count - 1, acc: fv :: acc)
+end
+
+/** Reduce a body-resolved require row to the published contract: a generic-cap
+ *  entry whose every arg is committed (concrete or one of the fn's own type
+ *  params) is kept; an entry with any still-fresh `?` arg is reduced to bare. */
+let finalize_row = fn (row: TypeExpr, fn_tps: [ string ], caps: [ HirCap ]) -> TypeExpr do
+  match row do
+    | TyRow(types: ts, rest: tail) ->
+      return TyRow(types: finalize_entries(ts, fn_tps, caps, acc: []), rest: tail)
+    | _ -> return row
+  end
+end
+
+let finalize_entries = fn (
+  ts: [ TypeExpr ], fn_tps: [ string ], caps: [ HirCap ], acc: [ TypeExpr ]
+) -> [ TypeExpr ] do
+  match ts do
+    | [] -> return list.reverse(xs: acc)
+    | TyUserDefined(name: cn, args: cargs) :: rest ->
+      let entry = finalize_cap_entry(cn, cargs, fn_tps, caps)
+      return finalize_entries(ts: rest, fn_tps, caps, acc: entry :: acc)
+    | other :: rest -> return finalize_entries(ts: rest, fn_tps, caps, acc: other :: acc)
+  end
+end
+
+let finalize_cap_entry = fn (
+  cn: string, cargs: [ TypeExpr ], fn_tps: [ string ], caps: [ HirCap ]
+) -> TypeExpr do
+  let arity = generic_cap_tps(caps, bare: base_name_of(qualified: cn))
+  if arity <= 0 then return TyUserDefined(name: cn, args: []) end
+  // Count args that are NOT committed; keep the concrete args iff that count is
+  // zero, else fall back to the element-agnostic bare entry. A single-accumulator
+  // scan (no negation / early-return inside the recursion) keeps the self-host
+  // codegen well-behaved (nexus-3ibql build-walk caveat).
+  let uncommitted = count_uncommitted(args: cargs, fn_tps, acc: 0)
+  if uncommitted == 0 then return TyUserDefined(name: cn, args: cargs) end
+  return TyUserDefined(name: cn, args: [])
+end
+
+/** Count cap args that are NOT committed. An arg is committed when it is
+ *  concrete, or a type variable that is one of the function's own declared type
+ *  params (a polymorphic-helper element). A still-unsolved fresh inference var
+ *  (`?N`) is uncommitted → the cap was never used at a concrete element. */
+let count_uncommitted = fn (args: [ TypeExpr ], fn_tps: [ string ], acc: i64) -> i64 do
+  match args do
+    | [] -> return acc
+    | TyVar(name: nm) :: rest ->
+      let bump = if str_in(s: nm, xs: fn_tps) then 0 else 1 end
+      return count_uncommitted(args: rest, fn_tps, acc: acc + bump)
+    | _ :: rest -> return count_uncommitted(args: rest, fn_tps, acc)
+  end
+end
+
+let str_in = fn (s: string, xs: [ string ]) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest -> if x == s then return true end
+      return str_in(s, xs: rest)
+  end
+end
+
+// ─── Current-contract lookup + row equality ──────────────────────────────────
+
+/** The require row currently published for `name` (the env scheme's arrow). Bare
+ *  empty row when not an arrow / not bound (shouldn't happen for participants). */
+let current_contract_row = fn (state: CheckState, name: string) -> TypeExpr do
+  match tctypes.env_lookup(env: tctypes.state_env(state), name) do
+    | Some(val: Scheme(vars: _, typ: TyArrow(params: _, ret: _, requires: r, throw_row: _))) -> return r
+    | _ -> return TyRow(types: [], rest: None)
+  end
+end
+
+let add_params = fn (env: [ EnvEntry ], params: [ HirParam ]) -> [ EnvEntry ] do
+  match params do
+    | [] -> return env
+    | HirParam(label: _, name: n, sigil: _, typ: t) :: rest ->
+      return add_params(
+        env: tctypes.env_insert(env, name: n, scheme: tctypes.mono(typ: t)),
+        params: rest
+      )
+  end
+end
+
+/** Structural equality on two require rows, sufficient to detect fixpoint
+ *  convergence. Compares the cap entries' names and element args positionally. */
+let rows_equal = fn (a: TypeExpr, b: TypeExpr) -> bool do
+  return subst.type_eq(a, b)
+end
