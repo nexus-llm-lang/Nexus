@@ -14,7 +14,7 @@
  * - Array-element numbering (number_atoms, number_atoms_go)
  */
 import { LitUnit } from "src/types/vocab.nx"
-import { TypeExpr, TyUnit, TyI64, VariantDef, VariantField } from "src/types/type_expr.nx"
+import { TypeExpr, TyUnit, TyI64, TyRecord, NamedType, VariantDef, VariantField } from "src/types/type_expr.nx"
 import * as list from "std:list"
 import { LirError } from "src/ir/lir/errors.nx"
 import { Some, None } from "std:option"
@@ -31,7 +31,7 @@ import {
   MirRecordPatField
 } from "src/ir/mir/types.nx"
 import { LirAtom, LirStmt, LirNamedAtom } from "src/ir/lir/types.nx"
-import { LowerCtx, lir_lookup_type, atom_type } from "src/ir/lir/context.nx"
+import { LowerCtx, lir_lookup_type, insert_type, atom_type } from "src/ir/lir/context.nx"
 import { infer_semantic_type } from "src/ir/lir/semantic_types.nx"
 import { VariantIndex } from "src/ir/support/variant_index.nx"
 import * as vidx from "src/ir/support/variant_index.nx"
@@ -192,6 +192,117 @@ let lookup_named_variant_field = fn (
   end
 end
 
+// ---------------------------------------------------------------------------
+// Pattern-binder semantic-type registration
+// ---------------------------------------------------------------------------
+//
+// When a match arm's BODY references a pattern binder (`| Wrapped(h: hh) -> [{
+// col: hh.c }]`), the body's semantic type must be inferred with that binder's
+// type in `semantic_vars` — otherwise `infer_semantic_type` defaults `hh` to
+// `TyI64`, `hh.c` erases to `TyI64`, and the resulting structural-compare helper
+// is keyed on / built for the erased field type (`col=i64`) → identity-compare
+// or a harvested-vs-call-site helper-name divergence (E3001). The real decision-
+// tree emission registers these binders (lir_emit_bindings / lir_extract_fields_
+// loop), but the result-type inference (`lir_infer_match_result_type`) and the
+// struct-eq harvest run BEFORE / WITHOUT that emission, so they register the
+// binders here.
+//
+// Returns a ctx whose `semantic_vars` is extended with each DIRECT
+// constructor-payload / record-pattern binder of `pattern`, typed by the
+// field's declared type resolved through any record alias (so a record-typed
+// binder carries its `TyRecord` body and a subsequent `.field` on it resolves).
+// Nested patterns recurse, using the resolved field type as the inner
+// scrutinee. A binder whose field type can't be located (or whose field type is
+// a still-polymorphic type parameter) is simply not registered — it then keeps
+// the conservative `TyI64` default, unchanged from prior behavior.
+
+/** Public function register_pattern_binders. */
+export let register_pattern_binders = fn (
+  pattern: MirPattern,
+  scrutinee_sem: TypeExpr,
+  ctx: LowerCtx
+) -> LowerCtx throws { LirError } do
+  let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
+  match pattern do
+    | MirPatConstructor(name: ctor, fields: fs) ->
+      return register_ctor_field_binders(ctor, fields: fs, enum_defs: ed, ctx)
+    | MirPatRecord(fields: rfs, is_partial: _) ->
+      return register_record_field_binders(fields: rfs, rec_sem: vidx.resolve_record_alias(idx: ed, typ: scrutinee_sem), ctx)
+    | _ -> return ctx
+  end
+end
+
+let register_ctor_field_binders = fn (
+  ctor: string,
+  fields: [ MirPatternField ],
+  enum_defs: VariantIndex,
+  ctx: LowerCtx
+) -> LowerCtx throws { LirError } do
+  match fields do
+    | [] -> return ctx
+    | MirPatternField(name: Some(val: fname), pattern: fpat) :: rest ->
+      let field_ty = match binder_field_type_of_ctor(ctor, field_name: fname, enum_defs) do
+        | Some(val: ft) -> vidx.resolve_record_alias(idx: enum_defs, typ: ft)
+        | None -> TyI64
+      end
+      let ctx1 = register_binder_or_recurse(pat: fpat, sem: field_ty, ctx)
+      return register_ctor_field_binders(ctor, fields: rest, enum_defs, ctx: ctx1)
+    | MirPatternField(name: None, pattern: _) :: rest ->
+      return register_ctor_field_binders(ctor, fields: rest, enum_defs, ctx)
+  end
+end
+
+let register_record_field_binders = fn (
+  fields: [ MirRecordPatField ],
+  rec_sem: TypeExpr,
+  ctx: LowerCtx
+) -> LowerCtx throws { LirError } do
+  match fields do
+    | [] -> return ctx
+    | MirRecordPatField(name: fname, pattern: fpat) :: rest ->
+      let field_ty = match rec_sem do
+        | TyRecord(fields: rfs) ->
+          match lookup_record_field_type(fields: rfs, name: fname) do
+            | Some(val: ft) -> ft
+            | None -> TyI64
+          end
+        | _ -> TyI64
+      end
+      let ctx1 = register_binder_or_recurse(pat: fpat, sem: field_ty, ctx)
+      return register_record_field_binders(fields: rest, rec_sem, ctx: ctx1)
+  end
+end
+
+// Register `pat` as a leaf binder of semantic type `sem`, or recurse into a
+// nested ctor/record pattern with `sem` as the inner scrutinee. A polymorphic
+// (`TyVar`-bearing) field type is not registered — a `.field` on it would not
+// resolve anyway, and registering it could mis-route a downstream compare.
+let register_binder_or_recurse = fn (
+  pat: MirPattern,
+  sem: TypeExpr,
+  ctx: LowerCtx
+) -> LowerCtx throws { LirError } do
+  match pat do
+    | MirPatVariable(name: bn, sigil: _) ->
+      let LowerCtx(vars: v, semantic_vars: sv, stmts: s, temp_counter: c, enum_defs: ed) = ctx
+      return LowerCtx(vars: v, semantic_vars: insert_type(name: bn, typ: sem, entries: sv), stmts: s, temp_counter: c, enum_defs: ed)
+    | MirPatConstructor(name: _, fields: _) -> return register_pattern_binders(pattern: pat, scrutinee_sem: sem, ctx)
+    | MirPatRecord(fields: _, is_partial: _) -> return register_pattern_binders(pattern: pat, scrutinee_sem: sem, ctx)
+    | _ -> return ctx
+  end
+end
+
+let lookup_record_field_type = fn (
+  fields: [ NamedType ],
+  name: string
+) -> Option<TypeExpr> throws { LirError } do
+  match fields do
+    | [] -> return None
+    | NamedType(name: n, typ: t) :: rest ->
+      if n == name then return Some(val: t) else return lookup_record_field_type(fields: rest, name) end
+  end
+end
+
 // Find which constructor/record field of `pattern` binds the variable `binder`
 // and return that field's declared type. Used to recover the type of a match
 // arm that yields a bare pattern binder (`| Ctor(f: x) -> x`) — at result-type
@@ -253,13 +364,14 @@ end
 
 export let lir_infer_match_result_type = fn (
   cases: [ MirMatchCase ],
+  scrutinee_sem: TypeExpr,
   ctx: LowerCtx
 ) -> TypeExpr throws { LirError } do
   match cases do
     | [] -> return TyUnit
     | MirMatchCase(pattern: pat, body) :: rest ->
       match body do
-        | [] -> return lir_infer_match_result_type(cases: rest, ctx)
+        | [] -> return lir_infer_match_result_type(cases: rest, scrutinee_sem, ctx)
         | _ ->
           let last = lir_last_mir_expr(body)
           // A bare pattern-binder arm (`-> x`) is not yet in `semantic_vars`, so
@@ -272,12 +384,19 @@ export let lir_infer_match_result_type = fn (
               binder_type_in_pattern(pattern: pat, binder: vn, enum_defs: ed)
             | _ -> None
           end
+          // For a non-bare body, infer its type with the arm's pattern binders
+          // registered in `semantic_vars`, so a binder reference deeper in the
+          // body (`hh` in `[{ col: hh.c }]`) resolves to its real record/sum type
+          // instead of the `TyI64` default — keeping the structural-compare helper
+          // keyed on the binder's actual field type. Binders are scoped to THIS
+          // arm only (the extended ctx is local; the recursion uses the original).
+          let arm_ctx = register_pattern_binders(pattern: pat, scrutinee_sem, ctx)
           let t = match from_binder do
             | Some(val: bt) -> bt
-            | None -> infer_semantic_type(expr: last, ctx)
+            | None -> infer_semantic_type(expr: last, ctx: arm_ctx)
           end
           match t do
-            | TyUnit -> return lir_infer_match_result_type(cases: rest, ctx)
+            | TyUnit -> return lir_infer_match_result_type(cases: rest, scrutinee_sem, ctx)
             | _ -> return t
           end
       end
