@@ -1027,7 +1027,13 @@ let check_stmt = fn (
       // call leak check. Nested calls inside larger
       // expressions are not at stmt level — they consume their inputs and
       // close the leak window via the surrounding consumer.
-      return check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level)
+      let st1 = check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level)
+      // Mirror the `| Let` boundary: a linear consumed inside an `if`/`match`
+      // EXPRESSION statement (e.g. `if c then sink(%p) else sink(%p) end` with
+      // no binding) is dropped from BOTH the live and consumed sets by the
+      // branch-join, so a later reuse would be wrongly admitted. Fold the
+      // live-set delta into consumed to restore the reuse invariant (E2008).
+      return lin_record_consumed_since(st: st1, pre_live: lin_state_vars(st))
     | Return(expr: e) ->
       // Walk the returned expression so any linear uses inside it are consumed.
       let st1 = check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level: false)
@@ -1041,7 +1047,11 @@ let check_stmt = fn (
         | Some(val: leaked) -> throw LinearUnused(name: leaked, span)
         | None -> ()
       end
-      return st1
+      // Fold any linear the returned expression consumed inside an `if`/`match`
+      // EXPRESSION branch into consumed (the branch-join drops it). Defensive /
+      // uniform with `| Let` and `| Expr`: no statement is reachable after a
+      // return, so this only keeps the consumed-set invariant intact.
+      return lin_record_consumed_since(st: st1, pre_live: lin_state_vars(st))
     | Assign(target: t, value: v) ->
       let st1 = check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
       return check_expr(expr: v, st: st1, sigs, tdefs, enum_defs, at_stmt_level: false)
@@ -1281,27 +1291,44 @@ let check_expr_kind = fn (
             // Additionally, all outer linears must have been consumed: the join
             // point is unreachable, so any outer linear still live is a real leak.
             check_divergent_arm_linears(arm_out: st_then, span)
-            return lin_set_vars(st: st1, vs: [])
+            return lin_record_consumed_since(
+              st: lin_set_vars(st: st1, vs: []),
+              pre_live: lin_state_vars(st: st1)
+            )
           end
           if then_diverges then
             // Then diverges, else does not: then_rem ⊆ else_rem.
             if !outer_rem_subset_of(a: outer_rem_then, b: outer_rem_else) then
               throw LinearMismatch(detail: "match arms diverge on outer-linear consumption", span)
             end
-            return lin_set_vars(st: st1, vs: outer_rem_else)
+            return lin_record_consumed_since(
+              st: lin_set_vars(st: st1, vs: outer_rem_else),
+              pre_live: lin_state_vars(st: st1)
+            )
           end
           if else_diverges then
             // Else diverges, then does not: else_rem ⊆ then_rem.
             if !outer_rem_subset_of(a: outer_rem_else, b: outer_rem_then) then
               throw LinearMismatch(detail: "match arms diverge on outer-linear consumption", span)
             end
-            return lin_set_vars(st: st1, vs: outer_rem_then)
+            return lin_record_consumed_since(
+              st: lin_set_vars(st: st1, vs: outer_rem_then),
+              pre_live: lin_state_vars(st: st1)
+            )
           end
           // Neither diverges: require equality.
           if !vars_equal(a: outer_rem_then, b: outer_rem_else) then
             throw LinearMismatch(detail: "match arms diverge on outer-linear consumption", span)
           end
-          return lin_set_vars(st: st1, vs: outer_rem_then)
+          // A linear consumed in BOTH arms is removed from the live set here but
+          // the join restores st1's PRE-branch consumed set, which would lose
+          // its consumed-ness and wrongly admit a later reuse (double-free).
+          // Fold the live-set delta (linears live before the branch but gone in
+          // both arms) into consumed so a subsequent use is rejected (E2008).
+          return lin_record_consumed_since(
+            st: lin_set_vars(st: st1, vs: outer_rem_then),
+            pre_live: lin_state_vars(st: st1)
+          )
       end
     | Match(target: t, cases: cs) ->
       // P-Var: determine if the scrutinee is a live linear variable *before*
@@ -1510,25 +1537,40 @@ let check_match_cases_go = fn (
   let outer_vars = lin_state_vars(st)
   match cases do
     | [] ->
+      // A linear consumed consistently across the arms is removed from the live
+      // set at the join, but the join is built from the PRE-match `st` whose
+      // consumed set predates the arms. Without folding the live-set delta into
+      // consumed, the linear is in neither set and a later reuse is wrongly
+      // admitted (double-free). lin_record_consumed_since restores the invariant
+      // (idempotent: the delta is disjoint from the existing consumed set).
       match join_ref do
         | None ->
           // All arms diverged (or no arms). Check all div_rems are equal.
           match div_rems do
             | [] ->
-              // No arms at all — vacuously OK, outer_vars unchanged.
-              return lin_set_vars(st, vs: outer_vars)
+              // No arms at all — vacuously OK, outer_vars unchanged (no delta).
+              return lin_record_consumed_since(
+                st: lin_set_vars(st, vs: outer_vars),
+                pre_live: lin_state_vars(st)
+              )
             | ref_rem :: rest_rems ->
               check_div_rems_equal(div_rems: rest_rems, ref_rem, span)
               // All-diverged: the join point is unreachable. Outer linears still
               // live in any arm are a real leak — require ref_rem (the agreed
               // remainder) to be empty (all outer linears consumed in every arm).
               require_empty_or_droppable(vars: ref_rem, params: [], span)
-              return lin_set_vars(st, vs: [])
+              return lin_record_consumed_since(
+                st: lin_set_vars(st, vs: []),
+                pre_live: lin_state_vars(st)
+              )
           end
         | Some(val: jr) ->
           // Mixed: check any remaining div_rems are subsets of join state.
           check_div_rems_subset(div_rems, join_rem: jr, span)
-          return lin_set_vars(st, vs: jr)
+          return lin_record_consumed_since(
+            st: lin_set_vars(st, vs: jr),
+            pre_live: lin_state_vars(st)
+          )
       end
     | HirMatchCase(pattern: p, body: b) :: rest ->
       // Pattern binders that introduce linear vars (`%v` patterns, or plain
