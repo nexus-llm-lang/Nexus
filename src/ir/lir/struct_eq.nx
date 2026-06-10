@@ -56,8 +56,7 @@ import { TypeExpr, TyRecord, TyUserDefined, TyBool, TyI64, TyF64, TyChar,
          TyString, TyList, TyVar, NamedType,
          EnumDef, RecordDef, VariantDef, VariantField } from "src/types/type_expr.nx"
 import { Span } from "src/types/span.nx"
-import { BinaryOp, OpEq, OpNe, OpAnd,
-         Literal, LitInt, LitFloat, LitBool, LitChar, LitString, LitUnit } from "src/types/vocab.nx"
+import { BinaryOp, OpEq, OpNe, OpAnd } from "src/types/vocab.nx"
 import {
   LirAtom,
   LirAtomVar,
@@ -78,9 +77,12 @@ import {
 } from "src/ir/lir/types.nx"
 import {
   LowerCtx,
+  TypeEntry,
   BindResult,
-  bind_expr_to_temp
+  bind_expr_to_temp,
+  insert_type
 } from "src/ir/lir/context.nx"
+import { infer_semantic_type } from "src/ir/lir/semantic_types.nx"
 import { LirError } from "src/ir/lir/errors.nx"
 import { Some, None, Option } from "std:option"
 import * as list from "std:list"
@@ -89,8 +91,8 @@ import { VariantIndex }, * as vidx from "src/ir/support/variant_index.nx"
 import { constructor_tag } from "src/backend/wasm/defs.nx"
 import {
   MirFunction,
+  MirParam,
   MirExpr,
-  MirLiteral,
   MirBinaryOp,
   MirCall,
   MirConstructor,
@@ -108,6 +110,7 @@ import {
   MirSuspend,
   MirResume,
   MirBlock,
+  MirInjectValue,
   MirNamedExpr,
   MirCallArg,
   MirStmt,
@@ -948,102 +951,151 @@ let make_list_helpers = fn (
   end
 end
 
-// ─── ANONYMOUS-record list-element harvesting (from MIR) ────────────────────
+// ─── ANONYMOUS-record list-element harvesting (from MIR, with a semantic env) ─
 //
-// A list whose element is an ANONYMOUS record (`[{a, b}]`) has no declared type
-// name, so its `__streq_List$Rec$...` helper cannot be seeded from the program's
-// EnumDef / RecordDef tables (the named-aggregate path). The element shape is
-// only visible in the MIR. A list LITERAL `[{...}]` (and `::`) desugars to the
-// built-in list constructors `Cons(rest, v)` / `Nil` — alphabetical ctor args
-// `[rest, v]`, so the head record value `v` sits at index 1. We therefore walk
-// the MIR and, for every record-head `Cons`, push the list ELEMENT type
-// (`TyRecord(field-types)`, or `TyList(TyRecord(...))` for `[[{...}]]`) so the
-// matching helper is synthesized. Field types are recovered structurally from the
-// head record's field values (literals, nested records, nested lists); a field
-// whose value is not statically classifiable falls back to TyI64 (the same
-// type-erased value compare the generic helper uses), which still compares the
-// field by value. The collected set is over-approximate and dedup'd by helper
-// name (push_elem); unused helpers are harmless.
+// A list whose element is an ANONYMOUS record (`[{a, b}]` / `[{ col: mk(7) }]`)
+// has no declared type name, so its `__streq_List$Rec$...` helper cannot be seeded
+// from the EnumDef / RecordDef tables — the element shape lives only in the MIR.
+// A list literal desugars to `Cons(rest, v)` / `Nil`, so for every `Cons` we
+// recover the list ELEMENT type from the head value `v` and, when it (or a nesting
+// of it) carries an anonymous record, push that element type so the matching helper
+// is synthesized.
+//
+// KEY (nexus-h69yj): the element type MUST be recovered with the SAME
+// `infer_semantic_type` the `==` CALL SITE uses, because an anon-record FIELD value
+// may be a call / variable / match / field-access (`{ col: mk(7) }`) whose type is
+// semantic, not a syntactic literal. The previous `mir_field_type` walk had a
+// catch-all that erased those to `TyI64`, so the harvested helper name
+// (`…col=i64…`) diverged from the call site's (`…col=Color…`) → the helper was
+// never generated → E3001 codegen abort. We therefore thread the SAME running
+// semantic-variable env the real LIR lowering builds (function params + each `let`
+// binding's recovered type) and type each `Cons` head with `infer_semantic_type`.
+//
+// The recursive walk threads a SINGLE flat `[TypeExpr]` accumulator of the raw
+// recovered list types (NOT yet filtered) — mirroring the known-good single-
+// accumulator shape; the anon-record FILTER runs in a SEPARATE, non-recursive pass
+// (harvested_anon_record_elems). This deliberately avoids threading a richer record
+// through the deep mutual recursion, which the self-host seed miscompiles.
 
-// Best-effort structural type of a MIR expression WITHOUT a LowerCtx: only the
-// shapes needed to key an anonymous-record list element (literals, anon records,
-// list constructors). Everything else erases to TyI64 (value compare).
-// Does variant `vname` belong to one of these enums? Returns the owning enum
-// name. Used to key an anon-record field whose value is a user-defined sum
-// constructor by its ENUM type (so the harvested helper name matches the call
-// site, which uses the semantic type) — nexus-qgnoi.
-let variant_name_in = fn (vs: [ VariantDef ], vname: string) -> bool do
-  match vs do
-    | [] -> return false
-    | VariantDef(name: vn, fields: _) :: rest ->
-      if vn == vname then return true end
-      return variant_name_in(vs: rest, vname)
-  end
-end
-
-let harvest_enum_of_variant = fn (eds: [ EnumDef ], vname: string) -> Option<string> do
-  match eds do
-    | [] -> return None
-    | EnumDef(name: ename, is_public: _, is_opaque: _, type_params: _, variants: vs) :: rest ->
-      if variant_name_in(vs: vs, vname) then return Some(val: ename) end
-      return harvest_enum_of_variant(eds: rest, vname)
-  end
-end
-
-let mir_field_type = fn (e: MirExpr, eds: [ EnumDef ]) -> TypeExpr do
+// Walk an expr, pushing the RAW recovered semantic type of every `MirConstructor`
+// (a `Cons` yields `TyList(elem)`), and always recursing into sub-exprs so nested
+// list literals (`[[{...}]]`, `f([{...}])`) are caught.
+let harvest_expr = fn (e: MirExpr, ctx: LowerCtx, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
   match e do
-    | MirLiteral(lit: l) ->
-      match l do
-        | LitInt(_) -> return TyI64
-        | LitFloat(_) -> return TyF64
-        | LitBool(_) -> return TyBool
-        | LitChar(_) -> return TyChar
-        | LitString(_) -> return TyString
-        | LitUnit -> return TyUnit
+    | MirConstructor(name: _, args: cargs) ->
+      let acc1 = infer_semantic_type(expr: e, ctx) :: acc
+      return harvest_exprs(es: cargs, ctx, acc: acc1)
+    | MirRecord(fields: fs) -> return harvest_named_exprs(fs, ctx, acc)
+    | MirArray(elems: es) -> return harvest_exprs(es, ctx, acc)
+    | MirBinaryOp(left: l, op: _, right: r) -> return harvest_expr(e: r, ctx, acc: harvest_expr(e: l, ctx, acc))
+    | MirCall(func: _, args: cas, ret_type: _) -> return harvest_call_args(cas, ctx, acc)
+    | MirCallClosure(closure: c, args: cas, ret_type: _) -> return harvest_call_args(cas, ctx, acc: harvest_expr(e: c, ctx, acc))
+    | MirIndex(target: t, index: i) -> return harvest_expr(e: i, ctx, acc: harvest_expr(e: t, ctx, acc))
+    | MirFieldAccess(target: t, field: _) -> return harvest_expr(e: t, ctx, acc)
+    | MirIf(cond: c, then_body: tb, else_body: eb) ->
+      let acc1 = harvest_expr(e: c, ctx, acc)
+      let acc2 = harvest_stmts(stmts: tb, ctx, acc: acc1)
+      match eb do
+        | Some(val: ebs) -> return harvest_stmts(stmts: ebs, ctx, acc: acc2)
+        | None -> return acc2
       end
-    | MirRecord(fields: fs) -> return TyRecord(fields: mir_record_field_types(fields: fs, eds: eds))
-    | MirConstructor(name: cn, args: cargs) ->
-      // List literals desugar to `Cons(rest, v)` / `Nil`; recover `[elem]` from
-      // the head value `v` (alphabetical args put `rest` at 0, `v` at 1).
-      if cn == "Cons" then
-        match cargs do
-          | _ :: v :: _ -> return TyList(elem: mir_field_type(e: v, eds: eds))
-          | _ -> return TyI64
-        end
-      else if cn == "Nil" then return TyI64
-      else
-        // A user-defined SUM constructor (e.g. `Red(...)` of enum `Color`): key
-        // the field by its ENUM type so the harvested anon-record helper name
-        // matches the call site's (which uses the field's semantic type). Without
-        // this the field erased to TyI64 and the synthesized helper name diverged
-        // from the called one → E3001 codegen abort (nexus-qgnoi).
-        match harvest_enum_of_variant(eds: eds, vname: cn) do
-          | Some(val: ename) -> return TyUserDefined(name: ename, args: [])
-          | None -> return TyI64
-        end
-      end
-    | MirArray(elems: es) ->
-      match es do
-        | x :: _ -> return TyList(elem: mir_field_type(e: x, eds: eds))
-        | [] -> return TyI64
-      end
-    | _ -> return TyI64
+    | MirMatch(target: t, cases: cs) -> return harvest_cases(cs, ctx, acc: harvest_expr(e: t, ctx, acc))
+    | MirWhile(cond: c, body: b) -> return harvest_stmts(stmts: b, ctx, acc: harvest_expr(e: c, ctx, acc))
+    | MirRaise(expr: x) -> return harvest_expr(e: x, ctx, acc)
+    | MirForce(expr: x) -> return harvest_expr(e: x, ctx, acc)
+    | MirMakeClosure(func_name: _, captures: cs) -> return harvest_exprs(es: cs, ctx, acc)
+    | MirSuspend(tag_name: _, payload: p, ret_type: _) -> return harvest_expr(e: p, ctx, acc)
+    | MirResume(cont_var: _, value: v, ret_type: _) -> return harvest_expr(e: v, ctx, acc)
+    | MirBlock(stmts: ss) -> return harvest_stmts(stmts: ss, ctx, acc)
+    | MirInjectValue(stmts: ss, ret_type: _) -> return harvest_stmts(stmts: ss, ctx, acc)
+    | _ -> return acc
   end
 end
 
-let mir_record_field_types = fn (fields: [ MirNamedExpr ], eds: [ EnumDef ]) -> [ NamedType ] do
-  match fields do
-    | [] -> return []
-    | MirNamedExpr(name: n, value: v) :: rest ->
-      return NamedType(name: n, typ: mir_field_type(e: v, eds: eds)) :: mir_record_field_types(fields: rest, eds: eds)
+let harvest_exprs = fn (es: [ MirExpr ], ctx: LowerCtx, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match es do
+    | [] -> return acc
+    | x :: rest -> return harvest_exprs(es: rest, ctx, acc: harvest_expr(e: x, ctx, acc))
+  end
+end
+
+let harvest_named_exprs = fn (fs: [ MirNamedExpr ], ctx: LowerCtx, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match fs do
+    | [] -> return acc
+    | MirNamedExpr(name: _, value: v) :: rest -> return harvest_named_exprs(fs: rest, ctx, acc: harvest_expr(e: v, ctx, acc))
+  end
+end
+
+let harvest_call_args = fn (cas: [ MirCallArg ], ctx: LowerCtx, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match cas do
+    | [] -> return acc
+    | MirCallArg(label: _, value: v) :: rest -> return harvest_call_args(cas: rest, ctx, acc: harvest_expr(e: v, ctx, acc))
+  end
+end
+
+let harvest_cases = fn (cs: [ MirMatchCase ], ctx: LowerCtx, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match cs do
+    | [] -> return acc
+    // Match-arm bodies run in a nested scope; the env only grows, a sound
+    // over-approximation — pattern-bound names resolve to TyI64 (their
+    // constructors are still walked).
+    | MirMatchCase(pattern: _, body: b) :: rest -> return harvest_cases(cs: rest, ctx, acc: harvest_stmts(stmts: b, ctx, acc))
+  end
+end
+
+// Walk statements threading the running env: a `let` extends the env with the
+// binding's recovered semantic type so a LATER list literal that references the
+// variable recovers the same element type the real lowering does.
+let harvest_stmts = fn (stmts: [ MirStmt ], ctx: LowerCtx, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match stmts do
+    | [] -> return acc
+    | s :: rest ->
+      let HarvestStmtResult(ctx: ctx1, acc: acc1) = harvest_stmt(s, ctx, acc)
+      return harvest_stmts(stmts: rest, ctx: ctx1, acc: acc1)
+  end
+end
+
+type HarvestStmtResult = HarvestStmtResult(ctx: LowerCtx, acc: [ TypeExpr ])
+
+let harvest_stmt = fn (s: MirStmt, ctx: LowerCtx, acc: [ TypeExpr ]) -> HarvestStmtResult throws { LirError } do
+  match s do
+    | MirStmtLet(name: n, typ: _, expr: e) ->
+      let acc1 = harvest_expr(e, ctx, acc)
+      let inst = infer_semantic_type(expr: e, ctx)
+      let LowerCtx(vars: v, semantic_vars: sv, stmts: st, temp_counter: tc, enum_defs: ed) = ctx
+      return HarvestStmtResult(ctx: LowerCtx(vars: v, semantic_vars: insert_type(name: n, typ: inst, entries: sv), stmts: st, temp_counter: tc, enum_defs: ed), acc: acc1)
+    | MirStmtExpr(expr: e) -> return HarvestStmtResult(ctx, acc: harvest_expr(e, ctx, acc))
+    | MirStmtReturn(expr: e) -> return HarvestStmtResult(ctx, acc: harvest_expr(e, ctx, acc))
+    | MirStmtAssign(target: t, value: vv) -> return HarvestStmtResult(ctx, acc: harvest_expr(e: vv, ctx, acc: harvest_expr(e: t, ctx, acc)))
+    | MirStmtTry(body: b, catch_param: _, catch_body: cb) ->
+      let acc1 = harvest_stmts(stmts: b, ctx, acc)
+      return HarvestStmtResult(ctx, acc: harvest_stmts(stmts: cb, ctx, acc: acc1))
+    | _ -> return HarvestStmtResult(ctx, acc)
+  end
+end
+
+let seed_param_env = fn (params: [ MirParam ], acc: [ TypeEntry ]) -> [ TypeEntry ] do
+  match params do
+    | [] -> return acc
+    | MirParam(label: _, name: n, typ: t) :: rest -> return seed_param_env(params: rest, acc: TypeEntry(name: n, typ: t) :: acc)
+  end
+end
+
+let harvest_func = fn (f: MirFunction, enum_defs: VariantIndex, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  let MirFunction(name: _, params: ps, ret_type: _, body: b, span: _) = f
+  let ctx0 = LowerCtx(vars: [], semantic_vars: seed_param_env(params: ps, acc: []), stmts: [], temp_counter: 0, enum_defs)
+  return harvest_stmts(stmts: b, ctx: ctx0, acc)
+end
+
+let harvest_mir_funcs = fn (funcs: [ MirFunction ], enum_defs: VariantIndex, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match funcs do
+    | [] -> return acc
+    | f :: rest -> return harvest_mir_funcs(funcs: rest, enum_defs, acc: harvest_func(f, enum_defs, acc))
   end
 end
 
 // Does a list-element type carry an anonymous record anywhere a generated helper
-// would need (the element itself, or under one or more `[..]` nestings)? Only
-// such elements need MIR-harvested helpers — primitive / named-aggregate element
-// helpers are already seeded from the type tables. (TyVar / opaque erase to a
-// value compare and don't need a structural helper.)
+// would need it (the element itself, or under one or more `[..]` nestings)?
 let elem_carries_anon_record = fn (t: TypeExpr) -> bool do
   match t do
     | TyRecord(fields: _) -> return true
@@ -1052,122 +1104,16 @@ let elem_carries_anon_record = fn (t: TypeExpr) -> bool do
   end
 end
 
-// Given the HEAD value of a list `Cons(rest, v)` (the head element `v`), push the
-// list ELEMENT type when that head is (or nests) an anonymous record, so the
-// corresponding `__streq_List$Rec$...` / `__streq_List$List$Rec$...` helper is
-// synthesized. `mir_field_type` recovers the head's structural shape: a
-// `MirRecord` head → `TyRecord` (element of `[{...}]`); a `Cons` head whose own
-// head is a record → `TyList(TyRecord)` (element of `[[{...}]]`). Heads with no
-// anon record push nothing (their list helpers, if any, are seeded elsewhere).
-// Dedup'd by helper name via push_elem.
-let push_anon_record_elem = fn (head: MirExpr, eds: [ EnumDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
-  let elem = mir_field_type(e: head, eds: eds)
-  if elem_carries_anon_record(t: elem) then return push_elem(e: elem, acc)
-  else return acc
-  end
-end
-
-// Walk a MIR expression, pushing the anonymous-record list-element type for every
-// list `Cons` (a list literal `[{...}]` / `::` desugars to `Cons`) whose head is
-// (or nests) an anonymous record. Recurses through every sub-expression /
-// statement so nested occurrences are caught.
-let harvest_expr = fn (e: MirExpr, eds: [ EnumDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
-  match e do
-    | MirConstructor(name: cn, args: cargs) ->
-      // A list literal `[{...}]` (and `::`) desugars to `Cons(rest, v)` — the
-      // load-bearing case. Alphabetical ctor args `[rest, v]` put the head value
-      // `v` at index 1; a record head means this is a list-of-anonymous-records,
-      // so push its element type and the `__streq_List$Rec$...` helper is built.
-      let acc1 = if cn == "Cons" then
-        match cargs do
-          | _ :: head :: _ -> push_anon_record_elem(head, eds: eds, acc)
-          | _ -> acc
-        end
-      else acc end
-      return harvest_exprs(es: cargs, eds: eds, acc: acc1)
-    | MirRecord(fields: fs) -> return harvest_named_exprs(fs, eds: eds, acc)
-    // A `MirArray` is the fixed-ARRAY form (`[T]` array). List literals desugar to
-    // `Cons`, not this, and arrays never reach the list `==` helper path
-    // (should_struct_eq / named_aggregate_name have no TyArray arm), so no element
-    // helper is harvested here — just recurse for any nested record literals.
-    | MirArray(elems: es) -> return harvest_exprs(es, eds: eds, acc)
-    | MirBinaryOp(left: l, op: _, right: r) -> return harvest_expr(e: r, eds: eds, acc: harvest_expr(e: l, eds: eds, acc))
-    | MirCall(func: _, args: cas, ret_type: _) -> return harvest_call_args(cas, eds: eds, acc)
-    | MirCallClosure(closure: c, args: cas, ret_type: _) -> return harvest_call_args(cas, eds: eds, acc: harvest_expr(e: c, eds: eds, acc))
-    | MirIndex(target: t, index: i) -> return harvest_expr(e: i, eds: eds, acc: harvest_expr(e: t, eds: eds, acc))
-    | MirFieldAccess(target: t, field: _) -> return harvest_expr(e: t, eds: eds, acc)
-    | MirIf(cond: c, then_body: tb, else_body: eb) ->
-      let acc1 = harvest_expr(e: c, eds: eds, acc)
-      let acc2 = harvest_stmts(stmts: tb, eds: eds, acc: acc1)
-      match eb do
-        | Some(val: ebs) -> return harvest_stmts(stmts: ebs, eds: eds, acc: acc2)
-        | None -> return acc2
-      end
-    | MirMatch(target: t, cases: cs) -> return harvest_cases(cs, eds: eds, acc: harvest_expr(e: t, eds: eds, acc))
-    | MirWhile(cond: c, body: b) -> return harvest_stmts(stmts: b, eds: eds, acc: harvest_expr(e: c, eds: eds, acc))
-    | MirRaise(expr: x) -> return harvest_expr(e: x, eds: eds, acc)
-    | MirForce(expr: x) -> return harvest_expr(e: x, eds: eds, acc)
-    | MirMakeClosure(func_name: _, captures: cs) -> return harvest_exprs(es: cs, eds: eds, acc)
-    | MirSuspend(tag_name: _, payload: p, ret_type: _) -> return harvest_expr(e: p, eds: eds, acc)
-    | MirResume(cont_var: _, value: v, ret_type: _) -> return harvest_expr(e: v, eds: eds, acc)
-    | MirBlock(stmts: ss) -> return harvest_stmts(stmts: ss, eds: eds, acc)
-    | MirInjectValue(stmts: ss, ret_type: _) -> return harvest_stmts(stmts: ss, eds: eds, acc)
-    | _ -> return acc
-  end
-end
-
-let harvest_exprs = fn (es: [ MirExpr ], eds: [ EnumDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
-  match es do
+// Non-recursive post-pass: from the flat raw list of recovered constructor types,
+// push the ELEMENT type of every `TyList(elem)` whose element carries an anonymous
+// record (dedup by helper name via push_elem).
+let harvested_anon_record_elems = fn (raw: [ TypeExpr ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match raw do
     | [] -> return acc
-    | x :: rest -> return harvest_exprs(es: rest, eds: eds, acc: harvest_expr(e: x, eds: eds, acc))
-  end
-end
-
-let harvest_named_exprs = fn (fs: [ MirNamedExpr ], eds: [ EnumDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
-  match fs do
-    | [] -> return acc
-    | MirNamedExpr(name: _, value: v) :: rest -> return harvest_named_exprs(fs: rest, eds: eds, acc: harvest_expr(e: v, eds: eds, acc))
-  end
-end
-
-let harvest_call_args = fn (cas: [ MirCallArg ], eds: [ EnumDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
-  match cas do
-    | [] -> return acc
-    | MirCallArg(label: _, value: v) :: rest -> return harvest_call_args(cas: rest, eds: eds, acc: harvest_expr(e: v, eds: eds, acc))
-  end
-end
-
-let harvest_cases = fn (cs: [ MirMatchCase ], eds: [ EnumDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
-  match cs do
-    | [] -> return acc
-    | MirMatchCase(pattern: _, body: b) :: rest -> return harvest_cases(cs: rest, eds: eds, acc: harvest_stmts(stmts: b, eds: eds, acc))
-  end
-end
-
-let harvest_stmts = fn (stmts: [ MirStmt ], eds: [ EnumDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
-  match stmts do
-    | [] -> return acc
-    | s :: rest -> return harvest_stmts(stmts: rest, eds: eds, acc: harvest_stmt(s, eds: eds, acc))
-  end
-end
-
-let harvest_stmt = fn (s: MirStmt, eds: [ EnumDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
-  match s do
-    | MirStmtLet(name: _, typ: _, expr: e) -> return harvest_expr(e, eds: eds, acc)
-    | MirStmtExpr(expr: e) -> return harvest_expr(e, eds: eds, acc)
-    | MirStmtReturn(expr: e) -> return harvest_expr(e, eds: eds, acc)
-    | MirStmtAssign(target: t, value: v) -> return harvest_expr(e: v, eds: eds, acc: harvest_expr(e: t, eds: eds, acc))
-    | MirStmtTry(body: b, catch_param: _, catch_body: cb) ->
-      return harvest_stmts(stmts: cb, eds: eds, acc: harvest_stmts(stmts: b, eds: eds, acc))
-    | _ -> return acc
-  end
-end
-
-let harvest_mir_funcs = fn (funcs: [ MirFunction ], eds: [ EnumDef ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
-  match funcs do
-    | [] -> return acc
-    | MirFunction(name: _, params: _, ret_type: _, body: b, span: _) :: rest ->
-      return harvest_mir_funcs(funcs: rest, eds: eds, acc: harvest_stmts(stmts: b, eds: eds, acc))
+    | TyList(elem: el) :: rest ->
+      let acc1 = if elem_carries_anon_record(t: el) then push_elem(e: el, acc) else acc end
+      return harvested_anon_record_elems(raw: rest, acc: acc1)
+    | _ :: rest -> return harvested_anon_record_elems(raw: rest, acc)
   end
 end
 
@@ -1197,9 +1143,14 @@ export let gen_struct_eq_helpers = fn (
   let base1 = enum_name_elems(defs: enum_def_list, acc: base)
   let base2 = record_name_elems(defs: record_defs, acc: base1)
   // Anonymous-record list element types harvested from the MIR (`[{...}]` has no
-  // declared type name to seed from). Recorded BEFORE nest_one_level so a bare
-  // `[[{...}]]` (list-of-list-of-anon-record) also gets its helper.
-  let base3 = harvest_mir_funcs(funcs: mir_funcs, eds: enum_def_list, acc: base2)
+  // declared type name to seed from). The walk recovers each list element with
+  // `infer_semantic_type` (a semantic-env walk over params + lets), so a field
+  // VALUE that is a call/variable/match/field-access (`[{ col: mk(7) }]`) keys the
+  // SAME element type the `==` call site does — nexus-h69yj. Filtered to anon-record
+  // elements (post-pass) and recorded BEFORE nest_one_level so a bare `[[{...}]]`
+  // also gets its helper.
+  let raw_harvest = harvest_mir_funcs(funcs: mir_funcs, enum_defs, acc: [])
+  let base3 = harvested_anon_record_elems(raw: raw_harvest, acc: base2)
   let nested = nest_one_level(bases: base3, acc: base3)
   let with_enum_fields = enum_field_types(defs: enum_def_list, acc: nested)
   let with_rec_fields = record_field_types(defs: record_defs, acc: with_enum_fields)
