@@ -1,0 +1,921 @@
+/**
+ * struct_eq/emit: per-type `__streq_<T>` helper EMISSION — the structural-equality
+ * comparison codegen.
+ *
+ * Owns the emission CORE shared by every struct-eq helper:
+ *  - Naming / keying of helpers (`struct_eq_helper_name`, `list_elem_key`,
+ *    `inst_key`, `enum_inst_name`, anon-record structural keys, …)
+ *  - Operand-type classification (`should_struct_eq`, `pick_struct_sem`,
+ *    `named_aggregate_name`, `list_elem_covered`, …)
+ *  - Field-name (alphabetical) heap layout (`heap_index_of`, …)
+ *  - Per-field load + recursive compare (`compare_field`, `compare_values`,
+ *    `compare_record`, `compare_sum`, `compare_variant_payload`, `call_helper`,
+ *    `compare_primitive`, `emit_variant_dispatch`, `build_branch_stmts`)
+ *  - Per-type helper synthesis (`make_helper`, `make_list_helper`,
+ *    `make_inst_enum_helper`, `make_enum_helpers`, `make_record_helpers`)
+ *
+ * Used by struct_eq/harvest.nx (element-type discovery), struct_eq/inst.nx
+ * (per-instantiation routing), and the struct_eq.nx facade (public entry). This
+ * module imports neither — it is the emission leaf.
+ */
+import { TypeExpr, TyRecord, TyUserDefined, TyBool, TyI64, TyF64, TyChar,
+         TyString, TyList, TyVar, NamedType,
+         EnumDef, RecordDef, VariantDef, VariantField } from "src/types/type_expr.nx"
+import { Span } from "src/types/span.nx"
+import { BinaryOp, OpEq, OpNe, OpAnd } from "src/types/vocab.nx"
+import {
+  LirAtom,
+  LirAtomVar,
+  LirAtomBool,
+  LirAtomInt,
+  LirExpr,
+  LirExprAtom,
+  LirExprBinary,
+  LirExprCall,
+  LirExprObjectField,
+  LirExprObjectTag,
+  LirCallArg,
+  LirParam,
+  LirFunction,
+  LirStmt,
+  LirStmtLet,
+  LirStmtIf
+} from "src/ir/lir/types.nx"
+import {
+  LowerCtx,
+  BindResult,
+  bind_expr_to_temp
+} from "src/ir/lir/context.nx"
+import { LirError } from "src/ir/lir/errors.nx"
+import { Some, None, Option } from "std:option"
+import * as list from "std:list"
+import * as str from "std:str"
+import { VariantIndex }, * as vidx from "src/ir/support/variant_index.nx"
+import { constructor_tag } from "src/backend/wasm/defs.nx"
+
+// ─── Helper naming ──────────────────────────────────────────────────────────
+
+/** Canonical synthesized helper name for a named aggregate type. One helper per
+ *  distinct type name; recursive / mutually-recursive references reuse the same
+ *  name so the emitted wasm calls itself / its sibling. */
+export let struct_eq_helper_name = fn (type_name: string) -> string do
+  return "__streq_" ++ type_name
+end
+
+// Canonical key string for a list ELEMENT type. Distinct element types map to
+// distinct keys (so `[i64]` and `[string]` get separate helpers); the SAME
+// element type always maps to the same key, so a recursive `rest: [elem]` field
+// self-calls the right helper. A type-parameter / unknown element erases to the
+// generic key, whose helper bottoms out at an i64 value compare on the element
+// (acceptable per the monomorphic-helper precedent — generic `List<T>` recursion
+// is type-erased). The synthetic helper-bearing type name for `[elem]` is
+// `List$<key(elem)>`, never collidable with a user type (`$` is not a legal
+// identifier char), and shared so the helper recurses on itself.
+export let list_elem_key = fn (elem: TypeExpr) -> string do
+  match elem do
+    | TyI64 -> return "i64"
+    | TyBool -> return "bool"
+    | TyF64 -> return "f64"
+    | TyChar -> return "char"
+    | TyString -> return "string"
+    | TyUserDefined(name: n, args: _) -> return n
+    | TyList(elem: inner) -> return "List$" ++ list_elem_key(elem: inner)
+    // An ANONYMOUS record element (`[{a, b}]`) carries no type name, so derive a
+    // stable structural key from its (alphabetically sorted) field names + field
+    // types. Two anon records that differ in field names OR field types get
+    // distinct keys (hence distinct helpers); the SAME shape always maps to the
+    // same key so a `rest: [{...}]` recursion self-calls the right helper. The
+    // `$` / `_` separators are not legal identifier chars, so the synthesized
+    // `List$Rec$...` name can never collide with a user type or another key.
+    | TyRecord(fields: fs) -> return "Rec$" ++ anon_record_key(fields: fs)
+    | _ -> return "T"
+  end
+end
+
+// Stable key fragment for an anonymous record's field set: alphabetically sorted
+// `name=type` pairs joined by `~` (so field order at the literal can't change the
+// key, matching the alphabetical heap layout). Field types recurse through
+// list_elem_key, so a nested anon-record / list field contributes structurally.
+export let anon_record_key = fn (fields: [ NamedType ]) -> string do
+  return anon_record_key_go(fields: sort_named_fields(fields), first: true, acc: "")
+end
+
+let anon_record_key_go = fn (fields: [ NamedType ], first: bool, acc: string) -> string do
+  match fields do
+    | [] -> return acc
+    | NamedType(name: n, typ: t) :: rest ->
+      let piece = n ++ "=" ++ list_elem_key(elem: t)
+      let acc2 = if first then piece else acc ++ "~" ++ piece end
+      return anon_record_key_go(fields: rest, first: false, acc: acc2)
+  end
+end
+
+// Sort record fields alphabetically by name (mirrors the alphabetical heap
+// layout used by record extraction and `heap_index_of`).
+let sort_named_fields = fn (fields: [ NamedType ]) -> [ NamedType ] do
+  match fields do
+    | [] -> return []
+    | x :: rest -> return list.insert_sorted_by(x, xs: sort_named_fields(fields: rest), lt: fn (a: NamedType, b: NamedType) -> bool do
+        let NamedType(name: an, typ: _) = a
+        let NamedType(name: bn, typ: _) = b
+        return an < bn
+      end)
+  end
+end
+
+// Synthetic helper-bearing type name for the list type `[elem]`.
+export let list_type_name = fn (elem: TypeExpr) -> string do
+  return "List$" ++ list_elem_key(elem)
+end
+
+// ─── Per-instantiation keying (generic-enum-at-concrete payload) ────────────
+//
+// `list_elem_key` ERASES a generic instantiation's type arguments
+// (`TyUserDefined(n, _) -> n`), so `Option<Color>` and `Option<i64>` share the
+// bare `__streq_Option` / `__streq_List$Option` helper (whose type-parameter
+// payload is identity-compared). `inst_key` instead PRESERVES the arguments
+// (`Option<Color>` → `Option$Color`), keying the per-instantiation structural
+// helper whose payload recurses into the concrete type's own compare. Used only
+// on the gen-inst routing path (a `==` site or another per-inst helper body); a
+// BARE helper body keeps `list_elem_key`'s erasure so a never-`==`'d type's
+// concrete generic field (`VariantIndex.by_variant: Map<string, VariantInfo>`)
+// routes to the bare element helper — never dragging in a per-inst closure.
+export let inst_key = fn (t: TypeExpr) -> string do
+  match t do
+    | TyI64 -> return "i64"
+    | TyBool -> return "bool"
+    | TyF64 -> return "f64"
+    | TyChar -> return "char"
+    | TyString -> return "string"
+    | TyUserDefined(name: n, args: []) -> return n
+    | TyUserDefined(name: n, args: ats) -> return n ++ "$" ++ inst_key_args(ats, first: true, acc: "")
+    | TyList(elem: inner) -> return "List$" ++ inst_key(t: inner)
+    | TyRecord(fields: fs) -> return "Rec$" ++ anon_record_key(fields: fs)
+    | _ -> return "T"
+  end
+end
+
+let inst_key_args = fn (ats: [ TypeExpr ], first: bool, acc: string) -> string do
+  match ats do
+    | [] -> return acc
+    | a :: rest ->
+      let piece = inst_key(t: a)
+      let acc2 = if first then piece else acc ++ "$" ++ piece end
+      return inst_key_args(ats: rest, first: false, acc: acc2)
+  end
+end
+
+// The per-instantiation enum helper's type-name for `Enum<args>` (e.g.
+// `Option$Color`). Equal to `inst_key(TyUserDefined(enum, args))` so a nested
+// `Option<Option<Color>>` field and the standalone `Option<Color>` `==` site key
+// the SAME `__streq_Option$Color` helper.
+export let enum_inst_name = fn (enum: string, args: [ TypeExpr ]) -> string do
+  return inst_key(t: TyUserDefined(name: enum, args))
+end
+
+// True iff `t` is a CONCRETE generic instantiation `K<args>` with at least one
+// argument and no remaining type variable (`TyVar`) — i.e. one for which a
+// per-instantiation helper can be keyed. A bare `K<>` (no args), a primitive, or
+// a `TyVar`-bearing shape is NOT.
+export let is_concrete_generic_inst = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyUserDefined(name: _, args: []) -> return false
+    | TyUserDefined(name: _, args: ats) -> return !type_list_has_tyvar(ts: ats)
+    | _ -> return false
+  end
+end
+
+let type_has_tyvar_se = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyVar(name: _) -> return true
+    | TyList(elem: e) -> return type_has_tyvar_se(t: e)
+    | TyUserDefined(name: _, args: ats) -> return type_list_has_tyvar(ts: ats)
+    | TyRecord(fields: fs) -> return named_list_has_tyvar(nts: fs)
+    | _ -> return false
+  end
+end
+
+let type_list_has_tyvar = fn (ts: [ TypeExpr ]) -> bool do
+  match ts do
+    | [] -> return false
+    | t :: rest -> if type_has_tyvar_se(t) then return true else return type_list_has_tyvar(ts: rest) end
+  end
+end
+
+let named_list_has_tyvar = fn (nts: [ NamedType ]) -> bool do
+  match nts do
+    | [] -> return false
+    | NamedType(name: _, typ: t) :: rest -> if type_has_tyvar_se(t) then return true else return named_list_has_tyvar(nts: rest) end
+  end
+end
+
+// The monomorphized `Cons`/`Nil` variant defs for `[elem]`, matching the
+// built-in `List` layout (`Cons(v: elem, rest: [elem])`, `Nil`). Drives the
+// list helper body's structural compare: the `v` field recurses on `elem`
+// (string→string compare, record→its helper, list→its helper); the `rest`
+// field recurses on `[elem]` → a self-call of this list's helper.
+let list_variant_defs = fn (elem: TypeExpr) -> [ VariantDef ] do
+  return [
+    VariantDef(name: "Nil", fields: []),
+    VariantDef(name: "Cons", fields: [
+      VariantField(name: Some(val: "v"), typ: elem),
+      VariantField(name: Some(val: "rest"), typ: TyList(elem)) ]) ]
+end
+
+// ─── Operand-type classification ────────────────────────────────────────────
+
+export let resolve_operand_type = fn (t: TypeExpr, ctx: LowerCtx) -> TypeExpr do
+  // A named type may be a record alias (resolve to its TyRecord body) or a sum
+  // (kept as TyUserDefined so the sum path can enumerate variants). Records
+  // already arrive as TyRecord.
+  let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
+  match t do
+    | TyUserDefined(name: _, args: _) -> return vidx.resolve_record_alias(idx: ed, typ: t)
+    | _ -> return t
+  end
+end
+
+/** True iff `op` is an equality operator (`==` / `!=`) — the only ops with a
+ *  structural variant. Ordering comparisons (`<`, `<=`, …) are out of scope. */
+export let is_struct_eq_op = fn (op: BinaryOp) -> bool do
+  match op do
+    | OpEq | OpNe -> return true
+    | _ -> return false
+  end
+end
+
+/** Pick the better structural-compare type from a `==`/`!=` site's two operand
+ *  semantic types. When BOTH name the same generic enum but only ONE carries the
+ *  concrete instantiation (`a: Option<Color>` vs an erased `b: Option<>` coming
+ *  from a bare `None` / a TyI64-defaulted value), prefer the CONCRETE side so the
+ *  site routes to the per-instantiation structural helper rather than the
+ *  type-erased bare one (which would identity-compare a sum/record payload).
+ *  Otherwise keep the existing left-biased "first that needs a structural
+ *  compare" choice. */
+export let pick_struct_sem = fn (a: TypeExpr, b: TypeExpr, ctx: LowerCtx) -> TypeExpr do
+  let a_ok = should_struct_eq(t: a, ctx)
+  let b_ok = should_struct_eq(t: b, ctx)
+  // If exactly one side is structural, that side is the only choice.
+  if a_ok && !b_ok then return a end
+  if b_ok && !a_ok then return b end
+  // Both structural: prefer a concrete generic instantiation over an erased one.
+  if is_concrete_generic_inst(t: a) && !is_concrete_generic_inst(t: b) then return a end
+  if is_concrete_generic_inst(t: b) && !is_concrete_generic_inst(t: a) then return b end
+  // Neither (or both) concrete: keep the prior left-biased choice.
+  if a_ok then return a else return b end
+end
+
+/** True iff `==`/`!=` on an operand of semantic type `t` needs a structural
+ *  compare: `t` resolves to a record, or to a named sum with known variants.
+ *  Primitives / strings / unknown (TyI64-erased) types return false and keep
+ *  the legacy value/identity binary path. */
+export let should_struct_eq = fn (t: TypeExpr, ctx: LowerCtx) -> bool do
+  match resolve_operand_type(t, ctx) do
+    | TyRecord(fields: _) -> return true
+    // A `[elem]` list compares structurally (same length AND element-wise equal)
+    // via a generated runtime helper, NOT the heap-pointer identity the legacy
+    // binary path produces. Element structurality is preserved through the
+    // helper keyed on `elem` (strings/records/nested lists recurse correctly).
+    | TyList(elem: _) -> return true
+    | TyUserDefined(name: en, args: _) ->
+      let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
+      match vidx.variants_of_enum(idx: ed, enum_name: en) do
+        | [] -> return false
+        | _ -> return true
+      end
+    | _ -> return false
+  end
+end
+
+// `named_aggregate_name`: the helper-bearing type name of `t`, if `t` is a named
+// sum (TyUserDefined with known variants) or a named record alias (TyUserDefined
+// resolving to a TyRecord body). Anonymous TyRecord carries no name → None.
+
+// True iff `elem`'s specific list helper (`__streq_List$<key(elem)>`) is among
+// the generated set, so `[elem]` can route to it (preserving element
+// structurality). Mirrors gen_struct_eq_helpers' coverage: primitives, named
+// aggregates with in-scope structure, and ONE level of list-of-those. Anything
+// else (deeper bare nesting, type vars, opaque enums) is uncovered and routes to
+// the generic `__streq_List$T` helper, whose element compare is the i64 value
+// compare (type-erased precedent).
+let list_elem_covered = fn (elem: TypeExpr, ctx: LowerCtx) -> bool do
+  match elem do
+    | TyI64 | TyString | TyBool | TyF64 | TyChar -> return true
+    // An ANONYMOUS record element (`[{a, b}]`) gets a structural list helper
+    // whose head compare expands the record inline (compare_record). Always
+    // covered — the helper is synthesized from the anon-record element types
+    // harvested out of the MIR (see harvest_mir_anon_record_lists).
+    | TyRecord(fields: _) -> return true
+    | TyUserDefined(name: _, args: _) ->
+      match resolve_operand_type(t: elem, ctx) do
+        | TyRecord(fields: _) -> return true
+        | TyUserDefined(name: en, args: _) ->
+          let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
+          match vidx.variants_of_enum(idx: ed, enum_name: en) do
+            | [] -> return false
+            | _ -> return true
+          end
+        | _ -> return false
+      end
+    // One nesting level: `[[prim]]` / `[[aggregate]]` / `[[{...}]]` are
+    // generated; deeper not.
+    | TyList(elem: inner) ->
+      match inner do
+        | TyI64 | TyString | TyBool | TyF64 | TyChar -> return true
+        | TyRecord(fields: _) -> return list_elem_covered(elem: inner, ctx)
+        | TyUserDefined(name: _, args: _) -> return list_elem_covered(elem: inner, ctx)
+        | _ -> return false
+      end
+    | _ -> return false
+  end
+end
+
+// Helper-bearing type name for a `[elem]` compare site: the specific element
+// helper when covered, else the generic `List$T` fallback. The recursive `rest`
+// field inside a helper resolves through this same routing on the SAME element
+// type, so it self-calls the right helper consistently.
+//
+// `gen_inst` selects the element KEY: on the gen-inst path (a `==` site / a
+// per-instantiation helper body) a concrete generic element `Option<Color>` keys
+// the per-instantiation list helper `List$Option$Color` (whose `v` recurses into
+// `__streq_Option$Color`); a BARE helper body (`gen_inst = false`) erases the
+// element's args so `[Option<i64>]` routes to the bare `List$Option` (today's
+// type-erased behavior). The worklist guarantees every `gen_inst`-keyed list
+// helper is actually synthesized.
+let list_site_type_name = fn (elem: TypeExpr, gen_inst: bool, ctx: LowerCtx) -> string do
+  if list_elem_covered(elem, ctx) then
+    if gen_inst then return "List$" ++ inst_key(t: elem) else return list_type_name(elem) end
+  else return list_type_name(elem: TyVar(name: "T"))
+  end
+end
+
+// `named_aggregate_name`: the helper-bearing type name of `t`. On the `gen_inst`
+// path a concrete generic-enum instantiation `Enum<args>` routes to its
+// per-instantiation helper `Enum$args` (structural payload compare); off it
+// (a bare helper body) the args are erased to the bare `Enum` so a never-`==`'d
+// type's concrete generic field never requests an un-generated per-inst helper.
+let named_aggregate_name = fn (t: TypeExpr, gen_inst: bool, ctx: LowerCtx) -> Option<string> do
+  match t do
+    // `[elem]` routes to the per-element-type generated list helper. Returning a
+    // name here makes `compare_values` emit a CALL (not an inline expansion), so
+    // the recursive `rest` field terminates at run time like recursive sums do.
+    | TyList(elem: et) -> return Some(val: list_site_type_name(elem: et, gen_inst, ctx))
+    | TyUserDefined(name: n, args: _) ->
+      // Either a record alias or a sum with known variants gets a helper.
+      match resolve_operand_type(t, ctx) do
+        | TyRecord(fields: _) -> return Some(val: n)
+        | TyUserDefined(name: en, args: _) ->
+          let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
+          match vidx.variants_of_enum(idx: ed, enum_name: en) do
+            | [] -> return None
+            | _ ->
+              // Per-instantiation helper on the gen-inst path for a concrete
+              // generic enum; bare helper otherwise.
+              if gen_inst && is_concrete_generic_inst(t) then return Some(val: enum_inst_name(enum: en, args: inst_args_of(t)))
+              else return Some(val: en) end
+          end
+        | _ -> return None
+      end
+    | _ -> return None
+  end
+end
+
+let inst_args_of = fn (t: TypeExpr) -> [ TypeExpr ] do
+  match t do
+    | TyUserDefined(name: _, args: ats) -> return ats
+    | _ -> return []
+  end
+end
+
+// ─── Field-name layout (alphabetical, mirrors HIR sort_ctor_args / record sort)
+
+let sort_names = fn (ns: [ string ]) -> [ string ] do
+  match ns do
+    | [] -> return []
+    | x :: rest -> return list.insert_sorted_by(x, xs: sort_names(ns: rest), lt: fn (a: string, b: string) -> bool do return a < b end)
+  end
+end
+
+// Alphabetical heap index of `name` among `all_names` (the field's position once
+// the field-name set is sorted). Matches constructor_field_heap_index /
+// sorted_named_type_index used everywhere else.
+let heap_index_of = fn (name: string, all_names: [ string ]) -> i64 do
+  return heap_index_go(name, sorted: sort_names(ns: all_names), idx: 0)
+end
+
+let heap_index_go = fn (name: string, sorted: [ string ], idx: i64) -> i64 do
+  match sorted do
+    | [] -> return idx
+    | h :: rest ->
+      if h == name then return idx
+      else return heap_index_go(name, sorted: rest, idx: idx + 1)
+      end
+  end
+end
+
+// ─── Per-field load + recursive compare ─────────────────────────────────────
+
+export type CmpResult = CmpResult(ctx: LowerCtx, atom: LirAtom)
+
+// Load `parent.field[heap_idx]` (object field at alphabetical index) for both
+// operands and compare them structurally. `gen_inst` is forwarded so a concrete
+// generic-enum field routes to its per-instantiation helper on the gen-inst path
+// (a `==` site / per-inst helper body) and to the bare/erased helper otherwise.
+let compare_field = fn (
+  lhs_parent: LirAtom,
+  rhs_parent: LirAtom,
+  heap_idx: i64,
+  field_type: TypeExpr,
+  gen_inst: bool,
+  ctx: LowerCtx
+) -> CmpResult throws { LirError } do
+  // wasm slot type for the field load: strings flow as i64 packed handles but
+  // must be TYPED TyString so the recursive compare routes through the string
+  // path (codegen is_string_op trusts atom_type == TyString). Aggregates and
+  // primitives load as i64.
+  let load_wt = match resolve_operand_type(t: field_type, ctx) do
+    | TyString -> TyString
+    | _ -> TyI64
+  end
+  let BindResult(ctx: ctx1, atom: l_field) = bind_expr_to_temp(
+    ctx,
+    expr: LirExprObjectField(value: lhs_parent, index: heap_idx, typ: load_wt),
+    typ: load_wt
+  )
+  let BindResult(ctx: ctx2, atom: r_field) = bind_expr_to_temp(
+    ctx: ctx1,
+    expr: LirExprObjectField(value: rhs_parent, index: heap_idx, typ: load_wt),
+    typ: load_wt
+  )
+  return compare_values(l: l_field, r: r_field, sem_type: field_type, gen_inst, ctx: ctx2)
+end
+
+// Compare two already-loaded operand atoms of semantic type `sem_type`,
+// emitting whatever statements the comparison needs and yielding a bool atom.
+//
+// A NAMED aggregate (sum / record alias) routes to a CALL of that type's
+// generated helper — including recursive positions, which terminate at run time.
+// An ANONYMOUS record is expanded inline one level (its aggregate fields recurse
+// through their helpers). Everything else is a single value compare. `gen_inst`
+// selects per-instantiation vs bare/erased routing for a concrete generic enum
+// (see `named_aggregate_name`).
+export let compare_values = fn (
+  l: LirAtom,
+  r: LirAtom,
+  sem_type: TypeExpr,
+  gen_inst: bool,
+  ctx: LowerCtx
+) -> CmpResult throws { LirError } do
+  match named_aggregate_name(t: sem_type, gen_inst, ctx) do
+    | Some(val: nm) -> return call_helper(l, r, type_name: nm, ctx)
+    | None ->
+      match resolve_operand_type(t: sem_type, ctx) do
+        | TyRecord(fields: fs) -> return compare_record(l, r, fields: fs, gen_inst, ctx)
+        | _ -> return compare_primitive(l, r, ctx)
+      end
+  end
+end
+
+// Emit `__streq_<type_name>(l, r)` and bind the bool result. The args are
+// emitted in sorted-param order (labels "l" < "r") so the positional
+// internal-call ABI lines up with the helper's sorted params.
+let call_helper = fn (
+  l: LirAtom,
+  r: LirAtom,
+  type_name: string,
+  ctx: LowerCtx
+) -> CmpResult throws { LirError } do
+  let BindResult(ctx: ctx1, atom) = bind_expr_to_temp(
+    ctx,
+    expr: LirExprCall(
+      func: struct_eq_helper_name(type_name),
+      args: [ LirCallArg(label: "l", value: l), LirCallArg(label: "r", value: r) ],
+      typ: TyBool
+    ),
+    typ: TyBool
+  )
+  return CmpResult(ctx: ctx1, atom)
+end
+
+// Primitive / string / type-param / opaque: a single value-compare binary.
+// TyString operands route to emit_string_compare in codegen; everything else to
+// i32/i64 eq.
+let compare_primitive = fn (
+  l: LirAtom,
+  r: LirAtom,
+  ctx: LowerCtx
+) -> CmpResult throws { LirError } do
+  let BindResult(ctx: ctx1, atom) = bind_expr_to_temp(
+    ctx,
+    expr: LirExprBinary(op: OpEq, lhs: l, rhs: r, typ: TyBool),
+    typ: TyBool
+  )
+  return CmpResult(ctx: ctx1, atom)
+end
+
+// ─── Record compare: AND-fold field comparisons ────────────────────────────
+
+let record_field_names = fn (fields: [ NamedType ], acc: [ string ]) -> [ string ] do
+  match fields do
+    | [] -> return list.reverse(xs: acc)
+    | NamedType(name: n, typ: _) :: rest -> return record_field_names(fields: rest, acc: n :: acc)
+  end
+end
+
+export let compare_record = fn (
+  l: LirAtom,
+  r: LirAtom,
+  fields: [ NamedType ],
+  gen_inst: bool,
+  ctx: LowerCtx
+) -> CmpResult throws { LirError } do
+  let all_names = record_field_names(fields, acc: [])
+  return compare_record_go(l, r, fields, all_names, acc: None, gen_inst, ctx)
+end
+
+let compare_record_go = fn (
+  l: LirAtom,
+  r: LirAtom,
+  fields: [ NamedType ],
+  all_names: [ string ],
+  acc: Option<LirAtom>,
+  gen_inst: bool,
+  ctx: LowerCtx
+) -> CmpResult throws { LirError } do
+  match fields do
+    | [] ->
+      match acc do
+        | Some(val: a) -> return CmpResult(ctx, atom: a)
+        // Empty record: structurally equal unconditionally.
+        | None -> return CmpResult(ctx, atom: LirAtomBool(val: true))
+      end
+    | NamedType(name: fname, typ: ftyp) :: rest ->
+      let heap_idx = heap_index_of(name: fname, all_names)
+      let CmpResult(ctx: ctx1, atom: feq) = compare_field(
+        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, gen_inst, ctx
+      )
+      let next_acc = match acc do
+        | None -> CmpResult(ctx: ctx1, atom: feq)
+        | Some(val: prev) ->
+          let BindResult(ctx: ctx2, atom: anded) = bind_expr_to_temp(
+            ctx: ctx1,
+            expr: LirExprBinary(op: OpAnd, lhs: prev, rhs: feq, typ: TyBool),
+            typ: TyBool
+          )
+          CmpResult(ctx: ctx2, atom: anded)
+      end
+      let CmpResult(ctx: ctx3, atom: acc_atom) = next_acc
+      return compare_record_go(l, r, fields: rest, all_names, acc: Some(val: acc_atom), gen_inst, ctx: ctx3)
+  end
+end
+
+// ─── Sum compare: tag check then per-variant payload dispatch ───────────────
+
+let variant_field_name = fn (vf: VariantField, pos_from_end: i64) -> string do
+  let VariantField(name: n_opt, typ: _) = vf
+  match n_opt do
+    | Some(val: n) -> return n
+    | None -> return str.from_i64(val: pos_from_end)
+  end
+end
+
+let count_fields = fn (fs: [ VariantField ]) -> i64 do
+  match fs do
+    | [] -> return 0
+    | _ :: rest -> return 1 + count_fields(fs: rest)
+  end
+end
+
+// Build the (alphabetical) field-name list for a variant, matching
+// get_variant_field_names in match_tree/emit.nx (positional fields named by
+// their position-from-end).
+let variant_field_names = fn (fs: [ VariantField ], acc: [ string ]) -> [ string ] do
+  match fs do
+    | [] -> return list.reverse(xs: acc)
+    | vf :: rest ->
+      let nm = variant_field_name(vf, pos_from_end: count_fields(fs: rest))
+      return variant_field_names(fs: rest, acc: nm :: acc)
+  end
+end
+
+let arity_of = fn (vd: VariantDef) -> i64 do
+  let VariantDef(name: _, fields: fs) = vd
+  return count_fields(fs)
+end
+
+// Compare the payload fields of ONE variant (both operands already known to
+// carry this variant's tag). AND-folds per-field comparisons; nullary → true.
+let compare_variant_payload = fn (
+  l: LirAtom,
+  r: LirAtom,
+  vd: VariantDef,
+  gen_inst: bool,
+  ctx: LowerCtx
+) -> CmpResult throws { LirError } do
+  let VariantDef(name: _, fields: fs) = vd
+  let all_names = variant_field_names(fs, acc: [])
+  return compare_variant_fields_go(l, r, fields: fs, all_names, acc: None, gen_inst, ctx)
+end
+
+let compare_variant_fields_go = fn (
+  l: LirAtom,
+  r: LirAtom,
+  fields: [ VariantField ],
+  all_names: [ string ],
+  acc: Option<LirAtom>,
+  gen_inst: bool,
+  ctx: LowerCtx
+) -> CmpResult throws { LirError } do
+  match fields do
+    | [] ->
+      match acc do
+        | Some(val: a) -> return CmpResult(ctx, atom: a)
+        | None -> return CmpResult(ctx, atom: LirAtomBool(val: true))
+      end
+    | VariantField(name: n_opt, typ: ftyp) :: rest ->
+      let fname = match n_opt do
+        | Some(val: n) -> n
+        | None -> str.from_i64(val: count_fields(fs: rest))
+      end
+      let heap_idx = heap_index_of(name: fname, all_names)
+      let CmpResult(ctx: ctx1, atom: feq) = compare_field(
+        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, gen_inst, ctx
+      )
+      let next_acc = match acc do
+        | None -> CmpResult(ctx: ctx1, atom: feq)
+        | Some(val: prev) ->
+          let BindResult(ctx: ctx2, atom: anded) = bind_expr_to_temp(
+            ctx: ctx1,
+            expr: LirExprBinary(op: OpAnd, lhs: prev, rhs: feq, typ: TyBool),
+            typ: TyBool
+          )
+          CmpResult(ctx: ctx2, atom: anded)
+      end
+      let CmpResult(ctx: ctx3, atom: acc_atom) = next_acc
+      return compare_variant_fields_go(l, r, fields: rest, all_names,
+                                       acc: Some(val: acc_atom), gen_inst, ctx: ctx3)
+  end
+end
+
+// Sum equality: load both tags, require tag equality, then dispatch on the
+// (shared) tag to the matching variant's payload compare. Variants are
+// processed as a chain of `if tag_l == constructor_tag(V) then <payload eq>`;
+// the trailing default yields `true` (tags already equal ⇒ same nullary /
+// already-handled variant). The whole thing is AND'd with the tag-equality
+// flag so a tag mismatch is `false` regardless of payload reads.
+export let compare_sum = fn (
+  l: LirAtom,
+  r: LirAtom,
+  variants: [ VariantDef ],
+  gen_inst: bool,
+  ctx: LowerCtx
+) -> CmpResult throws { LirError } do
+  // tag_l / tag_r
+  let BindResult(ctx: c1, atom: tag_l) = bind_expr_to_temp(
+    ctx, expr: LirExprObjectTag(value: l, typ: TyI64), typ: TyI64
+  )
+  let BindResult(ctx: c2, atom: tag_r) = bind_expr_to_temp(
+    ctx: c1, expr: LirExprObjectTag(value: r, typ: TyI64), typ: TyI64
+  )
+  let BindResult(ctx: c3, atom: tags_eq) = bind_expr_to_temp(
+    ctx: c2, expr: LirExprBinary(op: OpEq, lhs: tag_l, rhs: tag_r, typ: TyBool), typ: TyBool
+  )
+  // Pre-declare the payload-result temp; the guarded dispatch assigns it.
+  let BindResult(ctx: c4, atom: payload_eq) = bind_expr_to_temp(
+    ctx: c3, expr: LirExprBinary(op: OpEq, lhs: tag_l, rhs: tag_l, typ: TyBool), typ: TyBool
+  )
+  let payload_name = match payload_eq do
+    | LirAtomVar(name: pn, typ: _) -> pn
+    | _ -> ""
+  end
+  // Guard the per-variant payload compare behind tag equality. When the tags
+  // DIFFER the payloads must NOT be read: with structural recursion a field of
+  // the wrong-shaped operand would be loaded as a heap pointer and recursed
+  // into, faulting on garbage. So: `if tags_eq then <dispatch> else payload=false`.
+  let LowerCtx(vars: gv, semantic_vars: gsv, stmts: g_saved, temp_counter: gc, enum_defs: ged) = c4
+  let then_ctx0 = LowerCtx(vars: gv, semantic_vars: gsv, stmts: [], temp_counter: gc, enum_defs: ged)
+  let then_done = emit_variant_dispatch(l, r, tag_l, variants, payload_name, gen_inst, ctx: then_ctx0)
+  let LowerCtx(vars: tv, semantic_vars: tsv, stmts: then_rev, temp_counter: tc, enum_defs: ted) = then_done
+  let then_stmts = list.reverse(xs: then_rev)
+  let else_stmts = [ LirStmtLet(name: payload_name, typ: TyBool, expr: LirExprAtom(atom: LirAtomBool(val: false))) ]
+  let c5 = LowerCtx(
+    vars: tv, semantic_vars: tsv,
+    stmts: LirStmtIf(cond: tags_eq, then_body: then_stmts, else_body: else_stmts) :: g_saved,
+    temp_counter: tc, enum_defs: ted
+  )
+  // result = tags_eq && payload_eq (payload_eq already false on tag mismatch).
+  let BindResult(ctx: c6, atom: result) = bind_expr_to_temp(
+    ctx: c5,
+    expr: LirExprBinary(op: OpAnd, lhs: tags_eq, rhs: payload_eq, typ: TyBool),
+    typ: TyBool
+  )
+  return CmpResult(ctx: c6, atom: result)
+end
+
+// Emit `if tag_l == ctor_tag(V) then payload_name = <V payload eq> else <rest>`
+// chained over all variants. Each branch is lowered in an ISOLATED stmt list
+// (saved/restored ctx.stmts) so the nested compares land inside the branch.
+let emit_variant_dispatch = fn (
+  l: LirAtom,
+  r: LirAtom,
+  tag_l: LirAtom,
+  variants: [ VariantDef ],
+  payload_name: string,
+  gen_inst: bool,
+  ctx: LowerCtx
+) -> LowerCtx throws { LirError } do
+  match variants do
+    | [] -> return ctx
+    | vd :: rest ->
+      let VariantDef(name: vname, fields: _) = vd
+      let tag_val = constructor_tag(name: vname, arity: arity_of(vd))
+      // cond = (tag_l == tag_val)
+      let BindResult(ctx: c1, atom: cond) = bind_expr_to_temp(
+        ctx,
+        expr: LirExprBinary(op: OpEq, lhs: tag_l, rhs: LirAtomInt(val: tag_val), typ: TyBool),
+        typ: TyBool
+      )
+      // THEN branch: compute this variant's payload eq into payload_name.
+      let then_stmts = build_branch_stmts(
+        l, r, vd, payload_name, gen_inst, ctx: c1
+      )
+      // ELSE branch: recurse over the remaining variants, again isolated.
+      let LowerCtx(vars: ev, semantic_vars: esv, stmts: saved, temp_counter: ec, enum_defs: eed) = c1
+      let else_ctx0 = LowerCtx(vars: ev, semantic_vars: esv, stmts: [],
+                               temp_counter: ec, enum_defs: eed)
+      let else_done = emit_variant_dispatch(l, r, tag_l, variants: rest,
+                                            payload_name, gen_inst, ctx: else_ctx0)
+      let LowerCtx(vars: ev2, semantic_vars: esv2, stmts: else_rev,
+                   temp_counter: ec2, enum_defs: eed2) = else_done
+      let else_stmts = list.reverse(xs: else_rev)
+      // Re-emit the if into the ORIGINAL (restored) stmt stream.
+      let c_final = LowerCtx(
+        vars: ev2, semantic_vars: esv2,
+        stmts: LirStmtIf(cond, then_body: then_stmts, else_body: else_stmts) :: saved,
+        temp_counter: ec2, enum_defs: eed2
+      )
+      return c_final
+  end
+end
+
+// Lower one variant's payload comparison in an isolated stmt list, with a
+// trailing assignment of the result into `payload_name`. Returns the branch
+// statement list (forward order).
+let build_branch_stmts = fn (
+  l: LirAtom,
+  r: LirAtom,
+  vd: VariantDef,
+  payload_name: string,
+  gen_inst: bool,
+  ctx: LowerCtx
+) -> [ LirStmt ] throws { LirError } do
+  let LowerCtx(vars: v, semantic_vars: sv, stmts: _, temp_counter: c, enum_defs: ed) = ctx
+  let iso = LowerCtx(vars: v, semantic_vars: sv, stmts: [], temp_counter: c, enum_defs: ed)
+  let CmpResult(ctx: iso2, atom: peq) = compare_variant_payload(l, r, vd, gen_inst, ctx: iso)
+  let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = iso2
+  let assign = LirStmtLet(name: payload_name, typ: TyBool, expr: LirExprAtom(atom: peq))
+  return list.reverse(xs: assign :: body_rev)
+end
+
+// ─── Generated runtime helpers ──────────────────────────────────────────────
+
+let zero_span = Span(offset: 0, line: 0, col: 0)
+
+// Build the body of a structural-compare helper for `sem_type` with the two
+// operands bound to params `l` / `r`. Returns the helper's statement list
+// (forward order) and the final bool result atom. The body compares ONE LEVEL
+// of `sem_type`'s structure inline; aggregate field positions emit a CALL to the
+// relevant helper (self-call for recursive positions), so recursion is at run
+// time and always terminates on finite values.
+let build_helper_body = fn (
+  sem_type: TypeExpr,
+  gen_inst: bool,
+  enum_defs: VariantIndex
+) -> BindResult throws { LirError } do
+  let l = LirAtomVar(name: "l", typ: TyI64)
+  let r = LirAtomVar(name: "r", typ: TyI64)
+  let ctx0 = LowerCtx(vars: [], semantic_vars: [], stmts: [], temp_counter: 0, enum_defs)
+  // Dispatch on the type's own shape (NOT named_aggregate_name — that would emit
+  // a self-call and never bottom out).
+  let CmpResult(ctx: ctx1, atom: result) = match vidx.resolve_record_alias(idx: enum_defs, typ: sem_type) do
+    | TyRecord(fields: fs) -> compare_record(l, r, fields: fs, gen_inst, ctx: ctx0)
+    | TyUserDefined(name: en, args: _) ->
+      match vidx.variants_of_enum(idx: enum_defs, enum_name: en) do
+        | [] -> compare_primitive(l, r, ctx: ctx0)
+        | vs -> compare_sum(l, r, variants: vs, gen_inst, ctx: ctx0)
+      end
+    | _ -> compare_primitive(l, r, ctx: ctx0)
+  end
+  let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = ctx1
+  return BindResult(ctx: ctx1, atom: result)
+end
+
+// Synthesize one `__streq_<Name>(l, r) -> bool` helper for a named aggregate. The
+// BARE per-named-type helper is built with `gen_inst = false` so a generic field
+// erases to identity (today's behavior); a per-INSTANTIATION helper passes
+// `gen_inst = true` so its (substituted) generic-payload fields recurse.
+let make_helper = fn (
+  type_name: string,
+  sem_type: TypeExpr,
+  gen_inst: bool,
+  enum_defs: VariantIndex
+) -> LirFunction throws { LirError } do
+  let BindResult(ctx: ctx1, atom: result) = build_helper_body(sem_type, gen_inst, enum_defs)
+  let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = ctx1
+  // Params labelled "l" < "r" so sort_lir_params keeps [l, r]; call sites emit
+  // args in that same order (positional internal-call ABI).
+  return LirFunction(
+    name: struct_eq_helper_name(type_name),
+    params: [ LirParam(label: "l", name: "l", typ: TyI64),
+              LirParam(label: "r", name: "r", typ: TyI64) ],
+    ret_type: TyBool,
+    body: list.reverse(xs: body_rev),
+    ret: result,
+    span: zero_span
+  )
+end
+
+// Synthesize the `__streq_List$<key>(l, r) -> bool` helper for the list type
+// `[elem]`. Body = a sum compare over the monomorphized `Nil`/`Cons` variants:
+// equal iff same tag (both Nil, or both Cons) AND, for Cons, the head `v`
+// (type `elem`) and tail `rest` (type `[elem]`) are both structurally equal.
+// The `rest` recursion self-calls this same helper (terminates on finite data);
+// the `v` recursion routes through `elem`'s own compare path so strings, records
+// and nested lists compare structurally rather than by i64 identity.
+// `gen_inst` + `type_name` let a per-INSTANTIATION list helper
+// (`__streq_List$Option$Color`, built with `gen_inst = true`) recurse its head
+// `v: Option<Color>` into the per-inst element helper; the BARE list helper
+// (`__streq_List$Option`, `gen_inst = false`) erases the element's generic args.
+export let make_list_helper = fn (
+  type_name: string,
+  elem: TypeExpr,
+  gen_inst: bool,
+  enum_defs: VariantIndex
+) -> LirFunction throws { LirError } do
+  let l = LirAtomVar(name: "l", typ: TyI64)
+  let r = LirAtomVar(name: "r", typ: TyI64)
+  let ctx0 = LowerCtx(vars: [], semantic_vars: [], stmts: [], temp_counter: 0, enum_defs)
+  let CmpResult(ctx: ctx1, atom: result) = compare_sum(l, r, variants: list_variant_defs(elem: elem), gen_inst, ctx: ctx0)
+  let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = ctx1
+  return LirFunction(
+    name: struct_eq_helper_name(type_name),
+    params: [ LirParam(label: "l", name: "l", typ: TyI64),
+              LirParam(label: "r", name: "r", typ: TyI64) ],
+    ret_type: TyBool,
+    body: list.reverse(xs: body_rev),
+    ret: result,
+    span: zero_span
+  )
+end
+
+export let make_enum_helpers = fn (
+  defs: [ EnumDef ],
+  enum_defs: VariantIndex,
+  acc: [ LirFunction ]
+) -> [ LirFunction ] throws { LirError } do
+  match defs do
+    | [] -> return list.reverse(xs: acc)
+    | EnumDef(name: en, is_public: _, is_opaque: _, type_params: _, variants: vs, layout_variants: _) :: rest ->
+      // Skip enums with no in-scope variants (opaque imported) — no structure to
+      // compare; a compare on such a value keeps the legacy i64 path.
+      let acc2 = match vs do
+        | [] -> acc
+        | _ -> make_helper(type_name: en, sem_type: TyUserDefined(name: en, args: []), gen_inst: false, enum_defs) :: acc
+      end
+      return make_enum_helpers(defs: rest, enum_defs, acc: acc2)
+  end
+end
+
+export let make_record_helpers = fn (
+  defs: [ RecordDef ],
+  enum_defs: VariantIndex,
+  acc: [ LirFunction ]
+) -> [ LirFunction ] throws { LirError } do
+  match defs do
+    | [] -> return list.reverse(xs: acc)
+    | RecordDef(name: rn, is_public: _, type_params: _, fields: fs) :: rest ->
+      let helper = make_helper(type_name: rn, sem_type: TyRecord(fields: fs), gen_inst: false, enum_defs)
+      return make_record_helpers(defs: rest, enum_defs, acc: helper :: acc)
+  end
+end
+
+// Synthesize `__streq_<type_name>(l, r) -> bool` for an enum instantiation from
+// its SUBSTITUTED variant defs (a sum compare, `gen_inst = true`). Lives here
+// (with the compare core) so the per-instantiation routing in struct_eq/inst.nx
+// can reuse the shared sum-compare emission.
+export let make_inst_enum_helper = fn (type_name: string, variants: [ VariantDef ], enum_defs: VariantIndex) -> LirFunction throws { LirError } do
+  let l = LirAtomVar(name: "l", typ: TyI64)
+  let r = LirAtomVar(name: "r", typ: TyI64)
+  let ctx0 = LowerCtx(vars: [], semantic_vars: [], stmts: [], temp_counter: 0, enum_defs)
+  let CmpResult(ctx: ctx1, atom: result) = compare_sum(l, r, variants, gen_inst: true, ctx: ctx0)
+  let LowerCtx(vars: _, semantic_vars: _, stmts: body_rev, temp_counter: _, enum_defs: _) = ctx1
+  return LirFunction(
+    name: struct_eq_helper_name(type_name),
+    params: [ LirParam(label: "l", name: "l", typ: TyI64),
+              LirParam(label: "r", name: "r", typ: TyI64) ],
+    ret_type: TyBool,
+    body: list.reverse(xs: body_rev),
+    ret: result,
+    span: zero_span
+  )
+end

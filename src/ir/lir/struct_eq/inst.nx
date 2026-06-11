@@ -1,0 +1,224 @@
+/**
+ * struct_eq/inst: per-INSTANTIATION generic-enum routing — the worklist that
+ * closes over `==`-site instantiation seeds and synthesizes one structural helper
+ * per concrete generic instantiation (`__streq_Option$Color`, `__streq_Box$Color`,
+ * `__streq_List$Option$Color`, …).
+ *
+ * Owns:
+ *  - Type-parameter substitution (`subst_param_type`, `subst_variant_defs`, …)
+ *    that specializes an enum's declared variant defs at concrete args.
+ *  - The transitive-closure worklist (`close_worklist`, `inst_children`,
+ *    `variant_targets`) seeded from harvest's `#EQSITE#` targets.
+ *  - Per-instantiation helper synthesis (`make_inst_helper`, `make_inst_helpers`),
+ *    delegating the actual sum-compare emission to struct_eq/emit.nx.
+ *
+ * Imports the emission leaf (struct_eq/emit.nx) and the harvest targets walk
+ * (struct_eq/harvest.nx). Imported by the struct_eq.nx facade.
+ */
+import { TypeExpr, TyUserDefined, TyVar, TyList, TyRecord, NamedType,
+         EnumDef, VariantDef, VariantField } from "src/types/type_expr.nx"
+import { LirFunction } from "src/ir/lir/types.nx"
+import { LirError } from "src/ir/lir/errors.nx"
+import { Some, None, Option } from "std:option"
+import * as list from "std:list"
+import { VariantIndex } from "src/ir/support/variant_index.nx"
+import {
+  inst_key,
+  enum_inst_name,
+  make_list_helper,
+  make_inst_enum_helper
+} from "src/ir/lir/struct_eq/emit.nx"
+import { targets_in_type } from "src/ir/lir/struct_eq/harvest.nx"
+
+// ─── Worklist transitive closure ────────────────────────────────────────────
+
+let lookup_enum_def = fn (defs: [ EnumDef ], name: string) -> Option<EnumDef> do
+  match defs do
+    | [] -> return None
+    | EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: vs, layout_variants: lvs) :: rest ->
+      if n == name then return Some(val: EnumDef(name: n, is_public: p, is_opaque: o, type_params: tps, variants: vs, layout_variants: lvs))
+      else return lookup_enum_def(defs: rest, name) end
+  end
+end
+
+// Build a param-name → concrete-arg map (positional) for an enum instantiation.
+let zip_params_args = fn (params: [ string ], args: [ TypeExpr ], acc: [ NamedType ]) -> [ NamedType ] do
+  match params do
+    | [] -> return acc
+    | p :: prest ->
+      match args do
+        | [] -> return acc
+        | a :: arest -> return zip_params_args(params: prest, args: arest, acc: NamedType(name: p, typ: a) :: acc)
+      end
+  end
+end
+
+// Substitute a declared variant-field type's type parameters with the
+// instantiation's concrete args. A type parameter `p` arrives EITHER as
+// `TyVar("p")` (the builtin enums List / Option / Result declare their params as
+// `TyVar`) OR as `TyUserDefined("p", [])` (a USER generic enum's params are
+// shape-identical to a named type at MIR) — both are substituted. Recurses
+// through `[T]` / `K<…>` / records.
+let subst_param_type = fn (t: TypeExpr, subst: [ NamedType ]) -> TypeExpr do
+  match t do
+    | TyVar(name: n) ->
+      match lookup_nt(target: n, fields: subst) do
+        | Some(val: bound) -> return bound
+        | None -> return t
+      end
+    | TyUserDefined(name: n, args: []) ->
+      match lookup_nt(target: n, fields: subst) do
+        | Some(val: bound) -> return bound
+        | None -> return t
+      end
+    | TyUserDefined(name: n, args: ats) -> return TyUserDefined(name: n, args: subst_param_type_list(ts: ats, subst))
+    | TyList(elem: e) -> return TyList(elem: subst_param_type(t: e, subst))
+    | TyRecord(fields: fs) -> return TyRecord(fields: subst_param_named(nts: fs, subst))
+    | _ -> return t
+  end
+end
+
+let subst_param_type_list = fn (ts: [ TypeExpr ], subst: [ NamedType ]) -> [ TypeExpr ] do
+  match ts do
+    | [] -> return []
+    | x :: rest -> return subst_param_type(t: x, subst) :: subst_param_type_list(ts: rest, subst)
+  end
+end
+
+let subst_param_named = fn (nts: [ NamedType ], subst: [ NamedType ]) -> [ NamedType ] do
+  match nts do
+    | [] -> return []
+    | NamedType(name: n, typ: t) :: rest -> return NamedType(name: n, typ: subst_param_type(t, subst)) :: subst_param_named(nts: rest, subst)
+  end
+end
+
+let lookup_nt = fn (target: string, fields: [ NamedType ]) -> Option<TypeExpr> do
+  match fields do
+    | [] -> return None
+    | NamedType(name: n, typ: t) :: rest -> if n == target then return Some(val: t) else return lookup_nt(target, fields: rest) end
+  end
+end
+
+// The CHILD instantiation targets a per-inst helper for `t` recurses into: the
+// generic instantiations appearing in its (substituted) variant-field /
+// list-element types. A named non-generic payload (`Color`) uses its bare helper
+// and contributes no child.
+let inst_children = fn (t: TypeExpr, enum_def_list: [ EnumDef ], enum_defs: VariantIndex) -> [ TypeExpr ] throws { LirError } do
+  match t do
+    | TyList(elem: el) -> return targets_in_type(t: el, enum_defs, acc: [])
+    | TyUserDefined(name: en, args: ats) ->
+      match lookup_enum_def(defs: enum_def_list, name: en) do
+        | None -> return []
+        | Some(val: EnumDef(name: _, is_public: _, is_opaque: _, type_params: tps, variants: vs, layout_variants: _)) ->
+          let subst = zip_params_args(params: tps, args: ats, acc: [])
+          return variant_targets(vs, subst, enum_defs, acc: [])
+      end
+    | _ -> return []
+  end
+end
+
+let variant_targets = fn (vs: [ VariantDef ], subst: [ NamedType ], enum_defs: VariantIndex, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match vs do
+    | [] -> return acc
+    | VariantDef(name: _, fields: fs) :: rest -> return variant_targets(vs: rest, subst, enum_defs, acc: variant_field_targets(fs, subst, enum_defs, acc))
+  end
+end
+
+let variant_field_targets = fn (fs: [ VariantField ], subst: [ NamedType ], enum_defs: VariantIndex, acc: [ TypeExpr ]) -> [ TypeExpr ] throws { LirError } do
+  match fs do
+    | [] -> return acc
+    | VariantField(name: _, typ: t) :: rest ->
+      let acc1 = targets_in_type(t: subst_param_type(t, subst), enum_defs, acc)
+      return variant_field_targets(fs: rest, subst, enum_defs, acc: acc1)
+  end
+end
+
+// Fuel-bounded worklist closure: process each pending target once (dedup by
+// `inst_key` via the `seen` name list), append its child targets, accumulate the
+// full target list. Separate flat `pending` / `seen` / `result` params (no rich
+// record threaded) mirror the seed-safe reachability shape. The `seen` set makes
+// this terminate on finite distinct instantiations; `fuel` is a hard safety bound.
+export let close_worklist = fn (
+  pending: [ TypeExpr ],
+  seen: [ string ],
+  result: [ TypeExpr ],
+  fuel: i64,
+  enum_def_list: [ EnumDef ],
+  enum_defs: VariantIndex
+) -> [ TypeExpr ] throws { LirError } do
+  if fuel <= 0 then return result end
+  match pending do
+    | [] -> return result
+    | t :: rest ->
+      let key = inst_key(t)
+      if str_list_contains_se(xs: seen, s: key) then
+        return close_worklist(pending: rest, seen, result, fuel: fuel - 1, enum_def_list, enum_defs)
+      else
+        let children = inst_children(t, enum_def_list, enum_defs)
+        return close_worklist(
+          pending: list.concat(xs: children, ys: rest),
+          seen: key :: seen,
+          result: t :: result,
+          fuel: fuel - 1,
+          enum_def_list, enum_defs
+        )
+      end
+  end
+end
+
+let str_list_contains_se = fn (xs: [ string ], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest -> if x == s then return true else return str_list_contains_se(xs: rest, s) end
+  end
+end
+
+// ─── Per-instantiation helper synthesis ─────────────────────────────────────
+
+// Build one per-instantiation helper for a target. An enum instantiation
+// `Option<Color>` yields `__streq_Option$Color` whose variant defs are the enum's
+// with type params substituted (so the `Some` payload field is `Color`, routed
+// `gen_inst = true` into `__streq_Color`). A list-of-generic `[Option<Color>]`
+// yields `__streq_List$Option$Color` whose `Cons.v` is `Option<Color>` (routed
+// into `__streq_Option$Color`).
+let make_inst_helper = fn (t: TypeExpr, enum_def_list: [ EnumDef ], enum_defs: VariantIndex) -> Option<LirFunction> throws { LirError } do
+  match t do
+    | TyList(elem: el) ->
+      return Some(val: make_list_helper(type_name: "List$" ++ inst_key(t: el), elem: el, gen_inst: true, enum_defs))
+    | TyUserDefined(name: en, args: ats) ->
+      match lookup_enum_def(defs: enum_def_list, name: en) do
+        | None -> return None
+        | Some(val: EnumDef(name: _, is_public: _, is_opaque: _, type_params: tps, variants: vs, layout_variants: _)) ->
+          let subst = zip_params_args(params: tps, args: ats, acc: [])
+          let inst_variants = subst_variant_defs(vs, subst)
+          return Some(val: make_inst_enum_helper(type_name: enum_inst_name(enum: en, args: ats), variants: inst_variants, enum_defs))
+      end
+    | _ -> return None
+  end
+end
+
+let subst_variant_defs = fn (vs: [ VariantDef ], subst: [ NamedType ]) -> [ VariantDef ] do
+  match vs do
+    | [] -> return []
+    | VariantDef(name: vn, fields: fs) :: rest -> return VariantDef(name: vn, fields: subst_variant_fields(fs, subst)) :: subst_variant_defs(vs: rest, subst)
+  end
+end
+
+let subst_variant_fields = fn (fs: [ VariantField ], subst: [ NamedType ]) -> [ VariantField ] do
+  match fs do
+    | [] -> return []
+    | VariantField(name: n, typ: t) :: rest -> return VariantField(name: n, typ: subst_param_type(t, subst)) :: subst_variant_fields(fs: rest, subst)
+  end
+end
+
+export let make_inst_helpers = fn (targets: [ TypeExpr ], enum_def_list: [ EnumDef ], enum_defs: VariantIndex, acc: [ LirFunction ]) -> [ LirFunction ] throws { LirError } do
+  match targets do
+    | [] -> return list.reverse(xs: acc)
+    | t :: rest ->
+      let acc2 = match make_inst_helper(t, enum_def_list, enum_defs) do
+        | Some(val: f) -> f :: acc
+        | None -> acc
+      end
+      return make_inst_helpers(targets: rest, enum_def_list, enum_defs, acc: acc2)
+  end
+end
