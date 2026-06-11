@@ -1,25 +1,29 @@
 /**
- * task: real-thread dispatch for `@`-thunks (WASI threads).
+ * task: two-step dispatch for `@`-thunks (sequential, inline).
  *
  * Two-step protocol:
  *
  *   host_spawn : <T>(@T) -> %Task<T>    // consumes the thunk, returns a handle
  *   host_join  : <T>(%Task<T>) -> T     // waits on the handle, returns the value
  *
- * `host_spawn` starts an OS thread (via `wasi.thread-spawn`) that forces the
- * thunk against the same shared linear memory the caller sees; `host_join`
- * parks on the task's ready flag and reads the forced value. `Task<T>` is an
- * opaque linear wrapper around the runtime task pointer — the linearity
- * checker rejects spawn-without-join, and the phantom `T` keeps the FFI's
- * type-erased i64 channel from being misused across the pair.
+ * Execution is inline and sequential: `host_spawn` records the thunk in the
+ * handle but does NOT force it; `host_join` forces it (no OS thread is created
+ * — `wasi.thread-spawn` is never imported). `Task<T>` is an opaque linear
+ * wrapper around the runtime task pointer — the linearity checker rejects
+ * spawn-without-join, and the phantom `T` keeps the FFI's type-erased i64
+ * channel from being misused across the pair.
  *
- * Single `@x` force is still synchronous (a `call_indirect`); this module and
- * `std:lazy`'s `force_all` are the parallel paths. `race` / `cancel` / `detach`
- * in `std:lazy` remain sequential — they would need host-side cancel/arbiter
- * primitives that do not exist.
+ * Exception timing: because the thunk is forced at `host_join`, a thunk's
+ * exception surfaces at the JOIN point (`docs/spec/lazy.md` §Exception
+ * Semantics) — a `try`/`catch` around `host_join` observes it.
  *
- * Importing this module pulls the `wasi.thread-spawn` import into the produced
- * wasm; run it via the bundled `nexus` launcher (or `wasmtime -S threads`).
+ * Single `@x` force is also synchronous (a `call_indirect`); this module and
+ * `std:lazy`'s `force_all` drive the multi-thunk paths. `race` / `cancel` /
+ * `detach` in `std:lazy` are likewise sequential — true parallelism / cancel /
+ * arbiter primitives do not exist on the host.
+ *
+ * This module imports no host threading primitive; the produced wasm runs on a
+ * plain WASI preview1/2/3 runtime.
  */
 import * as lz from "std:runtime/lazy"
 
@@ -27,8 +31,9 @@ import * as lz from "std:runtime/lazy"
 export opaque type Task<T> = Task(id: i64)
 
 /**
-Dispatch a thunk to a worker thread; returns a linear handle that must be
-consumed by `host_join`. The `@T` is consumed.
+Record a thunk in a linear handle that must be consumed by `host_join`. The
+`@T` is consumed. The thunk is NOT forced here — `host_join` forces it — so a
+thunk that throws raises its exception at `host_join`, not at `host_spawn`.
 */
 export let host_spawn = fn <T>(a: @T) -> %Task<T> do
   let id = lz.lazy_spawn(a_thunk: a)
@@ -39,8 +44,10 @@ end
 
 /**
 Await a previously spawned thunk and return its forced value. Consumes the
-linear handle. The parameter is named `handle` because `task` is a reserved
-keyword.
+linear handle. The thunk is forced HERE (inline), so if it throws, the
+exception surfaces at this join point — a `try`/`catch` around `host_join`
+observes it (`docs/spec/lazy.md` §Exception Semantics). The parameter is
+named `handle` because `task` is a reserved keyword.
 */
 export let host_join = fn <T>(handle: %Task<T>) -> T do
   let Task(id) = handle

@@ -1,25 +1,36 @@
 /**
  * runtime/lazy: thunk execution runtime for `@`-thunk parallelism.
  *
- * Phase 1 (WASI p3 compatible): sequential-first implementation.
+ * Phase 1 (WASI p3 compatible): sequential, inline implementation.
  * A "task" is a 24-byte struct in linear memory:
  *
- *   offset  0  ready      i32 (0 = pending, 1 = done; padded to 8 bytes)
- *   offset  8  result     i64 (the thunk's forced value, when ready == 1)
+ *   offset  0  ready      i32 (0 = not yet forced, 1 = forced/result ready;
+ *                              padded to 8 bytes)
+ *   offset  8  result     i64 (the thunk's forced value, once ready == 1)
  *   offset 16  closure_ptr i64 (the 0-arg closure heap pointer to force)
  *
- * **Sequential path (default, WASI p3 compatible):**
- * `lazy_spawn` allocates the task, forces the closure immediately, stores
- * the result, and marks ready=1. `lazy_join` does a SC atomic spin-wait on
- * the ready flag (resolved on the first check) then reads the result via
- * paired SC atomic i32 loads. No shared memory or thread-spawn required.
+ * **Sequential / inline path (the only path `lazy_spawn` takes):**
+ * `lazy_spawn` allocates the task and records the closure pointer, but does
+ * NOT force it yet (ready stays 0). No OS thread is created —
+ * `wasi.thread-spawn` is never imported. `lazy_join` performs the actual
+ * `force_closure` and parks the result. Forcing the thunk at *join* (rather
+ * than at spawn) is what makes a task's exception surface at the JOIN point:
+ * the thunk runs inside `lazy_join`, so any exception it raises propagates out
+ * of `lazy_join` / `host_join`, where a `try`/`catch` around the join observes
+ * it. This matches `docs/spec/lazy.md` §Exception Semantics and the documented
+ * spawn-then-`try`/`catch`-around-join contract. Because forcing is deferred,
+ * `lazy_join`'s exception timing is correct without any type-erased exception
+ * stashing or row widening on the join signature.
  *
  * **Threads path (`wasi_thread_start` export, for WASI preview2 + threads):**
- * The `wasi_thread_start` export is retained for compatibility with
- * `wasmtime -S threads` builds. However, the sequential `lazy_spawn`
- * no longer calls `wasi.thread-spawn`; programs that need true parallel
- * execution should use `-S p3=y -S threads=y` with the WASI threads API
- * directly (tracked in bd future phases).
+ * In the retained thread path, `lazy_run_task` forces the closure on a worker
+ * thread and publishes the result with ready == 1 via paired SC atomic i32
+ * stores; `lazy_join` then observes ready == 1 and reads the parked result
+ * instead of forcing it itself. So `lazy_join` forces inline only when the
+ * task was spawned sequentially (ready still 0). The `wasi_thread_start`
+ * export is retained for compatibility with `wasmtime -S threads` builds;
+ * programs that need true parallel execution should use `-S p3=y -S threads=y`
+ * with the WASI threads API directly (tracked in bd future phases).
  *
  * `force-closure` / `thunk-addr` / `value-of-i64` are codegen intrinsics
  * (`nexus:intrinsic`, no import entry): the first inlines a `call_indirect`
@@ -31,7 +42,7 @@
  * params alphabetically, so its params are named `a_tid`, `b_arg` to land in
  * ABI order.
  *
- * phase 1: sequential lazy to unblock `-S p3=y` single-threaded
+ * phase 1: sequential, inline lazy to unblock `-S p3=y` single-threaded
  * runs. True parallel `future<T>` migration is phase 2
  * and requires component-model emit.
  */
@@ -61,11 +72,15 @@ import * as atomic from "std:runtime/atomic"
 import * as cast from "std:runtime/cast"
 
 /**
-Spawn `a_thunk` — sequential phase 1 implementation: forces the thunk
-immediately, stores the result in a 24-byte task struct on the arena, and
-marks the task ready. Returns the task pointer. No OS thread is created;
-`lazy_join`'s SC atomic ready-flag check returns on the first iteration
-since the flag is already 1.
+Spawn `a_thunk` — sequential, inline implementation: records the thunk's
+closure pointer in a 24-byte task struct on the arena and returns the task
+pointer WITHOUT forcing it (ready stays 0). No OS thread is created.
+
+The thunk is deliberately NOT forced here: `lazy_join` performs the force.
+Deferring the force to the join site is what makes a task's exception surface
+at the JOIN point (`docs/spec/lazy.md` §Exception Semantics) — the thunk runs
+inside `lazy_join`, so a `try`/`catch` around the join observes any exception
+it raises. `lazy_spawn` therefore never runs user code and never throws.
 
 This is compatible with both WASI preview2 and preview3 since it does not
 import `wasi.thread-spawn` or use shared memory atomics for synchronisation.
@@ -73,56 +88,44 @@ import `wasi.thread-spawn` or use shared memory atomics for synchronisation.
 export let lazy_spawn = fn <T>(a_thunk: @T) -> i64 do
   let cl = thunk_addr(a_thunk)
   let t = arena.alloc_raw(size: 24)
-  // Force the closure inline (sequential; no thread spawned).
-  let r = force_closure(a_p: cl)
-  mem.store_i64(addr: t + 8, val: r)
+  // Record the closure to force; leave ready == 0 so `lazy_join` forces it.
   mem.store_i64(addr: t + 16, val: cl)
-  atomic.store_i32(addr: t, val: 1)
+  atomic.store_i32(addr: t, val: 0)
   return t
-end
-
-/**
-Spin-wait until the ready flag at `a_task + 0` reads 1 (SC atomic load).
-In sequential mode the flag is already 1 so this returns on the first
-iteration.  In the thread path the WASM SC total-order guarantees that once
-we observe `ready == 1` we also observe the two SC atomic i32 result stores
-at `a_task + 8` and `a_task + 12` that `lazy_run_task` issued before it
-stored the flag.
-*/
-let lazy_wait_ready = fn (a_task: i64) -> unit do
-  if atomic.load_i32(addr: a_task) == 0 then
-    return lazy_wait_ready(a_task)
-  end
-  return ()
 end
 
 /** Wait for `a_task` to complete and return its forced value.
  *
- * Synchronisation protocol (mirrors `lazy_run_task`'s write side):
+ * Sequential path (the one `lazy_spawn` produces): the task was spawned with
+ * ready == 0 and the closure was never forced, so `lazy_join` forces it HERE
+ * via `force_closure`.  Running the thunk inside `lazy_join` is what makes a
+ * thunk's exception surface at the join point: it propagates out of
+ * `lazy_join` / `host_join`, where a `try`/`catch` around the join observes
+ * it.  No exception value is stashed and no row widening is needed on this
+ * function's signature — the exception simply flows through the in-progress
+ * force, exactly as a direct `@thunk` force would.
  *
- * 1. Spin-wait on the SC atomic ready flag at `a_task + 0` until it reads 1
- *    (via `lazy_wait_ready`).  In sequential mode (`lazy_spawn`) this is
- *    satisfied on the first check; in the thread path the SC total order
- *    guarantees that once `ready == 1` is observed we also observe both SC
- *    atomic i32 stores at `a_task + 8` and `a_task + 12`.
- *
- * 2. Read the 64-bit result via two SC atomic i32 loads (low half at `a_task
- *    + 8`, high half at `a_task + 12`) and reconstruct the i64.  A plain
- *    non-atomic `mem.load_i64` would NOT participate in the SC synchronises-
- *    with relation established by `lazy_run_task`'s SC stores and would be
- *    a data race on any shared-memory build.
- *
- * Reconstructed value: `(hi << 32) | lo` where `lo` and `hi` are the
- * zero-extended i32 values returned by the SC atomic loads.
+ * Thread path (`lazy_run_task` on a worker): the closure was already forced
+ * and its result published with ready == 1 via paired SC atomic i32 stores.
+ * `lazy_join` observes ready == 1 and reads the parked result instead of
+ * forcing again, reconstructing the i64 from two SC atomic i32 loads (low
+ * half at `a_task + 8`, high half at `a_task + 12`).  A plain non-atomic
+ * `mem.load_i64` would NOT participate in the SC synchronises-with relation
+ * established by `lazy_run_task`'s SC stores and would be a data race on any
+ * shared-memory build.
  */
 export let lazy_join = fn <T>(a_task: i64) -> T do
-  // Step 1: wait until ready == 1 (SC atomic load; no-op in sequential mode).
-  lazy_wait_ready(a_task)
-  // Step 2: read the result via two SC atomic i32 loads — matching
-  // `lazy_run_task`'s paired SC i32 stores — then reassemble the i64.
-  // Using non-atomic mem.load_i64 here would be a data race on any
-  // shared-memory build: it does not participate in the SC synchronises-with
-  // relation established by the SC stores in lazy_run_task.
+  if atomic.load_i32(addr: a_task) == 0 then
+    // Sequential path: force the thunk now (at the join site). Any exception
+    // it raises propagates out of `lazy_join`, surfacing at the join.
+    let cl = mem.load_i64(addr: a_task + 16)
+    let r = force_closure(a_p: cl)
+    mem.store_i64(addr: a_task + 8, val: r)
+    atomic.store_i32(addr: a_task, val: 1)
+    return value_of_i64(a_x: r)
+  end
+  // Thread path: result already published; reassemble the i64 from the
+  // paired SC atomic i32 loads matching `lazy_run_task`'s SC i32 stores.
   let lo = atomic.load_i32(addr: a_task + 8)
   let hi = atomic.load_i32(addr: a_task + 12)
   return value_of_i64(a_x: lo | (hi << 32))
