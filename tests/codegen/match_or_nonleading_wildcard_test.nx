@@ -1,0 +1,121 @@
+// Regression test for nexus-6gcqv: a `match` whose arm is an or-pattern with a
+// wildcard `_` at a NON-LEADING position (`P1 | ... | _ -> e`) miscompiled when
+// another arm targeted a constructor declared LATER in the enum than the
+// or-pattern's first alternative.
+//
+// Root cause: the codegen-only arm reorder (Phase 2 in
+// src/ir/hir/canonicalize_match.nx) sorts arms by enum declaration order,
+// keying an or-pattern arm by its FIRST alternative's variant index
+// (`pat_ctor_name` reads `alts[0]`). For `A | B(_) | _ -> 200`, that key is A's
+// index (0), so the arm — which is actually a CATCH-ALL because of the trailing
+// `_` — sorted AHEAD of a more-specific `C(..) -> 100` arm. The `_` then
+// shadowed C, so `f(C(..))` silently returned 200 (the wildcard body) at exit 0.
+//
+// Fix: Phase 2 skips reordering entirely when any arm is an or-pattern that
+// contains a wildcard alternative (`has_or_wildcard_arm`), preserving source
+// order — which is always semantically correct.
+//
+// Controls below confirm the fix does NOT over-shadow: leading-wildcard,
+// no-wildcard, and plain two-arm matches keep working, and the distinct-value
+// arms catch any dropped-leaf-atom regression.
+import * as test_assert from "std:test/assert"
+
+type T = A | B(x: i64) | C(y: i64, z: i64)
+
+// The issue repro shape: catch-all or-pattern arm is LAST, but its first alt
+// (A) is declared before C. C must still win.
+let f_tail_wild = fn (t: T) -> i64 do
+  match t do
+    | C(y: _, z: _) -> return 100
+    | A | B(_) | _ -> return 200
+  end
+end
+
+// Wildcard in the MIDDLE of the or-pattern.
+let f_mid_wild = fn (t: T) -> i64 do
+  match t do
+    | C(y: _, z: _) -> return 11
+    | A | _ | B(_) -> return 22
+  end
+end
+
+// Two specific arms (B and C, both after A) plus an A|_ catch-all. Distinct
+// values per arm catch a dropped/duplicated leaf-atom.
+let f_two_specific = fn (t: T) -> i64 do
+  match t do
+    | B(x: _) -> return 7
+    | C(y: _, z: _) -> return 9
+    | A | _ -> return 5
+  end
+end
+
+// CONTROL: leading wildcard in the or-pattern (was always handled correctly).
+let f_lead_wild = fn (t: T) -> i64 do
+  match t do
+    | C(y: _, z: _) -> return 100
+    | _ | A | B(_) -> return 200
+  end
+end
+
+// CONTROL: or-pattern with NO wildcard — reorder is still allowed and correct.
+let f_no_wild = fn (t: T) -> i64 do
+  match t do
+    | C(y: _, z: _) -> return 100
+    | A | B(_) -> return 200
+  end
+end
+
+// Nested match: outer or-wildcard arm, inner match in the specific arm.
+let f_nested = fn (t: T) -> i64 do
+  match t do
+    | C(y: yy, z: _) ->
+      match t do
+        | C(y: _, z: zz) -> return yy + zz
+        | A | B(_) | _ -> return 0
+      end
+    | A | B(_) | _ -> return 999
+  end
+end
+
+let main = fn () -> unit throws { Exn } do
+  // --- tail-wildcard: C wins over the A|B(_)|_ catch-all ---
+  test_assert.assert_eq_i64(actual: f_tail_wild(t: C(y: 1, z: 2)), expected: 100,
+    label: "6gcqv: tail-wild C -> 100 (not shadowed)")
+  test_assert.assert_eq_i64(actual: f_tail_wild(t: A), expected: 200,
+    label: "6gcqv: tail-wild A -> 200")
+  test_assert.assert_eq_i64(actual: f_tail_wild(t: B(x: 5)), expected: 200,
+    label: "6gcqv: tail-wild B -> 200")
+
+  // --- mid-wildcard ---
+  test_assert.assert_eq_i64(actual: f_mid_wild(t: C(y: 1, z: 2)), expected: 11,
+    label: "6gcqv: mid-wild C -> 11")
+  test_assert.assert_eq_i64(actual: f_mid_wild(t: A), expected: 22,
+    label: "6gcqv: mid-wild A -> 22")
+  test_assert.assert_eq_i64(actual: f_mid_wild(t: B(x: 5)), expected: 22,
+    label: "6gcqv: mid-wild B -> 22")
+
+  // --- two specific arms + catch-all, distinct values ---
+  test_assert.assert_eq_i64(actual: f_two_specific(t: B(x: 5)), expected: 7,
+    label: "6gcqv: two-specific B -> 7")
+  test_assert.assert_eq_i64(actual: f_two_specific(t: C(y: 1, z: 2)), expected: 9,
+    label: "6gcqv: two-specific C -> 9")
+  test_assert.assert_eq_i64(actual: f_two_specific(t: A), expected: 5,
+    label: "6gcqv: two-specific A -> 5")
+
+  // --- controls ---
+  test_assert.assert_eq_i64(actual: f_lead_wild(t: C(y: 1, z: 2)), expected: 100,
+    label: "6gcqv: lead-wild C -> 100")
+  test_assert.assert_eq_i64(actual: f_lead_wild(t: A), expected: 200,
+    label: "6gcqv: lead-wild A -> 200")
+  test_assert.assert_eq_i64(actual: f_no_wild(t: C(y: 1, z: 2)), expected: 100,
+    label: "6gcqv: no-wild C -> 100")
+  test_assert.assert_eq_i64(actual: f_no_wild(t: B(x: 5)), expected: 200,
+    label: "6gcqv: no-wild B -> 200")
+
+  // --- nested ---
+  test_assert.assert_eq_i64(actual: f_nested(t: C(y: 3, z: 4)), expected: 7,
+    label: "6gcqv: nested C -> yy+zz = 7")
+  test_assert.assert_eq_i64(actual: f_nested(t: A), expected: 999,
+    label: "6gcqv: nested A -> 999")
+  return ()
+end
