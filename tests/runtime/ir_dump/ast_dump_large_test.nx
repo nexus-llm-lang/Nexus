@@ -1,0 +1,124 @@
+// nexus-n6ak6 — `nexus ast` text dump must stay byte-faithful and linear at
+// scale. The old `ast_to_text` joined the line list with `str.join`, which is
+// O(n^2) string concatenation and, on moderate inputs, drove huge transient
+// allocations into the 4GB wasm32 ceiling — there the bump allocator wrapped
+// and overwrote live memory, degenerating the dump into a single mega-line
+// where every `\n` was replaced by a digit byte (exit 0, corrupted) or
+// trapping (`memory fault ... out of bounds`, exit 134).
+//
+// The fix builds the text into a single `%ByteBuffer` (linear, amortized
+// O(|line|) per append). This test exercises `ast_to_text` directly on a
+// many-top-level fixture (same rationale as ast_dump_test: Proc.exec is -1
+// under WASI preview1, so a subprocess never reaches driver code) and asserts:
+//   1. The banner is present and reports the correct top-level count.
+//   2. The output is well-formed: it ends with the trailing newline and every
+//      `\n`-delimited line is short — i.e. NO degenerate corrupted mega-line.
+//   3. The line count grows with the number of top-levels (the dump is not
+//      silently truncated or collapsed).
+
+import * as test_assert from "std:test/assert"
+import * as str from "std:str"
+import * as list from "std:list"
+import * as ast_dump from "src/tools/dump/ast_dump.nx"
+import { None } from "std:option"
+import { Span } from "src/types/span.nx"
+import {
+  Program, SpannedTopLevel, TLLet, GlobalLet,
+  SpannedExpr, ExprLambda, ExprLiteral,
+  SpannedStmt, StmtReturn,
+  LitInt,
+  TyI64, TyRow
+} from "src/syntax/ast.nx"
+import { dummy_span } from "tests/_fixtures/span.nx"
+
+// Build N trivial top-levels: `let f = fn () -> i64 do return 0 end`, each a
+// distinct TLLet so the dump has many sibling lines (the case the old join
+// blew up on).
+let build_tls = fn (n: i64, acc: [ SpannedTopLevel ]) -> [ SpannedTopLevel ] do
+  if n <= 0 then return acc end
+  let s = dummy_span()
+  let body = [ SpannedStmt(
+    node: StmtReturn(value: SpannedExpr(node: ExprLiteral(lit: LitInt(val: 0)), span: s)),
+    span: s
+  ) ]
+  let lam = SpannedExpr(node: ExprLambda(
+    type_params: [],
+    params: [],
+    ret_type: TyI64,
+    requires: TyRow(types: [], rest: None),
+    throw_row: TyRow(types: [], rest: None),
+    body
+  ), span: s)
+  let glet = GlobalLet(name: "f", is_public: false, typ: None, value: lam)
+  let tl = SpannedTopLevel(node: TLLet(def: glet), span: s)
+  return build_tls(n: n - 1, acc: tl :: acc)
+end
+
+// Largest `\n`-delimited line length in `out`. A correct dump keeps every line
+// short; the corruption bug produced one ~593KB line.
+let max_line_len = fn (out: string) -> i64 do
+  let lines = str.split(s: out, sep: "\n")
+  return max_line_len_go(xs: lines, best: 0)
+end
+let max_line_len_go = fn (xs: [ string ], best: i64) -> i64 do
+  match xs do
+    | [] -> return best
+    | l :: rest ->
+      let n = str.byte_length(s: l)
+      let b2 = if n > best then n else best end
+      return max_line_len_go(xs: rest, best: b2)
+  end
+end
+
+let test_large_dump_well_formed = fn () -> unit throws { Exn } do
+  let count = 200
+  let prog = Program(definitions: build_tls(n: count, acc: []), module_doc: None)
+  let out = ast_dump.ast_to_text(prog)
+
+  // 1. Banner present and reports the count.
+  test_assert.assert_eq_bool(
+    actual: str.starts_with(s: out, prefix: "=== AST dump"),
+    expected: true,
+    label: "n6ak6: large dump starts with banner"
+  )
+  test_assert.assert_eq_bool(
+    actual: str.contains(s: out, sub: "200 top-level items"),
+    expected: true,
+    label: "n6ak6: banner reports 200 top-level items"
+  )
+
+  // 2. Faithful tail: the format is `banner\n` + lines joined by `\n` +
+  //    trailing `\n`. The last rendered node is the `ExprLiteral int=0` of the
+  //    final TLLet, so the dump ends with that node line followed by the
+  //    trailing newline. Guards that the final node is rendered in full (not
+  //    truncated mid-line) AND the trailing newline is preserved.
+  test_assert.assert_eq_bool(
+    actual: str.ends_with(s: out, suffix: "int=0\n"),
+    expected: true,
+    label: "n6ak6: dump ends with the final node line + trailing newline"
+  )
+
+  // 3. No degenerate mega-line: every line is short (a single AST node line is
+  //    far under 1KB). The corruption bug produced a ~593KB line here.
+  let longest = max_line_len(out)
+  test_assert.assert_eq_bool(
+    actual: longest < 1024,
+    expected: true,
+    label: "n6ak6: no corrupted mega-line (longest line < 1KB)"
+  )
+
+  // 4. Line count scales with the input — at least one line per top-level
+  //    (each TLLet renders multiple lines). Guards against truncation/collapse.
+  let n_lines = list.length(xs: str.split(s: out, sep: "\n"))
+  test_assert.assert_eq_bool(
+    actual: n_lines > count,
+    expected: true,
+    label: "n6ak6: dump has more lines than top-levels (not collapsed)"
+  )
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  test_large_dump_well_formed()
+  return ()
+end
