@@ -128,6 +128,113 @@ export let empty_variant_index = fn () -> VariantIndex do
   return VariantIndex(by_variant: map.string_map(), record_defs: [], opaque_layouts: map.string_map())
 end
 
+/** One module's own-declared constructor scope: the declaring module's
+ *  `module` path paired with a `VariantIndex` built from only that module's
+ *  own enums. */
+export type ModuleScope = ModuleScope(module: string, idx: VariantIndex)
+
+/** Per-module constructor index.
+ *
+ *  The flat `by_variant` map keys constructors by their BARE name, so two enums
+ *  that share a constructor name across distinct modules collide there
+ *  (first-defined wins). That is correct for the current root-only type-check
+ *  (a non-defining module's constructors are withheld, so no two LIVE entries
+ *  ever share a bare name) but conflates them once imported bodies are checked:
+ *  module A's `Diagnostic` and module B's `Diagnostic` are different types.
+ *
+ *  `ModuleVariantIndex` keeps one `ModuleScope` per declaring module plus the
+ *  program-wide `global` index as a fallback for built-ins / imports.
+ *  `lookup_variant_info_scoped(_, module: M, variant: c)` resolves `c` against
+ *  module M's OWN enums first (so M's `Diagnostic` wins) and only then against
+ *  `global`; constructors from an unrelated module N are absent from M's scope
+ *  and never shadow M's own. No Map is stored in a record field — each
+ *  `VariantIndex` is built independently — preserving the dictionary-passing
+ *  contract the flat map relies on. */
+export type ModuleVariantIndex = ModuleVariantIndex(
+  scopes: [ ModuleScope ],
+  global: VariantIndex
+)
+
+let group_modules = fn (defs: [ EnumDef ], acc: [ string ]) -> [ string ] do
+  match defs do
+    | [] -> return list.reverse(xs: acc)
+    | ed :: rest ->
+      let EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: _, layout_variants: _, module: m) = ed
+      if list_contains_str(xs: acc, s: m) then
+        return group_modules(defs: rest, acc)
+      else
+        return group_modules(defs: rest, acc: m :: acc)
+      end
+  end
+end
+
+let list_contains_str = fn (xs: [ string ], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest -> if x == s then return true else return list_contains_str(xs: rest, s) end
+  end
+end
+
+let defs_of_module = fn (defs: [ EnumDef ], module: string, acc: [ EnumDef ]) -> [ EnumDef ] do
+  match defs do
+    | [] -> return list.reverse(xs: acc)
+    | ed :: rest ->
+      let EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: _, layout_variants: _, module: m) = ed
+      if m == module then
+        return defs_of_module(defs: rest, module, acc: ed :: acc)
+      else
+        return defs_of_module(defs: rest, module, acc)
+      end
+  end
+end
+
+let build_scopes = fn (defs: [ EnumDef ], modules: [ string ], acc: [ ModuleScope ]) -> [ ModuleScope ] do
+  match modules do
+    | [] -> return list.reverse(xs: acc)
+    | m :: rest ->
+      let own = defs_of_module(defs, module: m, acc: [])
+      return build_scopes(defs, modules: rest, acc: ModuleScope(module: m, idx: build_variant_index(defs: own)) :: acc)
+  end
+end
+
+/** Build a per-module constructor index over the program's enum defs. The
+ *  `global` fallback indexes every constructor (bare-name, first-defined wins);
+ *  each module scope indexes only that module's own-declared constructors. */
+export let build_module_variant_index = fn (defs: [ EnumDef ]) -> ModuleVariantIndex do
+  let modules = group_modules(defs, acc: [])
+  return ModuleVariantIndex(
+    scopes: build_scopes(defs, modules, acc: []),
+    global: build_variant_index(defs)
+  )
+end
+
+let find_scope = fn (scopes: [ ModuleScope ], module: string) -> Option<VariantIndex> do
+  match scopes do
+    | [] -> return None
+    | ModuleScope(module: m, idx: i) :: rest ->
+      if m == module then return Some(val: i) else return find_scope(scopes: rest, module) end
+  end
+end
+
+/** Resolve a constructor against module `module`'s own scope first, then the
+ *  program-wide fallback. Keeps same-named constructors from unrelated modules
+ *  distinct: only M's own constructors live in M's scope. */
+export let lookup_variant_info_scoped = fn (
+  mvi: ModuleVariantIndex,
+  module: string,
+  variant: string
+) -> Option<VariantInfo> do
+  let ModuleVariantIndex(scopes: ss, global: g) = mvi
+  match find_scope(scopes: ss, module) do
+    | Some(val: own) ->
+      match lookup_variant_info(idx: own, variant) do
+        | Some(val: vi) -> return Some(val: vi)
+        | None -> return lookup_variant_info(idx: g, variant)
+      end
+    | None -> return lookup_variant_info(idx: g, variant)
+  end
+end
+
 /** Attach the program's record-type-alias table to an existing index so the
  *  LIR path can expand `TyUserDefined` field types to their `TyRecord` body
  **/
