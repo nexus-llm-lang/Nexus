@@ -12,8 +12,10 @@
  *   // lint:allow L0001, L0002    comma-separated list of codes
  *   // lint:allow                 bare form — suppresses ALL codes on the line
  *
- * The directive prefix is matched anywhere in the line (not just the start),
- * so `some_call() // lint:allow L0001` also works.
+ * A directive is honoured only when it appears inside a COMMENT (`//` or
+ * `/* */`), anywhere in the line — so `some_call() // lint:allow L0001` works,
+ * but the same text inside a string/char literal is treated as program DATA
+ * and does NOT disarm any rule (a literal cannot silently disable gating).
  *
  * Suppression is applied ONLY to findings whose span.line matches the target
  * line (on-line or allow-next) or whose code is in the file-wide set.
@@ -54,14 +56,85 @@ let trim_parts = fn (xs: [ string ], acc: [ string ]) -> [ string ] do
   end
 end
 
-// Try to find a directive prefix in the line. Returns the tail after the
-// prefix keyword, or "" if this prefix is not present.
-// We search for the prefix after "lint:" which always begins directives.
+// ─── Comment-aware prefix scan ────────────────────────────────────────────────
+//
+// A directive is only honoured when it appears inside a COMMENT, never inside a
+// string/char literal — otherwise program DATA (e.g. a string literal that
+// happens to contain `lint:allow-file L0001`) could silently disable a gating
+// rule.  The Nexus lexer discards comments before the AST, so we re-scan the
+// raw line tracking literal/comment context, mirroring the literal-aware scanner
+// in `src/lint/fix.nx` (`range_has_comment`).
+//
+// `mode`: 0 = normal code, 1 = inside a string literal, 2 = inside a char
+// literal, 3 = inside a `//` line comment, 4 = inside a `/* */` block comment.
+// A backslash inside a literal escapes the next byte.  Only while in a comment
+// mode (3 or 4) do we test for the directive prefix.
+
+// True if `prefix` matches `line` byte-for-byte starting at offset `i`.
+let matches_at = fn (line: string, i: i64, prefix: string, k: i64) -> bool do
+  let plen = str.byte_length(s: prefix)
+  if k >= plen then return true end
+  let pos = i + k
+  if pos >= str.byte_length(s: line) then return false end
+  if str.byte_at(s: line, idx: pos) != str.byte_at(s: prefix, idx: k) then return false end
+  return matches_at(line, i, prefix, k: k + 1)
+end
+
+// Walk the line tracking literal/comment context. While inside a comment, test
+// whether `prefix` begins at the current byte; if so, return the byte offset
+// just past the prefix (so the caller can slice the code-list tail). Returns -1
+// if the prefix never occurs inside a comment.
+let scan_directive = fn (line: string, prefix: string, i: i64, mode: i64) -> i64 do
+  if i >= str.byte_length(s: line) then return -1 end
+  let c = str.byte_at(s: line, idx: i)
+  if mode == 1 then
+    // Inside a string literal: ignore directives, honour backslash escapes.
+    if c == '\\' then return scan_directive(line, prefix, i: i + 2, mode: 1) end
+    if c == '"' then return scan_directive(line, prefix, i: i + 1, mode: 0) end
+    return scan_directive(line, prefix, i: i + 1, mode: 1)
+  end
+  if mode == 2 then
+    // Inside a char literal: ignore directives, honour backslash escapes.
+    if c == '\\' then return scan_directive(line, prefix, i: i + 2, mode: 2) end
+    if c == '\'' then return scan_directive(line, prefix, i: i + 1, mode: 0) end
+    return scan_directive(line, prefix, i: i + 1, mode: 2)
+  end
+  if mode == 3 then
+    // Inside a `//` line comment (runs to end of line): test for the directive.
+    if matches_at(line, i, prefix, k: 0) then return i + str.byte_length(s: prefix) end
+    return scan_directive(line, prefix, i: i + 1, mode: 3)
+  end
+  if mode == 4 then
+    // Inside a `/* */` block comment: test for the directive, watch for `*/`.
+    if matches_at(line, i, prefix, k: 0) then return i + str.byte_length(s: prefix) end
+    let n2 = if i + 1 < str.byte_length(s: line) then str.byte_at(s: line, idx: i + 1) else '\0' end
+    if c == '*' && n2 == '/' then return scan_directive(line, prefix, i: i + 2, mode: 0) end
+    return scan_directive(line, prefix, i: i + 1, mode: 4)
+  end
+  // Normal code: enter a comment or a literal, otherwise advance.
+  let nc = if i + 1 < str.byte_length(s: line) then str.byte_at(s: line, idx: i + 1) else '\0' end
+  if c == '/' && nc == '/' then return scan_directive(line, prefix, i: i + 2, mode: 3) end
+  if c == '/' && nc == '*' then return scan_directive(line, prefix, i: i + 2, mode: 4) end
+  if c == '"' then return scan_directive(line, prefix, i: i + 1, mode: 1) end
+  if c == '\'' then return scan_directive(line, prefix, i: i + 1, mode: 2) end
+  return scan_directive(line, prefix, i: i + 1, mode: 0)
+end
+
+// Find a directive prefix that occurs INSIDE A COMMENT on this line, and return
+// the tail after the prefix keyword, or "" if this prefix is not present in a
+// comment.  A directive inside a string/char literal is NOT honoured.  The
+// distinction between "not present" and "present with empty tail" (a bare
+// directive) is carried by `prefix_in_comment`, which the caller checks first.
 let after_prefix = fn (line: string, prefix: string) -> string do
-  let idx = str.index_of(s: line, sub: prefix)
-  if idx < 0 then return "" end
-  let after = idx + str.length(s: prefix)
+  let after = scan_directive(line, prefix, i: 0, mode: 0)
+  if after < 0 then return "" end
   return str.byte_substring(s: line, start: after, len: str.byte_length(s: line) - after)
+end
+
+// True if `prefix` appears inside a comment on this line (string/char literals
+// excluded).  Replaces the old comment-unaware `str.contains` guard.
+let prefix_in_comment = fn (line: string, prefix: string) -> bool do
+  return scan_directive(line, prefix, i: 0, mode: 0) >= 0
 end
 
 // ─── Suppression record ──────────────────────────────────────────────────────
@@ -88,20 +161,22 @@ let scan_lines = fn (lines: [ string ], line_no: i64, acc: [ Suppression ]) -> [
 end
 
 let process_line = fn (line: string, line_no: i64, acc: [ Suppression ]) -> [ Suppression ] do
+  // Directives are only honoured inside COMMENTS — a `lint:allow…` occurrence
+  // inside a string/char literal is program DATA and must NOT disarm any rule.
   // Check lint:allow-file (whole-file suppression)
-  if str.contains(s: line, sub: prefix_allow_file()) then
+  if prefix_in_comment(line, prefix: prefix_allow_file()) then
     let tail = after_prefix(line, prefix: prefix_allow_file())
     let codes = parse_code_list(tail)
     return Suppression(target_line: -1, codes) :: acc
   end
   // Check lint:allow-next (next-line suppression)
-  if str.contains(s: line, sub: prefix_allow_next()) then
+  if prefix_in_comment(line, prefix: prefix_allow_next()) then
     let tail = after_prefix(line, prefix: prefix_allow_next())
     let codes = parse_code_list(tail)
     return Suppression(target_line: line_no + 1, codes) :: acc
   end
   // Check lint:allow (same-line suppression — only when neither -next nor -file)
-  if str.contains(s: line, sub: prefix_allow()) then
+  if prefix_in_comment(line, prefix: prefix_allow()) then
     let tail = after_prefix(line, prefix: prefix_allow())
     let codes = parse_code_list(tail)
     return Suppression(target_line: line_no, codes) :: acc
