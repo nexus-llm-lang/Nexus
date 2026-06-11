@@ -38,6 +38,7 @@ import {
   TyI64,
   TyString,
   TyUnit,
+  TyList,
   TyRow,
   TyVar,
   TyUserDefined
@@ -77,6 +78,9 @@ end
  *  surface as `MainThrowsTooBroad`. `Exn` itself is admitted: the
  *  synthesised match dispatches every Exn variant via the wildcard arm and
  *  most fixtures declare `throws { Exn }` to mean "may throw anything".
+ *
+ *  The implicit-absent-throws sentinel (omitted `throws` clause) is handled
+ *  separately by `throws_row_is_implicit_absent` below.
  */
 let throws_row_is_wrappable = fn (row: TypeExpr) -> bool do
   match row do
@@ -86,6 +90,78 @@ let throws_row_is_wrappable = fn (row: TypeExpr) -> bool do
         | None -> return throws_row_entries_are_named(entries: ts)
       end
     | _ -> return false
+  end
+end
+
+/** True for the implicit-absent-throws sentinel
+ *  `TyRow([], Some(TyVar("__implicit")))` that `parse_optional_throws`
+ *  emits when `main` OMITS its `throws` clause. An omitted clause does NOT
+ *  enforce a closed `{}` row, so a checked exception raised by a callee can
+ *  still propagate out of `main` and escape to the host uncaught at runtime
+ *  (the twyov fiber-double-free hazard). Wrapping this case installs the
+ *  catch-all so the escape becomes a controlled `proc_exit(1)`.
+ *
+ *  This is intentionally narrow: only the exact `__implicit` sentinel with
+ *  no leading entries qualifies. Any other open row (a differently-named
+ *  tail variable, or a row carrying entries alongside a tail) is NOT this
+ *  case and stays unwrappable so `validate_main` surfaces
+ *  `MainThrowsTooBroad`.
+ */
+let throws_row_is_implicit_absent = fn (row: TypeExpr) -> bool do
+  match row do
+    | TyRow(types: ts, rest: r) ->
+      match r do
+        | Some(val: TyVar(name: vn)) ->
+          match ts do
+            | [] -> return vn == "__implicit"
+            | _ :: _ -> return false
+          end
+        | _ -> return false
+      end
+    | _ -> return false
+  end
+end
+
+/** True when `main`'s signature is a valid program entry point:
+ *  monomorphic (no type params), returns `unit`, and takes either no
+ *  params or a single `[string]` argv param. The implicit-absent-throws
+ *  wrap is gated on this so a malformed `main` (wrong return type,
+ *  polymorphic, or odd params) is left intact for `validate_main` to
+ *  reject with its precise diagnostic (E2034/E2027/E2004/...) — wrapping
+ *  such a `main` would rename it out of sight and corrupt that diagnostic.
+ */
+let main_is_valid_entry_shape = fn (f: HirFunction) -> bool do
+  let HirFunction(
+    name: _,
+    type_params: tps,
+    params: ps,
+    ret_type: rt,
+    throw_row: _,
+    body: _,
+    span: _,
+    file: _,
+    requires: _
+  ) = f
+  match tps do
+    | [] -> ()
+    | _ :: _ -> return false
+  end
+  match rt do
+    | TyUnit -> ()
+    | _ -> return false
+  end
+  return main_params_are_entry_shape(params: ps)
+end
+
+let main_params_are_entry_shape = fn (params: [ HirParam ]) -> bool do
+  match params do
+    | [] -> return true
+    | HirParam(label: _, name: _, sigil: _, typ: pt) :: [] ->
+      match pt do
+        | TyList(elem: TyString) -> return true
+        | _ -> return false
+      end
+    | _ :: _ :: _ -> return false
   end
 end
 
@@ -320,6 +396,21 @@ end
  *  surprises for downstream consumers like linearity).
  */
 export let wrap_main_if_needed = fn (prog: HirProgram) -> HirProgram do
+  return wrap_main_if_needed_opts(prog, component_target: false)
+end
+
+/** As `wrap_main_if_needed`, but `component_target` is true when the build
+ *  targets a wasm component (`--p3-component` / `--p2-component`). Component
+ *  builds do not instantiate a `wasi_snapshot_preview1` module, so the
+ *  catch-all wrapper's `proc_exit` import would be unsatisfiable and the
+ *  produced binary would fail to instantiate. The implicit-absent-throws
+ *  wrap is therefore suppressed for component targets; an uncaught throw
+ *  there keeps its pre-existing (un-wrapped) behavior.
+ */
+export let wrap_main_if_needed_opts = fn (
+  prog: HirProgram,
+  component_target: bool
+) -> HirProgram do
   let HirProgram(
     caps,
     functions: funcs,
@@ -349,11 +440,25 @@ export let wrap_main_if_needed = fn (prog: HirProgram) -> HirProgram do
       if throws_row_is_empty(row: tw) then
         return prog
       end
-      // Too-broad rows (`{Exn}`, open rows, non-named entries) deliberately
-      // fall through unchanged so `validate_main` can surface
-      // `MainThrowsTooBroad`. Wrapping them would silently widen the
-      // catch-all and hide the user's mis-narrowed signature.
-      if !throws_row_is_wrappable(row: tw) then
+      // Decide whether this main needs the catch-all wrapper:
+      //   1. A wrappable DECLARED row (`throws { E, ... }` / `{ Exn }`) — the
+      //      pre-existing behavior, always wrapped regardless of entry shape.
+      //   2. An OMITTED throws clause (the `__implicit` sentinel) — wrapped
+      //      only when `main` is a valid entry shape (so a malformed main is
+      //      left intact for validate_main's precise diagnostic) and the
+      //      build is NOT a component target (no host `wasi_snapshot_preview1`
+      //      to satisfy the wrapper's proc_exit import there).
+      // Too-broad rows (open rows other than `__implicit`, rows with
+      // non-named entries) deliberately fall through unchanged so
+      // `validate_main` can surface `MainThrowsTooBroad`.
+      let needs_wrap = if throws_row_is_wrappable(row: tw) then
+          true
+        else if throws_row_is_implicit_absent(row: tw) then
+          main_is_valid_entry_shape(f: m) && !component_target
+        else
+          false
+        end
+      if !needs_wrap then
         return prog
       end
       let renamed_user = rename_main_to_user(f: m)
