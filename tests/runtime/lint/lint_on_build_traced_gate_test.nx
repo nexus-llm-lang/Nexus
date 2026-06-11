@@ -1,0 +1,149 @@
+// Regression: `run_lint_on_build_traced` — the actual build-path entry that
+// `src/main.nx` calls — must return the real promoted-error count, not a
+// defaulted 0.
+//
+// The wrapper selects the verbose/no-op `Trace` around-advice handler and runs
+// the lint pass under a single inject. The inject is an EXPRESSION whose
+// value-channel is its body's trailing value, so the wrapper must `return` that
+// inject to surface the i64 count. A trailing un-`return`ed `if … inject …`
+// falls through to the defaulted i64 return slot (== 0) and the
+// `lint_errors > 0` gate at src/main.nx never halts the build — the bug this
+// test guards against.
+//
+// Strategy: parse a fixture whose `require { Console }` cap is never consumed
+// (fires L0002 at warning severity), drive `run_lint_on_build_traced` under
+// both the verbose and the non-verbose toggle, and assert the gating count is
+// surfaced (== 1) under --lint-level=error / --deny=L0002 and not surfaced
+// (== 0) under the default and --no-lint policies. The companion
+// lint_on_build_test.nx covers the inner run_lint_on_build; this one covers the
+// _traced wrapper specifically, on both verbose paths.
+
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import * as stdio from "std:stdio"
+import { None, Some } from "std:option"
+import * as lexer from "src/frontend/lexer.nx"
+import { ParseDiagnostics }, * as parser from "src/frontend/parser.nx"
+import { Program } from "src/syntax/ast.nx"
+import { make_lint_build_policy, run_lint_on_build_traced } from "src/cli/lint_on_build.nx"
+
+// Fixture with an unused `Console` require on a helper — fires L0002 (warning).
+let l0002_source = fn () -> string do
+  return "import { Console } from \"std:stdio\"\n"
+    ++ "let helper = fn () -> i64 require { Console } do\n"
+    ++ "  return 42\n"
+    ++ "end\n"
+    ++ "let main = fn () -> unit do\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+end
+
+let parse_fixture = fn (src: string) -> Program do
+  let tokens = lexer.tokenize(src)
+  match parser.parse_collect(tokens, file: "fixture.nx") do
+    | ParseDiagnostics(prog, diags: _) -> return prog
+  end
+end
+
+// (a) --lint-level=error, non-verbose: the no-op-handler branch must surface the
+// promoted count (== 1). Pre-fix this fell through to 0 → gate never halted.
+let test_traced_gates_nonverbose = fn () -> unit require { Console } throws { Exn } do
+  let src = l0002_source()
+  let prog = parse_fixture(src)
+  let policy = make_lint_build_policy(no_lint: false, level_error: true, deny: None)
+  let n = run_lint_on_build_traced(prog, src, file: "fixture.nx", policy, verbose: false)
+  test_assert.assert_eq_i64(
+    actual: n,
+    expected: 1,
+    label: "4owsc: traced wrapper surfaces the gating count (non-verbose, --lint-level=error)"
+  )
+  return ()
+end
+
+// (b) --lint-level=error, verbose: the verbose-handler branch must also surface
+// the promoted count (== 1).
+let test_traced_gates_verbose = fn () -> unit require { Console } throws { Exn } do
+  let src = l0002_source()
+  let prog = parse_fixture(src)
+  let policy = make_lint_build_policy(no_lint: false, level_error: true, deny: None)
+  let n = run_lint_on_build_traced(prog, src, file: "fixture.nx", policy, verbose: true)
+  test_assert.assert_eq_i64(
+    actual: n,
+    expected: 1,
+    label: "4owsc: traced wrapper surfaces the gating count (verbose, --lint-level=error)"
+  )
+  return ()
+end
+
+// (c) --deny=L0002, non-verbose: the named code is promoted and surfaced (== 1).
+let test_traced_deny_gates = fn () -> unit require { Console } throws { Exn } do
+  let src = l0002_source()
+  let prog = parse_fixture(src)
+  let policy = make_lint_build_policy(no_lint: false, level_error: false, deny: Some(val: "L0002"))
+  let n = run_lint_on_build_traced(prog, src, file: "fixture.nx", policy, verbose: false)
+  test_assert.assert_eq_i64(
+    actual: n,
+    expected: 1,
+    label: "4owsc: traced wrapper surfaces the --deny=L0002 gating count"
+  )
+  return ()
+end
+
+// (d) Default policy, non-verbose: warning surfaces but does not gate (== 0).
+// Guards that the fix does not over-gate the happy path.
+let test_traced_default_no_gate = fn () -> unit require { Console } throws { Exn } do
+  let src = l0002_source()
+  let prog = parse_fixture(src)
+  let policy = make_lint_build_policy(no_lint: false, level_error: false, deny: None)
+  let n = run_lint_on_build_traced(prog, src, file: "fixture.nx", policy, verbose: false)
+  test_assert.assert_eq_i64(
+    actual: n,
+    expected: 0,
+    label: "4owsc: traced wrapper does not gate the default (warn) policy"
+  )
+  return ()
+end
+
+// (e) --no-lint, verbose: lint is skipped entirely → count 0 on the verbose
+// branch too, even with escalation flags set.
+let test_traced_no_lint_skips = fn () -> unit require { Console } throws { Exn } do
+  let src = l0002_source()
+  let prog = parse_fixture(src)
+  let policy = make_lint_build_policy(no_lint: true, level_error: true, deny: Some(val: "L0002"))
+  let n = run_lint_on_build_traced(prog, src, file: "fixture.nx", policy, verbose: true)
+  test_assert.assert_eq_i64(
+    actual: n,
+    expected: 0,
+    label: "4owsc: traced wrapper honours --no-lint on the verbose branch"
+  )
+  return ()
+end
+
+let body = fn () -> unit require { Console } throws { Exn } do
+  test_traced_gates_nonverbose()
+  test_traced_gates_verbose()
+  test_traced_deny_gates()
+  test_traced_default_no_gate()
+  test_traced_no_lint_skips()
+  return ()
+end
+
+// run_lint_on_build_traced provides its own `Trace` handler internally (that is
+// the unit under test), so the body only needs `Console`. Catch any assertion
+// throw and convert to a 0/1 so the trap-on-zero below makes the failure loud.
+let safe_run = fn () -> i64 require { Console } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole } do
+  inject stdio.system_handler do
+    let ok = safe_run()
+    1 / ok
+    return ()
+  end
+end
