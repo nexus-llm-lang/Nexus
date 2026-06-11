@@ -1,0 +1,226 @@
+// `nexus lint --check DIR` must recurse into the directory and exit 1 when any
+// `.nx` file under it has a finding — it previously read the directory as an
+// empty file and silently exited 0, defeating the advertised
+// `nexus lint --check src/` CI gate (src/cli/specs.nx).
+//
+// Root: `lint_collect_one` only handled file paths; a directory path slipped
+// past the existence guard, read as empty content, produced zero findings, and
+// exited 0. Fix: expand directory args to every `*.nx` descendant
+// (`collect_lint_inputs`, mirroring `nexus fmt` / `nexus test` discovery)
+// before the collect phase.
+//
+// Strategy: build a temp tree with a dirty file (unused `Console` require →
+// L0002) at the top level AND in a sub-directory, plus a clean file and a
+// non-`.nx` file. Assert `collect_lint_inputs` finds exactly the `.nx` files
+// (skipping README.md and the ignored `.git` / `target` dirs), then drive
+// `run_lint_subcommand` end-to-end to verify the exit codes.
+import * as test_assert from "std:test/assert"
+import { Fs } from "std:fs"
+import { Console } from "std:stdio"
+import * as fs_mod from "std:fs"
+import * as stdio from "std:stdio"
+import * as list from "std:list"
+import { collect_lint_inputs, run_lint_subcommand } from "src/tools/lint.nx"
+
+// Membership for string lists — std:list only ships an i64 `contains`.
+let str_list_contains = fn (xs: [ string ], val: string) -> bool do
+  match xs do
+    | [] -> return false
+    | x :: rest ->
+      if x == val then return true end
+      return str_list_contains(xs: rest, val)
+  end
+end
+
+let count_list = fn (xs: [ string ]) -> i64 do
+  return list.length(xs)
+end
+
+// ─── Temp-tree construction ─────────────────────────────────────────────
+// Per-test unique root keeps reruns idempotent. bootstrap.sh mounts /tmp into
+// the wasmtime sandbox.
+let root_dir = fn () -> string do
+  return "/tmp/nx_1hf9c_lint_walk"
+end
+
+// `dirty_*` declare `require { Console }` but never call `Console.*`, firing
+// L0002 (warning). `clean.nx` has no findings. `README.md` is a non-`.nx`
+// regular file the walk must skip.
+let dirty_source = fn () -> string do
+  return "import { Console } from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { Console } do\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+end
+let clean_source = fn () -> string do
+  return "let add = fn (a: i64, b: i64) -> i64 do return a + b end\n"
+end
+let readme_text = fn () -> string do return "# not a nexus source\n" end
+let ignored_dirty = fn () -> string do
+  return "import { Console } from \"std:stdio\"\n"
+    ++ "let f = fn () -> unit require { Console } do return () end\n"
+end
+
+let setup_dirty_tree = fn () -> unit require { Fs } throws { Exn } do
+  let root = root_dir()
+  let sub = root ++ "/sub"
+  let dot_git = root ++ "/.git"
+  let target = root ++ "/target"
+  Fs.create_dir_all(path: root)
+  Fs.create_dir_all(path: sub)
+  Fs.create_dir_all(path: dot_git)
+  Fs.create_dir_all(path: target)
+  // Top-level: one dirty `.nx`, one clean `.nx`, one non-`.nx`.
+  Fs.write_string(path: root ++ "/top_dirty.nx", content: dirty_source())
+  Fs.write_string(path: root ++ "/clean.nx", content: clean_source())
+  Fs.write_string(path: root ++ "/README.md", content: readme_text())
+  // Sub-dir `.nx` must be discovered by the recursive walk.
+  Fs.write_string(path: sub ++ "/sub_dirty.nx", content: dirty_source())
+  // Files inside ignored dirs MUST NOT be linted even though they have the
+  // `.nx` suffix and would fire L0002.
+  Fs.write_string(path: dot_git ++ "/hidden.nx", content: ignored_dirty())
+  Fs.write_string(path: target ++ "/artifact.nx", content: ignored_dirty())
+  return ()
+end
+
+let cleanup_file_if_exists = fn (path: string) -> unit require { Fs } throws { Exn } do
+  if Fs.exists(path) then
+    Fs.remove_file(path)
+  end
+  return ()
+end
+
+let cleanup_tree = fn () -> unit require { Fs } throws { Exn } do
+  let root = root_dir()
+  cleanup_file_if_exists(path: root ++ "/top_dirty.nx")
+  cleanup_file_if_exists(path: root ++ "/clean.nx")
+  cleanup_file_if_exists(path: root ++ "/README.md")
+  cleanup_file_if_exists(path: root ++ "/sub/sub_dirty.nx")
+  cleanup_file_if_exists(path: root ++ "/.git/hidden.nx")
+  cleanup_file_if_exists(path: root ++ "/target/artifact.nx")
+  // Leave the dirs themselves: Fs has no rmdir cap, and an empty dir doesn't
+  // affect the next run.
+  return ()
+end
+
+// ─── Test bodies ────────────────────────────────────────────────────────
+
+// (a) `collect_lint_inputs` over a single dir returns exactly the `.nx` files
+//     under it (recursing into sub/), skipping README.md and ignored dirs.
+let case_walk_collects_nx = fn () -> unit require { Fs, Console } throws { Exn } do
+  let inputs = collect_lint_inputs(paths: [ root_dir() ])
+  test_assert.assert_eq_i64(
+    actual: count_list(xs: inputs),
+    expected: 3,
+    label: "1hf9c: dir walk collects 3 .nx files"
+  )
+  test_assert.assert_true(
+    cond: str_list_contains(xs: inputs, val: root_dir() ++ "/top_dirty.nx"),
+    label: "1hf9c: walk includes top_dirty.nx"
+  )
+  test_assert.assert_true(
+    cond: str_list_contains(xs: inputs, val: root_dir() ++ "/clean.nx"),
+    label: "1hf9c: walk includes clean.nx"
+  )
+  test_assert.assert_true(
+    cond: str_list_contains(xs: inputs, val: root_dir() ++ "/sub/sub_dirty.nx"),
+    label: "1hf9c: walk recurses into sub/"
+  )
+  test_assert.assert_false(
+    cond: str_list_contains(xs: inputs, val: root_dir() ++ "/README.md"),
+    label: "1hf9c: walk skips README.md"
+  )
+  test_assert.assert_false(
+    cond: str_list_contains(xs: inputs, val: root_dir() ++ "/.git/hidden.nx"),
+    label: "1hf9c: walk skips .git/"
+  )
+  test_assert.assert_false(
+    cond: str_list_contains(xs: inputs, val: root_dir() ++ "/target/artifact.nx"),
+    label: "1hf9c: walk skips target/"
+  )
+  return ()
+end
+
+// (b) THE BUG: `--check DIR` with a dirty file under it must exit 1, both with
+//     a trailing slash and without (the two forms the issue reported as 0).
+let case_check_dir_exits_1 = fn () -> unit require { Fs, Console } throws { Exn } do
+  let code_slash = run_lint_subcommand(args: [ "--check", root_dir() ++ "/" ])
+  test_assert.assert_eq_i64(
+    actual: code_slash,
+    expected: 1,
+    label: "1hf9c: --check DIR/ exits 1 on a finding"
+  )
+  let code_no_slash = run_lint_subcommand(args: [ "--check", root_dir() ])
+  test_assert.assert_eq_i64(
+    actual: code_no_slash,
+    expected: 1,
+    label: "1hf9c: --check DIR exits 1 on a finding"
+  )
+  return ()
+end
+
+// (c) Recursion: a finding ONLY in a sub-directory must still trip --check.
+let case_check_subdir_only_exits_1 = fn () -> unit require { Fs, Console } throws { Exn } do
+  let code = run_lint_subcommand(args: [ "--check", root_dir() ++ "/sub" ])
+  test_assert.assert_eq_i64(
+    actual: code,
+    expected: 1,
+    label: "1hf9c: --check on sub/ (finding in subdir) exits 1"
+  )
+  return ()
+end
+
+// (d) Without --check, a dir with findings stays warning-only → exit 0.
+let case_no_check_dir_exits_0 = fn () -> unit require { Fs, Console } throws { Exn } do
+  let code = run_lint_subcommand(args: [ root_dir() ])
+  test_assert.assert_eq_i64(
+    actual: code,
+    expected: 0,
+    label: "1hf9c: no --check on dir exits 0 (warnings only)"
+  )
+  return ()
+end
+
+// ─── Clean-tree case ─────────────────────────────────────────────────────
+// A directory whose only `.nx` file is clean must exit 0 under --check.
+let clean_root_dir = fn () -> string do
+  return "/tmp/nx_1hf9c_lint_clean"
+end
+
+let setup_clean_tree = fn () -> unit require { Fs } throws { Exn } do
+  Fs.create_dir_all(path: clean_root_dir())
+  Fs.write_string(path: clean_root_dir() ++ "/only.nx", content: clean_source())
+  return ()
+end
+
+let cleanup_clean_tree = fn () -> unit require { Fs } throws { Exn } do
+  cleanup_file_if_exists(path: clean_root_dir() ++ "/only.nx")
+  return ()
+end
+
+let case_check_clean_dir_exits_0 = fn () -> unit require { Fs, Console } throws { Exn } do
+  let code = run_lint_subcommand(args: [ "--check", clean_root_dir() ])
+  test_assert.assert_eq_i64(
+    actual: code,
+    expected: 0,
+    label: "1hf9c: --check on a clean dir exits 0"
+  )
+  return ()
+end
+
+let main = fn () -> unit require { PermFs, PermConsole } throws { Exn } do
+  inject fs_mod.system_handler, stdio.system_handler do
+    cleanup_tree()
+    setup_dirty_tree()
+    case_walk_collects_nx()
+    case_check_dir_exits_1()
+    case_check_subdir_only_exits_1()
+    case_no_check_dir_exits_0()
+    cleanup_tree()
+    cleanup_clean_tree()
+    setup_clean_tree()
+    case_check_clean_dir_exits_0()
+    cleanup_clean_tree()
+  end
+  return ()
+end

@@ -41,6 +41,7 @@
 
 import * as list from "std:list"
 import * as lazy from "std:lazy"
+import * as str from "std:str"
 import { Fs, FileNotFound } from "std:fs"
 import { Console } from "std:stdio"
 import { InvalidUsage } from "src/diagnostics/error.nx"
@@ -229,6 +230,126 @@ end
  */
 let parallel_threshold = fn () -> i64 do return 2 end
 
+//
+// Argument resolution: positional args may be files or directories. A
+// directory is walked recursively, collecting every `*.nx` file outside the
+// hardcoded ignore set (mirrors `nexus fmt` / `nexus test` discovery). Files
+// passed directly pass through verbatim (extension not enforced — preserves
+// the single-file contract `lint_check_mode_test` relies on). Without this
+// expansion a directory path reached `lint_collect_one`, read as empty, and
+// silently exited 0 — defeating the advertised `nexus lint --check src/` CI
+// gate.
+
+// Directory basenames that are never descended into. Hidden dotfiles are
+// caught by the dot-prefix check; this list covers VCS / build scratch dirs
+// that don't start with a dot. Same set as `nexus fmt`.
+let is_ignored_dirname = fn (name: string) -> bool do
+  if str.starts_with(s: name, prefix: ".") then return true end
+  if name == "target" then return true end
+  if name == "build" then return true end
+  if name == "node_modules" then return true end
+  return false
+end
+
+let has_nx_suffix = fn (name: string) -> bool do
+  return str.ends_with(s: name, suffix: ".nx")
+end
+
+let strip_trailing_slash = fn (s: string) -> string do
+  let n = str.length(s)
+  if n == 0 then return s end
+  if str.ends_with(s, suffix: "/") then
+    return str.substring(s, start: 0, len: n - 1)
+  end
+  return s
+end
+
+// Intentional narrow row for the directory-walk cluster below
+// (walk_for_nx / walk_for_nx_entries / visit_lint_entry / expand_lint_input /
+//  collect_lint_inputs / collect_lint_inputs_go): only FileNotFound can escape
+// from Fs operations at this layer. ArgParse faults are resolved earlier.
+let walk_for_nx = fn (
+  path: string,
+  acc: [ string ]
+) -> [ string ] require { Fs } throws { FileNotFound } do
+  let names = Fs.list_dir(path)
+  return walk_for_nx_entries(names, dir: path, acc)
+end
+
+let walk_for_nx_entries = fn (
+  names: [ string ],
+  dir: string,
+  acc: [ string ]
+) -> [ string ] require { Fs } throws { FileNotFound } do
+  match names do
+    | [] -> return acc
+    | name :: rest ->
+      let full = dir ++ "/" ++ name
+      let acc2 = visit_lint_entry(path: full, name, acc)
+      return walk_for_nx_entries(names: rest, dir, acc: acc2)
+  end
+end
+
+let visit_lint_entry = fn (
+  path: string,
+  name: string,
+  acc: [ string ]
+) -> [ string ] require { Fs } throws { FileNotFound } do
+  if Fs.is_file(path) then
+    // Skip non-`.nx` files inside walked directories. Direct file arguments
+    // bypass this filter — see `expand_lint_input`.
+    if has_nx_suffix(name) then
+      return path :: acc
+    end
+    return acc
+  end
+  // Directory: honor the ignore list before recursing.
+  if is_ignored_dirname(name) then return acc end
+  return walk_for_nx(path, acc)
+end
+
+// Resolve one CLI positional. Files pass through as-is (extension not checked
+// here so `nexus lint myfile` keeps working). Directories expand to every
+// `*.nx` descendant.
+let expand_lint_input = fn (
+  path: string,
+  acc: [ string ]
+) -> [ string ] require { Fs } throws { FileNotFound } do
+  if Fs.exists(path) == false then
+    // Keep the path so `lint_collect_one` handles a missing file the same way
+    // as before (its existence guard returns no findings → exit 0), preserving
+    // the v1 single-file behaviour for typo'd args.
+    return path :: acc
+  end
+  if Fs.is_file(path) then
+    return path :: acc
+  end
+  // Directory entry-point: caller may pass `src/` or `src` — normalize.
+  return walk_for_nx(path: strip_trailing_slash(s: path), acc)
+end
+
+/** Expand each positional arg, accumulating `*.nx` files for directories and
+ *  passing files through unchanged. The order of files within a single dir is
+ *  unspecified (depends on `Fs.list_dir` iteration order). */
+export let collect_lint_inputs = fn (paths: [ string ]) -> [ string ] require {
+  Fs
+} throws { FileNotFound } do
+  let acc = collect_lint_inputs_go(paths, acc: [])
+  return list.reverse(xs: acc)
+end
+
+let collect_lint_inputs_go = fn (
+  paths: [ string ],
+  acc: [ string ]
+) -> [ string ] require { Fs } throws { FileNotFound } do
+  match paths do
+    | [] -> return acc
+    | p :: rest ->
+      let acc2 = expand_lint_input(path: p, acc)
+      return collect_lint_inputs_go(paths: rest, acc: acc2)
+  end
+end
+
 /** Execute `nexus lint`. Returns exit code:
  *   0 — no findings (both modes), or findings present without --check
  *   1 — at least one finding AND --check was passed (CI gate), OR a
@@ -257,11 +378,17 @@ export let run_lint_subcommand = fn (args: [ string ]) -> i64 require { Console,
     if fix_mode || fix_diff then
       return run_fix_each_file(paths, fix_diff, all_ok: true)
     end
-    let n = list.length(xs: paths)
+    // Directory args expand to every `*.nx` descendant (ignoring `.git`,
+    // `target`, `build`, `node_modules`, and any dot-prefixed dir), mirroring
+    // `nexus fmt`. File args pass through verbatim. This makes the advertised
+    // `nexus lint --check src/` CI gate (specs.nx) actually scan the tree
+    // instead of silently exiting 0 on a directory.
+    let expanded = collect_lint_inputs(paths)
+    let n = list.length(xs: expanded)
     let results = if n <= parallel_threshold() then
-      collect_sequential(paths, acc: [])
+      collect_sequential(paths: expanded, acc: [])
     else
-      collect_parallel(paths)
+      collect_parallel(paths: expanded)
     end
     let total = emit_results(results, total: 0)
     if check_mode && total > 0 then return 1 else return 0 end
