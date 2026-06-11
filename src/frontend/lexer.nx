@@ -385,13 +385,19 @@ end
 
 type HexAccum = LexHexOk(st: LexerState, code: i64) | LexHexErr(st: LexerState, msg: string)
 
-let collect_hex_digits = fn (st: LexerState, code: i64) -> HexAccum do
+let collect_hex_digits = fn (st: LexerState, code: i64, count: i64) -> HexAccum do
   if at_end(st) then
     return LexHexErr(st, msg: "unterminated \\u{} escape")
   end
   let c = peek(st)
   if c == ch_rbrace then
     let st2 = advance(st)
+    // Empty escape `\u{}` is invalid: the grammar requires HEX_DIGIT+
+    // (one or more). Reject before any range check so an empty run is
+    // never silently accepted as U+0000 (NUL).
+    if count == 0 then
+      return LexHexErr(st: st2, msg: "\\u{} escape requires at least one hex digit")
+    end
     if code > 1114111 then
       return LexHexErr(st: st2, msg: "\\u{} codepoint must be at most U+10FFFF")
     end
@@ -402,7 +408,17 @@ let collect_hex_digits = fn (st: LexerState, code: i64) -> HexAccum do
   end
   let v = char.hex_digit_value(c)
   if v >= 0 then
-    return collect_hex_digits(st: advance(st), code: code * 16 + v)
+    let next_code = code * 16 + v
+    // Detect over-range as digits accumulate, BEFORE the i64 accumulator
+    // can wrap. The accumulator only grows (code, v >= 0), so once it
+    // passes U+10FFFF it can never come back; rejecting here (within the
+    // first 6 hex digits) means a >= 2^64 run can no longer wrap mod 2^64
+    // past the closing-`}` guard and slip through with a low-bits value.
+    // Same diagnostic class as the non-overflowing `\u{200000}` case.
+    if next_code > 1114111 then
+      return LexHexErr(st: advance(st), msg: "\\u{} codepoint must be at most U+10FFFF")
+    end
+    return collect_hex_digits(st: advance(st), code: next_code, count: count + 1)
   else
     return LexHexErr(st, msg: "invalid hex digit in \\u{} escape")
   end
@@ -485,7 +501,7 @@ let lex_string_body = fn (st: LexerState, start_pos: i64, acc: string) -> LexRes
     // Unicode escape: \u{NNNN}
     if c2 == 'u' then
       if peek_at(st, offset: 2) == ch_lbrace then
-        match collect_hex_digits(st: advance_n(st, n: 3), code: 0) do
+        match collect_hex_digits(st: advance_n(st, n: 3), code: 0, count: 0) do
           | LexHexOk(st: st3, code) ->
             let LexerState(src: _, sp: SourcePos(pos: np, line: _, col: _), len: _) = st3
             return lex_string_body(st: st3, start_pos: np, acc: acc2 ++ str.from_char_code(code))
@@ -582,7 +598,7 @@ let lex_char_escape = fn (st: LexerState, span: Span, c2: char) -> LexResult do
   if c2 == ch_squote then return lex_char_close(st: advance_n(st, n: 2), span, code: 39) end
   if c2 == 'u' then
     if peek_at(st, offset: 2) == ch_lbrace then
-      match collect_hex_digits(st: advance_n(st, n: 3), code: 0) do
+      match collect_hex_digits(st: advance_n(st, n: 3), code: 0, count: 0) do
         | LexHexOk(st: st3, code: hex_code) ->
           return lex_char_close(st: st3, span, code: hex_code)
         | LexHexErr(st: st3, msg) ->
