@@ -192,6 +192,59 @@ let find_comma_before_loop = fn (src: string, i: i64, limit: i64) -> i64 do
   return find_comma_before_loop(src: src, i: i - 1, limit: limit)
 end
 
+// ── comment-intersection guard for the raw-source rewrite spans ─────────────
+//
+// The Nexus lexer discards comments wholesale (no comment tokens reach the
+// token stream), so the L0001/L0002/L0007 enrichment helpers — which carve
+// rewrites out of RAW source byte slices — can splice a stray `//` / `/*`
+// comment into the rewritten text (or have a `find_word_in` keyword scan match
+// a keyword *inside* a comment).  Either way a passing file becomes
+// non-compiling.  These helpers detect whether a comment opener appears inside
+// `[start, stop)` so the enrichment can defensively bail (return None, leaving
+// the source untouched) when one does.
+//
+// String (`"…"`) and char (`'…'`) literals are tracked so a `//` or `/*` inside
+// a literal (e.g. the target expression `"http://x"`) is NOT mistaken for a
+// comment — that would over-bail on perfectly safe rewrites.  The scan must
+// start at a byte position known to be outside any literal (a token boundary),
+// which is how every caller invokes it.
+//
+// `mode`: 0 = normal code, 1 = inside a string literal, 2 = inside a char
+// literal.  A backslash inside a literal escapes the next byte.
+let range_has_comment_loop = fn (src: string, i: i64, stop: i64, mode: i64) -> bool do
+  if i >= stop then return false end
+  let c = str.byte_at(s: src, idx: i)
+  if mode == 1 then
+    // Inside a string literal.
+    if c == '\\' then return range_has_comment_loop(src, i: i + 2, stop, mode: 1) end
+    if c == '"' then return range_has_comment_loop(src, i: i + 1, stop, mode: 0) end
+    return range_has_comment_loop(src, i: i + 1, stop, mode: 1)
+  end
+  if mode == 2 then
+    // Inside a char literal.
+    if c == '\\' then return range_has_comment_loop(src, i: i + 2, stop, mode: 2) end
+    if c == '\'' then return range_has_comment_loop(src, i: i + 1, stop, mode: 0) end
+    return range_has_comment_loop(src, i: i + 1, stop, mode: 2)
+  end
+  // Normal code: look for a comment opener, or the start of a literal.
+  let c2 = if i + 1 < str.byte_length(s: src) then str.byte_at(s: src, idx: i + 1) else '\0' end
+  if c == '/' && c2 == '/' then return true end
+  if c == '/' && c2 == '*' then return true end
+  if c == '"' then return range_has_comment_loop(src, i: i + 1, stop, mode: 1) end
+  if c == '\'' then return range_has_comment_loop(src, i: i + 1, stop, mode: 2) end
+  return range_has_comment_loop(src, i: i + 1, stop, mode: 0)
+end
+
+// True if a `//` or `/*` comment opener appears within `[start, stop)`, ignoring
+// markers inside string/char literals.  `start` must be outside any literal.
+let range_has_comment = fn (src: string, start: i64, stop: i64) -> bool do
+  let n = str.byte_length(s: src)
+  let lo = if start < 0 then 0 else start end
+  let hi = if stop > n then n else stop end
+  if hi <= lo then return false end
+  return range_has_comment_loop(src, i: lo, stop: hi, mode: 0)
+end
+
 // Enrich an L0001 fixit: the AST produced `start=0, len=0` as a placeholder.
 // We scan from `span.offset` (the `inject` keyword) forward for the whole-word
 // `end` that closes the empty inject body, and replace the entire
@@ -202,6 +255,10 @@ let enrich_l0001_fixit = fn (src: string, sp: Span, fix: Fixit) -> Option<Fixit>
   let Span(offset, line: _, col: _) = sp
   let end_pos = find_word_in(src, start: offset, window: 4096, word: "end")
     if end_pos < 0 then return None end
+    // Defensive: if a comment sits between the `inject` keyword and the matched
+    // `end`, the raw `end` scan may have matched a keyword inside the comment
+    // (truncating the deletion span) — bail rather than corrupt the file.
+    if range_has_comment(src, start: offset, stop: end_pos + 3) then return None end
     let real_start = offset
     let raw_len = end_pos + 3 - real_start
     // Consume a trailing newline so the removed line doesn't leave a blank.
@@ -233,6 +290,11 @@ let enrich_l0002_fixit = fn (src: string, sp: Span, fix: Fixit) -> Option<Fixit>
       // Find the closing `}`.
       let brace_close = str.find_byte(s: src, start: brace_open + 1, ch: '}')
       if brace_close < 0 then return None end
+      // Defensive: if a comment sits anywhere between the `fn` keyword and the
+      // closing `}` of the require row, the raw `require` scan may have anchored
+      // on a keyword inside the comment (splicing the rewrite) — bail rather
+      // than corrupt the file.
+      if range_has_comment(src, start: offset, stop: brace_close + 1) then return None end
       // Locate the cap name inside the braces.
       let inner_window = brace_close - brace_open
       let cn_pos = find_word_in(src, start: brace_open + 1, window: inner_window, word: cn)
@@ -469,6 +531,11 @@ let enrich_l0007_fixit = fn (src: string, sp: Span, fix: Fixit) -> Option<Fixit>
         let from_do = toks_from_offset(toks: after_match, offset: do_off)
         let end_off = find_match_end(toks: from_do, depth: 0, prev_else: false)
         if end_off < 0 then return None end
+        // Defensive: the rewrite reconstructs the `let`/body from raw source
+        // slices of `[match_off, end_off)`.  A comment inside that span would be
+        // spliced into the slice (e.g. between the pattern and `->`, commenting
+        // out the `= target`) or silently dropped — bail rather than corrupt.
+        if range_has_comment(src, start: match_off, stop: end_off) then return None end
         let ArmHead(pipe_off, arrow_off) = find_arm_head(toks: from_do, pipe_off: 0 - 1)
         if pipe_off < 0 || arrow_off < 0 then return None end
         let target_text = slice_trim(src, start: target_start, stop: do_off)
@@ -603,8 +670,11 @@ let fix_loop_for_file = fn (
     | FixPassNoChange ->
       return 0
     | FixPassPipelineError(message) ->
+      // A residual pipeline error after the fix pass must ALWAYS surface as a
+      // nonzero exit, even when earlier fix-its were applied: a corrupting
+      // autofix (e.g. a comment-unaware rewrite that produced non-compiling
+      // code) would otherwise be silently reported as success (exit 0).
       Console.eprintln(val: message)
-      if fixes_applied > 0 then return 0 end
       return 1
     | FixPassApplied(new_src, sp, fix) ->
       if fix_diff then

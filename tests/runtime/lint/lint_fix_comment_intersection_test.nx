@@ -1,0 +1,176 @@
+// nexus-1fk1u: `nexus lint --fix` must never turn compiling code into
+// non-compiling code via a comment-unaware raw-source rewrite.
+//
+// The Nexus lexer discards comments wholesale (no comment tokens reach the
+// token stream), so the L0001 / L0002 / L0007 fix-it enrichment helpers — which
+// carve rewrites out of RAW source byte slices in src/lint/fix.nx — could splice
+// a stray `//` comment into the rewritten text, or have a `find_word_in` keyword
+// scan match a keyword INSIDE a comment. Either way a passing file became
+// non-compiling, and (compounding) `--fix` reported exit 0.
+//
+// The fix is a defensive bail: when a comment opener intersects a rewrite span,
+// the enrichment returns None (the fix-it is skipped, the source is left
+// untouched). AND a residual post-fix pipeline error now always surfaces as a
+// nonzero exit, so a corrupting fix can never be reported as success.
+//
+// This test asserts, for each of the three rules, that a comment-intersection
+// fixture is left BYTE-FOR-BYTE UNCHANGED by --fix (the bail fired), plus that
+// the exit code propagates nonzero when a fix is applied yet the pipeline still
+// reports an error.
+
+import * as test_assert from "std:test/assert"
+import { Console } from "std:stdio"
+import { Fs } from "std:fs"
+import * as stdio from "std:stdio"
+import * as fs_mod from "std:fs"
+import * as str from "std:str"
+import { run_lint_subcommand } from "src/tools/lint.nx"
+
+// ── L0007: a line comment between the pattern and `->` ──────────────────────
+// Raw `slice_trim(src, pat_start, arrow_off)` would have embedded the comment,
+// commenting out the ` = b` and yielding `let Box(v: n) // bound here = b`.
+let l0007_comment_source = fn () -> string do
+  return "type Box = Box(v: i64)\n"
+    ++ "let f = fn (b: Box) -> i64 do\n"
+    ++ "  match b do\n"
+    ++ "    | Box(v: n) // bound here\n"
+    ++ "      -> return n + 1\n"
+    ++ "  end\n"
+    ++ "end\n"
+end
+
+// ── L0001: the word `end` inside a body comment ─────────────────────────────
+// The raw `find_word_in(src, …, "end")` scan would have matched the `end` in
+// `back end`, truncating the deletion span and leaving stray ` later`/`end`.
+let l0001_comment_source = fn () -> string do
+  return "import { Console } from \"std:stdio\"\n"
+    ++ "import * as stdio from \"std:stdio\"\n"
+    ++ "let main = fn () -> unit require { PermConsole } do\n"
+    ++ "  inject stdio.system_handler do\n"
+    ++ "    // todo: wire the back end later\n"
+    ++ "  end\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+end
+
+// ── L0002: the word `require` inside a comment before the real clause ───────
+// The raw `find_word_in(src, …, "require")` scan would have anchored on the
+// comment's `require`, splicing the ` do` onto the comment line.
+let l0002_comment_source = fn () -> string do
+  return "import { Console } from \"std:stdio\"\n"
+    ++ "let foo = fn () // we used to require Console here\n"
+    ++ "  -> unit require { Console } do\n"
+    ++ "  return ()\n"
+    ++ "end\n"
+end
+
+// ── exit-code propagation: a clean L0007 applies, then E2005 remains ─────────
+// The single-arm match rewrites cleanly to a `let`, but the unused lazy binding
+// `@unused` is surfaced by the pipeline (E2005, not auto-fixable). --fix must
+// exit nonzero even though a fix was applied.
+let exit_code_source = fn () -> string do
+  return "type Box = Box(v: i64)\n"
+    ++ "let make = fn () -> i64 do return 7 end\n"
+    ++ "let f = fn (b: Box) -> i64 do\n"
+    ++ "  let @unused = make()\n"
+    ++ "  match b do\n"
+    ++ "    | Box(v: n) -> return n + 1\n"
+    ++ "  end\n"
+    ++ "end\n"
+end
+
+let fixture_path = fn () -> string do
+  return "./.1fk1u_comment_fixture.nx"
+end
+
+let write_fixture = fn (path: string, src: string) -> unit require { Fs } throws { Exn } do
+  Fs.write_string(path: path, content: src)
+  return ()
+end
+
+let cleanup = fn (path: string) -> unit require { Fs } do
+  try
+    Fs.remove_file(path: path)
+    return ()
+  catch _ -> return ()
+  end
+end
+
+// A comment-intersection fixture must be left byte-for-byte unchanged by --fix
+// (the enrichment bailed), so the previously-passing source still compiles.
+let assert_unchanged_after_fix = fn (
+  src: string,
+  rule: string
+) -> unit require { Console, Fs } throws { Exn } do
+  write_fixture(path: fixture_path(), src: src)
+  let code = run_lint_subcommand(args: [ "--fix", fixture_path() ])
+  // The fix was skipped (no edit), no corruption, no residual pipeline error.
+  test_assert.assert_eq_i64(actual: code, expected: 0, label: rule ++ ": --fix exits 0 (bail, no edit)")
+  let after = Fs.read_to_string(path: fixture_path())
+  test_assert.assert_eq_string(
+    actual: after,
+    expected: src,
+    label: rule ++ ": --fix leaves comment-intersection source byte-for-byte unchanged"
+  )
+  cleanup(path: fixture_path())
+  return ()
+end
+
+let test_l0007_comment_bail = fn () -> unit require { Console, Fs } throws { Exn } do
+  assert_unchanged_after_fix(src: l0007_comment_source(), rule: "1fk1u/L0007")
+  return ()
+end
+
+let test_l0001_comment_bail = fn () -> unit require { Console, Fs } throws { Exn } do
+  assert_unchanged_after_fix(src: l0001_comment_source(), rule: "1fk1u/L0001")
+  return ()
+end
+
+let test_l0002_comment_bail = fn () -> unit require { Console, Fs } throws { Exn } do
+  assert_unchanged_after_fix(src: l0002_comment_source(), rule: "1fk1u/L0002")
+  return ()
+end
+
+// A fix IS applied (clean L0007), but the pipeline still reports E2005. --fix
+// must NOT report success: it exits nonzero (the compounding exit-0 bug).
+let test_exit_code_nonzero_on_residual_error = fn () -> unit require { Console, Fs } throws { Exn } do
+  write_fixture(path: fixture_path(), src: exit_code_source())
+  let code = run_lint_subcommand(args: [ "--fix", fixture_path() ])
+  test_assert.assert_eq_i64(
+    actual: code,
+    expected: 1,
+    label: "1fk1u: --fix exits nonzero when a residual pipeline error remains after a fix"
+  )
+  cleanup(path: fixture_path())
+  return ()
+end
+
+let body = fn () -> unit require { Console, Fs } throws { Exn } do
+  try
+    test_l0007_comment_bail()
+    test_l0001_comment_bail()
+    test_l0002_comment_bail()
+    test_exit_code_nonzero_on_residual_error()
+    return ()
+  catch e ->
+    cleanup(path: fixture_path())
+    throw e
+  end
+end
+
+let safe_run = fn () -> i64 require { Console, Fs } do
+  try
+    body()
+    return 1
+  catch _ ->
+    return 0
+  end
+end
+
+let main = fn () -> unit require { PermConsole, PermFs } do
+  inject stdio.system_handler, fs_mod.system_handler do
+    let ok = safe_run()
+    1 / ok
+    return ()
+  end
+end
