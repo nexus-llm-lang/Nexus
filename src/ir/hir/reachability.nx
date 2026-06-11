@@ -27,6 +27,7 @@ import {
   EagerBody,
   LazyBody
 } from "src/ir/hir/types.nx"
+import { TypeExpr, TyList, TyString } from "src/types/type_expr.nx"
 import * as list from "std:list"
 import * as str from "std:str"
 import { Map }, * as map from "std:collection/map"
@@ -222,7 +223,7 @@ export let collect_reachable = fn (
   handler_bindings: [ HirHandlerBindingEntry ]
 ) -> [ string ] do
   let handler_seeds = collect_handler_seeds(bindings: handler_bindings, acc: [])
-  let intrinsic_seeds = collect_intrinsic_seeds(functions, acc: [])
+  let intrinsic_seeds = collect_intrinsic_seeds(functions, acc: collect_argv_seeds(functions, acc: []))
   let worklist = concat_str_lists(
     a: [ "main"],
     b: concat_str_lists(a: handler_seeds, b: intrinsic_seeds)
@@ -246,7 +247,7 @@ export let collect_reachable_no_thread_start = fn (
   handler_bindings: [ HirHandlerBindingEntry ]
 ) -> [ string ] do
   let handler_seeds = collect_handler_seeds(bindings: handler_bindings, acc: [])
-  let trampoline_seeds = collect_trampoline_seeds(functions, acc: [])
+  let trampoline_seeds = collect_trampoline_seeds(functions, acc: collect_argv_seeds(functions, acc: []))
   let func_index = build_func_index(functions, acc: map.string_map())
   let seen0: Map<string, i64> = map.string_map()
   let worklist = concat_str_lists(
@@ -320,6 +321,74 @@ let collect_intrinsic_seeds = fn (functions: [ HirFunction ], acc: [ string ]) -
         return collect_intrinsic_seeds(functions: rest, acc: n :: acc)
       end
       return collect_intrinsic_seeds(functions: rest, acc)
+  end
+end
+
+/** True when the program declares `main(args: [string])` — i.e. some `main`
+ *  function with one or more params. `main` is registered under the bare name
+ *  (no source qualifier), so an exact-name compare is sufficient.
+ */
+let main_takes_args = fn (functions: [ HirFunction ]) -> bool do
+  match functions do
+    | [] -> return false
+    | HirFunction(name: n, type_params: _, params: ps, ret_type: _, _) :: rest ->
+      if n == "main" then
+        match ps do
+          | [] -> return false
+          | _ :: _ -> return true
+        end
+      end
+      return main_takes_args(functions: rest)
+  end
+end
+
+/** Extra reachability roots for the `main(args)` entry shape. When `main`
+ *  takes an argv param, codegen synthesises a `wasi_run` wrapper that calls
+ *  the compiled `proc.argv` function (the `[string]`-returning one) and passes
+ *  its result to `main` — but no *user* call site references `argv`, so the
+ *  dead-function pass would prune it and the wrapper falls back to an empty
+ *  list (`main(args)` then silently received `[]` unless `proc.argv()`
+ *  was independently reachable). Anchoring the `argv` function as a root keeps
+ *  it live, mirroring how `collect_intrinsic_seeds` anchors the sched
+ *  trampoline. The wrapper's own lookup (`find_func_by_suffix "#argv"`) then
+ *  resolves it.
+ *
+ *  Only `[string]`-returning `argv` is seeded: the low-level
+ *  `runtime/sysio` `argv` returns a packed `i64` and is NOT what the wrapper
+ *  passes to `main(args: [string])`; seeding it would make the wrapper hand
+ *  `main` a raw pointer (garbage list → trap/hang). When `std:proc` is not
+ *  imported no `[string]` `argv` exists, so nothing is seeded and the empty
+ *  fallback stands. Seeding is a no-op for `main()` programs.
+ */
+let collect_argv_seeds = fn (functions: [ HirFunction ], acc: [ string ]) -> [ string ] do
+  if !main_takes_args(functions) then return acc end
+  return collect_argv_names(functions, acc)
+end
+
+let collect_argv_names = fn (functions: [ HirFunction ], acc: [ string ]) -> [ string ] do
+  match functions do
+    | [] -> return acc
+    | HirFunction(name: n, type_params: _, params: _, ret_type: rt, _) :: rest ->
+      if is_argv_name(s: n) && returns_string_list(rt) then
+        return collect_argv_names(functions: rest, acc: n :: acc)
+      end
+      return collect_argv_names(functions: rest, acc)
+  end
+end
+
+/** The compiled `proc.argv` is named bare `argv` or source-qualified
+ *  `<source>#argv` — the same two forms the wasi_run wrapper looks up. */
+let is_argv_name = fn (s: string) -> bool do
+  return s == "argv" || str_ends_with_suffix(s, suffix: "#argv")
+end
+
+/** True iff the function's declared return type is `[string]`
+ *  (`TyList(TyString)`) — the shape the wasi_run wrapper feeds to
+ *  `main(args: [string])`. */
+let returns_string_list = fn (rt: TypeExpr) -> bool do
+  match rt do
+    | TyList(elem: TyString) -> return true
+    | _ -> return false
   end
 end
 

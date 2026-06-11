@@ -1,0 +1,47 @@
+/**
+ * Regression: declaring `main(args: [string])` must ROOT the
+ * `proc.argv` function in reachability so the synthesised `wasi_run` wrapper
+ * passes REAL argv to `main`. Before the fix, `argv` survived dead-function
+ * elimination only when user code independently called `proc.argv()`;
+ * importing `std:proc` but NOT calling `proc.argv()` (the "import-but-unused"
+ * case) left `main(args)` with a synthesised EMPTY list.
+ *
+ * Root cause: src/ir/hir/reachability.nx seeded the call-graph worklist from
+ * `main` (+ handler/intrinsic seeds) only; the wrapper-called `argv` had no
+ * explicit user call site, so DCE pruned it. Fix: `collect_argv_seeds`
+ * anchors the `[string]`-returning `argv` as a reachability root whenever
+ * `main` takes a param. Only the `[string]` form is seeded — the low-level
+ * `runtime/sysio` `argv` returns a packed i64 and is NOT what the wrapper
+ * hands `main(args: [string])`.
+ *
+ * Test mechanism — the `nexus test` positive harness runs the program with NO
+ * extra argv, so wasmtime supplies only arg0 = the wasm path:
+ *   - FIXED  : real argv ⇒ `args` holds at least the program name ⇒
+ *              length >= 1 ⇒ assert passes ⇒ exit 0 ⇒ PASS.
+ *   - BUGGY  : empty synth argv ⇒ length 0 ⇒ assert throws AssertionFailed ⇒
+ *              uncaught at main ⇒ trap ⇒ non-zero exit ⇒ FAIL.
+ *
+ * Crucially this fixture imports `std:proc` but never INJECTS proc_handler and
+ * never calls `proc.argv()` — injecting the handler would seed the `argv`
+ * handler arm as reachable and mask the bug. The single `std:proc` import is
+ * what keeps `nxlib_stdlib_io_proc_nx#argv` in the program for the fix to root.
+ *
+ * Expected output: margc=1 (then a clean exit)
+ */
+import { Console, system_handler as console_handler } from "std:stdio"
+import { from_i64 } from "std:str"
+import * as proc from "std:proc"
+import * as list from "std:list"
+import * as test_assert from "std:test/assert"
+
+let main = fn (args: [ string ]) -> unit require { PermConsole, PermProc } throws { AssertError } do
+  inject console_handler do
+    let n = list.length(xs: args)
+    Console.println(val: "margc=" ++ from_i64(val: n))
+    // n >= 1 once `main(args)` roots argv (arg0 = program name is always
+    // present in real argv). n == 0 means the wasi_run wrapper used the
+    // synthesised empty list, i.e. argv was pruned: the bug under test.
+    test_assert.assert(cond: n >= 1, label: "main(args) must receive real argv")
+  end
+  return ()
+end
