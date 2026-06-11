@@ -101,11 +101,6 @@ export let infer_stmt_impl = fn (
       let HirExpr(node: target_node, span: _) = target
       match target_node do
         | Variable(name: n, sigil: _) ->
-          // T-Assign: the LHS must have type `~τ` (TyRef) per
-          // the modality rule. We look up the env type directly rather than
-          // routing through infer_expr — the lowering hardcodes the target's
-          // sigil to SigilMutable, so the auto-deref in infer_variable would
-          // strip the wrapper before the assign site can verify it.
           match tctypes.env_lookup(env: tctypes.state_env(state), name: n) do
             | None -> return InferExprErr(message: "assign: unbound variable '" ++ n ++ "'", span)
             | Some(val: sch) ->
@@ -144,11 +139,6 @@ export let infer_stmt_impl = fn (
                   end
           end
         | Index(target: arr, index: idx) ->
-          // Indexed assignment `arr[idx] <- val`: the array LHS
-          // must be `~τ`-able as an array (linear/owned or borrow), the index
-          // must be i64, and the value must unify with the element type. We
-          // route the array side through infer_expr so borrow auto-deref and
-          // linear-array semantics flow uniformly with the read path.
           match infer_expr_fn(state, expr: arr, ret_type) do
             | InferExprErr(
               message: m,
@@ -168,8 +158,6 @@ export let infer_stmt_impl = fn (
                       span
                     )
                     | UnifyOk(subst: s2) ->
-                      // Strip TyBorrow and any TyLinear/TyLazy wrappers when
-                      // reading the element type out of the array.
                       let t_arr_a = subst.subst_apply(subst: s2, typ: t_arr)
                       let elem_t = match t_arr_a do
                         | TyArray(elem: e)
@@ -243,37 +231,17 @@ export let infer_inject_body = fn (
     ret_type: TypeExpr
   ) -> InferExprResult throws { TypeError }
 ) -> InferExprResult throws { TypeError } do
-  // Step 1: verify all handler names are bound and not thunks.
   match check_handlers_bound(state, handlers, span) do
     | InferExprErr(message: m, span: esp) -> return InferExprErr(message: m, span: esp)
     | InferExprOk(_) ->
-      // Step 2: T-Inject ∀i≠j. P_i ≠ P_j — injection uniqueness.
-      // Each cap may appear at most once in an inject site.
       check_inject_uniqueness(state, handlers, seen: [], span)
-      // Step 3: T-Inject ∀i. ρ_i ⊆ ρ_q — handler require ⊆ ambient.
-      // Each handler's declared require row must be a subset of the
-      // enclosing function's ambient require row.
       let ambient_req = tctypes.state_require_row(state)
       check_inject_require_subset(state, handlers, ambient: ambient_req, span)
-      // T-Inject: ρ_q' = merge(ρ_q, {P̄}) — extend the ambient require_row
-      // with the injected cap names so that nested inject sites inside
-      // the body see them as available capabilities.
       let body_req = extend_require_row(state, handlers, ambient: ambient_req)
       let body_state0 = tctypes.state_with_require_row(state, require_row: body_req)
-      // Generic-cap soundness: inside this inject, shadow each injected
-      // generic-cap handler's `<cap>.<method>` call-site scheme with the
-      // CONCRETE instantiation recorded for that specific handler binding
-      // (its arm signature). A call at one element type under a handler for
-      // a different element type then fails to unify and is rejected, instead
-      // of silently type-confusing through the free `forall T` poly scheme
-      // (which would miscompile to an OOB memory access). Monomorphic-cap
-      // handlers have no `__handlerinst::` entries → this is a no-op for them.
       let shadowed_env = apply_injected_handler_instances(
         env: tctypes.state_env(body_state0), handler_names: handlers)
       let body_state = tctypes.state_with_env(state: body_state0, env: shadowed_env)
-      // T-Inject: close the block scope — bindings introduced
-      // inside the inject body must not leak past `end`. Mirrors the env
-      // pop in infer_match_cases/infer_try.
       match infer_stmts_fn(state: body_state, stmts: body, ret_type) do
         | InferExprErr(message: m, span: espan) -> return InferExprErr(message: m, span: espan)
         | InferExprOk(state: st1, subst: s1, typ: t) ->
@@ -318,21 +286,6 @@ export let infer_let_impl = fn (
   ) -> InferExprResult throws { TypeError }
 ) -> InferExprResult throws { TypeError } do
   let HirExpr(node: val_node, span: val_span) = value
-  // T-Borrow's ^ω precondition: only an unrestricted
-  // (q = ω) binding may be borrowed. The carve-out for argument
-  // position (`f(p: &x)`) lives in T-App: the borrow is discharged
-  // when the callee returns, so a linear `x` survives. Let-rhs
-  // position has no such discharge — a `let r = &b` would create a
-  // long-lived `&T` binding whose target `b` is q = 1, violating the
-  // spec. Reject at let-rhs before falling through to `infer_expr`,
-  // which is permissive on the borrow form (so the arg-position path
-  // through `check_call_args_walk` keeps working untouched).
-  //
-  // The check is intentionally only against the *syntactic* let-rhs
-  // shape `Borrow(target)`. A deeper `let r = (if c then &b else ...)`
-  // would also be problematic but is not in scope for this fix —
-  // existing flow-sensitive linearity checks downstream already
-  // catch the never-consumed half in such constructions.
   match val_node do
     | Borrow(name: target, sigil: _) ->
       match tctypes.env_lookup(env: tctypes.state_env(state), name: target) do
@@ -354,18 +307,6 @@ export let infer_let_impl = fn (
       end
     | _ -> ()
   end
-  // T-Let-Lazy / T-Lambda no-ref-capture premise for `@`-thunk bindings.
-  // A `let @t = e` defers `e` into a thunk (the HIR has wrapped the rhs in a
-  // `Thunk`, see convert/core.nx). A thunk may be forced later or in parallel,
-  // so — exactly like a lambda or a handler arm — it must not close over a
-  // stack-confined `~`-mutable ref: `∀ x ∈ fv(e) ∩ dom(Γ). Γ(x) ≠ ~σ`
-  // (spec type-system-formal.md, T-Lambda). The lambda path
-  // (infer/exprs.nx) and the handler-arm path (infer.nx) already enforce this
-  // via capture.scan_lambda_captures; the thunk-introduction path did not,
-  // letting a ref-reading computation be suspended into a thunk that may
-  // escape its declaring frame (nexus-vi3v3). Scan the thunk body against the
-  // construction-site env and raise the same E2001 "captures mutable ref
-  // binding …" diagnostic the lambda rule produces.
   match val_node do
     | Thunk(body: thunk_body) ->
       match capture.scan_thunk_captures(body: thunk_body, outer_env: tctypes.state_env(state)) do
@@ -381,19 +322,6 @@ export let infer_let_impl = fn (
       end
     | _ -> ()
   end
-  // Variable-aliasing carve-out for let-polymorphism.
-  //   let f = id   // id : Scheme(["T"], T -> T)
-  // Without this carve-out, infer_expr looks up `id`, instantiates it to
-  // a fresh `?a -> ?a`, and infer_let binds `f` *monomorphically* to
-  // that `?a -> ?a`. Subsequent uses `f(x: 10)` would constrain `?a`
-  // to i64, and `f(x: true)` would then fail to unify bool with int.
-  // By copying the source scheme directly when the RHS is a plain
-  // (non-mutable, unannotated) variable reference to a polymorphic
-  // binding, every call site of `f` re-instantiates exactly as if it
-  // had referenced `id` directly. This is HM-style `generalize` at let,
-  // restricted to the syntactic-value case where the RHS is itself a variable.
-  // Lambdas and other RHS expressions remain monomorphic-bound to keep
-  // linearity / value-restriction invariants intact.
   match alias_poly_scheme(state, name, sigil, ann, val_node, span) do
     | Some(val: result) -> return result
     | None -> ()
@@ -414,11 +342,6 @@ export let infer_let_impl = fn (
     )
     tctypes.state_with_env(state, env: env1)
   else state end
-  // When the rhs is a binary op and the let-binding carries a concrete numeric
-  // annotation, route through `infer_binop_fn` so the annotation hint is
-  // threaded into `select_int_type`/`select_float_type` before the result is
-  // committed. For all other rhs forms (and unannotated lets), fall through to
-  // the standard `infer_expr_fn` path.
   let rhs_result = match val_node do
     | BinOp(left: bl, op: bop, right: br) ->
       infer_binop_fn(state: st0, left: bl, op: bop, right: br, span: val_span, expected: ann)
@@ -431,12 +354,6 @@ export let infer_let_impl = fn (
       span: espan
     ) -> return InferExprErr(message: "let " ++ name ++ ": " ++ m, span: espan)
     | InferExprOk(state: st1, subst: s1, typ: t1) ->
-      // T-Let-Lazy modality reading: `let @y : T = v` binds `y` at type `@T`
-      // by auto-lazifying the annotation. The HIR pass has already wrapped
-      // the rhs in a Thunk (so t1 is `TyLazy(_)`); without this rewrite the
-      // bare `T` annotation would mismatch the lazified rhs. Mirrors the
-      // call-site weakening rule in `check_call_args` that lets a plain `T`
-      // value satisfy a `@T` parameter.
       let effective_ann = match ann do
         | Some(val: expected) ->
           if let SigilLazy = sigil then
@@ -455,19 +372,6 @@ export let infer_let_impl = fn (
           end
         | None -> default_numeric_literals(typ: t1)
       end
-      // T-Let-Mutable: a `let ~x = v` binding stores its value
-      // in a mutable cell. The env type is `~τ` (TyRef) so that T-Assign can
-      // verify the LHS modality and use-site `~x` reads can auto-deref.
-      //
-      // T-Let premise `μ = ~ ⟹ ¬linear(τ')` :
-      // mutable refs cannot hold linear values. "Linear" here is structural:
-      // a bare `%T` / `@T` is rejected, but so is a `TyRecord` or
-      // `TyUserDefined` record whose fields transitively carry linear
-      // components — type_carries_linear walks records, named records, and
-      // unwraps through TyRef/TyBorrow nesting (collections.nx). Spec
-      // type-system-formal.md §Linearity: "Linearity is entirely structural,
-      // so the check also rejects ~ cells holding records or ADTs with any
-      // linear component."
       if let SigilMutable = sigil then
         let tdefs_for_lin = tctypes.state_typedefs(state: st1)
         let lin_kind = let_mut_linear_kind(typ: inferred_type, tdefs: tdefs_for_lin)
@@ -490,11 +394,6 @@ export let infer_let_impl = fn (
           | LetMutOk -> ()
         end
       end
-      // T-Let wrapSigil: when the binding sigil is `%` (linear)
-      // or `@` (lazy), wrap the inferred type in the corresponding modality
-      // constructor if it is not already wrapped. `infer_constructor` deliberately
-      // omits this wrap (see its comment) to avoid breaking bare-ctor call sites;
-      // the let-binder is the canonical place to apply the sigil to the env type.
       let final_type = match sigil do
         | SigilMutable -> wrap_ref(typ: inferred_type)
         | SigilLinear ->
@@ -561,32 +460,12 @@ export let infer_return_impl = fn (
       span: espan
     ) -> return InferExprErr(message: "return: " ++ m, span: espan)
     | InferExprOk(state: st1, subst: s1, typ: t1) ->
-      // T-Return gravity rule: ¬escapesRef(τ).
-      // Check fires on the *inferred* type τ (not the declared τ_r) so it
-      // catches cases where τ_r is a unification variable that happened to
-      // resolve to a ref type. Spec: type-system-formal.md §T-Return.
-      // borrow_escapes: false here. This fires on the INFERRED type τ of the
-      // returned expression, which is a TyBorrow whenever the value is a
-      // borrow-bound variable (e.g. `match (x:&i64) do | n -> return n end`)
-      // EVEN WHEN the function legitimately returns a non-borrow (the borrow is
-      // stripped to its inner type at the actual return). Form A — a function
-      // that *declares* a `&σ` return type — is already rejected at the
-      // declared-return-type sites (T-Lambda exprs.nx, register_functions,
-      // walk_funcs, D-Cap method, D-External) with borrow_escapes: true. So a
-      // bare `&σ` here would over-reject valid borrow-of-nonlinear code
-      //The
-      // `~σ` mutable-ref escape is still caught here.
       tcwf.enforce_no_escapes_ref(typ: t1, context: "return statement", span, borrow_escapes: false)
       let expected = subst.subst_apply(subst: s1, typ: ret_type)
       let tdefs = tctypes.state_typedefs(state: st1)
       let unify_result = match unify.unify(t1, t2: expected, tdefs) do
         | UnifyOk(subst: s2) -> UnifyOk(subst: s2)
         | UnifyErr(message: m) ->
-          // Linearity weakening at the return site: allow
-          // returning a plain `T` value where the declared return is `%T`
-          // / `@T`. Mirrors `check_call_args` weakening at the call site —
-          // the function arrow lexically tags the modality; the value's
-          // own linearity is enforced by the linearity pass downstream.
           match expected do
             | TyLinear(inner: pinner) ->
               match unify.unify(t1, t2: pinner, tdefs) do
@@ -599,14 +478,6 @@ export let infer_return_impl = fn (
                 | UnifyErr(_) -> UnifyErr(message: m)
               end
             | _ ->
-              // Nullary value-binding thunk weakening: a top-level `let x = e`
-              // is registered with the shape `() -> T` (so it stays callable as
-              // `x()`), but `return x` denotes the VALUE of type T. If the
-              // returned type is `() -> T` and the declared return is T, peel
-              // and retry — mirroring the call-argument auto-force. Guarded on
-              // the first-try failure, so a genuine nullary-function-valued
-              // return (which unifies arrow-to-arrow on the first try) is
-              // unaffected.
               match t1 do
                 | TyArrow(params: [], ret: tinner, requires: _, throw_row: _) ->
                   match unify.unify(t1: tinner, t2: expected, tdefs) do
@@ -620,13 +491,6 @@ export let infer_return_impl = fn (
       match unify_result do
         | UnifyErr(message: m) -> return InferExprErr(message: "return type mismatch: " ++ m, span)
         | UnifyOk(subst: s2) ->
-          // T-Match diverging-arm carve-out (spec `tail = bottom` for return):
-          // a `return e` statement diverges from the surrounding block, so the
-          // block's tail type must not constrain the unifier. Mirror the
-          // `infer_raise` treatment by exposing a fresh ?alpha — the
-          // surrounding context (match arm sigma, if-branch unification)
-          // picks whatever it needs. Already-validated `ret_type` ensures the
-          // returned value still matches the declared function return type.
           let FreshResult(state: st2, typ: tv) = tctypes.tc_fresh_var(state: st1)
           return InferExprOk(state: st2, subst: subst.subst_compose(s1, s2), typ: tv)
       end
@@ -641,30 +505,11 @@ export let infer_try_impl = fn (
     ret_type: TypeExpr
   ) -> InferExprResult throws { TypeError }
 ) -> InferExprResult throws { TypeError } do
-  // T-TryCatch residual narrowing (spec type-system-formal.md §T-TryCatch):
-  //
-  // The try body is type-checked under an *augmented* throws-row that extends
-  // the enclosing declared row with the exception variants handled by the catch
-  // arms.  This allows throw sites for caught variants to be admitted even when
-  // the outer row is `throws {}`.
-  //
-  //   catch-all arm  → body row = open (admits everything; residual = {})
-  //   selective arms → body row = outer_row ∪ {CaughtVariant₁, CaughtVariant₂, …}
-  //
-  // Any throws in the body that are NOT in the augmented row are still rejected
-  // at the throw site (they would escape the try/catch AND violate the outer
-  // declared row).
-  //
-  // The enclosing declared outer_row stays unchanged for the catch body and for
-  // all call-site checks outside the try block.
   let outer_row = tctypes.state_throw_row(state)
   let is_catch_all = catch_is_catch_all(catch_param, catch_body)
   let body_throw_row = if is_catch_all then
-    // Catch-all: the body may throw anything — all exceptions are handled.
     TyRow(types: [], rest: Some(val: outer_row))
   else
-    // Selective: augment the outer row with the caught variant types so that
-    // throw sites for those variants are admitted.
     let caught_types = collect_caught_types(catch_param, catch_body)
     build_try_body_row(outer_row, caught_types)
   end
@@ -675,22 +520,7 @@ export let infer_try_impl = fn (
       span: espan
     ) -> return InferExprErr(message: "try body: " ++ m, span: espan)
     | InferExprOk(state: st1, subst: s1, typ: _) ->
-      // Restore the outer throw_row in st1 before typing the catch body.
       let st1r = tctypes.state_with_throw_row(state: st1, throw_row: outer_row)
-      // T-TryCatch: derive the catch parameter's type from the active
-      // throws-row, projecting whatever the body could throw. Every Nexus
-      // exception is a variant of the built-in `Exn` enum, so when the row
-      // is `{Exn}`, an exception group like `{LirError}`, or specific named
-      // exceptions, the catch parameter ends up bound to the same `Exn`
-      // enum type — but we read the name out of the row instead of hard-
-      // coding the string literal "Exn". The desugared `match catch_param`
-      // (built by hir.nx for multi-arm catch) then drives per-arm dispatch
-      // through bind_constructor_pattern unchanged.
-      //
-      // When the outer row is closed-empty (throws {}) but the body is allowed
-      // to throw (because a catch-all handles it), the catch param still needs
-      // Exn type so the catch body can pattern-match.  Use the body_throw_row
-      // (which was augmented or opened) for the param type projection.
       let row_for_param = subst.subst_apply(subst: s1, typ: body_throw_row)
       let param_ty = catch_param_type_from_row(row_for_param)
       let catch_env = tctypes.env_insert(
@@ -699,11 +529,6 @@ export let infer_try_impl = fn (
         scheme: tctypes.mono(typ: param_ty)
       )
       let st2 = tctypes.state_with_env(state: st1r, env: catch_env)
-      // The selective `catch` desugar (src/ir/hir/convert/core.nx) appends a
-      // synthetic `| __exn_v -> throw __exn_v` re-throw arm, so the desugared
-      // `match __exn` is exhaustive over `Exn` and unmatched variants PROPAGATE
-      // out via the function's throws row. No catch-body exhaustiveness
-      // suppression is needed.
       match infer_stmts_fn(state: st2, stmts: catch_body, ret_type) do
         | InferExprErr(
           message: m,

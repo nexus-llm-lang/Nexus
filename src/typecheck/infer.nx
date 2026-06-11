@@ -184,37 +184,7 @@ export let infer_expr = fn (
     | ExternalRef(symbol: _, type_params: _, arg_names: _, typ) ->
       return InferExprOk(state, subst: subst.subst_empty(), typ)
     | Handler(cap_name: pname, requires: handler_req, arms: hms) ->
-      // Inline handler expressions type as TyHandler(cap, requires).
-      // The requires row is now preserved from the source-level `require { ... }`
-      // declaration so that inject-site require-subset checking (T-Inject:
-      // ∀i. ρ_i ⊆ ρ_q) can verify it against the ambient row at the inject
-      // site.  Top-level handler bindings go through register_handler_bindings
-      // which still registers an empty requires row; those handlers are
-      // looked up by name at inject time and their TyHandler.requires is used
-      // for the subset check.
-      //
-      // spec §T-Handler (type-system-formal.md)
-      // requires `∀y ∈ ⋃_j fv(e_j) ∩ dom(Γ). Γ(y) ≠ ~σ` — the same
-      // no-ref-capture premise T-Lambda enforces. Handler arms are hoisted
-      // out to top-level HirFunctions later (synthesize_handler) and re-
-      // checked via check_handler_arm_bodies, but by then the construction-
-      // site env is lost. Run the scan here where we still see it, mirroring
-      // infer_lambda's RefCaptureHit handling.
-      //
-      // T-Handler wfCap: the declared `require { … }` row of an inline handler
-      // must satisfy wfCap — every named capability must be in SysCaps or a
-      // declared cap.  Global handlers are checked in register_handler_bindings
-      // (check.nx); inline expression handlers are checked here.
-      // We pass `caps: []` here because inline handlers cannot name user caps
-      // in their require row (only system capabilities are valid at expression
-      // sites without an enclosing cap declaration context) — the same
-      // convention used by check_handler_arm_throw_rows for arm-level caps.
       tcwf.wf_cap(row: handler_req, caps: [], span: sp)
-      // T-Handler arm/method 1-1 correspondence for inline handler expressions
-      // (spec T-Handler). Top-level handlers are validated in check_program via
-      // validate_handler_arm_sets before body checking; inline handlers reach
-      // infer_expr directly and were previously skipped. We use the cap_name as
-      // the synthetic handler_name for error messages.
       validate_inline_handler_arm_set(
         caps: tctypes.state_caps(state),
         cap_name: pname,
@@ -229,19 +199,12 @@ export let infer_expr = fn (
             span: rsp
           )
         | None ->
-          // T-Handler cross-arm linear-capture uniqueness:
-          //   ∀ y ∈ dom(Γ_cap). |{ j ∈ J | y ∈ fv(e_j) }| = 1
-          // Reject handlers where the same linear binding appears in more than one arm.
           match scan_handler_arms_for_linear_cross(
             arms: hms,
             outer_env: tctypes.state_env(state)
           ) do
             | Some(val: dup_name) -> throw HandlerLinearCrossArm(name: dup_name, span: sp)
             | None ->
-              // T-Continuation: for `with @k` arms, every control path must
-              // terminate divergently. Check each such arm body here for the
-              // inline handler path (top-level handlers are checked in
-              // check_arm_body after synthesize_handler).
               check_inline_kont_arm_tails(state, arms: hms)
               return InferExprOk(
                 state,
@@ -251,9 +214,6 @@ export let infer_expr = fn (
           end
       end
     | Inject(handlers, body) ->
-      // Expression-form inject: type as its body's trailing-value type via the
-      // shared T-Inject helper (same premise checks / require-row extension /
-      // generic-cap shadowing / scope close as the statement form).
       return infer_inject_expr(
         state,
         handlers,
@@ -265,13 +225,6 @@ export let infer_expr = fn (
   end
 end
 
-// check_inline_kont_arm_tails: enforce T-Continuation tail(s̄) = ⊥ for each
-// `with @k` arm in an inline handler expression. Mirrors check_arm_body in
-// check.nx (which covers the top-level let-bound handler path). For each arm
-// with a continuation binder, sets up the body environment with @k bound,
-// runs infer_stmts to determine body_typ, then rejects with TypeMismatch when
-// the arm declares a non-unit return but the body falls through with unit type
-// and no tail-diverging control path.
 let check_inline_kont_arm_tails = fn (
   state: CheckState,
   arms: [ HirHandlerArm ]
@@ -297,9 +250,7 @@ let check_inline_kont_arm_tails = fn (
       let conv_ret = convert_ud_to_var(typ: ret, vars: tps)
       let ret_is_unit = if let TyUnit = conv_ret then true else false end
       if !ret_is_unit then
-        // Bind params in env so infer_stmts can resolve parameter references.
         let param_env = add_inline_arm_params(env: tctypes.state_env(state), params)
-        // Bind k as @ret_type so that forcing @k type-checks correctly.
         let kont_env = tctypes.env_insert(
           env: param_env,
           name: k,
@@ -330,8 +281,6 @@ let check_inline_kont_arm_tails = fn (
   end
 end
 
-// add_inline_arm_params: bind arm parameter names into the environment so that
-// infer_stmts on the arm body can resolve parameter references.
 let add_inline_arm_params = fn (env: [ EnvEntry ], params: [ HirParam ]) -> [ EnvEntry ] do
   match params do
     | [] -> return env
@@ -343,13 +292,6 @@ let add_inline_arm_params = fn (env: [ EnvEntry ], params: [ HirParam ]) -> [ En
   end
 end
 
-// infer_binop: infer a binary op with an optional annotation hint.
-// When `expected` is `Some(τ)` and the operands are all-literal sub-expressions,
-// the hint is threaded into `select_int_type`/`select_float_type` so that
-// `intlit × intlit` resolves to `τ` instead of defaulting to i64/f64.
-// To propagate the hint into nested arithmetic (e.g. `2 * 3 - 1`), sub-expressions
-// that are themselves BinOps are inferred recursively through `infer_binop` with the
-// same expected type, rather than through `infer_expr` (which has no expected parameter).
 /** Peel a nullary value-binding thunk for use at a binary-operator operand
  *  position. A top-level `let x = e` is registered with the nullary-thunk shape
  *  `TyArrow(params: [], ret: T)` (mirroring a real `fn () -> T`), but a bare
@@ -455,8 +397,6 @@ export let infer_stmts = fn (
             | [] ->
               return InferExprOk(state: st1, subst: s1, typ: stmt_type)
             | HirStmt(node: _, span: rest_sp) :: _ ->
-              // T-Seq: if τ₁ = ⊥ (the statement diverges), all following
-              // statements are unreachable — reject with E2021.
               if stmt_diverges(s) then
                 throw UnreachableCode(span: rest_sp)
               end
@@ -512,9 +452,6 @@ export let infer_stmts_pinning_require = fn (
               end
               let env1 = subst.subst_apply_env(subst: s1, env: tctypes.state_env(state: st1))
               let st2 = tctypes.state_with_env(state: st1, env: env1)
-              // The threading the ordinary sequencer omits: resolve the ambient
-              // require row under this statement's subst so a pinned cap element
-              // is visible to later cap calls.
               let req1 = subst.subst_apply(
                 subst: s1, typ: tctypes.state_require_row(state: st1)
               )
