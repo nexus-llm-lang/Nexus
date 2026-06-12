@@ -19,7 +19,15 @@
  */
 
 import { Span } from "src/types/span.nx"
-import { TypeExpr, TyRow, TyHandler, TyLazy, TyUnit, TyUserDefined } from "src/types/type_expr.nx"
+import {
+  TypeExpr,
+  TyRow,
+  TyHandler,
+  TyLazy,
+  TyUnit,
+  TyUserDefined,
+  TyVar
+} from "src/types/type_expr.nx"
 import {
   HirExpr, HirExprKind, HirStmt, HirStmtKind, HirMatchCase,
   HirPatternKind, PVar, PCtor, PWild,
@@ -35,6 +43,7 @@ import * as unify from "src/typecheck/unify.nx"
 import { TypeError, DuplicateInjectCap, HandlerRequireNotSubset } from "src/typecheck/errors.nx"
 import { Option, Some, None } from "std:option"
 import * as list from "std:list"
+import * as str from "std:str"
 
 export type RaiseAdmissionResult =
   RaiseOk
@@ -51,26 +60,85 @@ export type RaiseAdmissionResult =
  *  `Some(variant)` for nullary exception constructors.
  *
  *  Row semantics (T-Raise):
- *  - Open row `TyRow(_, rest: Some(_))`: effect-polymorphic or implicitly
- *    declared (absent `throws` clause).  Any throw is admitted.  Functions
- *    in `src/` that predate row-typed throws declarations parse to
+ *  - Open row with an IMPLICIT or INFERENCE tail
+ *    (`TyRow(_, rest: Some(TyVar("__implicit" | "?N")))`): effect-polymorphic
+ *    by omission (absent `throws` clause) or an as-yet-unsolved inference
+ *    variable.  Any throw is admitted.  Functions in `src/` that predate
+ *    row-typed throws declarations parse to
  *    `TyRow([], rest: Some(TyVar("__implicit")))` via `parse_optional_throws`
  *    and fall here.
+ *  - Open row with a RIGID tail (`throws R` where `R` is a generalized type
+ *    parameter): the tail is a universally-quantified row variable, NOT an
+ *    absorber.  A caller may instantiate `R := {}`, so a CONCRETE throw whose
+ *    exception is not covered by an explicit head label would escape past a
+ *    closed `throws {}` caller (P5 hole).  Only a body that is pure or merely
+ *    re-throws a parameter's effect (an opaque `None` raise) satisfies
+ *    `throws R`; a concrete `throw Boom` is rejected.
  *  - Closed non-empty row `TyRow([X, ...], rest: None)`: only declared
  *    members (or the universal `Exn` sentinel) are admitted.
  *  - Closed empty row `TyRow([], rest: None)`: the function explicitly
  *    declared `throws {}` — no exceptions are permitted and every throw
  *    site is an error (P5 enforcement).
- *  - Non-row types (TyVar unsolved, etc.): admit conservatively.
+ *  - Bare `TyVar` row (NOT a TyRow): a `throws R` clause where `R` is a
+ *    generalized type parameter parses as a bare type, since
+ *    `parse_row_or_type` routes a bare identifier through `parse_type`. A
+ *    rigid such var is treated as an empty rigid open row (concrete throw
+ *    rejected). An unsolved inference var (`?N`) admits conservatively.
+ *  - Other non-row types: admit conservatively.
  */
 export let check_raise_admitted = fn (
   name_opt: Option<string>, row: TypeExpr, groups: [ ExceptionGroupEntry ]
 ) -> RaiseAdmissionResult throws { TypeError } do
   match row do
-    | TyRow(types: _, rest: Some(_)) -> return RaiseOk
+    | TyRow(types: row_types, rest: Some(val: tail)) ->
+      if row_tail_is_rigid(tail) then
+        return check_raise_admitted_rigid(name_opt, row_types, groups)
+      end
+      return RaiseOk
     | TyRow(types: row_types, rest: None) ->
       return check_raise_admitted_closed(name_opt, row_types, groups)
-    | _ -> return RaiseOk
+    | _ ->
+      if row_tail_is_rigid(tail: row) then
+        return check_raise_admitted_rigid(name_opt, row_types: [], groups)
+      end
+      return RaiseOk
+  end
+end
+
+/** True when an open throws-row tail is a RIGID generalized row quantifier
+ *  (a declared `throws R` type parameter) rather than the legacy `__implicit`
+ *  sentinel (absent throws clause) or a fresh inference variable (`?N`).
+ *  Rigid tails do NOT absorb concrete throws; inference / implicit tails do. */
+let row_tail_is_rigid = fn (tail: TypeExpr) -> bool do
+  match tail do
+    | TyVar(name: n) ->
+      if n == "__implicit" then return false end
+      if str.starts_with(s: n, prefix: "?") then return false end
+      return true
+    | _ -> return false
+  end
+end
+
+/** Raise admission under a rigid open row `{ ...head | R }`. A concrete throw
+ *  is admitted only if an explicit head label covers it (the rigid tail `R`
+ *  contributes nothing, since a caller may instantiate `R := {}`). An opaque
+ *  (`None`) raise — a re-thrown parameter effect — is admitted conservatively:
+ *  its variant is not statically known and it is the legitimate
+ *  effect-polymorphic form. */
+let check_raise_admitted_rigid = fn (
+  name_opt: Option<string>, row_types: [ TypeExpr ], groups: [ ExceptionGroupEntry ]
+) -> RaiseAdmissionResult throws { TypeError } do
+  match name_opt do
+    | None -> return RaiseOk
+    | Some(val: name) ->
+      if row_admits_exception(name, row_types, groups) then
+        return RaiseOk
+      end
+      return RaiseRejected(
+        message: "throw " ++ name
+          ++ ": exception not in throws row (a generalized `throws R` row variable"
+          ++ " does not admit a concrete throw — a caller may instantiate R := {})"
+      )
   end
 end
 
@@ -458,7 +526,10 @@ export let check_cap_args_covered = fn (
   tdefs: [ TypeDefEntry ]
 ) -> CapArgResult do
   match callee_row do
-    | TyRow(types: ts, rest: _) -> return cap_args_go(ts, ambient_row, tdefs, acc: subst.subst_empty())
+    | TyRow(
+      types: ts,
+      rest: _
+    ) -> return cap_args_go(ts, ambient_row, tdefs, acc: subst.subst_empty())
     | _ -> return CapArgOk(subst: subst.subst_empty())
   end
 end
@@ -697,7 +768,12 @@ export let check_each_callee_member_admitted = fn (
           match lookup_group_members(name: n, groups) do
             | Some(val: members) ->
               if caller_admits_all_members(members, caller_types, groups) then
-                return check_each_callee_member_admitted(callee_types: rest, caller_types, groups, func)
+                return check_each_callee_member_admitted(
+                  callee_types: rest,
+                  caller_types,
+                  groups,
+                  func
+                )
               end
               return RaiseRejected(
                 message: "call " ++ func ++ ": exception group " ++ n ++ " raised by callee not fully admitted by caller's throws row"
