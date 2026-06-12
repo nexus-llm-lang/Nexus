@@ -1166,6 +1166,54 @@ let check_stmt = fn (
   end
 end
 
+/** True when the array elements of `target` are themselves linear, so that an
+ *  `a[i]` access MOVES a linear element out of the array and must register the
+ *  array's use-once obligation (a second `a[i]` then rejects as LinearReuse).
+ *
+ *  Recovered structurally from the binding's construction expression via
+ *  `lin_lookup_ctor` (the name-based pass carries no inferred element type):
+ *  a `let a = [| … |]` whose any element is linear under the liveness-
+ *  independent `ctor_arg_is_linear` classifier denotes a linear-element array.
+ *  When the construction is unavailable or its elements are non-linear (e.g.
+ *  `[| 0, 0, 0 |]` of i64), the access is a copy/borrow read and the array
+ *  obligation is NOT touched — preserving plain indexed reads/writes. */
+let index_target_moves_linear = fn (
+  target: HirExpr, st: LinState, sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> bool do
+  let HirExpr(node: tn, span: _) = target
+  match tn do
+    | Variable(name: m, sigil: _) ->
+      match lin_lookup_ctor(st, name: m) do
+        | None -> return false
+        | Some(val: ce) ->
+          let HirExpr(node: cn, span: _) = ce
+          match cn do
+            | Array(elems: es) -> return any_ctor_arg_is_linear(args: es, st, sigs, tdefs, enum_defs)
+            | _ -> return false
+          end
+      end
+    | _ -> return false
+  end
+end
+
+/** True when the `Index` target is a COMPUTED value rather than a bare place,
+ *  so walking it can never over-consume a borrowed array binding. A computed
+ *  target (`f(%arr)[i]`, `g()[i]`, `m[j][i]`, `Ctor(…)[i]`, …) produces a fresh
+ *  value whose own linear consumes happen regardless of the indexing; those
+ *  consumes MUST be tracked (e.g. `f(%arr)[i]` consumes `%arr`). A bare place —
+ *  `Variable` / `Borrow` / `FieldAccess` — is borrowed by the index operation
+ *  (per the `(&a)[i]` borrow rule) and is handled by the element-move check. */
+let index_target_is_computed = fn (target: HirExpr) -> bool do
+  let HirExpr(node: tn, span: _) = target
+  match tn do
+    | Variable(_) -> return false
+    | Borrow(_) -> return false
+    | FieldAccess(_) -> return false
+    | _ -> return true
+  end
+end
+
 // ─── Expression walk ─────────────────────────────────────────────────────────
 
 let check_expr = fn (
@@ -1221,13 +1269,14 @@ let check_expr_kind = fn (
     | Array(elems: es) ->
       return check_exprs(exprs: es, st, sigs, tdefs, enum_defs)
     | Index(target: t, index: i) ->
-      // Array indexing is a borrow-like operation: the array stays live after
-      // a[i] read or a[i] <- v write. Do NOT consume the array target here.
-      // Move-out of linear-element arrays (a[i] consuming elem) requires
-      // per-Index typing; left to a future linearity follow-up.
-      // Only recurse into the index expression (may itself use linears).
-      t
-      return check_expr(expr: i, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      let walk_target = index_target_is_computed(target: t)
+        || index_target_moves_linear(target: t, st, sigs, tdefs, enum_defs)
+      let st_t = if walk_target then
+        check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
+      else
+        st
+      end
+      return check_expr(expr: i, st: st_t, sigs, tdefs, enum_defs, at_stmt_level: false)
     | FieldAccess(target: t, field: _) ->
       return check_expr(expr: t, st, sigs, tdefs, enum_defs, at_stmt_level: false)
     | If(cond: c, then_branch: tb, else_branch: eb) ->
