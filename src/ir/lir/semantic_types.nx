@@ -148,18 +148,15 @@ export let infer_semantic_type = fn (
           | OpFAdd | OpFSub | OpFMul | OpFDiv -> return TyF64
           | _ -> return TyI64
         end
-      | MirIf(cond: _, then_body: tb, else_body: _) ->
-        return infer_stmts_type(stmts: tb, ctx)
+      | MirIf(cond: _, then_body: tb, else_body: eb) ->
+        return infer_branches_type(arms: if_arms(then_body: tb, else_body: eb), ctx)
       | MirMatch(target: _, cases: cs) ->
-        match cs do
-          | MirMatchCase(pattern: _, body: b) :: _ ->
-            return infer_stmts_type(stmts: b, ctx)
-          | [] -> return TyUnit
-        end
+        return infer_branches_type(arms: match_case_bodies(cases: cs), ctx)
       | MirRecord(fields: fs) ->
         return TyRecord(fields: infer_record_field_types(fields: fs, ctx))
       | MirMakeClosure(_) -> return TyI64
-      | MirCallClosure(closure: _, args: _, ret_type: rt) -> return rt
+      | MirCallClosure(closure: clos, args: _, ret_type: rt) ->
+        return resolve_closure_ret_type(clos, fallback: rt, ctx)
       | MirBlock(_) -> return TyUnit
       | MirInjectValue(stmts: _, ret_type: rt) -> return rt
       | MirEnvLoad(_) | _ -> return TyI64
@@ -188,6 +185,25 @@ export let resolve_closure_ret_type = fn (
       end
   else
     return fallback
+  end
+end
+
+/** Recover the `TyArrow` signature of a closure built by `MirMakeClosure`.
+ *  The lifted closure body is a top-level function (`func_name`) whose full
+ *  semantic signature is registered under `#FNSIG#<func_name>`; the `let` that
+ *  binds the closure value can adopt that arrow as its semantic type so a later
+ *  `resolve_closure_ret_type` on a call of the binding recovers the real
+ *  (record/sum) return type instead of the `TyI64` placeholder. Falls back to
+ *  `TyI64` when no signature is registered. */
+export let closure_arrow_type = fn (
+  func_name: string,
+  ctx: LowerCtx
+) -> TypeExpr throws { LirError } do
+  let LowerCtx(vars: _, semantic_vars: sv, stmts: _, temp_counter: _, enum_defs: _) = ctx
+  match lir_lookup_type(name: fnsig_sentinel(name: func_name), entries: sv) do
+    | Some(val: TyArrow(params: ps, ret: r, requires: rq, throw_row: tr)) ->
+      return TyArrow(params: ps, ret: r, requires: rq, throw_row: tr)
+    | _ -> return TyI64
   end
 end
 
@@ -626,6 +642,88 @@ export let infer_stmts_type = fn (
         | _ -> return TyUnit
       end
     | _ :: rest -> return infer_stmts_type(stmts: rest, ctx)
+  end
+end
+
+/** Collect an `if`'s arm bodies (then, then else when present) as a flat list
+ *  of statement sequences, so the value-position type inference can skip
+ *  diverging arms and read the type from a value-producing one. */
+export let if_arms = fn (
+  then_body: [ MirStmt ],
+  else_body: Option<[ MirStmt ]>
+) -> [ [ MirStmt ] ] throws { LirError } do
+  match else_body do
+    | Some(val: eb) -> return [ then_body, eb ]
+    | None -> return [ then_body ]
+  end
+end
+
+let match_case_bodies = fn (
+  cases: [ MirMatchCase ]
+) -> [ [ MirStmt ] ] throws { LirError } do
+  match cases do
+    | [] -> return []
+    | MirMatchCase(pattern: _, body: b) :: rest -> return b :: match_case_bodies(cases: rest)
+  end
+end
+
+/** True iff a statement sequence cannot produce a value because its last
+ *  statement transfers control away (a `return` or a `throw`). The value-typed
+ *  `if`/`match` inference must skip such arms — their last statement carries no
+ *  binding-typed value, so reading their type yields the catch-all `TyI64` and
+ *  a later `.field` projection on the bound result aborts LIR with E6002. This
+ *  mirrors the typechecker's diverging-branch carve-out: the binding's type is
+ *  taken from a value-producing arm. */
+export let stmts_diverge = fn (stmts: [ MirStmt ]) -> bool throws { LirError } do
+  match last_stmt_opt(stmts) do
+    | Some(val: MirStmtReturn(expr: _)) -> return true
+    | Some(val: MirStmtExpr(expr: MirRaise(expr: _))) -> return true
+    | _ -> return false
+  end
+end
+
+let last_stmt_opt = fn (stmts: [ MirStmt ]) -> Option<MirStmt> throws { LirError } do
+  match stmts do
+    | [] -> return None
+    | [ s ] -> return Some(val: s)
+    | _ :: rest -> return last_stmt_opt(stmts: rest)
+  end
+end
+
+/** Infer the value type shared by a set of branch bodies (`if`/`match` arms),
+ *  preferring the first value-producing (non-diverging) arm. Falls back to the
+ *  first arm's type when every arm diverges (the binding is then dead, so the
+ *  resulting `TyI64` is never projected). */
+export let infer_branches_type = fn (
+  arms: [ [ MirStmt ] ],
+  ctx: LowerCtx
+) -> TypeExpr throws { LirError } do
+  match arms do
+    | [] -> return TyUnit
+    | arm :: rest ->
+      if stmts_diverge(stmts: arm) then
+        match infer_first_value_arm(arms: rest, ctx) do
+          | Some(val: t) -> return t
+          | None -> return infer_stmts_type(stmts: arm, ctx)
+        end
+      else
+        return infer_stmts_type(stmts: arm, ctx)
+      end
+  end
+end
+
+let infer_first_value_arm = fn (
+  arms: [ [ MirStmt ] ],
+  ctx: LowerCtx
+) -> Option<TypeExpr> throws { LirError } do
+  match arms do
+    | [] -> return None
+    | arm :: rest ->
+      if stmts_diverge(stmts: arm) then
+        return infer_first_value_arm(arms: rest, ctx)
+      else
+        return Some(val: infer_stmts_type(stmts: arm, ctx))
+      end
   end
 end
 
