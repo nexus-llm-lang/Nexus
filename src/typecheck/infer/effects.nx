@@ -17,13 +17,16 @@
  */
 
 import { HirHandlerArm, HirFunction, HirCap, HirCapMethod, EagerBody, LazyBody, EnvEntry } from "src/ir/hir/types.nx"
-import { TypeExpr, TyRow, TyArrow, TyVar, TyUserDefined, TyHandler, NamedType } from "src/types/type_expr.nx"
+import {
+  TypeExpr, TyRow, TyArrow, TyVar, TyUserDefined, TyHandler, NamedType,
+  TyList, TyArray, TyRef, TyLinear, TyBorrow
+} from "src/types/type_expr.nx"
 import { CheckState, Scheme, SubstEntry }, * as tctypes from "src/typecheck/types.nx"
 import * as capture from "src/typecheck/capture.nx"
 import { base_name_of } from "src/typecheck/tcwf.nx"
 import { hir_params_to_named_types } from "src/typecheck/check/registration.nx"
 import { handler_instance_key_prefix } from "src/typecheck/check/handler_validation.nx"
-import { convert_named_types } from "src/typecheck/check/occurs.nx"
+import { convert_named_types, convert_ud_to_var } from "src/typecheck/check/occurs.nx"
 import * as bb from "std:bytebuffer"
 import { Option, Some, None } from "std:option"
 import * as list from "std:list"
@@ -233,12 +236,14 @@ let first_inst_binding = fn (
 ) -> Option<[ TypeExpr ]> do
   match methods do
     | [] -> return None
-    | HirCapMethod(name: mname, requires: _, span: _, throw_row: _, typ_params: mparams, typ_ret: _) :: rest ->
+    | HirCapMethod(name: mname, requires: _, span: _, throw_row: _, typ_params: mparams, typ_ret: mret) :: rest ->
       let key = bb.concat(parts: [ prefix, cap_qname, ".", mname ])
       match tctypes.env_lookup(env: tctypes.state_env(state), name: key) do
-        | Some(val: Scheme(vars: _, typ: TyArrow(params: arm_params, ret: _, requires: _, throw_row: _))) ->
+        | Some(val: Scheme(vars: _, typ: TyArrow(params: arm_params, ret: arm_ret, requires: _, throw_row: _))) ->
           let decl_nts = convert_named_types(nts: hir_params_to_named_types(params: mparams), vars: cap_tps)
-          let bindings = match_nts(pats: decl_nts, concretes: arm_params, acc: [])
+          let param_bindings = match_nts(pats: decl_nts, concretes: arm_params, acc: [])
+          let decl_ret = convert_ud_to_var(typ: mret, vars: cap_tps)
+          let bindings = match_type(pat: decl_ret, concrete: arm_ret, acc: param_bindings)
           match all_bound(cap_tps, bindings, acc: []) do
             | Some(val: args) -> return Some(val: args)
             | None -> return first_inst_binding(state, prefix, cap_qname, cap_tps, methods: rest)
@@ -262,6 +267,62 @@ let match_nts = fn (
         | NamedType(name: _, typ: ct) :: crest ->
           let acc1 = if let TyVar(name: nm) = pt then SubstEntry(var: nm, typ: ct) :: acc else acc end
           return match_nts(pats: prest, concretes: crest, acc: acc1)
+      end
+  end
+end
+
+/** Structurally match a declared-type pattern (cap type params rendered as
+ *  `TyVar`) against an arm's concrete type, collecting `cap-type-param → concrete`
+ *  bindings. Used to recover a generic-cap handler's element instantiation when
+ *  the cap type param occurs in a method's RETURN position (`fn make(...) -> T`)
+ *  rather than an argument; without it the inject ambient row stays
+ *  element-agnostic and a return-channel laundered call escapes coverage. */
+let match_type = fn (pat: TypeExpr, concrete: TypeExpr, acc: [ SubstEntry ]) -> [ SubstEntry ] do
+  match pat do
+    | TyVar(name: nm) -> return SubstEntry(var: nm, typ: concrete) :: acc
+    | TyList(elem: pe) ->
+      match concrete do
+        | TyList(elem: ce) -> return match_type(pat: pe, concrete: ce, acc)
+        | _ -> return acc
+      end
+    | TyArray(elem: pe) ->
+      match concrete do
+        | TyArray(elem: ce) -> return match_type(pat: pe, concrete: ce, acc)
+        | _ -> return acc
+      end
+    | TyRef(inner: pi) ->
+      match concrete do
+        | TyRef(inner: ci) -> return match_type(pat: pi, concrete: ci, acc)
+        | _ -> return acc
+      end
+    | TyLinear(inner: pi) ->
+      match concrete do
+        | TyLinear(inner: ci) -> return match_type(pat: pi, concrete: ci, acc)
+        | _ -> return acc
+      end
+    | TyBorrow(inner: pi) ->
+      match concrete do
+        | TyBorrow(inner: ci) -> return match_type(pat: pi, concrete: ci, acc)
+        | _ -> return acc
+      end
+    | TyUserDefined(name: pn, args: pargs) ->
+      match concrete do
+        | TyUserDefined(name: cn, args: cargs) ->
+          if pn == cn then return match_type_list(pats: pargs, concretes: cargs, acc) end
+          return acc
+        | _ -> return acc
+      end
+    | _ -> return acc
+  end
+end
+
+let match_type_list = fn (pats: [ TypeExpr ], concretes: [ TypeExpr ], acc: [ SubstEntry ]) -> [ SubstEntry ] do
+  match pats do
+    | [] -> return acc
+    | p :: prest ->
+      match concretes do
+        | [] -> return acc
+        | c :: crest -> return match_type_list(pats: prest, concretes: crest, acc: match_type(pat: p, concrete: c, acc))
       end
   end
 end

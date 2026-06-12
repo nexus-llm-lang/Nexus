@@ -338,6 +338,18 @@ export let infer_call = fn (
                               // resolves to `Box<i64>`. Compose it so it reaches the
                               // derivation pass's body substitution.
                               let s_cov = subst.subst_compose(s1: s_all, s2: cap_s)
+                              match check_fn_value_arg_caps_covered(
+                                state: st2,
+                                params,
+                                args,
+                                ambient_row: ambient_req,
+                                subst: s_cov,
+                                infer_expr_fn
+                              ) do
+                                | CapArgMismatch(cap_name: _, message: m) ->
+                                  return InferExprErr(message: "call " ++ func ++ ": " ++ m, span)
+                                | CapArgOk(subst: _) -> ()
+                              end
                               // T-App (inference-row pinning): if the caller's
                               // active throws-row is still an unsolved variable (a
                               // collecting thunk row), extend it to include the
@@ -400,6 +412,135 @@ export let check_call_args = fn (
           infer_expr_fn
         )
       end
+  end
+end
+
+/** Generic-cap soundness for HIGHER-ORDER value-parameter forwarders. A function
+ *  value committed to a concrete element type (`need_i64 : require { Box<i64> }`)
+ *  may be passed to a parameter declared with a bare generic-cap require row
+ *  (`g : (s: i64) -> i64 require { Box }`); the arrow-unify require-row subtyping
+ *  (unify.row_remove_bare_cap) admits `Box<i64> ⊆ bare Box`, ERASING the element
+ *  type at the parameter boundary. A callee that itself carries that cap invokes
+ *  the value parameter under the AMBIENT handler in scope, so the value's
+ *  committed element type must be covered by that ambient handler — otherwise an
+ *  `i64` commitment runs under a `Box<string>` handler (the laundered, transitive
+ *  type confusion). For every function-valued argument whose matching parameter
+ *  type carries a generic-cap require row, recover the argument's own require row
+ *  and cover its concrete cap element args against the ambient row, MATCHING the
+ *  direct-call and named-call coverage checks. Bare argument rows are
+ *  element-agnostic and admitted (no over-rejection of polymorphic helpers). */
+let check_fn_value_arg_caps_covered = fn (
+  state: CheckState,
+  params: [ NamedType ],
+  args: [ HirCallArg ],
+  ambient_row: TypeExpr,
+  subst: [ SubstEntry ],
+  infer_expr_fn: (
+    state: CheckState,
+    expr: HirExpr,
+    ret_type: TypeExpr
+  ) -> InferExprResult throws { TypeError }
+) -> CapArgResult throws { TypeError } do
+  match params do
+    | [] -> return CapArgOk(subst: subst.subst_empty())
+    | NamedType(name: pname, typ: ptyp) :: rp ->
+      match args do
+        | [] -> return CapArgOk(subst: subst.subst_empty())
+        | HirCallArg(label: _, value: arg_val) :: ra ->
+          let p_resolved = subst.subst_apply(subst, typ: ptyp)
+          match arrow_require_row(typ: p_resolved) do
+            | None -> return check_fn_value_arg_caps_covered(
+                state, params: rp, args: ra, ambient_row, subst, infer_expr_fn
+              )
+            | Some(val: prow) ->
+              if row_has_no_cap(row: prow) then
+                return check_fn_value_arg_caps_covered(
+                  state, params: rp, args: ra, ambient_row, subst, infer_expr_fn
+                )
+              end
+              match probe_arg_type(state, arg_val, infer_expr_fn) do
+                | None -> return check_fn_value_arg_caps_covered(
+                    state, params: rp, args: ra, ambient_row, subst, infer_expr_fn
+                  )
+                | Some(val: ProbeArgType(state: st1, subst: s_arg, typ: arg_t)) ->
+                  let arg_resolved = subst.subst_apply(subst: s_arg, typ: arg_t)
+                  match arrow_require_row(typ: arg_resolved) do
+                    | None -> return check_fn_value_arg_caps_covered(
+                        state, params: rp, args: ra, ambient_row, subst, infer_expr_fn
+                      )
+                    | Some(val: arg_row) ->
+                      match check_cap_args_covered(
+                        callee_row: arg_row,
+                        ambient_row,
+                        tdefs: tctypes.state_typedefs(state: st1)
+                      ) do
+                        | CapArgMismatch(cap_name: cn, message: m) ->
+                          return CapArgMismatch(cap_name: cn, message: m)
+                        | CapArgOk(subst: _) -> return check_fn_value_arg_caps_covered(
+                            state, params: rp, args: ra, ambient_row, subst, infer_expr_fn
+                          )
+                      end
+                  end
+              end
+          end
+      end
+  end
+end
+
+type ProbeArgType = ProbeArgType(state: CheckState, subst: [ SubstEntry ], typ: TypeExpr)
+
+/** Read-only probe of an argument expression's type for the higher-order
+ *  coverage check. The probe state and its substitution are discarded by the
+ *  caller (only the recovered type is consulted), so this never affects the main
+ *  argument walk's linearity / substitution flow. Any inference error is
+ *  swallowed: the argument is checked for real by `check_call_args_walk`, and a
+ *  probe failure simply skips the optional coverage refinement. */
+let probe_arg_type = fn (
+  state: CheckState,
+  arg_val: HirExpr,
+  infer_expr_fn: (
+    state: CheckState,
+    expr: HirExpr,
+    ret_type: TypeExpr
+  ) -> InferExprResult throws { TypeError }
+) -> Option<ProbeArgType> do
+  try
+    match infer_expr_fn(state, expr: arg_val, ret_type: TyUnit) do
+      | InferExprErr(message: _, span: _) -> return None
+      | InferExprOk(state: st1, subst: s_arg, typ: arg_t) ->
+        return Some(val: ProbeArgType(state: st1, subst: s_arg, typ: arg_t))
+    end
+  catch
+    | _ -> return None
+  end
+end
+
+/** The require row of a (possibly linear/lazy-wrapped) arrow type, else None. */
+let arrow_require_row = fn (typ: TypeExpr) -> Option<TypeExpr> do
+  match typ do
+    | TyArrow(params: _, ret: _, requires: rq, throw_row: _) -> return Some(val: rq)
+    | TyLinear(inner: i) -> return arrow_require_row(typ: i)
+    | TyLazy(inner: i, require_row: _, throw_row: _) -> return arrow_require_row(typ: i)
+    | _ -> return None
+  end
+end
+
+/** True when a require row names no capability entry at all. A parameter arrow
+ *  whose require row names a cap (bare `Box` or concrete `Box<τ>`) WILL invoke
+ *  the passed function value under that cap's ambient handler, so the argument's
+ *  own commitment must be covered; an empty row carries no such obligation. */
+let row_has_no_cap = fn (row: TypeExpr) -> bool do
+  match row do
+    | TyRow(types: ts, rest: _) -> return entries_have_no_cap(ts)
+    | _ -> return true
+  end
+end
+
+let entries_have_no_cap = fn (ts: [ TypeExpr ]) -> bool do
+  match ts do
+    | [] -> return true
+    | TyUserDefined(name: _, args: _) :: _ -> return false
+    | _ :: rest -> return entries_have_no_cap(ts: rest)
   end
 end
 
