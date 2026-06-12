@@ -16,9 +16,10 @@
  * - Body / statement / function lowering (see src/ir/lir/lir.nx)
  */
 import { BinaryOp } from "src/types/vocab.nx"
-import { TypeExpr, TyRecord, NamedType, TyArrow, TyList, TyUserDefined, TyVar,
+import { TypeExpr, TyRecord, NamedType, TyArrow, TyList, TyArray, TyUserDefined, TyVar,
+         TyF32, TyF64, TyI32, TyI64,
          VariantDef, VariantField } from "src/types/type_expr.nx"
-import { VariantInfo } from "src/ir/support/variant_index.nx"
+import { VariantInfo, VariantIndex } from "src/ir/support/variant_index.nx"
 import * as list from "std:list"
 import {
   LirError,
@@ -626,6 +627,90 @@ let infer_record_field_types_go = fn (
     | MirNamedExpr(name: n, value: e) :: rest ->
       let ft = infer_semantic_type(expr: e, ctx)
       return infer_record_field_types_go(fields: rest, ctx, acc: NamedType(name: n, typ: ft) :: acc)
+  end
+end
+
+/** Prefer the annotation's narrow numeric WIDTH (`f32`/`i32`) over the
+ *  structurally-inferred wide default (`f64`/`i64`), leaf-only. A literal carries
+ *  no width on its atom (`LirAtomFloat`/`LirAtomInt` lower to `f64`/`i64`), so a
+ *  declared-narrow leaf must take its width from the annotation. Non-narrow
+ *  annotations leave the inferred type untouched. */
+let prefer_narrow_width = fn (declared: TypeExpr, inferred: TypeExpr) -> TypeExpr do
+  match declared do
+    | TyF32 -> match inferred do | TyF64 -> return TyF32 | _ -> return inferred end
+    | TyI32 -> match inferred do | TyI64 -> return TyI32 | _ -> return inferred end
+    | _ -> return inferred
+  end
+end
+
+let reconcile_record_field_widths = fn (
+  annot_fields: [ NamedType ],
+  inferred_fields: [ NamedType ]
+) -> [ NamedType ] throws { LirError } do
+  return reconcile_record_field_widths_go(annot_fields, inferred_fields, acc: [])
+end
+
+let reconcile_record_field_widths_go = fn (
+  annot_fields: [ NamedType ],
+  inferred_fields: [ NamedType ],
+  acc: [ NamedType ]
+) -> [ NamedType ] throws { LirError } do
+  match inferred_fields do
+    | [] -> return list.reverse(xs: acc)
+    | NamedType(name: n, typ: it) :: rest ->
+      let merged = match lookup_named_type_opt(target: n, fields: annot_fields) do
+        | Some(val: at) -> prefer_narrow_width(declared: at, inferred: it)
+        | None -> it
+      end
+      return reconcile_record_field_widths_go(annot_fields, inferred_fields: rest,
+        acc: NamedType(name: n, typ: merged) :: acc)
+  end
+end
+
+/** Carry the `let`-annotation's narrow numeric leaf WIDTH (`f32`/`i32`) onto the
+ *  structurally-inferred semantic type of a record / list / array literal,
+ *  field-by-field (record) or on the element (list/array).
+ *
+ *  A literal initializer infers its leaf type from the literal atom, which is
+ *  always the wide default (`atom_type` is width-less on float/int literals). So
+ *  `{ zed: <flit> }` infers `zed: f64` and `[ <flit> ]` infers element `f64`,
+ *  dropping a declared `f32`. The field/element LOAD then takes the wide arm of
+ *  `emit_typed_field_load` (`f64.load`, no demote), and an `f32` literal keeps
+ *  its full f64 precision instead of rounding. Reconciling the narrow width onto
+ *  the field/element routes the load through the `TyF32` demote arm — symmetric
+ *  with the sum-payload path, which already recovers `f32` from the variant def.
+ *
+ *  Only the leaf WIDTH is taken from the annotation; the inferred structure
+ *  (field names/order, nested record bodies, element record types) is preserved,
+ *  so a structurally-richer inferred element is never shadowed. The annotation is
+ *  resolved through any record alias so a named record type (`FieldRec`) exposes
+ *  its declared fields. */
+export let reconcile_annotation_widths = fn (
+  annot: TypeExpr,
+  inferred: TypeExpr,
+  enum_defs: VariantIndex
+) -> TypeExpr throws { LirError } do
+  match annot do
+    | TyList(elem: ae) ->
+      match inferred do
+        | TyList(elem: ie) -> return TyList(elem: prefer_narrow_width(declared: ae, inferred: ie))
+        | _ -> return inferred
+      end
+    | TyArray(elem: ae) ->
+      match inferred do
+        | TyArray(elem: ie) -> return TyArray(elem: prefer_narrow_width(declared: ae, inferred: ie))
+        | _ -> return inferred
+      end
+    | _ ->
+      match vidx.resolve_record_alias(idx: enum_defs, typ: annot) do
+        | TyRecord(fields: af) ->
+          match inferred do
+            | TyRecord(fields: inf) ->
+              return TyRecord(fields: reconcile_record_field_widths(annot_fields: af, inferred_fields: inf))
+            | _ -> return inferred
+          end
+        | _ -> return inferred
+      end
   end
 end
 

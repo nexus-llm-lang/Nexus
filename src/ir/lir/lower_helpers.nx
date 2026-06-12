@@ -14,7 +14,7 @@
  * - Array-element numbering (number_atoms, number_atoms_go)
  */
 import { LitUnit } from "src/types/vocab.nx"
-import { TypeExpr, TyUnit, TyI64, TyRecord, NamedType, VariantDef, VariantField } from "src/types/type_expr.nx"
+import { TypeExpr, TyUnit, TyI64, TyVar, TyList, TyArray, TyUserDefined, TyRecord, NamedType, VariantDef, VariantField } from "src/types/type_expr.nx"
 import * as list from "std:list"
 import { LirError } from "src/ir/lir/errors.nx"
 import { Some, None } from "std:option"
@@ -33,7 +33,7 @@ import {
 import { LirAtom, LirStmt, LirNamedAtom } from "src/ir/lir/types.nx"
 import { LowerCtx, lir_lookup_type, insert_type, atom_type } from "src/ir/lir/context.nx"
 import { infer_semantic_type, stmts_diverge } from "src/ir/lir/semantic_types.nx"
-import { VariantIndex } from "src/ir/support/variant_index.nx"
+import { VariantIndex, VariantInfo } from "src/ir/support/variant_index.nx"
 import * as vidx from "src/ir/support/variant_index.nx"
 import * as str from "std:str"
 
@@ -225,30 +225,89 @@ export let register_pattern_binders = fn (
   let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
   match pattern do
     | MirPatConstructor(name: ctor, fields: fs) ->
-      return register_ctor_field_binders(ctor, fields: fs, enum_defs: ed, ctx)
+      return register_ctor_field_binders(ctor, fields: fs, scrutinee_sem, enum_defs: ed, ctx)
     | MirPatRecord(fields: rfs, is_partial: _) ->
       return register_record_field_binders(fields: rfs, rec_sem: vidx.resolve_record_alias(idx: ed, typ: scrutinee_sem), ctx)
     | _ -> return ctx
   end
 end
 
+/** Declared type of a constructor field, with the variant's bare type-params
+ *  (`Cons.v : T`, `MkPair.fst : X`) substituted by the scrutinee's concrete type
+ *  args (`[ f32 ]` ⇒ T=f32) so a narrow element keeps its real width.
+ *
+ *  Without substitution `Cons.v` keeps `TyVar("T")`, whose `wasm_type` is the
+ *  catch-all i64; the match-result inference then types the result slot i64
+ *  while the decision-tree head load demotes to f32 (`lir_extract_fields_loop`),
+ *  so the f32 value is packed into an i64 slot then misread as f64. Mirrors the
+ *  substitution `lir_extract_fields_loop` already performs. Returns None for an
+ *  unknown field, leaving the binder at the conservative `TyI64` default. */
+let resolve_ctor_field_type = fn (
+  ctor: string,
+  fname: string,
+  scrutinee_sem: TypeExpr,
+  enum_defs: VariantIndex
+) -> Option<TypeExpr> throws { LirError } do
+  match binder_field_type_of_ctor(ctor, field_name: fname, enum_defs) do
+    | None -> return None
+    | Some(val: ft) ->
+      let tps = match vidx.lookup_variant_info(idx: enum_defs, variant: ctor) do
+        | Some(val: VariantInfo(enum_name: _, type_params: ps, def: _)) -> ps
+        | None -> []
+      end
+      let substituted = subst_ctor_type_params(typ: ft, params: tps, args: scrutinee_type_args(scrutinee_sem))
+      return Some(val: vidx.resolve_record_alias(idx: enum_defs, typ: substituted))
+  end
+end
+
+let scrutinee_type_args = fn (scr_sem: TypeExpr) -> [ TypeExpr ] do
+  match scr_sem do
+    | TyList(elem: e) -> return [ e ]
+    | TyUserDefined(name: _, args: a) -> return a
+    | _ -> return []
+  end
+end
+
+let subst_ctor_type_params = fn (typ: TypeExpr, params: [ string ], args: [ TypeExpr ]) -> TypeExpr throws { LirError } do
+  match typ do
+    | TyVar(name: n) -> return lookup_ctor_type_param(name: n, params, args)
+    | TyList(elem: e) -> return TyList(elem: subst_ctor_type_params(typ: e, params, args))
+    | TyArray(elem: e) -> return TyArray(elem: subst_ctor_type_params(typ: e, params, args))
+    | _ -> return typ
+  end
+end
+
+let lookup_ctor_type_param = fn (name: string, params: [ string ], args: [ TypeExpr ]) -> TypeExpr throws { LirError } do
+  match params do
+    | [] -> return TyVar(name)
+    | p :: prest ->
+      match args do
+        | [] -> return TyVar(name)
+        | a :: arest ->
+          if p == name then return a
+          else return lookup_ctor_type_param(name, params: prest, args: arest) end
+      end
+  end
+end
+
 let register_ctor_field_binders = fn (
   ctor: string,
   fields: [ MirPatternField ],
+  scrutinee_sem: TypeExpr,
   enum_defs: VariantIndex,
   ctx: LowerCtx
 ) -> LowerCtx throws { LirError } do
   match fields do
     | [] -> return ctx
     | MirPatternField(name: Some(val: fname), pattern: fpat) :: rest ->
-      let field_ty = match binder_field_type_of_ctor(ctor, field_name: fname, enum_defs) do
-        | Some(val: ft) -> vidx.resolve_record_alias(idx: enum_defs, typ: ft)
+      let field_ty = match resolve_ctor_field_type(ctor, fname, scrutinee_sem, enum_defs) do
+        | Some(val: ft) -> ft
         | None -> TyI64
       end
       let ctx1 = register_binder_or_recurse(pat: fpat, sem: field_ty, ctx)
-      return register_ctor_field_binders(ctor, fields: rest, enum_defs, ctx: ctx1)
+      return register_ctor_field_binders(ctor, fields: rest, scrutinee_sem, enum_defs, ctx: ctx1)
     | MirPatternField(name: None, pattern: _) :: rest ->
-      return register_ctor_field_binders(ctor, fields: rest, enum_defs, ctx)
+      return register_ctor_field_binders(ctor, fields: rest, scrutinee_sem, enum_defs, ctx)
   end
 end
 
@@ -317,11 +376,12 @@ end
 let binder_type_in_pattern = fn (
   pattern: MirPattern,
   binder: string,
+  scrutinee_sem: TypeExpr,
   enum_defs: VariantIndex
 ) -> Option<TypeExpr> throws { LirError } do
   match pattern do
     | MirPatConstructor(name: ctor, fields: fs) ->
-      return binder_type_in_ctor_fields(ctor, fields: fs, binder, enum_defs)
+      return binder_type_in_ctor_fields(ctor, fields: fs, binder, scrutinee_sem, enum_defs)
     | MirPatRecord(fields: rfs, is_partial: _) ->
       return binder_type_in_record_fields(fields: rfs, binder, enum_defs)
     | _ -> return None
@@ -332,14 +392,15 @@ let binder_type_in_ctor_fields = fn (
   ctor: string,
   fields: [ MirPatternField ],
   binder: string,
+  scrutinee_sem: TypeExpr,
   enum_defs: VariantIndex
 ) -> Option<TypeExpr> throws { LirError } do
   match fields do
     | [] -> return None
     | MirPatternField(name: Some(val: fname), pattern: MirPatVariable(name: bn, sigil: _)) :: rest ->
-      if bn == binder then return binder_field_type_of_ctor(ctor, field_name: fname, enum_defs)
-      else return binder_type_in_ctor_fields(ctor, fields: rest, binder, enum_defs) end
-    | _ :: rest -> return binder_type_in_ctor_fields(ctor, fields: rest, binder, enum_defs)
+      if bn == binder then return resolve_ctor_field_type(ctor, fname, scrutinee_sem, enum_defs)
+      else return binder_type_in_ctor_fields(ctor, fields: rest, binder, scrutinee_sem, enum_defs) end
+    | _ :: rest -> return binder_type_in_ctor_fields(ctor, fields: rest, binder, scrutinee_sem, enum_defs)
   end
 end
 
@@ -384,7 +445,7 @@ export let lir_infer_match_result_type = fn (
           let from_binder = match last do
             | MirVariable(name: vn) ->
               let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
-              binder_type_in_pattern(pattern: pat, binder: vn, enum_defs: ed)
+              binder_type_in_pattern(pattern: pat, binder: vn, scrutinee_sem, enum_defs: ed)
             | _ -> None
           end
           // For a non-bare body, infer its type with the arm's pattern binders
