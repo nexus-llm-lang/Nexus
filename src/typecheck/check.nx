@@ -17,6 +17,7 @@
 
 import * as list from "std:list"
 import * as lazy from "std:lazy"
+import { heap_mark, heap_reset } from "std:runtime/arena"
 import {
   TypeExpr,
   TyUnit,
@@ -292,6 +293,29 @@ end
  */
 let tc_parallel_threshold = fn () -> i64 do return 2 end
 
+/** Check one function body, reclaiming its transient typecheck allocations
+ *  before returning. A `check_function` call returns `unit` and reads only the
+ *  pre-allocated `state`, so every allocation it makes (freshened type vars,
+ *  substitutions, inference scratch) is dead once it completes. Bracketing the
+ *  call with `heap_mark`/`heap_reset` frees that scratch in O(1), keeping the
+ *  body-check loop's peak bump-allocator usage bounded by a single function's
+ *  working set rather than the cumulative sum over every checked function. The
+ *  mark is taken after `state` was built (by the caller), so resetting to it
+ *  never reclaims the loop's own inputs. Without this, a body-check pass over a
+ *  large function set walks the bump pointer toward the 4GB wasm32 ceiling and
+ *  trips the allocator's overflow trap. */
+let check_function_bounded = fn (
+  state: CheckState,
+  func: HirFunction,
+  cont_map: ContBinderMap,
+  safe_callees: [ string ]
+) -> unit throws { TypeError } do
+  let mark = heap_mark()
+  check_function(state, func, cont_map, safe_callees)
+  heap_reset(mark: mark)
+  return ()
+end
+
 /** Sequential body-check: mirror of the original check_all_functions loop.
  *  Used for N <= tc_parallel_threshold() and as the guaranteed-safe fallback.
  */
@@ -313,7 +337,7 @@ let check_all_sequential = fn (
         // (TyI64 placeholder ret) would fail check_function. Skip body check.
         match alias_src_name(func) do
           | Some(val: _) -> ()
-          | None -> check_function(state, func, cont_map, safe_callees)
+          | None -> check_function_bounded(state, func, cont_map, safe_callees)
         end
       end
       return check_all_sequential(state, funcs: rest, local_names, cont_map, safe_callees)
@@ -344,7 +368,7 @@ let build_check_thunks = fn (
         | Some(val: _) ->
           return build_check_thunks(state, funcs: rest, local_names, cont_map, safe_callees, acc)
         | None ->
-          let @t = check_function(state, func, cont_map, safe_callees)
+          let @t = check_function_bounded(state, func, cont_map, safe_callees)
           return build_check_thunks(state, funcs: rest, local_names, cont_map, safe_callees, acc: t :: acc)
       end
   end
