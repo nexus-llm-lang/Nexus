@@ -46,7 +46,7 @@ import {
 import {
   SubstEntry, Scheme, CheckState, FreshResult,
   InferExprResult, InferExprOk, InferExprErr,
-  UnifyOk, UnifyErr,
+  UnifyResult, UnifyOk, UnifyErr, TypeDefEntry,
   BindResult, BindOk, BindErr
 }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
@@ -237,7 +237,6 @@ export let infer_index = fn (
   end
 end
 
-
 export let infer_field_access = fn (
   state: CheckState, target: HirExpr, field: string, span: Span,
   infer_expr_fn: (
@@ -304,6 +303,47 @@ let named_type_names_list_go = fn (nts: [ NamedType ], acc: [ string ]) -> [ str
   end
 end
 
+/** Peel a top-level value-binding's nullary-thunk shape `TyArrow(params: [],
+ *  ret: r)` down to `r`. A bare reference to `let x = e` resolves through the
+ *  env to that nullary arrow (the shape that keeps `x()` callable); in value
+ *  position the reference denotes the value of type `r`. Returns the peeled
+ *  leaf, or the type unchanged when it is not a nullary thunk. */
+let peel_nullary_thunk = fn (typ: TypeExpr) -> TypeExpr do
+  match typ do
+    | TyArrow(params: [], ret: r, requires: _, throw_row: _) -> return r
+    | _ -> return typ
+  end
+end
+
+let is_nullary_thunk = fn (typ: TypeExpr) -> bool do
+  match typ do
+    | TyArrow(params: [], ret: _, requires: _, throw_row: _) -> return true
+    | _ -> return false
+  end
+end
+
+/** Retry unifying two `if`-branch result types after peeling a nullary
+ *  value-binding thunk on each side. A bare `let x = e` reference used as an
+ *  `if` branch result (`if c then x else y end`) carries the un-forced
+ *  `TyArrow(params: [], ret: T)` shape; the symmetric branch-result peel is the
+ *  one position the existing call-arg / ctor-field / binop peels do not cover.
+ *  Only consulted after the primary branch unify has already failed, and a
+ *  genuine `() -> T` branch (both sides arrows) peels to the same `T` on each
+ *  side so its primary unify already succeeded — this is never reached for it. */
+let retry_if_branches_peeled = fn (
+  then_t: TypeExpr,
+  else_t: TypeExpr,
+  tdefs: [ TypeDefEntry ]
+) -> Option<UnifyResult> do
+  let tp = peel_nullary_thunk(typ: then_t)
+  let ep = peel_nullary_thunk(typ: else_t)
+  let changed = is_nullary_thunk(typ: then_t) || is_nullary_thunk(typ: else_t)
+  if !changed then return None end
+  match unify.unify(t1: tp, t2: ep, tdefs) do
+    | UnifyOk(subst: s) -> return Some(val: UnifyOk(subst: s))
+    | UnifyErr(_) -> return None
+  end
+end
 
 export let infer_if = fn (
   state: CheckState, cond: HirExpr, then_b: [ HirStmt ], else_b: Option<[ HirStmt ]>, ret_type: TypeExpr, span: Span,
@@ -359,10 +399,28 @@ export let infer_if = fn (
                       let else_applied = subst.subst_apply(subst: sm3, typ: else_t)
                       match unify.unify(t1: then_applied, t2: else_applied, tdefs: tdefs2) do
                         | UnifyErr(message: m) ->
-                          return InferExprErr(
-                            message: "if branches: type mismatch — then `" ++ tctypes.type_to_string(typ: then_applied) ++ "`, else `" ++ tctypes.type_to_string(typ: else_applied) ++ "`: " ++ m,
-                            span
-                          )
+                          match retry_if_branches_peeled(
+                            then_t: then_applied,
+                            else_t: else_applied,
+                            tdefs: tdefs2
+                          ) do
+                            | Some(val: UnifyOk(subst: s5)) ->
+                              let final_subst = subst.subst_compose(s1: sm3, s2: s5)
+                              let result = subst.subst_apply(
+                                subst: final_subst,
+                                typ: peel_nullary_thunk(typ: else_applied)
+                              )
+                              let st_out = tctypes.state_with_env(
+                                state: st4,
+                                env: tctypes.state_env(state)
+                              )
+                              return InferExprOk(state: st_out, subst: final_subst, typ: result)
+                            | _ ->
+                              return InferExprErr(
+                                message: "if branches: type mismatch — then `" ++ tctypes.type_to_string(typ: then_applied) ++ "`, else `" ++ tctypes.type_to_string(typ: else_applied) ++ "`: " ++ m,
+                                span
+                              )
+                          end
                         | UnifyOk(subst: s5) ->
                           let final_subst = subst.subst_compose(s1: sm3, s2: s5)
                           let result = subst.subst_apply(subst: final_subst, typ: else_applied)
@@ -610,7 +668,12 @@ export let infer_lambda = fn (
         span
       )
   end
-  tcwf.enforce_no_escapes_ref(typ: ret_type, context: "return type of lambda", span, borrow_escapes: true)
+  tcwf.enforce_no_escapes_ref(
+    typ: ret_type,
+    context: "return type of lambda",
+    span,
+    borrow_escapes: true
+  )
   let param_types = build_param_named_types(params)
   tcwf.enforce_wf_ref_params(params: param_types, span, tdefs: tctypes.state_record_defs(state))
   let outer_env = tctypes.state_env(state)

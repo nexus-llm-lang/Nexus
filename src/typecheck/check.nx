@@ -21,6 +21,7 @@ import { heap_mark, heap_reset } from "std:runtime/arena"
 import {
   TypeExpr,
   TyUnit,
+  TyI64,
   TyUserDefined,
   TyVar,
   TyArrow,
@@ -108,12 +109,11 @@ import {
   alias_src_name, resolve_alias_registrations
 } from "src/typecheck/check/registration.nx"
 import { derive_generic_cap_contracts } from "src/typecheck/check/cap_contract.nx"
+import { resolve_value_binding_types } from "src/typecheck/check/value_binding.nx"
 import {
   register_handler_bindings, validate_handler_arm_sets
 } from "src/typecheck/check/handler_validation.nx"
-import {
-  register_enum_constructors, is_local
-} from "src/typecheck/check/enum_registration.nx"
+import { register_enum_constructors, is_local } from "src/typecheck/check/enum_registration.nx"
 import { validate_main } from "src/typecheck/check/main_validation.nx"
 import { check_cont_no_escape_stmts } from "src/typecheck/check/cont_escape.nx"
 import { build_module_variant_index } from "src/ir/support/variant_index.nx"
@@ -215,7 +215,17 @@ export let check_program = fn (
   // programs with no generic caps.
   let st7 = derive_generic_cap_contracts(state: st6, funcs, caps)
 
-  check_all_functions(state: st7, funcs, local_names, cont_map: cont_binder_map, safe_callees)
+  /** Resolve each top-level value binding's REAL type. A `let x = <non-literal>`
+   *  with no annotation is registered with the `() -> i64` placeholder (HIR
+   *  build cannot infer without an env); referrers of such a binding would
+   *  otherwise see a value of declared type `i64` where the real value is e.g. a
+   *  `Span`. This pass infers the initializer and re-publishes the scheme as
+   *  `() -> realT` for STRUCTURED results, before any referrer body is checked.
+   *  Best-effort and inert on the live path (no root-local body references these
+   *  placeholder bindings, so no local check result changes). */
+  let st7b = resolve_value_binding_types(state: st7, funcs)
+
+  check_all_functions(state: st7b, funcs, local_names, cont_map: cont_binder_map, safe_callees)
 
   // Pass 2b: Check handler arm bodies (synthesised function names aren't in
   // local_names, so they're missed by check_all_functions). With-kont arms
@@ -387,7 +397,14 @@ let build_check_thunks = fn (
           return build_check_thunks(state, funcs: rest, local_names, cont_map, safe_callees, acc)
         | None ->
           let @t = check_function_bounded(state, func, cont_map, safe_callees)
-          return build_check_thunks(state, funcs: rest, local_names, cont_map, safe_callees, acc: t :: acc)
+          return build_check_thunks(
+            state,
+            funcs: rest,
+            local_names,
+            cont_map,
+            safe_callees,
+            acc: t :: acc
+          )
       end
   end
 end
@@ -510,7 +527,12 @@ let check_arm_body = fn (
   // the `with @k` continuation binder before inference, so the runtime
   // miscompile can never be reached (see check_cont_no_escape_stmts).
   match cont_binder do
-    | Some(val: k) -> check_cont_no_escape_stmts(stmts: body, binders: [ k ], safe_callees, fname: name)
+    | Some(val: k) -> check_cont_no_escape_stmts(
+      stmts: body,
+      binders: [ k ],
+      safe_callees,
+      fname: name
+    )
     | None -> ()
   end
   let conv_params = convert_hir_params(params, vars: tps)
@@ -580,6 +602,38 @@ let check_arm_body = fn (
   end
 end
 
+/** Resolved return type for a top-level value binding whose declared type is
+ *  the `TyI64` placeholder. Returns `Some(structuredRet)` only when `func` is a
+ *  nullary, non-type-param binding (params == [], tps == []) whose declared
+ *  return type is exactly `TyI64` AND the value-binding pre-pass has published a
+ *  structured `() -> ret` scheme for it in the env. `None` for every other
+ *  function, and for placeholder bindings whose initializer stayed scalar /
+ *  failed inference (their scheme is still the `() -> i64` placeholder, which
+ *  `cur == TyI64` filters out). */
+let resolved_value_binding_ret = fn (
+  state: CheckState,
+  name: string,
+  tps: [ string ],
+  params: [ HirParam ],
+  declared: TypeExpr
+) -> Option<TypeExpr> do
+  match tps do | [] -> () | _ -> return None end
+  match params do | [] -> () | _ -> return None end
+  match declared do | TyUnit -> return None | _ -> () end
+  let is_placeholder = if let TyVar(name: _) = declared then false else
+    match declared do | TyI64 -> true | _ -> false end
+  end
+  if !is_placeholder then return None end
+  match tctypes.env_lookup(env: tctypes.state_env(state), name) do
+    | Some(val: Scheme(vars: [], typ: TyArrow(params: [], ret: cur, requires: _, throw_row: _))) ->
+      match cur do
+        | TyI64 -> return None
+        | _ -> return Some(val: cur)
+      end
+    | _ -> return None
+  end
+end
+
 let check_function = fn (
   state: CheckState,
   func: HirFunction,
@@ -601,11 +655,27 @@ let check_function = fn (
   // Reject indirect uses of a `with @k` continuation binder (let-bound handler
   // arm path; mirrors check_arm_body for inline handlers).
   match lookup_cont_binder(fname: name, map: cont_map) do
-    | Some(val: k) -> check_cont_no_escape_stmts(stmts: body, binders: [ k ], safe_callees, fname: name)
+    | Some(val: k) -> check_cont_no_escape_stmts(
+      stmts: body,
+      binders: [ k ],
+      safe_callees,
+      fname: name
+    )
     | None -> ()
   end
   let conv_params = convert_hir_params(params, vars: tps)
-  let conv_ret = convert_ud_to_var(typ: ret, vars: tps)
+  /** A top-level value binding `let x = <non-literal>` carries the `TyI64`
+   *  placeholder in its `ret_type` field (HIR build could not infer it). The
+   *  value-binding pre-pass (resolve_value_binding_types) has, by now, inferred
+   *  the real type and re-published the env scheme as `() -> realT`. Use that
+   *  resolved return type when checking the binding's OWN body so a `return
+   *  Span(...)` is validated against `Span` rather than the stale `i64`. Only
+   *  nullary, non-type-param bindings whose scheme was resolved to a structured
+   *  ret are affected; every other function uses its declared return type. */
+  let conv_ret = match resolved_value_binding_ret(state, name, tps, params, declared: ret) do
+    | Some(val: r) -> r
+    | None -> convert_ud_to_var(typ: ret, vars: tps)
+  end
   let conv_tw = convert_ud_to_var(typ: tw, vars: tps)
   let conv_req = convert_ud_to_var(typ: fn_req, vars: tps)
   let body_env = add_func_params(env: tctypes.state_env(state), params: conv_params)
@@ -908,10 +978,7 @@ end
 /** Build the set of provably-non-throwing top-level function names.
  *  Returns a list of function names that cannot throw (directly or transitively).
  */
-let build_fn_pure_set = fn (
-  funcs: [ HirFunction ],
-  exts: [ HirExternal ]
-) -> [ string ] do
+let build_fn_pure_set = fn (funcs: [ HirFunction ], exts: [ HirExternal ]) -> [ string ] do
   // Externals are WASM imports with no body — they can never contain a `Raise`,
   // so an external whose declared throw row is empty/closed is provably
   // non-throwing. Fold those names into `all_fns` so a call to (e.g.) a pure
