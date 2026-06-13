@@ -24,13 +24,91 @@
  *     constructor field types are stripped before matching.
  */
 
-import { TypeExpr, TyUserDefined } from "src/types/type_expr.nx"
-import { HirMatchCase, HirPatternKind, PVar, PWild } from "src/ir/hir/types.nx"
+import { TypeExpr, TyUserDefined, EnumDef, VariantDef } from "src/types/type_expr.nx"
+import { HirMatchCase, HirPatternKind, PVar, PWild, PCtor } from "src/ir/hir/types.nx"
 import { EnumEntry, TypeDefEntry } from "src/typecheck/types.nx"
 import { Some, None } from "std:option"
 import * as list from "std:list"
 import * as decision from "src/typecheck/exhaustive/decision.nx"
 import { strip_mod } from "src/ir/shared/type_pred.nx"
+
+/** Import-aware reordering of `enum_defs` so the exhaustiveness check resolves
+ *  the scrutinee's enum name to the SAME declaration the match arms' ctors
+ *  resolve to under the current module's import visibility.
+ *
+ *  When two modules export an enum with the same name (e.g. `std:stringmap` and
+ *  `std:hashmap` both export `Lookup = Found | Missing`), the flat first-match
+ *  `find_enum` picks an arbitrary one. If it picks the WRONG module's `Lookup`,
+ *  its `Found`/`Missing` ctors are module-qualified to that module, so they
+ *  fail to cover the arms' (correctly-resolved) ctors and the match is reported
+ *  spuriously non-exhaustive.
+ *
+ *  Resolution: take a ctor name from the arms (already module-qualified at this
+ *  stage), and hoist the same-named EnumDef that actually DECLARES that ctor to
+ *  the front of `enum_defs`. Because each module's `Lookup` carries its own
+ *  qualified `Found`/`Missing`, ctor membership unambiguously identifies the
+ *  arms' enum. Falls through unchanged when the scrutinee is not a named enum,
+ *  no ctor arm exists, or no same-named ambiguity is present. */
+export let reorder_enum_defs_for_scrutinee = fn (
+  scrutinee_type: TypeExpr,
+  cases: [ HirMatchCase ],
+  enum_defs: [ EnumEntry ]
+) -> [ EnumEntry ] do
+  match strip_mod(typ: scrutinee_type) do
+    | TyUserDefined(name: ename, args: _) ->
+      match first_ctor_name(cases) do
+        | None -> return enum_defs
+        | Some(val: ctor) ->
+          return hoist_enum_def(enum_defs, ename, ctor, acc: [])
+      end
+    | _ -> return enum_defs
+  end
+end
+
+/** First top-level constructor name appearing in the match arms, if any. */
+let first_ctor_name = fn (cases: [ HirMatchCase ]) -> Option<string> do
+  match cases do
+    | [] -> return None
+    | HirMatchCase(pattern: p, body: _) :: rest ->
+      match p do
+        | PCtor(variant: v, fields: _, sigil: _) -> return Some(val: v)
+        | _ -> return first_ctor_name(cases: rest)
+      end
+  end
+end
+
+/** Move the `EnumEntry` named `ename` that actually DECLARES constructor `ctor`
+ *  to the front, so the flat first-match `find_enum` selects the same `Lookup`
+ *  the arms' (module-qualified) ctors belong to rather than an arbitrary
+ *  same-named one. Matching on ctor membership is robust to the qualified-name
+ *  encoding: each module's `Lookup` carries its OWN qualified `Found`/`Missing`,
+ *  and the arms reference exactly one module's qualified ctor, so this picks the
+ *  unambiguously-correct declaration. No-op when no `ename` entry declares
+ *  `ctor` (no ambiguity, or the arms used a wildcard / built-in). */
+let hoist_enum_def = fn (
+  enum_defs: [ EnumEntry ], ename: string, ctor: string, acc: [ EnumEntry ]
+) -> [ EnumEntry ] do
+  match enum_defs do
+    | [] -> return list.reverse(xs: acc)
+    | EnumEntry(name: n, def: d) :: rest ->
+      let EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs, layout_variants: _, module: _) = d
+      if n == ename && enum_declares_ctor(variants: vs, ctor) then
+        return EnumEntry(name: n, def: d) :: list.concat(xs: list.reverse(xs: acc), ys: rest)
+      end
+      return hoist_enum_def(enum_defs: rest, ename, ctor, acc: EnumEntry(name: n, def: d) :: acc)
+  end
+end
+
+/** True when one of `variants` is the constructor `ctor` (exact name match;
+ *  names are already module-qualified at this stage). */
+let enum_declares_ctor = fn (variants: [ VariantDef ], ctor: string) -> bool do
+  match variants do
+    | [] -> return false
+    | VariantDef(name: vn, fields: _) :: rest ->
+      if vn == ctor then return true end
+      return enum_declares_ctor(variants: rest, ctor)
+  end
+end
 
 /** Outcome of an exhaustiveness check: either every value is covered, a witness of an uncovered value, or a redundant (unreachable) arm.
  *  `ExnNoCatchAll` is returned when the scrutinee is the open `Exn` type but
