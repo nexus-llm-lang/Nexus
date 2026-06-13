@@ -1,0 +1,145 @@
+/**
+ * Regression for the imported-body exhaustiveness faithfulness gap.
+ *
+ * The match exhaustiveness / redundancy check consults `CheckState`'s FULL
+ * (visibility-unstripped) enum set rather than the D-Export-stripped one used
+ * for constructor resolution. When an imported function body is checked, the
+ * stripped set leaves a non-visible enum's `variants` empty, which made
+ * `column_signature` return `SigFinite(ctors: [])` and yielded SPURIOUS
+ * non-exhaustive / redundant verdicts on matches that are in fact complete.
+ *
+ * `build_enum_entries_full` recovers the real variant set without stripping: a
+ * non-opaque enum keeps its `variants` verbatim; an opaque enum (whose
+ * `variants` were stripped to [] at HIR-build time, with the real declaration
+ * order kept in `layout_variants`) recovers its ctors from `layout_variants`.
+ *
+ * We feed both shapes through `build_enum_entries_full` and assert that a
+ * complete match over the recovered set is `Exhaustive` (not a false
+ * non-exhaustive) and that detection of genuine defects is preserved: a real
+ * missing arm still reports non-exhaustive and a real duplicate still reports
+ * redundant.
+ */
+
+import * as test_assert from "std:test/assert"
+import {
+  check_match_exhaustive, ExhaustiveResult, Exhaustive, NonExhaustive, RedundantArm, ExnNoCatchAll
+} from "src/typecheck/exhaustive.nx"
+import { build_enum_entries_full } from "src/typecheck/check/builtins.nx"
+import { HirMatchCase, PCtor } from "src/ir/hir/types.nx"
+import { TypeExpr, TyUserDefined, SigilImmutable, EnumDef, VariantDef } from "src/syntax/ast.nx"
+
+let hidden_ty = fn () -> TypeExpr do
+  return TyUserDefined(name: "Hidden", args: [])
+end
+
+/** A non-opaque, non-public enum: at the `edefs` level its variants are intact
+ *  (the non-opaque stripping happens later, in the visibility-filtered
+ *  `build_enum_entries`, which `build_enum_entries_full` deliberately skips). */
+let nonopaque_stripped_defs = fn () -> [ EnumDef ] do
+  return [EnumDef(
+    name: "Hidden",
+    is_public: false,
+    is_opaque: false,
+    type_params: [],
+    variants: [ VariantDef(name: "HiddenA", fields: []), VariantDef(name: "HiddenB", fields: []) ],
+    layout_variants: [], module: "some/imported/module.nx"
+  ) ]
+end
+
+/** An opaque imported enum: its `variants` were stripped to [] at HIR-build
+ *  time (D-Type-Sum-Opaque) with the real declaration order surviving only in
+ *  `layout_variants`. `build_enum_entries_full` must recover from there. */
+let opaque_layout_only_defs = fn () -> [ EnumDef ] do
+  return [EnumDef(
+    name: "Hidden",
+    is_public: false,
+    is_opaque: true,
+    type_params: [],
+    variants: [],
+    layout_variants: [
+      VariantDef(name: "HiddenA", fields: []),
+      VariantDef(name: "HiddenB", fields: [])
+    ],
+    module: "some/imported/module.nx"
+  ) ]
+end
+
+let ctor_arm = fn (name: string) -> HirMatchCase do
+  return HirMatchCase(pattern: PCtor(variant: name, fields: [], sigil: SigilImmutable), body: [])
+end
+
+let run = fn (cases: [ HirMatchCase ], defs: [ EnumDef ]) -> ExhaustiveResult do
+  return check_match_exhaustive(
+    cases: cases, scrutinee_type: hidden_ty(),
+    enum_defs: build_enum_entries_full(defs: defs), type_defs: []
+  )
+end
+
+let tag_of = fn (r: ExhaustiveResult) -> string do
+  match r do
+    | Exhaustive -> return "<Exhaustive>"
+    | RedundantArm(witness: w) -> return "<Redundant:" ++ w ++ ">"
+    | NonExhaustive(witness: _) -> return "<NonExhaustive>"
+    | ExnNoCatchAll -> return "<ExnNoCatchAll>"
+  end
+end
+
+/** A complete `HiddenA | HiddenB` match over the recovered full variant set is
+ *  Exhaustive — this is the false-positive the fix eliminates. Before the fix
+ *  the stripped (empty) signature mis-classified this complete match. */
+let test_complete_match_is_exhaustive_nonopaque = fn () -> unit throws { Exn } do
+  let r = run(
+    cases: [ ctor_arm(name: "HiddenA"), ctor_arm(name: "HiddenB") ],
+    defs: nonopaque_stripped_defs()
+  )
+  test_assert.assert_eq_string(
+    expected: "<Exhaustive>", actual: tag_of(r: r),
+    label: "complete match over recovered non-opaque variants is exhaustive"
+  )
+  return ()
+end
+
+/** The opaque-stripped case must recover ctors from `layout_variants` and also
+ *  accept the complete match. */
+let test_complete_match_is_exhaustive_opaque_layout = fn () -> unit throws { Exn } do
+  let r = run(
+    cases: [ ctor_arm(name: "HiddenA"), ctor_arm(name: "HiddenB") ],
+    defs: opaque_layout_only_defs()
+  )
+  test_assert.assert_eq_string(
+    expected: "<Exhaustive>", actual: tag_of(r: r),
+    label: "complete match over recovered opaque layout variants is exhaustive"
+  )
+  return ()
+end
+
+/** Soundness is preserved: a genuinely missing arm STILL reports non-exhaustive
+ *  against the full set (the fix makes checking faithful, never laxer). */
+let test_missing_arm_still_non_exhaustive = fn () -> unit throws { Exn } do
+  let r = run(cases: [ ctor_arm(name: "HiddenA") ], defs: nonopaque_stripped_defs())
+  test_assert.assert_eq_string(
+    expected: "<NonExhaustive>", actual: tag_of(r: r),
+    label: "missing HiddenB still flagged non-exhaustive"
+  )
+  return ()
+end
+
+/** Soundness is preserved: a genuinely redundant arm STILL reports redundant. */
+let test_duplicate_arm_still_redundant = fn () -> unit throws { Exn } do
+  let r = run(cases: [
+    ctor_arm(name: "HiddenA"), ctor_arm(name: "HiddenB"), ctor_arm(name: "HiddenA")
+  ], defs: nonopaque_stripped_defs())
+  test_assert.assert_eq_string(
+    expected: "<Redundant:arm #3 is unreachable>", actual: tag_of(r: r),
+    label: "duplicate HiddenA still flagged redundant"
+  )
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  test_complete_match_is_exhaustive_nonopaque()
+  test_complete_match_is_exhaustive_opaque_layout()
+  test_missing_arm_still_non_exhaustive()
+  test_duplicate_arm_still_redundant()
+  return ()
+end
