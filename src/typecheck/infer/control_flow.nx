@@ -197,6 +197,51 @@ end
  *  are considered (a fresh tail var carries no concrete exception). A bare
  *  group label in the caught row is admitted iff the declared row admits every
  *  one of its members. */
+/** Remove from a captured throws-row the variant names already discharged by
+ *  the catch arms preceding the catch-all (`drop_names`). The captured row is
+ *  the pinned form `{E1 | {E2 | ?tail}}` (or a flat `{E1, E2 | ?tail}`); this
+ *  walks every nested `TyRow` and drops named `TyUserDefined` entries whose name
+ *  appears in `drop_names`, preserving the tail. The result is the row a
+ *  `throw <binder>` in the catch-all arm can still carry at runtime. */
+export let subtract_caught_from_row = fn (
+  caught_row: TypeExpr, drop_names: [ string ]
+) -> TypeExpr do
+  match caught_row do
+    | TyRow(types: ts, rest: r) ->
+      let kept = filter_out_named(types: ts, drop_names)
+      let rest_filtered = match r do
+        | Some(val: tail) -> Some(val: subtract_caught_from_row(caught_row: tail, drop_names))
+        | None -> None
+      end
+      return TyRow(types: kept, rest: rest_filtered)
+    | _ -> return caught_row
+  end
+end
+
+let filter_out_named = fn (types: [ TypeExpr ], drop_names: [ string ]) -> [ TypeExpr ] do
+  match types do
+    | [] -> return []
+    | t :: rest ->
+      let keep = match t do
+        | TyUserDefined(name: n, args: _) -> !name_in_list(needle: n, haystack: drop_names)
+        | _ -> true
+      end
+      if keep then
+        return t :: filter_out_named(types: rest, drop_names)
+      end
+      return filter_out_named(types: rest, drop_names)
+  end
+end
+
+let name_in_list = fn (needle: string, haystack: [ string ]) -> bool do
+  match haystack do
+    | [] -> return false
+    | h :: rest ->
+      if h == needle then return true end
+      return name_in_list(needle, haystack: rest)
+  end
+end
+
 export let catch_rethrow_admits = fn (
   caught_row: TypeExpr, row_types: [ TypeExpr ], groups: [ ExceptionGroupEntry ]
 ) -> bool throws { TypeError } do
@@ -938,6 +983,88 @@ let cases_have_wildcard = fn (cases: [ HirMatchCase ]) -> bool do
           end
           return true
         | _ -> return cases_have_wildcard(cases: rest)
+      end
+  end
+end
+
+/** Name of the variable bound by the catch-all arm of a catch body — the
+ *  variable a `throw <name>` re-throw inside the catch may legitimately carry.
+ *
+ *  - Legacy single-variable catch (`catch e -> ...`, `catch_param != "__exn"`):
+ *    the binder is the catch param itself.
+ *  - Multi-arm desugar (`catch_param == "__exn"`): the catch body is
+ *    `[ Expr(Match(__exn, cases)) ]`; the catch-all is the first `PVar` arm that
+ *    is not the synthetic residual re-throw arm (`__exn_v`). Its binder is the
+ *    user variable (e.g. `err` in `| err -> throw err`).
+ *
+ *  Returns `None` when there is no user catch-all PVar arm (a bare `_` wildcard
+ *  binds nothing rethrowable, so it yields `None`). */
+export let catch_all_binder_name = fn (catch_param: string, catch_body: [ HirStmt ]) -> Option<string> do
+  if !(catch_param == "__exn") then return Some(val: catch_param) end
+  match catch_body do
+    | HirStmt(
+      node: Expr(expr: HirExpr(node: Match(target: _, cases: cs), span: _)),
+      span: _
+    ) :: [] ->
+      return catch_all_arm_var(cases: cs)
+    | _ -> return None
+  end
+end
+
+let catch_all_arm_var = fn (cases: [ HirMatchCase ]) -> Option<string> do
+  match cases do
+    | [] -> return None
+    | HirMatchCase(pattern: p, body: b) :: rest ->
+      match p do
+        | PVar(name: vn, sigil: _) ->
+          if is_synthetic_rethrow_arm(name: vn, body: b) then
+            return catch_all_arm_var(cases: rest)
+          end
+          return Some(val: vn)
+        | _ -> return catch_all_arm_var(cases: rest)
+      end
+  end
+end
+
+/** Caught variant types of the arms that PRECEDE the catch-all arm — the
+ *  variants already discharged before control reaches `throw <binder>`. These
+ *  are subtracted from the captured try-body row so the re-throw binder's
+ *  effective row is exactly what can still escape. Only irrefutable PCtor arms
+ *  (which always discharge their variant) contribute. */
+export let caught_before_catch_all = fn (catch_param: string, catch_body: [ HirStmt ]) -> [ TypeExpr ] do
+  if !(catch_param == "__exn") then return [] end
+  match catch_body do
+    | HirStmt(
+      node: Expr(expr: HirExpr(node: Match(target: _, cases: cs), span: _)),
+      span: _
+    ) :: [] ->
+      return caught_before_catch_all_cases(cases: cs, acc: [])
+    | _ -> return []
+  end
+end
+
+let caught_before_catch_all_cases = fn (
+  cases: [ HirMatchCase ], acc: [ TypeExpr ]
+) -> [ TypeExpr ] do
+  match cases do
+    | [] -> return acc
+    | HirMatchCase(pattern: p, body: b) :: rest ->
+      match p do
+        | PWild -> return acc
+        | PVar(name: vn, sigil: _) ->
+          if is_synthetic_rethrow_arm(name: vn, body: b) then
+            return caught_before_catch_all_cases(cases: rest, acc)
+          end
+          return acc
+        | PCtor(variant: v, fields: fs, sigil: _) ->
+          if ctor_fields_irrefutable(fields: fs) then
+            return caught_before_catch_all_cases(
+              cases: rest,
+              acc: TyUserDefined(name: v, args: []) :: acc
+            )
+          end
+          return caught_before_catch_all_cases(cases: rest, acc)
+        | _ -> return caught_before_catch_all_cases(cases: rest, acc)
       end
   end
 end
