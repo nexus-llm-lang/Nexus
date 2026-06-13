@@ -165,12 +165,33 @@ export let bind_pattern = fn (
   target_type: TypeExpr,
   pat_span: Span
 ) -> BindResult throws { TypeError } do
+  return bind_pattern_b(state, pattern, target_type, pat_span, borrowed: false)
+end
+
+/** Borrow-aware pattern binding. `borrowed` is true when the scrutinee whose
+ *  fields are being bound was reached through a `&` borrow (or is itself a
+ *  `&T`). A borrowed value is not owned, so destructuring it never transfers
+ *  ownership of its fields: a wildcard `_` discarding a borrowed linear field
+ *  (e.g. `let EffectMap(entries, lookup: _) = em` where `em: &EffectMap`) is
+ *  not a silent-leak violation — the field stays owned by the borrow's owner.
+ *  The flag propagates into nested constructor / record fields so a borrowed
+ *  scrutinee keeps every projected field borrowed. */
+let bind_pattern_b = fn (
+  state: CheckState,
+  pattern: HirPatternKind,
+  target_type: TypeExpr,
+  pat_span: Span,
+  borrowed: bool
+) -> BindResult throws { TypeError } do
   match pattern do
     | PWild ->
       // P-Wild: spec premise linear(τ) ∧ ¬autoDrop(τ) → error.
       // A wildcard silently discards its scrutinee; if the scrutinee is a
       // non-auto-droppable linear type (e.g. %Handle) that is a linearity
       // violation — the resource escapes without being consumed.
+      if borrowed || type_is_borrowed(typ: target_type) then
+        return BindOk(state, subst: subst.subst_empty(), env: [])
+      end
       let tdefs = tctypes.state_typedefs(state)
       // P-Wild: spec premise linear(τ) ∧ ¬autoDrop(τ) → error.
       // `linear` is structural (spec §Linearity), so a linear payload reached
@@ -203,14 +224,14 @@ export let bind_pattern = fn (
         | UnifyOk(subst: s) -> return BindOk(state, subst: s, env: [])
       end
     | PCtor(variant, fields, sigil: _) ->
-      return bind_constructor_pattern(state, variant, fields, target_type)
+      return bind_constructor_pattern(state, variant, fields, target_type, borrowed)
     | PRec(fields, is_partial: _) ->
-      return bind_record_pattern(state, fields, target_type, pat_span)
+      return bind_record_pattern(state, fields, target_type, pat_span, borrowed)
     | POr(alts) ->
       match alts do
         | [] -> return BindErr(message: "empty or-pattern")
         | first :: rest ->
-          match bind_pattern(state, pattern: first, target_type, pat_span) do
+          match bind_pattern_b(state, pattern: first, target_type, pat_span, borrowed) do
             | BindErr(message: m) -> return BindErr(message: "or-pattern: " ++ m)
             | BindOk(state: st1, subst: s1, env: ref_env) ->
               return bind_or_alts_validate(
@@ -218,35 +239,48 @@ export let bind_pattern = fn (
                 alts: rest,
                 target_type,
                 ref_env,
-                acc_subst: s1
+                acc_subst: s1,
+                borrowed
               )
           end
       end
   end
 end
 
+/** True when `typ`'s outermost modality wrapper is a `&` borrow. A borrowed
+ *  value is accessed without ownership, so its linear payload need not be
+ *  consumed on a wildcard discard. */
+let type_is_borrowed = fn (typ: TypeExpr) -> bool do
+  match typ do
+    | TyBorrow(inner: _) -> return true
+    | _ -> return false
+  end
+end
+
 let bind_or_alts_validate = fn (
   state: CheckState, alts: [ HirPatternKind ], target_type: TypeExpr,
-  ref_env: [ EnvEntry ], acc_subst: [ SubstEntry ]
+  ref_env: [ EnvEntry ], acc_subst: [ SubstEntry ], borrowed: bool
 ) -> BindResult throws { TypeError } do
   // hoist the haystack into a map once per call so
   // env_keys_match / unify_or_envs do O(1) lookups instead of O(N) per name.
   let ref_map = env_to_map(env: ref_env)
-  return bind_or_alts_validate_go(state, alts, target_type, ref_env, ref_map, acc_subst)
+  return bind_or_alts_validate_go(state, alts, target_type, ref_env, ref_map, acc_subst, borrowed)
 end
 
 let bind_or_alts_validate_go = fn (
   state: CheckState, alts: [ HirPatternKind ], target_type: TypeExpr,
-  ref_env: [ EnvEntry ], ref_map: Map<string, Scheme>, acc_subst: [ SubstEntry ]
+  ref_env: [ EnvEntry ], ref_map: Map<string, Scheme>, acc_subst: [ SubstEntry ],
+  borrowed: bool
 ) -> BindResult throws { TypeError } do
   match alts do
     | [] -> return BindOk(state, subst: acc_subst, env: ref_env)
     | alt :: rest ->
-      match bind_pattern(
+      match bind_pattern_b(
         state,
         pattern: alt,
         target_type,
-        pat_span: Span(offset: 0, line: 0, col: 0)
+        pat_span: Span(offset: 0, line: 0, col: 0),
+        borrowed
       ) do
         | BindErr(message: m) -> return BindErr(message: "or-pattern alternative: " ++ m)
         | BindOk(state: st1, subst: s1, env: alt_env) ->
@@ -266,7 +300,8 @@ let bind_or_alts_validate_go = fn (
                   target_type,
                   ref_env,
                   ref_map,
-                  acc_subst: s2
+                  acc_subst: s2,
+                  borrowed
                 )
             end
           else
@@ -393,7 +428,7 @@ end
 
 let bind_constructor_pattern = fn (
   state: CheckState, variant: string,
-  fields: [ HirPatternField ], target_type: TypeExpr
+  fields: [ HirPatternField ], target_type: TypeExpr, borrowed: bool
 ) -> BindResult throws { TypeError } do
   // spec strip(τ) peels %/& only — @σ thunks must be forced explicitly.
   match target_type do
@@ -401,6 +436,7 @@ let bind_constructor_pattern = fn (
       return BindErr(message: "cannot pattern-match constructor `" ++ variant ++ "` on thunk type `" ++ tctypes.type_to_string(typ: target_type) ++ "`; force the thunk first (e.g. `match @x do | " ++ variant ++ "(...) -> ... end`)")
     | _ -> ()
   end
+  let fields_borrowed = borrowed || type_is_borrowed(typ: target_type)
   let unwrapped = match target_type do
     | TyLinear(inner: i) | TyRef(inner: i) | TyBorrow(inner: i) -> i
     | _ -> target_type
@@ -434,7 +470,8 @@ let bind_constructor_pattern = fn (
                     field_types,
                     param_subst: full_subst,
                     subst: s1,
-                    env: []
+                    env: [],
+                    borrowed: fields_borrowed
                   )
               end
           end
@@ -594,7 +631,8 @@ end
 
 let bind_ctor_fields = fn (
   state: CheckState, fields: [ HirPatternField ], field_types: [ VariantField ],
-  param_subst: [ SubstEntry ], subst: [ SubstEntry ], env: [ EnvEntry ]
+  param_subst: [ SubstEntry ], subst: [ SubstEntry ], env: [ EnvEntry ],
+  borrowed: bool
 ) -> BindResult throws { TypeError } do
   match fields do
     | [] -> return BindOk(state, subst, env)
@@ -610,11 +648,12 @@ let bind_ctor_fields = fn (
             | None -> ()
           end
           let expected = subst.subst_apply(subst: param_subst, typ: ft)
-          match bind_pattern(
+          match bind_pattern_b(
             state,
             pattern: pat,
             target_type: expected,
-            pat_span: Span(offset: 0, line: 0, col: 0)
+            pat_span: Span(offset: 0, line: 0, col: 0),
+            borrowed
           ) do
             | BindErr(message: m) -> return BindErr(message: m)
             | BindOk(state: st1, subst: ps, env: new_binds) ->
@@ -637,7 +676,8 @@ let bind_ctor_fields = fn (
                   return bind_ctor_fields(
                     state: st1, fields: rf, field_types: rft,
                     param_subst, subst: sm,
-                    env: append_env(base: env, extra: new_binds)
+                    env: append_env(base: env, extra: new_binds),
+                    borrowed
                   )
               end
           end
@@ -701,7 +741,7 @@ end
 
 let bind_record_pattern = fn (
   state: CheckState, fields: [ HirRecordPatField ], target_type: TypeExpr,
-  pat_span: Span
+  pat_span: Span, borrowed: bool
 ) -> BindResult throws { TypeError } do
   // Spec P-Record premise distinct(ℓ̄): reject duplicate field labels before
   // attempting the per-field binding walk.
@@ -712,6 +752,7 @@ let bind_record_pattern = fn (
       return BindErr(message: "cannot pattern-match record on thunk type `" ++ tctypes.type_to_string(typ: target_type) ++ "`; force the thunk first (e.g. `match @x do | {...} -> ... end`)")
     | _ -> ()
   end
+  let fields_borrowed = borrowed || type_is_borrowed(typ: target_type)
   // Peel modality wrappers (Linear/Borrow/Ref) so `match h: %T do | {f: x} -> ...`
   // can match on the underlying record.
   let inner = match target_type do
@@ -720,14 +761,14 @@ let bind_record_pattern = fn (
   end
   match inner do
     | TyRecord(fields: rec_fields) ->
-      return bind_rec_pat_fields(state, fields, rec_fields, subst: subst.subst_empty(), env: [])
+      return bind_rec_pat_fields(state, fields, rec_fields, subst: subst.subst_empty(), env: [], borrowed: fields_borrowed)
     | TyUserDefined(name: n, args: _) ->
       // Project named record typedef (`p: Point`) to underlying TyRecord.
       // Anonymous record alias for surface types like `type Point = {...}`.
       match tctypes.typedef_lookup(defs: tctypes.state_typedefs(state), name: n) do
         | Some(val: rd) ->
           let RecordDef(name: _, is_public: _, type_params: _, fields: rec_fields) = rd
-          return bind_rec_pat_fields(state, fields, rec_fields, subst: subst.subst_empty(), env: [])
+          return bind_rec_pat_fields(state, fields, rec_fields, subst: subst.subst_empty(), env: [], borrowed: fields_borrowed)
         | None -> return BindErr(message: "record pattern on non-record type")
       end
     | _ -> return BindErr(message: "record pattern on non-record type")
@@ -736,7 +777,8 @@ end
 
 let bind_rec_pat_fields = fn (
   state: CheckState, fields: [ HirRecordPatField ],
-  rec_fields: [ NamedType ], subst: [ SubstEntry ], env: [ EnvEntry ]
+  rec_fields: [ NamedType ], subst: [ SubstEntry ], env: [ EnvEntry ],
+  borrowed: bool
 ) -> BindResult throws { TypeError } do
   match fields do
     | [] -> return BindOk(state, subst, env)
@@ -746,11 +788,12 @@ let bind_rec_pat_fields = fn (
           let sugs = suggest_names(typo: fname, candidates: named_type_field_names(nts: rec_fields))
           return BindErr(message: "no field '" ++ fname ++ "' in record pattern" ++ inline_suggestions(sugs))
         | Some(val: ft) ->
-          match bind_pattern(
+          match bind_pattern_b(
             state,
             pattern: pat,
             target_type: ft,
-            pat_span: Span(offset: 0, line: 0, col: 0)
+            pat_span: Span(offset: 0, line: 0, col: 0),
+            borrowed
           ) do
             | BindErr(message: m) -> return BindErr(message: m)
             | BindOk(state: st1, subst: ps, env: new_binds) ->
@@ -763,7 +806,8 @@ let bind_rec_pat_fields = fn (
                   let sm = subst.subst_compose(s1: subst, s2: ps)
                   return bind_rec_pat_fields(
                     state: st1, fields: rest, rec_fields,
-                    subst: sm, env: append_env(base: env, extra: new_binds)
+                    subst: sm, env: append_env(base: env, extra: new_binds),
+                    borrowed
                   )
               end
           end
