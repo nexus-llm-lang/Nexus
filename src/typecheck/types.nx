@@ -36,7 +36,11 @@ import {
   RecordDef
 } from "src/types/type_expr.nx"
 import { ExceptionGroupEntry, HirCap } from "src/ir/hir/types.nx"
-import { VariantIndex, VariantInfo, ModuleVariantIndex }, * as vidx from "src/ir/support/variant_index.nx"
+import {
+  VariantIndex,
+  VariantInfo,
+  ModuleVariantIndex
+}, * as vidx from "src/ir/support/variant_index.nx"
 import { ModuleImportIndex }, * as iidx from "src/typecheck/import_index.nx"
 import { Option, Some, None } from "std:option"
 import * as str from "std:str"
@@ -145,8 +149,22 @@ export type CheckState = CheckState(
    *  program-wide flat first-match. Built once in `check_program`; empty by
    *  default, in which case scoped resolution falls through to the flat path.
    */
-  module_import_index: ModuleImportIndex
+  module_import_index: ModuleImportIndex,
+  /** Active catch-all binder under check, with the actual exception row the
+   *  try body threw (its named-type members are the only exceptions the binder
+   *  can hold). Set by `infer_try_impl` while checking a catch-all catch body;
+   *  consulted by T-Raise so a rethrow `throw <binder>` of the catch-all binder
+   *  is admitted iff that caught row's members are all ⊆ the enclosing declared
+   *  throws row. `None` outside a catch-all body — a function/lambda parameter
+   *  of type `Exn` is NOT a catch binder, so its `throw` stays strictly checked.
+   */
+  catch_rethrow_binder: Option<CatchBinderInfo>
 )
+
+/** The catch-all binder name plus the actual exception row the try body threw.
+ *  Only the row's concrete named members gate admission; an open tail does not
+ *  widen the admitted set (the body's actual throws are its named members). */
+export type CatchBinderInfo = CatchBinderInfo(name: string, caught_row: TypeExpr)
 
 /** Result of `tc_fresh_var`: the advanced state plus the freshly-allocated TyVar. */
 export type FreshResult = FreshResult(state: CheckState, typ: TypeExpr)
@@ -193,7 +211,8 @@ export let tc_new_state = fn (
     module_variant_index: vidx.empty_module_variant_index(),
     current_module: "",
     full_enum_defs,
-    module_import_index: iidx.empty_module_import_index()
+    module_import_index: iidx.empty_module_import_index(),
+    catch_rethrow_binder: None
   )
 end
 
@@ -232,7 +251,8 @@ export let tc_fresh_var = fn (state: CheckState) -> FreshResult do
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   ) = state
   let name = "?" ++ str.from_i64(val: n)
   return FreshResult(
@@ -251,7 +271,8 @@ export let tc_fresh_var = fn (state: CheckState) -> FreshResult do
       module_variant_index: mvi,
       current_module: cm,
       full_enum_defs: fed,
-      module_import_index: mii
+      module_import_index: mii,
+      catch_rethrow_binder: crb
     ),
     typ: TyVar(name)
   )
@@ -316,7 +337,10 @@ end
  *  registration, or before `check_program` installs the real one) the fallback
  *  returns `None`, leaving behaviour byte-identical to
  *  `find_variant(state_variant_index(state), …)`. */
-export let find_variant_in_state = fn (state: CheckState, variant: string) -> Option<EnumVariantInfo> do
+export let find_variant_in_state = fn (
+  state: CheckState,
+  variant: string
+) -> Option<EnumVariantInfo> do
   match find_variant(idx: state_variant_index(state), variant) do
     | Some(val: evi) -> return Some(val: evi)
     | None ->
@@ -378,7 +402,8 @@ export let state_with_env = fn (state: CheckState, env: [ EnvEntry ]) -> CheckSt
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   ) = state
   return CheckState(
     supply: s,
@@ -395,7 +420,8 @@ export let state_with_env = fn (state: CheckState, env: [ EnvEntry ]) -> CheckSt
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   )
 end
 
@@ -416,7 +442,8 @@ export let state_with_throw_row = fn (state: CheckState, throw_row: TypeExpr) ->
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   ) = state
   return CheckState(
     supply: s,
@@ -433,7 +460,8 @@ export let state_with_throw_row = fn (state: CheckState, throw_row: TypeExpr) ->
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   )
 end
 
@@ -469,7 +497,8 @@ export let state_full_enums = fn (state: CheckState) -> [ EnumEntry ] do
     module_variant_index: _,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   ) = state
   return scope_enum_entries(entries: fed, current_module: cm, idx: mii)
 end
@@ -507,14 +536,27 @@ let filter_visible_enum_entries = fn (
   match entries do
     | [] -> return list_reverse_entries(xs: acc, acc: [])
     | EnumEntry(name: n, def: d) :: rest ->
-      let EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: _, layout_variants: _, module: m) = d
+      let EnumDef(
+        name: _,
+        is_public: _,
+        is_opaque: _,
+        type_params: _,
+        variants: _,
+        layout_variants: _,
+        module: m
+      ) = d
       let owned = m == current_module
       let imported = match iidx.resolve_import_source(idx, importer: current_module, name: n) do
           | Some(val: src) -> src == m
           | None -> false
         end
       if owned || imported then
-        return filter_visible_enum_entries(entries: rest, current_module, idx, acc: EnumEntry(name: n, def: d) :: acc)
+        return filter_visible_enum_entries(
+          entries: rest,
+          current_module,
+          idx,
+          acc: EnumEntry(name: n, def: d) :: acc
+        )
       else
         return filter_visible_enum_entries(entries: rest, current_module, idx, acc)
       end
@@ -628,7 +670,8 @@ export let state_with_in_catch_body = fn (state: CheckState, in_catch_body: bool
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   ) = state
   return CheckState(
     supply: s,
@@ -645,7 +688,63 @@ export let state_with_in_catch_body = fn (state: CheckState, in_catch_body: bool
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
+  )
+end
+
+/** Accessor: the active catch-all binder (name + caught row), or `None` when
+ *  not inside a catch-all catch body. */
+export let state_catch_rethrow_binder = fn (state: CheckState) -> Option<CatchBinderInfo> do
+  let CheckState(
+    supply: _, env: _, enum_defs: _, type_defs: _, throw_row: _,
+    exception_groups: _, variant_index: _, in_catch_body: _, require_row: _,
+    fn_pure_set: _, caps: _, module_variant_index: _, current_module: _,
+    full_enum_defs: _, module_import_index: _, catch_rethrow_binder: crb
+  ) = state
+  return crb
+end
+
+/** Return `state` with the active catch-all binder set (or cleared with `None`). */
+export let state_with_catch_rethrow_binder = fn (
+  state: CheckState,
+  catch_rethrow_binder: Option<CatchBinderInfo>
+) -> CheckState do
+  let CheckState(
+    supply: s,
+    env: e,
+    enum_defs: ed,
+    type_defs: td,
+    throw_row: tw,
+    exception_groups: egs,
+    variant_index: vi,
+    in_catch_body: icb,
+    require_row: rr,
+    fn_pure_set: fps,
+    caps: cs,
+    module_variant_index: mvi,
+    current_module: cm,
+    full_enum_defs: fed,
+    module_import_index: mii,
+    catch_rethrow_binder: _
+  ) = state
+  return CheckState(
+    supply: s,
+    env: e,
+    enum_defs: ed,
+    type_defs: td,
+    throw_row: tw,
+    exception_groups: egs,
+    variant_index: vi,
+    in_catch_body: icb,
+    require_row: rr,
+    fn_pure_set: fps,
+    caps: cs,
+    module_variant_index: mvi,
+    current_module: cm,
+    full_enum_defs: fed,
+    module_import_index: mii,
+    catch_rethrow_binder
   )
 end
 
@@ -666,7 +765,8 @@ export let state_with_require_row = fn (state: CheckState, require_row: TypeExpr
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   ) = state
   return CheckState(
     supply: s,
@@ -683,7 +783,8 @@ export let state_with_require_row = fn (state: CheckState, require_row: TypeExpr
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   )
 end
 
@@ -721,7 +822,8 @@ export let state_with_fn_pure_set = fn (state: CheckState, fn_pure_set: [ string
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   ) = state
   return CheckState(
     supply: s,
@@ -738,7 +840,8 @@ export let state_with_fn_pure_set = fn (state: CheckState, fn_pure_set: [ string
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   )
 end
 
@@ -796,7 +899,8 @@ export let state_with_caps = fn (state: CheckState, caps: [ HirCap ]) -> CheckSt
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   ) = state
   return CheckState(
     supply: s,
@@ -813,7 +917,8 @@ export let state_with_caps = fn (state: CheckState, caps: [ HirCap ]) -> CheckSt
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   )
 end
 
@@ -879,7 +984,8 @@ export let state_with_module_variant_index = fn (
     module_variant_index: _,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   ) = state
   return CheckState(
     supply: s,
@@ -896,7 +1002,8 @@ export let state_with_module_variant_index = fn (
     module_variant_index,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   )
 end
 
@@ -906,7 +1013,7 @@ export let state_module_import_index = fn (state: CheckState) -> ModuleImportInd
     supply: _, env: _, enum_defs: _, type_defs: _, throw_row: _,
     exception_groups: _, variant_index: _, in_catch_body: _, require_row: _,
     fn_pure_set: _, caps: _, module_variant_index: _, current_module: _,
-    full_enum_defs: _, module_import_index: mii
+    full_enum_defs: _, module_import_index: mii, catch_rethrow_binder: _
   ) = state
   return mii
 end
@@ -931,7 +1038,8 @@ export let state_with_module_import_index = fn (
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index: _
+    module_import_index: _,
+    catch_rethrow_binder: crb
   ) = state
   return CheckState(
     supply: s,
@@ -948,12 +1056,16 @@ export let state_with_module_import_index = fn (
     module_variant_index: mvi,
     current_module: cm,
     full_enum_defs: fed,
-    module_import_index
+    module_import_index,
+    catch_rethrow_binder: crb
   )
 end
 
 /** Set the current-module key for scoped constructor resolution (per-function). */
-export let state_with_current_module = fn (state: CheckState, current_module: string) -> CheckState do
+export let state_with_current_module = fn (
+  state: CheckState,
+  current_module: string
+) -> CheckState do
   let CheckState(
     supply: s,
     env: e,
@@ -969,7 +1081,8 @@ export let state_with_current_module = fn (state: CheckState, current_module: st
     module_variant_index: mvi,
     current_module: _,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   ) = state
   return CheckState(
     supply: s,
@@ -986,7 +1099,8 @@ export let state_with_current_module = fn (state: CheckState, current_module: st
     module_variant_index: mvi,
     current_module,
     full_enum_defs: fed,
-    module_import_index: mii
+    module_import_index: mii,
+    catch_rethrow_binder: crb
   )
 end
 
