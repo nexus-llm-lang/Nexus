@@ -1,0 +1,112 @@
+/**
+ * typecheck/infer/peel: nullary value-binding auto-force under list/array layers.
+ *
+ * A top-level `let x = e` is registered with the nullary-thunk shape
+ * `TyArrow(params: [], ret: T)` (so it stays callable as `x()`), but a bare
+ * `x` reference in value position denotes the value of type `T`. When such a
+ * reference is a list/array element whose element type variable is otherwise
+ * unconstrained, inference binds that variable to the whole arrow `() -> T`
+ * (the arrow unifies with a fresh variable without error), so the list takes
+ * type `[() -> T]`. Unifying that against a concrete `[T]` expectation then
+ * fails with "expected arrow type" at the element. The leaf peels at binop /
+ * return / ctor-field / array-element sites only fire when the un-peeled unify
+ * itself errors; here it does not (the spurious arrow binding happens earlier),
+ * so the failure surfaces one layer up at the enclosing call-arg / ctor-field /
+ * return unify against the concrete list type.
+ *
+ * `peel_value_binding_arrows` recovers from that: given an actual type and the
+ * expected type, it walks matching `TyList`/`TyArray` layers and, at a leaf
+ * where the actual is `TyArrow(params: [], ret: r)` and the expected is a
+ * non-arrow, peels to `r` and unifies. Callers invoke it only after a primary
+ * unify has already failed, so a genuine `[() -> T]` value passed where
+ * `[() -> T]` is expected (expected leaf IS an arrow) is never peeled — its
+ * primary unify succeeds and this helper is never consulted.
+ */
+
+import {
+  TypeExpr,
+  TyArrow,
+  TyList,
+  TyArray,
+  TyUserDefined
+} from "src/types/type_expr.nx"
+import {
+  UnifyResult, UnifyOk, UnifyErr
+}, * as tctypes from "src/typecheck/types.nx"
+import * as unify from "src/typecheck/unify.nx"
+import { Option, Some, None } from "std:option"
+import { TypeDefEntry } from "src/typecheck/types.nx"
+
+/** Both spellings of a list type — the `[T]` sugar `TyList(T)` and the named
+ *  enum `List<T>` (`TyUserDefined("List", [T])`, unified with the sugar per
+ *  spec §U-ListSugar) — carry one element type. Extract it from either form,
+ *  None for any non-list type. */
+let list_elem_of = fn (t: TypeExpr) -> Option<TypeExpr> do
+  match t do
+    | TyList(elem: e) -> return Some(val: e)
+    | TyUserDefined(name: n, args: [ e ]) ->
+      if n == "List" then return Some(val: e) else return None end
+    | _ -> return None
+  end
+end
+
+/** Rewrite `actual` by peeling a nullary-thunk arrow `() -> r` to `r` at each
+ *  leaf where the structurally-corresponding `expected` leaf is NOT an arrow,
+ *  descending through matching list/array layers (lists in either `[T]` or
+ *  `List<T>` spelling). Returns None when no leaf was peeled (so callers can
+ *  keep the original diagnostic). The expected shape gates the peel: an
+ *  arrow-typed expected leaf is left untouched, so a genuine list/array of
+ *  nullary functions is preserved. The rewritten layer is re-emitted in the
+ *  `[T]` sugar spelling, which the unifier bridges to `List<T>` either way. */
+let strip_value_binding_arrows = fn (actual: TypeExpr, expected: TypeExpr) -> Option<TypeExpr> do
+  match actual do
+    | TyArrow(params: [], ret: r, requires: _, throw_row: _) ->
+      match expected do
+        | TyArrow(params: _, ret: _, requires: _, throw_row: _) -> return None
+        | _ -> return Some(val: r)
+      end
+    | TyArray(elem: ae) ->
+      match expected do
+        | TyArray(elem: ee) ->
+          match strip_value_binding_arrows(actual: ae, expected: ee) do
+            | Some(val: peeled) -> return Some(val: TyArray(elem: peeled))
+            | None -> return None
+          end
+        | _ -> return None
+      end
+    | _ ->
+      match list_elem_of(t: actual) do
+        | None -> return None
+        | Some(val: ae) ->
+          match list_elem_of(t: expected) do
+            | None -> return None
+            | Some(val: ee) ->
+              match strip_value_binding_arrows(actual: ae, expected: ee) do
+                | Some(val: peeled) -> return Some(val: TyList(elem: peeled))
+                | None -> return None
+              end
+          end
+      end
+  end
+end
+
+/** Retry unification of `actual` against `expected` after peeling nullary
+ *  value-binding thunks at list/array leaves. Returns the resulting
+ *  `UnifyResult` only when a peel actually applied AND the peeled unify
+ *  succeeds; otherwise None, so the caller keeps its original error. Sound by
+ *  construction: callers invoke this only on a primary `UnifyErr`, and the
+ *  peel never fires when the expected leaf is itself an arrow. */
+export let peel_value_binding_arrows = fn (
+  actual: TypeExpr,
+  expected: TypeExpr,
+  tdefs: [ TypeDefEntry ]
+) -> Option<UnifyResult> do
+  match strip_value_binding_arrows(actual, expected) do
+    | None -> return None
+    | Some(val: peeled) ->
+      match unify.unify(t1: peeled, t2: expected, tdefs) do
+        | UnifyOk(subst: s) -> return Some(val: UnifyOk(subst: s))
+        | UnifyErr(_) -> return None
+      end
+  end
+end
