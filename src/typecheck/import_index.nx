@@ -1,0 +1,119 @@
+/**
+ * typecheck/import_index: per-module import-visibility index for
+ * import-graph-aware enum / constructor name resolution.
+ *
+ * A bare type or constructor name (`BindResult`, `ParsedExpr`, `Lookup`) can be
+ * declared by several different modules. The program-wide flat resolution
+ * (`find_enum` over the unstripped enum list, `find_variant` over the flat
+ * `VariantIndex`) picks the FIRST definition by bare name, which is correct only
+ * for root-module checking — once an imported function body is checked, the
+ * first-match may belong to a module the checked function never imported, so the
+ * WRONG variant set drives exhaustiveness / constructor resolution.
+ *
+ * `ModuleImportIndex` records, for every module M, the set of bare names M
+ * brings into scope by `import { … } from "D"` together with the SOURCE module
+ * `D` (its physical path, matching `EnumDef.module`). Resolution for a name `N`
+ * checked under module `M` then becomes: M's own declaration of `N` first, else
+ * the declaration in the module M imports `N` from, else (no edge — leave to the
+ * caller's existing flat fallback). This never exposes a definition M does not
+ * own or import, so it cannot leak a non-public / non-imported declaration.
+ */
+
+import { ImportDef, ImportItem, SpannedTopLevel } from "src/syntax/ast.nx"
+import { CacheEntry } from "src/ir/shared/imports.nx"
+import { extract_imports } from "src/ir/shared/resolve.nx"
+import { resolve_import_path } from "src/ir/shared/package.nx"
+import { Option, Some, None } from "std:option"
+import * as list from "std:list"
+
+/** One in-scope binding: module `importer` brought bare `name` into scope from
+ *  module `source` (both physical paths, `source` matching `EnumDef.module`). */
+export type ImportEdge = ImportEdge(importer: string, name: string, source: string)
+
+/** All import edges of a program, flat. Resolution scans for the edge whose
+ *  `importer` is the module under check and whose `name` matches. */
+export type ModuleImportIndex = ModuleImportIndex(edges: [ ImportEdge ])
+
+/** An empty index: every lookup misses, so resolution falls straight through to
+ *  the caller's flat fallback (byte-identical to pre-index behaviour). Carried
+ *  by a freshly built `CheckState` before the real index is installed. */
+export let empty_module_import_index = fn () -> ModuleImportIndex do
+  return ModuleImportIndex(edges: [])
+end
+
+let edges_of_import = fn (importer: string, imp: ImportDef, acc: [ ImportEdge ]) -> [ ImportEdge ] do
+  let ImportDef(path, alias: _, items, is_external: _) = imp
+  let source = resolve_import_path(path)
+  return edges_of_items(importer, source, items, acc)
+end
+
+let edges_of_items = fn (
+  importer: string,
+  source: string,
+  items: [ ImportItem ],
+  acc: [ ImportEdge ]
+) -> [ ImportEdge ] do
+  match items do
+    | [] -> return acc
+    | ImportItem(name, item_alias: _) :: rest ->
+      return edges_of_items(importer, source, items: rest, acc: ImportEdge(importer, name, source) :: acc)
+  end
+end
+
+let edges_of_module = fn (importer: string, defs: [ SpannedTopLevel ], acc: [ ImportEdge ]) -> [ ImportEdge ] do
+  return edges_of_imports(importer, imports: extract_imports(defs), acc)
+end
+
+let edges_of_imports = fn (importer: string, imports: [ ImportDef ], acc: [ ImportEdge ]) -> [ ImportEdge ] do
+  match imports do
+    | [] -> return acc
+    | imp :: rest ->
+      let acc2 = edges_of_import(importer, imp, acc)
+      return edges_of_imports(importer, imports: rest, acc: acc2)
+  end
+end
+
+let edges_of_cache = fn (cache: [ CacheEntry ], acc: [ ImportEdge ]) -> [ ImportEdge ] do
+  match cache do
+    | [] -> return acc
+    | CacheEntry(path: p, defs: d, entries: _) :: rest ->
+      let acc2 = edges_of_module(importer: p, defs: d, acc)
+      return edges_of_cache(cache: rest, acc: acc2)
+  end
+end
+
+/** Build the index from the import cache (every imported module's parsed defs)
+ *  plus the entry module's own defs+path, so a function in ANY module resolves
+ *  its imported names. Each `ImportDef.path` is run through `resolve_import_path`
+ *  so the recorded `source` matches the physical path stamped on `EnumDef.module`. */
+export let build_module_import_index = fn (
+  cache: [ CacheEntry ],
+  entry_defs: [ SpannedTopLevel ],
+  entry_source: string
+) -> ModuleImportIndex do
+  let cache_edges = edges_of_cache(cache, acc: [])
+  let all_edges = edges_of_module(importer: entry_source, defs: entry_defs, acc: cache_edges)
+  return ModuleImportIndex(edges: all_edges)
+end
+
+/** Source module that `importer` imports bare `name` from, or `None` when
+ *  `importer` does not import `name`. First matching edge wins; a module
+ *  imports a given bare name from at most one source (a genuine clash would
+ *  have been rejected earlier by import-collision detection). */
+export let resolve_import_source = fn (
+  idx: ModuleImportIndex,
+  importer: string,
+  name: string
+) -> Option<string> do
+  let ModuleImportIndex(edges) = idx
+  return find_edge(edges, importer, name)
+end
+
+let find_edge = fn (edges: [ ImportEdge ], importer: string, name: string) -> Option<string> do
+  match edges do
+    | [] -> return None
+    | ImportEdge(importer: i, name: n, source: s) :: rest ->
+      if i == importer && n == name then return Some(val: s) end
+      return find_edge(edges: rest, importer, name)
+  end
+end

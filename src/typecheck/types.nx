@@ -37,6 +37,7 @@ import {
 } from "src/types/type_expr.nx"
 import { ExceptionGroupEntry, HirCap } from "src/ir/hir/types.nx"
 import { VariantIndex, VariantInfo, ModuleVariantIndex }, * as vidx from "src/ir/support/variant_index.nx"
+import { ModuleImportIndex }, * as iidx from "src/typecheck/import_index.nx"
 import { Option, Some, None } from "std:option"
 import * as str from "std:str"
 
@@ -135,7 +136,16 @@ export type CheckState = CheckState(
    *  never consulted for constructor resolution, so visibility enforcement is
    *  unaffected.
    */
-  full_enum_defs: [ EnumEntry ]
+  full_enum_defs: [ EnumEntry ],
+  /** Per-module import-visibility index: for the function under check
+   *  (`current_module`), which bare type/constructor names it brings into scope
+   *  and from which source module. Drives import-graph-aware resolution of an
+   *  enum / constructor name that several modules declare under the same bare
+   *  name, so an imported body sees the definition IT imports rather than the
+   *  program-wide flat first-match. Built once in `check_program`; empty by
+   *  default, in which case scoped resolution falls through to the flat path.
+   */
+  module_import_index: ModuleImportIndex
 )
 
 /** Result of `tc_fresh_var`: the advanced state plus the freshly-allocated TyVar. */
@@ -182,7 +192,8 @@ export let tc_new_state = fn (
     caps: [],
     module_variant_index: vidx.empty_module_variant_index(),
     current_module: "",
-    full_enum_defs
+    full_enum_defs,
+    module_import_index: iidx.empty_module_import_index()
   )
 end
 
@@ -220,7 +231,8 @@ export let tc_fresh_var = fn (state: CheckState) -> FreshResult do
     caps: cs,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   ) = state
   let name = "?" ++ str.from_i64(val: n)
   return FreshResult(
@@ -238,7 +250,8 @@ export let tc_fresh_var = fn (state: CheckState) -> FreshResult do
       caps: cs,
       module_variant_index: mvi,
       current_module: cm,
-      full_enum_defs: fed
+      full_enum_defs: fed,
+      module_import_index: mii
     ),
     typ: TyVar(name)
   )
@@ -312,6 +325,35 @@ export let find_variant_in_state = fn (state: CheckState, variant: string) -> Op
         module: state_current_module(state),
         variant
       ) do
+        | Some(val: VariantInfo(enum_name: ename, type_params: tps, def: VariantDef(name: _, fields: fs))) ->
+          return Some(val: EnumVariantInfo(enum_name: ename, type_params: tps, fields: fs))
+        | None -> return find_variant_via_import(state, variant)
+      end
+  end
+end
+
+/** Third resolution tier for `find_variant_in_state`: a constructor the current
+ *  module brought into scope by `import { C } from "D"`. The flat index withheld
+ *  it (D's enum is not visible from the ROOT module) and own-module missed it (C
+ *  is not declared in the current module), but the SELECTIVE import edge proves
+ *  the current module legitimately imports C from D — so resolve C against D's
+ *  own-module scope. Because only selective `import { … }` items create edges, a
+ *  wildcard-imported non-exported constructor is never resolved here, keeping
+ *  D-Export visibility enforcement intact. Returns `None` (genuine unknown
+ *  constructor) when the current module has no import edge for `variant`. */
+let find_variant_via_import = fn (state: CheckState, variant: string) -> Option<EnumVariantInfo> do
+  match iidx.resolve_import_source(
+    idx: state_module_import_index(state),
+    importer: state_current_module(state),
+    name: variant
+  ) do
+    | None -> return None
+    | Some(val: source) ->
+      match vidx.lookup_variant_info_own_module(
+        mvi: state_module_variant_index(state),
+        module: source,
+        variant
+      ) do
         | None -> return None
         | Some(val: VariantInfo(enum_name: ename, type_params: tps, def: VariantDef(name: _, fields: fs))) ->
           return Some(val: EnumVariantInfo(enum_name: ename, type_params: tps, fields: fs))
@@ -335,7 +377,8 @@ export let state_with_env = fn (state: CheckState, env: [ EnvEntry ]) -> CheckSt
     caps: cs,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   ) = state
   return CheckState(
     supply: s,
@@ -351,7 +394,8 @@ export let state_with_env = fn (state: CheckState, env: [ EnvEntry ]) -> CheckSt
     caps: cs,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   )
 end
 
@@ -371,7 +415,8 @@ export let state_with_throw_row = fn (state: CheckState, throw_row: TypeExpr) ->
     caps: cs,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   ) = state
   return CheckState(
     supply: s,
@@ -387,7 +432,8 @@ export let state_with_throw_row = fn (state: CheckState, throw_row: TypeExpr) ->
     caps: cs,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   )
 end
 
@@ -421,10 +467,72 @@ export let state_full_enums = fn (state: CheckState) -> [ EnumEntry ] do
     fn_pure_set: _,
     caps: _,
     module_variant_index: _,
-    current_module: _,
-    full_enum_defs: fed
+    current_module: cm,
+    full_enum_defs: fed,
+    module_import_index: mii
   ) = state
-  return fed
+  return scope_enum_entries(entries: fed, current_module: cm, idx: mii)
+end
+
+/** Reorder `entries` so that, for the module under check, each bare enum name
+ *  resolves (via `find_enum`'s first-match) to the definition that module can
+ *  actually SEE — its OWN definition first, else the one it IMPORTS under that
+ *  name — rather than the program-wide first-match, which may belong to an
+ *  unrelated module that happens to declare the same bare name. Entries the
+ *  current module neither owns nor imports keep their original relative order
+ *  and stay AFTER the scoped ones, so resolution is unchanged for names with no
+ *  collision and never exposes a definition the module cannot see. With an empty
+ *  index / current_module (root checking, signature registration) nothing is
+ *  promoted and the list is returned in original order — behaviour-identical to
+ *  the previous flat `full_enum_defs`. */
+let scope_enum_entries = fn (
+  entries: [ EnumEntry ],
+  current_module: string,
+  idx: ModuleImportIndex
+) -> [ EnumEntry ] do
+  if current_module == "" then return entries end
+  let visible = filter_visible_enum_entries(entries, current_module, idx, acc: [])
+  match visible do
+    | [] -> return entries
+    | _ -> return list_append_entries(xs: visible, ys: entries)
+  end
+end
+
+let filter_visible_enum_entries = fn (
+  entries: [ EnumEntry ],
+  current_module: string,
+  idx: ModuleImportIndex,
+  acc: [ EnumEntry ]
+) -> [ EnumEntry ] do
+  match entries do
+    | [] -> return list_reverse_entries(xs: acc, acc: [])
+    | EnumEntry(name: n, def: d) :: rest ->
+      let EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: _, layout_variants: _, module: m) = d
+      let owned = m == current_module
+      let imported = match iidx.resolve_import_source(idx, importer: current_module, name: n) do
+          | Some(val: src) -> src == m
+          | None -> false
+        end
+      if owned || imported then
+        return filter_visible_enum_entries(entries: rest, current_module, idx, acc: EnumEntry(name: n, def: d) :: acc)
+      else
+        return filter_visible_enum_entries(entries: rest, current_module, idx, acc)
+      end
+  end
+end
+
+let list_reverse_entries = fn (xs: [ EnumEntry ], acc: [ EnumEntry ]) -> [ EnumEntry ] do
+  match xs do
+    | [] -> return acc
+    | h :: t -> return list_reverse_entries(xs: t, acc: h :: acc)
+  end
+end
+
+let list_append_entries = fn (xs: [ EnumEntry ], ys: [ EnumEntry ]) -> [ EnumEntry ] do
+  match xs do
+    | [] -> return ys
+    | h :: t -> return h :: list_append_entries(xs: t, ys)
+  end
 end
 
 /** Accessor: the program's record/type-alias declarations. */
@@ -519,7 +627,8 @@ export let state_with_in_catch_body = fn (state: CheckState, in_catch_body: bool
     caps: cs,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   ) = state
   return CheckState(
     supply: s,
@@ -535,7 +644,8 @@ export let state_with_in_catch_body = fn (state: CheckState, in_catch_body: bool
     caps: cs,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   )
 end
 
@@ -555,7 +665,8 @@ export let state_with_require_row = fn (state: CheckState, require_row: TypeExpr
     caps: cs,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   ) = state
   return CheckState(
     supply: s,
@@ -571,7 +682,8 @@ export let state_with_require_row = fn (state: CheckState, require_row: TypeExpr
     caps: cs,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   )
 end
 
@@ -608,7 +720,8 @@ export let state_with_fn_pure_set = fn (state: CheckState, fn_pure_set: [ string
     caps: cs,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   ) = state
   return CheckState(
     supply: s,
@@ -624,7 +737,8 @@ export let state_with_fn_pure_set = fn (state: CheckState, fn_pure_set: [ string
     caps: cs,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   )
 end
 
@@ -681,7 +795,8 @@ export let state_with_caps = fn (state: CheckState, caps: [ HirCap ]) -> CheckSt
     caps: _,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   ) = state
   return CheckState(
     supply: s,
@@ -697,7 +812,8 @@ export let state_with_caps = fn (state: CheckState, caps: [ HirCap ]) -> CheckSt
     caps,
     module_variant_index: mvi,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   )
 end
 
@@ -762,7 +878,8 @@ export let state_with_module_variant_index = fn (
     caps: cs,
     module_variant_index: _,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   ) = state
   return CheckState(
     supply: s,
@@ -778,7 +895,60 @@ export let state_with_module_variant_index = fn (
     caps: cs,
     module_variant_index,
     current_module: cm,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
+  )
+end
+
+/** Accessor: the per-module import-visibility index. */
+export let state_module_import_index = fn (state: CheckState) -> ModuleImportIndex do
+  let CheckState(
+    supply: _, env: _, enum_defs: _, type_defs: _, throw_row: _,
+    exception_groups: _, variant_index: _, in_catch_body: _, require_row: _,
+    fn_pure_set: _, caps: _, module_variant_index: _, current_module: _,
+    full_enum_defs: _, module_import_index: mii
+  ) = state
+  return mii
+end
+
+/** Install the per-module import-visibility index (called once in check_program). */
+export let state_with_module_import_index = fn (
+  state: CheckState,
+  module_import_index: ModuleImportIndex
+) -> CheckState do
+  let CheckState(
+    supply: s,
+    env: e,
+    enum_defs: ed,
+    type_defs: td,
+    throw_row: tw,
+    exception_groups: egs,
+    variant_index: vi,
+    in_catch_body: icb,
+    require_row: rr,
+    fn_pure_set: fps,
+    caps: cs,
+    module_variant_index: mvi,
+    current_module: cm,
+    full_enum_defs: fed,
+    module_import_index: _
+  ) = state
+  return CheckState(
+    supply: s,
+    env: e,
+    enum_defs: ed,
+    type_defs: td,
+    throw_row: tw,
+    exception_groups: egs,
+    variant_index: vi,
+    in_catch_body: icb,
+    require_row: rr,
+    fn_pure_set: fps,
+    caps: cs,
+    module_variant_index: mvi,
+    current_module: cm,
+    full_enum_defs: fed,
+    module_import_index
   )
 end
 
@@ -798,7 +968,8 @@ export let state_with_current_module = fn (state: CheckState, current_module: st
     caps: cs,
     module_variant_index: mvi,
     current_module: _,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   ) = state
   return CheckState(
     supply: s,
@@ -814,7 +985,8 @@ export let state_with_current_module = fn (state: CheckState, current_module: st
     caps: cs,
     module_variant_index: mvi,
     current_module,
-    full_enum_defs: fed
+    full_enum_defs: fed,
+    module_import_index: mii
   )
 end
 
