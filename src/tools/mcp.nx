@@ -42,6 +42,7 @@ import { Fs } from "std:fs"
 import * as fs_mod from "std:fs"
 import { Console } from "std:stdio"
 import * as stdio from "std:stdio"
+import { Coop, scheduler } from "std:concurrency/coop"
 import * as str from "std:str"
 import {
   IncomingMessage, Request, Notification, Malformed,
@@ -439,10 +440,16 @@ end
 // `read_ndjson_message_pipelined` returns so that `next_leftover` is below the
 // mark, dispatch+write the response, then reset to reclaim all per-request
 // pipeline allocations (parse tree, HIR, typecheck state, reply JSON) in O(1).
+/** The stdin/stdout NDJSON dispatch loop, run inside a `scheduler` inject so
+ *  each message ends at a `Coop.yield()` cooperative scheduling point. As with
+ *  the LSP loop, the body is exception-airtight — every frame/JSON/dispatch
+ *  fault is caught and logged, never propagated — both so the server survives a
+ *  bad frame and because an exception escaping the cooperative block would abort
+ *  the process under wasmtime#13584. */
 let run_mcp_loop = fn (
   remaining: i64,
   leftover: string
-) -> unit require { Console, Fs } throws { JsonRpcError } do
+) -> unit require { Console, Fs, Coop } throws { JsonRpcError } do
   if remaining == 0 then return () end
   try
     let Pair(left: msg_opt, right: next_leftover) = read_ndjson_message_pipelined(leftover)
@@ -468,22 +475,20 @@ let run_mcp_loop = fn (
         // tool-call dispatch result, reply JSON.  `next_leftover` (below mark)
         // is unaffected.
         arena.reset_to_request_mark()
+        Coop.yield()
         let next_remaining = if remaining < 0 then -1 else remaining - 1 end
         return run_mcp_loop(remaining: next_remaining, leftover: next_leftover)
     end
   catch err ->
     arena.reset_to_request_mark()
-    match err do
-      | JsonRpcFrameError(msg) ->
-        Console.eprintln(val: "[mcp] frame error: " ++ msg)
-        let next_remaining = if remaining < 0 then -1 else remaining - 1 end
-        return run_mcp_loop(remaining: next_remaining, leftover: "")
-      | JsonError(msg, pos: _) ->
-        Console.eprintln(val: "[mcp] json parse error: " ++ msg)
-        let next_remaining = if remaining < 0 then -1 else remaining - 1 end
-        return run_mcp_loop(remaining: next_remaining, leftover: "")
-      | _ -> throw err
+    let detail = match err do
+      | JsonRpcFrameError(msg) -> "frame error: " ++ msg
+      | JsonError(msg, pos: _) -> "json parse error: " ++ msg
+      | _ -> "unexpected dispatch fault"
     end
+    Console.eprintln(val: "[mcp] " ++ detail ++ "; continuing")
+    let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+    return run_mcp_loop(remaining: next_remaining, leftover: "")
   end
 end
 
@@ -496,11 +501,11 @@ end
 export let run_mcp_server = fn (max_iters: i64) -> unit require { PermConsole, PermFs } do
   inject stdio.system_handler, fs_mod.system_handler do
     try
-      run_mcp_loop(remaining: max_iters, leftover: "")
+      inject scheduler do
+        run_mcp_loop(remaining: max_iters, leftover: "")
+      end
       return ()
     catch _ ->
-      // Frame and JSON parse errors are caught inside run_mcp_loop; this
-      // catch covers genuine invariant violations only.
       Console.eprintln(val: "[mcp] server terminated abnormally")
       return ()
     end
