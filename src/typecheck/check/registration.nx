@@ -20,6 +20,7 @@ import {
   TypeExpr,
   TyArrow,
   TyRow,
+  TyVar,
   TyUserDefined,
   NamedType,
   RecordDef
@@ -57,6 +58,57 @@ let hir_params_to_named_types_go = fn (params: [ HirParam ], acc: [ NamedType ])
     | [] -> return list.reverse(xs: acc)
     | HirParam(label: l, name: _, sigil: _, typ: t) :: rest ->
       return hir_params_to_named_types_go(params: rest, acc: NamedType(name: l, typ: t) :: acc)
+  end
+end
+
+/** Reserved generalized row-variable name used to open the require row of an
+ *  external's thunk parameters. Added to the external's scheme quantifiers so
+ *  each call site instantiates a fresh tail (no cross-call-site sharing). The
+ *  name is namespaced to avoid colliding with any source-level type parameter. */
+let ext_require_tail_name = "__ext_require_tail"
+
+/** True when any parameter is a thunk-shaped (nullary-arrow) type whose require
+ *  row was opened by `open_thunk_param_require_rows`. */
+let params_have_thunk = fn (params: [ NamedType ]) -> bool do
+  match params do
+    | [] -> return false
+    | NamedType(name: _, typ: TyArrow(params: [], ret: _, requires: _, throw_row: _)) :: _ ->
+      return true
+    | _ :: rest -> return params_have_thunk(params: rest)
+  end
+end
+
+/** D-External require-row erasure on thunk parameters. An external is an FFI
+ *  boundary that is OPAQUE to the effect system: it receives a bare function
+ *  pointer and neither discharges nor propagates effects itself. Whatever
+ *  eventually forces a thunk argument runs it under the handlers in scope at
+ *  that point — e.g. `__nx_sched_spawn` enqueues a continuation the cooperative
+ *  `scheduler` inject resumes (installing `Coop`), while `Console` and any other
+ *  ambient caps remain in dynamic scope. So the require row a thunk argument
+ *  carries is discharged downstream, not at the external call.
+ *
+ *  Open the require row of every thunk-shaped (nullary-arrow) parameter to a
+ *  fresh generalized empty-head row `{ | tail_name }`, erasing the declared cap
+ *  requirement so any caller require row unifies at this FFI boundary. Non-thunk
+ *  parameters (and ordinary multi-arg function-valued parameters) are left
+ *  untouched, keeping require-row checking intact at all ordinary call sites. */
+let open_thunk_param_require_rows = fn (
+  params: [ NamedType ],
+  tail_name: string
+) -> [ NamedType ] do
+  match params do
+    | [] -> return []
+    | NamedType(name: pn, typ: TyArrow(params: [], ret: r, requires: _, throw_row: tw)) :: rest ->
+      let opened = TyArrow(
+        params: [],
+        ret: r,
+        requires: TyRow(types: [], rest: Some(val: TyVar(name: tail_name))),
+        throw_row: tw
+      )
+      return NamedType(name: pn, typ: opened)
+        :: open_thunk_param_require_rows(params: rest, tail_name)
+    | other :: rest ->
+      return other :: open_thunk_param_require_rows(params: rest, tail_name)
   end
 end
 
@@ -107,8 +159,18 @@ export let register_externals = fn (
       // then register as a polymorphic Scheme so each call site instantiates
       // T to a fresh metavar. Without this `external f: <T>(val: T) -> unit`
       // freezes T as a frozen non-int type and rejects int-literal callers.
+      let converted_params = convert_named_types(nts: param_types, vars: tps)
+      let opened_params = open_thunk_param_require_rows(
+        params: converted_params,
+        tail_name: ext_require_tail_name
+      )
+      let scheme_vars = if params_have_thunk(params: converted_params) then
+        ext_require_tail_name :: tps
+      else
+        tps
+      end
       let arrow = TyArrow(
-        params: convert_named_types(nts: param_types, vars: tps),
+        params: opened_params,
         ret: convert_ud_to_var(typ: ret, vars: tps),
         requires: TyRow(types: [], rest: None),
         throw_row: convert_ud_to_var(typ: thr, vars: tps)
@@ -116,7 +178,7 @@ export let register_externals = fn (
       let env = tctypes.env_insert(
         env: tctypes.state_env(state),
         name: n,
-        scheme: Scheme(vars: tps, typ: arrow)
+        scheme: Scheme(vars: scheme_vars, typ: arrow)
       )
       return register_externals(state: tctypes.state_with_env(state, env), exts: rest, tdefs)
   end
@@ -180,7 +242,12 @@ let register_functions_go = fn (
       // Checked at the declaration site so a typo such as `fn () -> ref(i64)`
       // is rejected at the binding, not at a downstream return statement.
       // Spec: type-system-formal.md §"Gravity Rule" + §T-Lambda.
-      tcwf.enforce_no_escapes_ref(typ: ret, context: "return type of '" ++ n ++ "'", span: sp, borrow_escapes: true)
+      tcwf.enforce_no_escapes_ref(
+        typ: ret,
+        context: "return type of '" ++ n ++ "'",
+        span: sp,
+        borrow_escapes: true
+      )
       let param_types = hir_params_to_named_types(params)
       // wfRef at parameter annotation sites
       // (spec §mutable-reference-well-formedness / wfRef):
@@ -341,7 +408,6 @@ let tps_as_ud_args = fn (tps: [ string ]) -> [ TypeExpr ] do
     | t :: rest -> return TyUserDefined(name: t, args: []) :: tps_as_ud_args(tps: rest)
   end
 end
-
 
 let row_contains_cap = fn (name: string, ts: [ TypeExpr ]) -> bool do
   match ts do
