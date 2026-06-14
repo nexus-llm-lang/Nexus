@@ -40,6 +40,7 @@ import { JsonValue, JsonNull } from "std:json"
 import { Option, Some, None } from "std:option"
 import { Fs } from "std:fs"
 import { Console } from "std:stdio"
+import { Coop, scheduler } from "std:concurrency/coop"
 import {
   IncomingMessage, Request, Notification, Malformed,
   JsonRpcFrameError, JsonRpcError,
@@ -347,11 +348,19 @@ let write_notifications = fn (xs: [ JsonValue ]) -> unit require { Console } thr
   end
 end
 
+/** The stdin/stdout dispatch loop, run inside a `scheduler` inject so each
+ *  frame ends at a `Coop.yield()` cooperative scheduling point. Two contracts
+ *  follow from running under the cooperative scheduler: (1) the loop body is
+ *  exception-airtight — every dispatch fault (frame/JSON parse error, protocol
+ *  error, or handler invariant violation) is caught and logged, never
+ *  propagated, both because an LSP server must survive a single bad frame and
+ *  because an exception escaping the cooperative block would abort the process
+ *  under wasmtime#13584; (2) it stays on the normal return path. */
 let run_server_go = fn (
   state: ServerState,
   remaining: i64,
   leftover: string
-) -> ServerState require { Console, Fs } throws { LspError } do
+) -> ServerState require { Console, Fs, Coop } throws { LspError } do
   if remaining == 0 then return state end
   try
     // Arena discipline: `read_message_pipelined` allocates
@@ -383,6 +392,7 @@ let run_server_go = fn (
             // diagnostics, notification JSON). `new_state` and `next_leftover`
             // are allocated below the mark and are unaffected.
             arena.reset_to_request_mark()
+            Coop.yield()
             let next_remaining = if remaining < 0 then -1 else remaining - 1 end
             return run_server_go(
               state: new_state,
@@ -393,15 +403,14 @@ let run_server_go = fn (
     end
   catch err ->
     arena.reset_to_request_mark()
-    // Frame and JSON parse errors mirror jsonrpc.dispatch_loop's policy:
-    // log to stderr and continue. Other exceptions propagate.
-    match err do
-      | JsonRpcFrameError(msg) ->
-        Console.eprintln(val: "[lsp/server] frame error: " ++ msg)
-        let next_remaining = if remaining < 0 then -1 else remaining - 1 end
-        return run_server_go(state, remaining: next_remaining, leftover: "")
-      | _ -> throw err
+    let detail = match err do
+      | JsonRpcFrameError(msg) -> "frame error: " ++ msg
+      | LspProtocolError(msg) -> "protocol error: " ++ msg
+      | _ -> "unexpected dispatch fault"
     end
+    Console.eprintln(val: "[lsp/server] " ++ detail ++ "; continuing")
+    let next_remaining = if remaining < 0 then -1 else remaining - 1 end
+    return run_server_go(state, remaining: next_remaining, leftover: "")
   end
 end
 
@@ -425,5 +434,7 @@ export let run_server = fn (
   initial_state: ServerState,
   max_iters: i64
 ) -> ServerState require { Console, Fs } throws { LspError } do
-  return run_server_go(state: initial_state, remaining: max_iters, leftover: "")
+  inject scheduler do
+    return run_server_go(state: initial_state, remaining: max_iters, leftover: "")
+  end
 end
