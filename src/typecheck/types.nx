@@ -44,6 +44,8 @@ import {
 import { ModuleImportIndex }, * as iidx from "src/typecheck/import_index.nx"
 import { Option, Some, None } from "std:option"
 import * as str from "std:str"
+import { smap_new, smap_put_str, smap_get_str, smap_has_str } from "std:runtime/collection"
+import { value_to_i64, value_of_i64 } from "std:runtime/lazy"
 
 /** Single substitution binding: type variable `var` maps to type expression `typ`. */
 export type SubstEntry = SubstEntry(var: string, typ: TypeExpr)
@@ -158,7 +160,20 @@ export type CheckState = CheckState(
    *  throws row. `None` outside a catch-all body — a function/lambda parameter
    *  of type `Exn` is NOT a catch binder, so its `throw` stays strictly checked.
    */
-  catch_rethrow_binder: Option<CatchBinderInfo>
+  catch_rethrow_binder: Option<CatchBinderInfo>,
+  /** Read-only global signature map: top-level function / external / cap-method
+   *  / enum-constructor names to their `Scheme`. Built once during pass-1
+   *  registration (and the generic-cap / value-binding re-publishing pre-passes),
+   *  then read-only during body checking. Holds the raw `std:runtime/collection`
+   *  string-map id (`i64`); the `Scheme` heap value rides the runtime's i64
+   *  value channel (`value_to_i64` / `value_of_i64`). The flat `env` keeps ONLY
+   *  per-scope locals (params, `let` / `match` binders) so it stays small; a
+   *  local correctly SHADOWS a global because lookup consults `env` first. The
+   *  map is mutable but never branches: all functionally-copied `CheckState`s
+   *  share the one underlying map (globals are registered before any body is
+   *  checked, then never structurally diverge), so threading the same id is
+   *  sound. See `state_lookup_scheme` / `state_put_global`. */
+  global_sigs: i64
 )
 
 /** The catch-all binder name plus the actual exception row the try body threw.
@@ -199,6 +214,7 @@ export let tc_new_state = fn (
   full_enum_defs: [ EnumEntry ]
 ) -> CheckState do
   let variant_index = build_variant_index_from_entries(entries: enum_defs)
+  let gsi = smap_new()
   return CheckState(
     supply: 0, env: [], enum_defs, type_defs,
     throw_row: TyRow(types: [], rest: None),
@@ -212,7 +228,8 @@ export let tc_new_state = fn (
     current_module: "",
     full_enum_defs,
     module_import_index: iidx.empty_module_import_index(),
-    catch_rethrow_binder: None
+    catch_rethrow_binder: None,
+    global_sigs: gsi
   )
 end
 
@@ -252,7 +269,8 @@ export let tc_fresh_var = fn (state: CheckState) -> FreshResult do
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   ) = state
   let name = "?" ++ str.from_i64(val: n)
   return FreshResult(
@@ -272,7 +290,8 @@ export let tc_fresh_var = fn (state: CheckState) -> FreshResult do
       current_module: cm,
       full_enum_defs: fed,
       module_import_index: mii,
-      catch_rethrow_binder: crb
+      catch_rethrow_binder: crb,
+      global_sigs: gsi
     ),
     typ: TyVar(name)
   )
@@ -293,6 +312,48 @@ end
 /** Prepend a `name → scheme` binding to the environment; lookup uses first-match shadowing. */
 export let env_insert = fn (env: [ EnvEntry ], name: string, scheme: Scheme) -> [ EnvEntry ] do
   return EnvEntry(name, scheme) :: env
+end
+
+/** Accessor: the read-only global signature map id. */
+export let state_global_sigs = fn (state: CheckState) -> i64 do
+  let CheckState(
+    supply: _, env: _, enum_defs: _, type_defs: _, throw_row: _,
+    exception_groups: _, variant_index: _, in_catch_body: _, require_row: _,
+    fn_pure_set: _, caps: _, module_variant_index: _, current_module: _,
+    full_enum_defs: _, module_import_index: _, catch_rethrow_binder: _, global_sigs: gsi
+  ) = state
+  return gsi
+end
+
+/** Publish a TOP-LEVEL/global signature into the shared global map. Mutates the
+ *  one underlying map all `CheckState` copies share, so the binding is visible
+ *  to every later lookup regardless of which functional copy reads it. Used by
+ *  pass-1 registration and by the generic-cap / value-binding re-publishing
+ *  pre-passes (a re-`put` of an existing name OVERWRITES, mirroring the old
+ *  first-match `env_insert` shadowing of a prior global registration). The
+ *  `Scheme` heap value rides the runtime i64 value channel. Returns `state`
+ *  unchanged (the side effect is on the shared map). */
+export let state_put_global = fn (state: CheckState, name: string, scheme: Scheme) -> CheckState do
+  smap_put_str(id: state_global_sigs(state), key: name, value: value_to_i64(a_x: scheme))
+  return state
+end
+
+/** Combined name resolution: per-scope LOCALS first (so a local correctly
+ *  SHADOWS a global), then the read-only global signature map. Every site that
+ *  previously did `env_lookup(env: state_env(state), name)` for a name that may
+ *  be a top-level function / external / cap-method / enum-constructor routes
+ *  here, so resolution is identical to the old single flat env — the data
+ *  structure is split purely to turn the O(N) global scan into an O(1) map probe. */
+export let state_lookup_scheme = fn (state: CheckState, name: string) -> Option<Scheme> do
+  match env_lookup(env: state_env(state), name) do
+    | Some(val: s) -> return Some(val: s)
+    | None ->
+      let gsi = state_global_sigs(state)
+      if smap_has_str(id: gsi, key: name) then
+        return Some(val: value_of_i64(a_x: smap_get_str(id: gsi, key: name, default_val: 0)))
+      end
+      return None
+  end
 end
 
 /** Wrap a monomorphic type as a closed scheme (empty `vars`). */
@@ -403,7 +464,8 @@ export let state_with_env = fn (state: CheckState, env: [ EnvEntry ]) -> CheckSt
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   ) = state
   return CheckState(
     supply: s,
@@ -421,7 +483,8 @@ export let state_with_env = fn (state: CheckState, env: [ EnvEntry ]) -> CheckSt
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   )
 end
 
@@ -443,7 +506,8 @@ export let state_with_throw_row = fn (state: CheckState, throw_row: TypeExpr) ->
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   ) = state
   return CheckState(
     supply: s,
@@ -461,7 +525,8 @@ export let state_with_throw_row = fn (state: CheckState, throw_row: TypeExpr) ->
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   )
 end
 
@@ -498,7 +563,8 @@ export let state_full_enums = fn (state: CheckState) -> [ EnumEntry ] do
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   ) = state
   return scope_enum_entries(entries: fed, current_module: cm, idx: mii)
 end
@@ -671,7 +737,8 @@ export let state_with_in_catch_body = fn (state: CheckState, in_catch_body: bool
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   ) = state
   return CheckState(
     supply: s,
@@ -689,7 +756,8 @@ export let state_with_in_catch_body = fn (state: CheckState, in_catch_body: bool
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   )
 end
 
@@ -700,7 +768,7 @@ export let state_catch_rethrow_binder = fn (state: CheckState) -> Option<CatchBi
     supply: _, env: _, enum_defs: _, type_defs: _, throw_row: _,
     exception_groups: _, variant_index: _, in_catch_body: _, require_row: _,
     fn_pure_set: _, caps: _, module_variant_index: _, current_module: _,
-    full_enum_defs: _, module_import_index: _, catch_rethrow_binder: crb
+    full_enum_defs: _, module_import_index: _, catch_rethrow_binder: crb, global_sigs: gsi
   ) = state
   return crb
 end
@@ -726,7 +794,8 @@ export let state_with_catch_rethrow_binder = fn (
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: _
+    catch_rethrow_binder: _,
+    global_sigs: gsi
   ) = state
   return CheckState(
     supply: s,
@@ -744,7 +813,8 @@ export let state_with_catch_rethrow_binder = fn (
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder
+    catch_rethrow_binder,
+    global_sigs: gsi
   )
 end
 
@@ -766,7 +836,8 @@ export let state_with_require_row = fn (state: CheckState, require_row: TypeExpr
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   ) = state
   return CheckState(
     supply: s,
@@ -784,7 +855,8 @@ export let state_with_require_row = fn (state: CheckState, require_row: TypeExpr
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   )
 end
 
@@ -823,7 +895,8 @@ export let state_with_fn_pure_set = fn (state: CheckState, fn_pure_set: [ string
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   ) = state
   return CheckState(
     supply: s,
@@ -841,7 +914,8 @@ export let state_with_fn_pure_set = fn (state: CheckState, fn_pure_set: [ string
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   )
 end
 
@@ -900,7 +974,8 @@ export let state_with_caps = fn (state: CheckState, caps: [ HirCap ]) -> CheckSt
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   ) = state
   return CheckState(
     supply: s,
@@ -918,7 +993,8 @@ export let state_with_caps = fn (state: CheckState, caps: [ HirCap ]) -> CheckSt
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   )
 end
 
@@ -985,7 +1061,8 @@ export let state_with_module_variant_index = fn (
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   ) = state
   return CheckState(
     supply: s,
@@ -1003,7 +1080,8 @@ export let state_with_module_variant_index = fn (
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   )
 end
 
@@ -1013,7 +1091,7 @@ export let state_module_import_index = fn (state: CheckState) -> ModuleImportInd
     supply: _, env: _, enum_defs: _, type_defs: _, throw_row: _,
     exception_groups: _, variant_index: _, in_catch_body: _, require_row: _,
     fn_pure_set: _, caps: _, module_variant_index: _, current_module: _,
-    full_enum_defs: _, module_import_index: mii, catch_rethrow_binder: _
+    full_enum_defs: _, module_import_index: mii, catch_rethrow_binder: _, global_sigs: _
   ) = state
   return mii
 end
@@ -1039,7 +1117,8 @@ export let state_with_module_import_index = fn (
     current_module: cm,
     full_enum_defs: fed,
     module_import_index: _,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   ) = state
   return CheckState(
     supply: s,
@@ -1057,7 +1136,8 @@ export let state_with_module_import_index = fn (
     current_module: cm,
     full_enum_defs: fed,
     module_import_index,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   )
 end
 
@@ -1082,7 +1162,8 @@ export let state_with_current_module = fn (
     current_module: _,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   ) = state
   return CheckState(
     supply: s,
@@ -1100,7 +1181,8 @@ export let state_with_current_module = fn (
     current_module,
     full_enum_defs: fed,
     module_import_index: mii,
-    catch_rethrow_binder: crb
+    catch_rethrow_binder: crb,
+    global_sigs: gsi
   )
 end
 
