@@ -1,0 +1,167 @@
+/**
+ * io/poll: cooperative stdin readiness primitives over WASI preview1
+ * `poll_oneoff` + `fd_read`.
+ *
+ * Backs the LSP/MCP cooperative event loop: a server that is idle-waiting for
+ * the next JSON-RPC frame must NOT block the whole wasm instance in a blocking
+ * `fd_read`, because that starves any cooperative fiber (e.g. a spawned
+ * diagnostics task) sitting on the run queue. These primitives let the read
+ * loop (a) block ONLY when there is nothing else to do (`stdin_wait_readable`,
+ * a `poll_oneoff` that parks until fd 0 is read-ready, no busy-spin), and (b)
+ * grab whatever bytes are currently buffered WITHOUT blocking
+ * (`stdin_read_available`, a zero-timeout readiness gate followed by a single
+ * `fd_read` only when ready).
+ *
+ * fd 0 (stdin) is never mutated into non-blocking mode here; readiness is
+ * decided per call by `poll_oneoff` so the existing blocking byte source
+ * (`Console.read_bytes`) keeps working unchanged alongside this.
+ *
+ * Subscription layout (mirrors the clock subscription documented in
+ * `io/clock.nx`'s `sleep`). A `__wasi_subscription_t` is 48 bytes:
+ *   userdata u64 @0;
+ *   subscription_u tag u8 @8 (the `__wasi_eventtype_t` enum: clock=0,
+ *     fd_read=1, fd_write=2);
+ *   for an FD_READ subscription, subscription_fd_readwrite: fd u32 @16;
+ *   for a CLOCK subscription, subscription_clock: id u32 @16, timeout u64 @24,
+ *     precision u64 @32, flags u16 @40 (0 = relative).
+ * An out event (`__wasi_event_t`) is 32 bytes: userdata u64 @0, errno u16 @8,
+ * eventtype u8 @10, ... — we only need the count of events returned.
+ */
+import external "wasi_snapshot_preview1"
+/** poll_oneoff(subscriptions_ptr, events_out_ptr, nsubscriptions, nevents_out_ptr) -> errno. */
+external w_poll_oneoff = "poll_oneoff" : (
+  a_in: i32,
+  b_out: i32,
+  c_nsub: i32,
+  d_nevents_out: i32
+) -> i32
+/** fd_read(fd, iovs_ptr, iovs_len, nread_ptr) -> errno. */
+external w_fd_read = "fd_read" : (
+  a_fd: i32,
+  b_iovs_ptr: i32,
+  c_iovs_len: i32,
+  d_nread_ptr: i32
+) -> i32
+
+import * as mem from "std:runtime/mem"
+import * as cast from "std:runtime/cast"
+import * as arena from "std:runtime/arena"
+import { pack, pun_str } from "std:runtime/sysio/core"
+
+let stdin_fd = 0
+
+/** Fill a 48-byte FD_READ subscription for fd 0 (stdin) at `sub`. */
+let write_fd_read_sub = fn (sub: i64) -> unit do
+  mem.store_i64(addr: sub, val: 0)
+  mem.store_i64(addr: sub + 8, val: 1)
+  mem.store_i64(addr: sub + 16, val: stdin_fd)
+  mem.store_i64(addr: sub + 24, val: 0)
+  mem.store_i64(addr: sub + 32, val: 0)
+  mem.store_i64(addr: sub + 40, val: 0)
+  return ()
+end
+
+/** Fill a 48-byte relative-monotonic CLOCK subscription with timeout `ns`
+ *  nanoseconds at `sub`. A `ns` of 0 makes `poll_oneoff` return immediately
+ *  (zero-timeout readiness probe). */
+let write_clock_sub = fn (sub: i64, ns: i64) -> unit do
+  mem.store_i64(addr: sub, val: 0)
+  mem.store_i64(addr: sub + 8, val: 0)
+  mem.store_i64(addr: sub + 16, val: 1)
+  mem.store_i64(addr: sub + 24, val: ns)
+  mem.store_i64(addr: sub + 32, val: 0)
+  mem.store_i64(addr: sub + 40, val: 0)
+  return ()
+end
+
+/**
+Block until stdin (fd 0) is read-ready or reaches EOF, via a single FD_READ
+`poll_oneoff` subscription. No busy-spin: the host parks the instance until the
+descriptor is readable. Any errno from `poll_oneoff` is ignored (best effort —
+the caller follows with a read that observes the real state). Uses a fresh
+192-byte scratch region ([0,48) sub, [64,96) event-out, [128,132) nevents-out).
+*/
+export let stdin_wait_readable = fn () -> unit do
+  let s = arena.alloc_raw(size: 192)
+  write_fd_read_sub(sub: s)
+  mem.store_i32(addr: s + 128, val: 0)
+  w_poll_oneoff(
+    a_in: cast.i32_of(x: s),
+    b_out: cast.i32_of(x: s + 64),
+    c_nsub: cast.i32_of(x: 1),
+    d_nevents_out: cast.i32_of(x: s + 128)
+  )
+  return ()
+end
+
+/**
+Zero-timeout readiness probe: is stdin (fd 0) read-ready RIGHT NOW? Submits two
+subscriptions to one `poll_oneoff` — an FD_READ on fd 0 and a CLOCK with a 0 ns
+relative timeout — so the call returns immediately whether or not bytes are
+waiting. Returns true iff at least one event came back AND the clock-timeout was
+not the sole event, i.e. fd 0 is readable (or at EOF, which also reports
+readable so the caller's subsequent read can observe the 0-byte EOF).
+
+Conservatively returns true on any unexpected `poll_oneoff` errno so the caller
+falls back to attempting a read rather than silently stalling.
+*/
+let stdin_ready_now = fn () -> bool do
+  let s = arena.alloc_raw(size: 256)
+  write_fd_read_sub(sub: s)
+  write_clock_sub(sub: s + 48, ns: 0)
+  mem.store_i32(addr: s + 160, val: 0)
+  let rc = w_poll_oneoff(
+    a_in: cast.i32_of(x: s),
+    b_out: cast.i32_of(x: s + 96),
+    c_nsub: cast.i32_of(x: 2),
+    d_nevents_out: cast.i32_of(x: s + 160)
+  )
+  if cast.i64_of(x: rc) != 0 then return true end
+  let nevents = mem.load_i32(addr: s + 160)
+  if nevents <= 0 then return false end
+  return event_set_has_fd_read(events_base: s + 96, n: nevents, idx: 0)
+end
+
+/** Scan the `n` returned 32-byte `__wasi_event_t` records starting at
+ *  `events_base` for an FD_READ event (eventtype u8 @10 == 1). */
+let event_set_has_fd_read = fn (events_base: i64, n: i64, idx: i64) -> bool do
+  if idx >= n then return false end
+  let ev = events_base + idx * 32
+  let etype = mem.load_u8(addr: ev + 10)
+  if etype == 1 then return true end
+  return event_set_has_fd_read(events_base, n, idx: idx + 1)
+end
+
+let avail_chunk_cap = 4096
+
+/**
+Non-blocking grab of whatever bytes are currently waiting on stdin (fd 0).
+Returns "" when nothing is ready (so the caller can yield and retry) and the
+read bytes otherwise. A single `fd_read` of up to `avail_chunk_cap` bytes runs
+ONLY after `stdin_ready_now` reports fd 0 readable, so this never blocks. A
+ready-but-0-byte read is genuine EOF; we still return "" (the caller's empty-buffer
+EOF guard distinguishes clean shutdown from a yield-retry by tracking accumulated
+bytes, exactly as the blocking drain does).
+
+The returned bytes are UTF-8: header bytes are pure ASCII and body bytes are
+RFC-8259 UTF-8, both round-tripping through the buffer's `to_string` view.
+*/
+export let stdin_read_available = fn () -> string do
+  if !stdin_ready_now() then return "" end
+  let dst = arena.alloc_raw(size: avail_chunk_cap)
+  let s = arena.alloc_raw(size: 64)
+  let iov = s
+  let nr = s + 16
+  mem.store_i32(addr: iov, val: dst)
+  mem.store_i32(addr: iov + 4, val: avail_chunk_cap)
+  let errno = w_fd_read(
+    a_fd: cast.i32_of(x: stdin_fd),
+    b_iovs_ptr: cast.i32_of(x: iov),
+    c_iovs_len: cast.i32_of(x: 1),
+    d_nread_ptr: cast.i32_of(x: nr)
+  )
+  if cast.i64_of(x: errno) != 0 then return "" end
+  let got = mem.load_i32(addr: nr)
+  if got <= 0 then return "" end
+  return pun_str(a_x: pack(ptr: dst, len: got))
+end

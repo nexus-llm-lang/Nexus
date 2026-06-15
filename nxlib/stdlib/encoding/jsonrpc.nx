@@ -50,6 +50,9 @@ import { Console } from "std:stdio"
 import { ByteBuffer }, * as bb from "std:bytebuffer"
 import * as str from "std:str"
 import * as char from "std:char"
+import { Coop } from "std:concurrency/coop"
+import { sched_runq_nonempty } from "std:runtime/sched"
+import { stdin_wait_readable, stdin_read_available } from "std:io/poll"
 
 // ─── Exceptions ──────────────────────────────────────────────────────────────
 
@@ -328,6 +331,85 @@ export let read_message_pipelined = fn (leftover: string) -> Pair<Option<JsonVal
   end
 end
 
+// ─── Cooperative (poll-gated) byte source ────────────────────────────────────
+//
+// The blocking drains above call `Console.read_bytes`, which parks the whole
+// wasm instance in `fd_read` until a byte arrives. Under the cooperative
+// scheduler that starves every spawned fiber (e.g. an LSP diagnostics task) that
+// is sitting on the run queue. The cooperative pull below replaces the blocking
+// read with a poll-gated event loop:
+//
+//   * Run queue NON-EMPTY  → `Coop.yield()` runs one round of pending fibers,
+//     then `stdin_read_available()` non-blockingly grabs any bytes that arrived
+//     in the meantime. No blocking: pending work keeps making progress.
+//   * Run queue EMPTY      → nothing else to do, so `stdin_wait_readable()`
+//     parks in `poll_oneoff` until fd 0 is read-ready (no busy-spin), then a
+//     non-blocking `stdin_read_available()` grabs the bytes.
+//
+// EOF is concluded ONLY on the poll-block path: after `poll_oneoff` reports fd 0
+// readable, a 0-byte read is a genuine end of stream. On the yield path a 0-byte
+// read just means "no bytes yet" — loop and yield again. A `CoopPull` carries the
+// freshly-read chunk plus whether the read observed EOF, so the per-transport
+// drains can apply the same empty-buffer EOF guard the blocking drains use.
+
+type CoopPull = CoopPull(chunk: string, at_eof: bool)
+
+// One cooperative byte-source step. Yields to pending fibers when the run queue
+// is non-empty (then non-blocking-reads), otherwise poll-blocks until fd 0 is
+// read-ready (then reads). Returns the bytes read and whether EOF was observed.
+let coop_pull_bytes = fn () -> CoopPull require { Coop } do
+  if sched_runq_nonempty() then
+    Coop.yield()
+    let chunk = stdin_read_available()
+    return CoopPull(chunk, at_eof: false)
+  end
+  stdin_wait_readable()
+  let chunk = stdin_read_available()
+  return CoopPull(chunk, at_eof: str.byte_length(s: chunk) == 0)
+end
+
+// Cooperative analogue of `drain_until_frame` (LSP Content-Length framing).
+// Loops pulling bytes via the poll-gated source until a complete frame is in
+// `acc`. Raises `JsonRpcEof` on a clean EOF with an empty `acc`, or
+// `JsonRpcFrameError` on truncation mid-frame.
+let drain_until_frame_cooperative = fn (acc: string) -> UnframedStep require { Coop } throws { JsonRpcError } do
+  match unframe_one(input: acc) do
+    | UnframedOk(value, rest) -> return UnframedOk(value, rest)
+    | UnframedNeedMore ->
+      let CoopPull(chunk, at_eof) = coop_pull_bytes()
+      if at_eof then
+        if str.byte_length(s: acc) == 0 then
+          throw JsonRpcEof
+        end
+        throw JsonRpcFrameError(msg: "unexpected EOF mid-frame")
+      end
+      return drain_until_frame_cooperative(acc: acc ++ chunk)
+  end
+end
+
+/**
+Cooperative variant of `read_message_pipelined`. Identical framing contract —
+same `Pair(left, right)` result, same `JsonRpcError` throws, `None` on clean EOF
+— but the byte source is the poll-gated cooperative event loop above, so spawned
+fibers run during the idle wait for the next frame instead of starving behind a
+blocking `fd_read`. Must be called inside a `scheduler` inject (it uses `Coop`).
+
+Frame assembly is identical to the blocking read: with input already buffered
+(piped stream, empty run queue) the poll returns immediately ready and the
+non-blocking read drains the buffered bytes; complete frames are assembled byte-
+for-byte the same way `drain_until_frame` does.
+*/
+export let read_message_cooperative = fn (leftover: string) -> Pair<Option<JsonValue>, string> require { Coop } throws { JsonRpcError } do
+  try
+    match drain_until_frame_cooperative(acc: leftover) do
+      | UnframedOk(value, rest) -> return Pair(left: Some(val: value), right: rest)
+      | UnframedNeedMore -> throw JsonRpcFrameError(msg: "unframe stalled despite EOF guard")
+    end
+  catch
+    | JsonRpcEof -> return Pair(left: None, right: "")
+  end
+end
+
 /**
 Write one framed JSON-RPC message to the Console. Always flushes a
 complete header + body in a single `Console.print` call so partial frames
@@ -405,6 +487,41 @@ or `Pair(left: Some(value), right: rest)` on a successful frame.
 export let read_ndjson_message_pipelined = fn (leftover: string) -> Pair<Option<JsonValue>, string> require { Console } throws { JsonRpcError } do
   try
     match drain_until_ndjson_frame(acc: leftover) do
+      | UnframedOk(value, rest) -> return Pair(left: Some(val: value), right: rest)
+      | UnframedNeedMore -> throw JsonRpcFrameError(msg: "ndjson unframe stalled despite EOF guard")
+    end
+  catch
+    | JsonRpcEof -> return Pair(left: None, right: "")
+  end
+end
+
+// Cooperative analogue of `drain_until_ndjson_frame` (MCP NDJSON framing). Same
+// poll-gated byte source as `drain_until_frame_cooperative`.
+let drain_until_ndjson_frame_cooperative = fn (acc: string) -> UnframedStep require { Coop } throws { JsonRpcError } do
+  match unframe_ndjson_one(input: acc) do
+    | UnframedOk(value, rest) -> return UnframedOk(value, rest)
+    | UnframedNeedMore ->
+      let CoopPull(chunk, at_eof) = coop_pull_bytes()
+      if at_eof then
+        if str.byte_length(s: acc) == 0 then
+          throw JsonRpcEof
+        end
+        throw JsonRpcFrameError(msg: "unexpected EOF mid-ndjson-frame")
+      end
+      return drain_until_ndjson_frame_cooperative(acc: acc ++ chunk)
+  end
+end
+
+/**
+Cooperative variant of `read_ndjson_message_pipelined`. Same framing contract,
+same `JsonRpcError` throws, `None` on clean EOF — but the byte source is the
+poll-gated cooperative event loop, so spawned fibers run during the idle wait
+instead of starving behind a blocking `fd_read`. Must be called inside a
+`scheduler` inject.
+*/
+export let read_ndjson_message_cooperative = fn (leftover: string) -> Pair<Option<JsonValue>, string> require { Coop } throws { JsonRpcError } do
+  try
+    match drain_until_ndjson_frame_cooperative(acc: leftover) do
       | UnframedOk(value, rest) -> return Pair(left: Some(val: value), right: rest)
       | UnframedNeedMore -> throw JsonRpcFrameError(msg: "ndjson unframe stalled despite EOF guard")
     end
