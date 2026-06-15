@@ -53,6 +53,8 @@ import {
 } from "src/tools/lsp/state/server_state.nx"
 import { saturating_pred } from "src/tools/lsp/common.nx"
 import * as arena from "std:runtime/arena"
+import { Coop, spawn } from "std:concurrency/coop"
+import { write_message, JsonRpcError } from "std:jsonrpc"
 
 //
 // Saturating clamp on coordinate conversion: a bogus 0 in the input becomes
@@ -336,4 +338,73 @@ export let publish_for_buffer = fn (
       let updated = with_cache(state: with_documents(state, docs: new_docs), cache: new_cache)
       return HandlerResult(state: updated, response: None, notifications: [ frame ])
   end
+end
+
+// Compute diagnostics for `(text, uri)` and write the publishDiagnostics frame.
+// Exception-airtight: every fault on the fallible diagnostics path (Fs reads,
+// HIR build, typecheck) and the frame write is caught and logged to stderr,
+// never propagated. This is mandatory for a spawned fiber — an exception or
+// trap escaping a fiber after a resume aborts the whole process under
+// wasmtime#13584 (see std:concurrency/coop). The published content is identical
+// to `publish_for_buffer`'s cache-miss branch; only delivery is asynchronous.
+let publish_diagnostics_airtight = fn (
+  uri: string,
+  text: string,
+  version: i64
+) -> unit require { Console, Fs } do
+  try
+    let internal = compute_diagnostics_for_buffer(text, file: uri)
+    let wire = to_wire_diagnostics(xs: internal)
+    let params = PublishDiagnosticsParams(uri, version: Some(val: version), diagnostics: wire)
+    let frame = make_publish_diagnostics_notification(params)
+    write_message(value: frame)
+    return ()
+  catch _ ->
+    Console.eprintln(val: "[lsp/diagnostics] spawned compute failed for " ++ uri ++ "; skipped publish")
+    return ()
+  end
+end
+
+/** Spawn-based variant of `publish_for_buffer` for `didOpen` / `didChange`:
+ *  records the buffer text in the document store synchronously (so subsequent
+ *  hover/definition/etc. see the latest content immediately), then SPAWNS a
+ *  cooperative fiber that computes the buffer's diagnostics and writes the
+ *  `publishDiagnostics` notification itself. The main dispatch loop returns
+ *  right away (no notifications threaded back) and proceeds to read the next
+ *  frame; the spawned fiber runs during the loop's idle-wait yields.
+ *
+ *  The spawned thunk is exception-airtight (`publish_diagnostics_airtight`) per
+ *  the wasmtime#13584 constraint. The version cache is intentionally bypassed on
+ *  this path: the cache is threaded through the functional `ServerState`, which
+ *  a detached fiber cannot write back into, so the spawned fiber recomputes
+ *  rather than memoizing. Published content is identical to the synchronous
+ *  path; only the memoization is skipped.
+ *
+ *  Arena safety: `text` and `uri` are captured by the spawned thunk and must
+ *  survive until the fiber runs. The dispatch loop (`run_server_go`) yields to
+ *  the scheduler BEFORE resetting the per-request arena mark, and a diagnostics
+ *  fiber has no internal `Coop.yield`, so it runs to completion in that single
+ *  resume while its captures are still live; the subsequent reset then reclaims
+ *  the fiber's scratch along with the rest of the request.
+ *
+ *  Must be called inside a `scheduler` inject (it uses `Coop` via `spawn`).
+ */
+export let spawn_publish_for_buffer = fn (
+  state: ServerState,
+  uri: string,
+  text: string,
+  version: i64
+) -> HandlerResult require { Console, Fs, Coop } do
+  let new_docs = documents_put(
+    store: state_documents(state),
+    rec: DocumentRecord(uri, text, version)
+  )
+  spawn(task: fn () -> unit require { Console, Fs } do
+    return publish_diagnostics_airtight(uri, text, version)
+  end)
+  return HandlerResult(
+    state: with_documents(state, docs: new_docs),
+    response: None,
+    notifications: []
+  )
 end

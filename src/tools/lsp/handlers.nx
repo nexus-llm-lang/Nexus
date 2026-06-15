@@ -46,7 +46,7 @@ import {
   JsonRpcFrameError, JsonRpcError,
   response_ok, response_error,
   method_not_found, invalid_request, invalid_params, internal_error,
-  classify, read_message, read_message_pipelined, write_message
+  classify, read_message, read_message_pipelined, read_message_cooperative, write_message
 } from "std:jsonrpc"
 import { Pair } from "std:tuple"
 import { semantic_tokens_legend } from "src/tools/lsp/handlers/semantic_tokens.nx"
@@ -205,7 +205,7 @@ let invoke_method = fn (
   state: ServerState,
   method: string,
   params: JsonValue
-) -> HandlerResult require { Console, Fs } throws { LspProtocolThrow } do
+) -> HandlerResult require { Console, Fs, Coop } throws { LspProtocolThrow } do
   match parse_method(s: method) do
     | MInitialize -> return on_initialize(state, params)
     | MInitialized -> return on_noop(state, params)
@@ -237,7 +237,7 @@ end
 export let dispatch_message = fn (
   state: ServerState,
   msg: IncomingMessage
-) -> StepOutcome require { Console, Fs } throws { LspProtocolThrow } do
+) -> StepOutcome require { Console, Fs, Coop } throws { LspProtocolThrow } do
   match msg do
     | Request(id, method, params) ->
       // Pre-initialize gate: only `initialize` is permitted before handshake.
@@ -363,13 +363,18 @@ let run_server_go = fn (
 ) -> ServerState require { Console, Fs, Coop } throws { LspError } do
   if remaining == 0 then return state end
   try
-    // Arena discipline: `read_message_pipelined` allocates
-    // `next_leftover` from the arena. We take the mark AFTER that allocation so
-    // the leftover string (which must survive into the next iteration) sits
-    // BELOW the mark. The entire dispatch — parse tree, HIR, typecheck, wire
-    // diagnostics, notifications — is allocated ABOVE the mark and reclaimed
-    // in O(1) after we write the response and notifications.
-    let Pair(left: msg_opt, right: next_leftover) = read_message_pipelined(leftover)
+    // Arena discipline: `read_message_cooperative` allocates `next_leftover`
+    // from the arena. We take the mark AFTER that allocation so the leftover
+    // string (which must survive into the next iteration) sits BELOW the mark.
+    // The entire dispatch — parse tree, HIR, typecheck, wire diagnostics,
+    // notifications — is allocated ABOVE the mark and reclaimed in O(1).
+    //
+    // The cooperative read replaces the blocking `read_message_pipelined`: while
+    // idle-waiting for the next frame it yields to spawned fibers (e.g. the
+    // diagnostics fiber from a didChange/didOpen) and non-blocking-polls input,
+    // blocking in `poll_oneoff` only when the run queue is empty. Frame assembly
+    // is identical to the blocking read for a piped/buffered stream.
+    let Pair(left: msg_opt, right: next_leftover) = read_message_cooperative(leftover)
     arena.save_request_mark()
     match msg_opt do
       | None ->
@@ -388,11 +393,14 @@ let run_server_go = fn (
               | None -> ()
             end
             write_notifications(xs: notifications)
-            // Reclaim all pipeline scratch (parse tree, HIR, typecheck, wire
-            // diagnostics, notification JSON). `new_state` and `next_leftover`
-            // are allocated below the mark and are unaffected.
-            arena.reset_to_request_mark()
+            // Yield to the scheduler BEFORE reclaiming this request's arena.
+            // A diagnostics fiber spawned during dispatch (didChange/didOpen)
+            // captured this request's buffer text/uri ABOVE the mark; it has no
+            // internal `Coop.yield`, so it runs to completion in this resume
+            // while those captures are still live. Only then do we reset, which
+            // reclaims the fiber's scratch along with the rest of the request.
             Coop.yield()
+            arena.reset_to_request_mark()
             let next_remaining = if remaining < 0 then -1 else remaining - 1 end
             return run_server_go(
               state: new_state,
