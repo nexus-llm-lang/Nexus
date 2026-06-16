@@ -24,9 +24,9 @@ import { TypeExpr, TyUserDefined, TyLazy, TyArrow, TyRecord, TyList, TyArray, Ty
 import * as list from "std:list"
 import { LirError } from "src/ir/lir/errors.nx"
 import { Some, None } from "std:option"
-import { BinaryOp } from "src/types/vocab.nx"
-import { MirExpr, MirStmt, MirCallArg, MirMatchCase, MirNamedExpr } from "src/ir/mir/types.nx"
-import { LirAtom, LirStmt, LirCallArg, LirNamedAtom } from "src/ir/lir/types.nx"
+import { BinaryOp, Literal, LitFloat } from "src/types/vocab.nx"
+import { MirExpr, MirStmt, MirCallArg, MirMatchCase, MirNamedExpr, MirLiteral } from "src/ir/mir/types.nx"
+import { LirAtom, LirStmt, LirCallArg, LirNamedAtom, LirExprAtom, LirAtomFloat } from "src/ir/lir/types.nx"
 import {
   LowerCtx,
   TempResult,
@@ -84,6 +84,7 @@ import {
   build_record_semantic_type,
   resolve_record_field,
   recover_generic_call_type,
+  instantiated_f32_arg_labels,
   reconcile_annotation_widths,
   env_slot_sentinel
 } from "src/ir/lir/semantic_types.nx"
@@ -191,28 +192,7 @@ let lower_expr_to_atom = fn (expr: MirExpr, ctx: LowerCtx) -> BindResult throws 
       return lower_binary_op(lhs, op, rhs, result_hint: None, ctx)
 
     | MirCall(func: f, args, ret_type: rt) ->
-      let LowerCallArgsResult(ctx: ctx2, lir_args: la) = lir_lower_call_args(args, ctx)
-      let LowerCtx(vars: _, semantic_vars: sv2, stmts: _, temp_counter: _, enum_defs: _) = ctx2
-      // Look up f in semantic_vars: sem_func_types (populated at function entry)
-      // maps function names to their resolved return type, converting
-      // TyUserDefined("Trip",[]) → TyRecord([...]) for structural record returns.
-      // This preserves the semantic layout across the call-return boundary so
-      // that subsequent field access and record destructure resolve correctly.
-      let sem_rt0 = match lir_lookup_type(name: f, entries: sv2) do
-        | Some(val: t) -> t
-        | None -> rt
-      end
-      // When the callee is generic its resolved return type is still a bare
-      // `TyVar` (or a `TyVar`-bearing shape); instantiate it from the argument
-      // semantic types so the bound result temp carries the concrete record/sum
-      // layout. Otherwise a downstream destructure / `.field` on the result
-      // reads field offset 0 for every projection (or aborts LIR with E6002).
-      // No-op for non-generic returns.
-      let sem_rt = recover_generic_call_type(callee: f, args, sem_rt: sem_rt0, ctx: ctx2)
-      let wt = wasm_type(typ: rt)
-        return bind_expr_to_temp_semantic(ctx: ctx2,
-          expr: LirExprCall(func: f, args: la, typ: wt),
-          typ: wt, semantic_type: sem_rt)
+      return lower_call_expr_with_hint(callee: f, args, rt, ret_hint: None, ctx)
 
     | MirConstructor(name: n, args) ->
       let LowerExprsResult(ctx: ctx2, atoms) = lower_exprs_to_atoms(exprs: args, ctx)
@@ -418,6 +398,99 @@ let lir_lower_call_args = fn (
   return LowerCallArgsResult(ctx: c, lir_args: sort_lir_call_args(args: la))
 end
 
+/** Lower a named call's arguments, demoting any float-LITERAL argument bound to
+ *  an f32-instantiated generic parameter to `f32` width first. The declared
+ *  parameter is a type variable erased to the `i64` value channel, so codegen
+ *  cannot see its `f32` instantiation; without this the literal's width-less
+ *  f64 bits cross the boundary un-rounded. Binding the literal to an `f32` temp
+ *  emits a runtime `f32.demote_f64`, then the temp's `f32` var packs the rounded
+ *  value (mirroring the working f32-VARIABLE argument path). */
+let lir_lower_call_args_named = fn (
+  callee: string,
+  args: [ MirCallArg ],
+  ret_hint: Option<TypeExpr>,
+  ctx: LowerCtx
+) -> LowerCallArgsResult throws { LirError } do
+  let f32_labels = instantiated_f32_arg_labels(callee, args, ret_hint, ctx)
+  match f32_labels do
+    | [] -> return lir_lower_call_args(args, ctx)
+    | _ ->
+      let LowerCallArgsResult(ctx: c, lir_args: la) =
+        lir_lower_call_args_f32_go(args, f32_labels, ctx, acc: [])
+      return LowerCallArgsResult(ctx: c, lir_args: sort_lir_call_args(args: la))
+  end
+end
+
+let lir_lower_call_args_f32_go = fn (
+  args: [ MirCallArg ],
+  f32_labels: [ string ],
+  ctx: LowerCtx,
+  acc: [ LirCallArg ]
+) -> LowerCallArgsResult throws { LirError } do
+  match args do
+    | [] -> return LowerCallArgsResult(ctx, lir_args: list.reverse(xs: acc))
+    | MirCallArg(label: l, value: e) :: rest ->
+      let BindResult(ctx: ctx2, atom: a) =
+        if let MirLiteral(lit: LitFloat(val: s)) = e then
+          if list_has_label(label: l, labels: f32_labels) then
+            bind_expr_to_temp(ctx, expr: LirExprAtom(atom: LirAtomFloat(val: s)), typ: TyF32)
+          else
+            lower_expr_to_atom(expr: e, ctx)
+          end
+        else
+          lower_expr_to_atom(expr: e, ctx)
+        end
+      return lir_lower_call_args_f32_go(
+          args: rest,
+          f32_labels,
+          ctx: ctx2,
+          acc: LirCallArg(label: l, value: a) :: acc
+        )
+  end
+end
+
+let list_has_label = fn (label: string, labels: [ string ]) -> bool throws { LirError } do
+  match labels do
+    | [] -> return false
+    | l :: rest -> if l == label then return true else return list_has_label(label, labels: rest) end
+  end
+end
+
+/** Lower a named-function call to a result temp. `ret_hint` is the call result's
+ *  declared `let` annotation (when known), supplied so a generic callee whose
+ *  return type variable is instantiated `f32` by that annotation demotes a
+ *  float-LITERAL argument bound to the same type variable to f32 width. */
+let lower_call_expr_with_hint = fn (
+  callee: string,
+  args: [ MirCallArg ],
+  rt: TypeExpr,
+  ret_hint: Option<TypeExpr>,
+  ctx: LowerCtx
+) -> BindResult throws { LirError } do
+  let LowerCallArgsResult(ctx: ctx2, lir_args: la) = lir_lower_call_args_named(callee, args, ret_hint, ctx)
+  let LowerCtx(vars: _, semantic_vars: sv2, stmts: _, temp_counter: _, enum_defs: _) = ctx2
+  // Look up the callee in semantic_vars: sem_func_types (populated at function
+  // entry) maps function names to their resolved return type, converting
+  // TyUserDefined("Trip",[]) → TyRecord([...]) for structural record returns.
+  // This preserves the semantic layout across the call-return boundary so that
+  // subsequent field access and record destructure resolve correctly.
+  let sem_rt0 = match lir_lookup_type(name: callee, entries: sv2) do
+    | Some(val: t) -> t
+    | None -> rt
+  end
+  // When the callee is generic its resolved return type is still a bare `TyVar`
+  // (or a `TyVar`-bearing shape); instantiate it from the argument semantic
+  // types so the bound result temp carries the concrete record/sum layout.
+  // Otherwise a downstream destructure / `.field` on the result reads field
+  // offset 0 for every projection (or aborts LIR with E6002). No-op for
+  // non-generic returns.
+  let sem_rt = recover_generic_call_type(callee, args, sem_rt: sem_rt0, ctx: ctx2)
+  let wt = wasm_type(typ: rt)
+  return bind_expr_to_temp_semantic(ctx: ctx2,
+    expr: LirExprCall(func: callee, args: la, typ: wt),
+    typ: wt, semantic_type: sem_rt)
+end
+
 type LowerExprsResult = LowerExprsResult(ctx: LowerCtx, atoms: [ LirAtom ])
 
 let lower_exprs_to_atoms = fn (
@@ -560,7 +633,8 @@ let emit_diverging_return = fn (
 ) -> BranchBodyResult throws { LirError } do
   let ret_type = lir_get_fn_ret_type(ctx)
   if let MirCall(func: f, args, ret_type: rt) = expr then
-    let LowerCallArgsResult(ctx: ctx2, lir_args: la) = lir_lower_call_args(args, ctx)
+    let LowerCallArgsResult(ctx: ctx2, lir_args: la) =
+      lir_lower_call_args_named(callee: f, args, ret_hint: Some(val: ret_type), ctx)
     let wt = wasm_type(typ: rt)
       let BindResult(ctx: ctx3, atom: _) = bind_expr_to_temp(
         ctx: ctx2,
@@ -778,6 +852,10 @@ let lower_stmt_inner = fn (
       let BindResult(ctx: ctx2, atom: a) = match e do
         | MirBinaryOp(left: blhs, op: bop, right: brhs) ->
           lower_binary_op(lhs: blhs, op: bop, rhs: brhs, result_hint: Some(val: t), ctx)
+        // Thread the declared `let` annotation into a generic call's result so a
+        // float-literal arg bound to the return type variable demotes to f32.
+        | MirCall(func: cf, args: cargs, ret_type: crt) ->
+          lower_call_expr_with_hint(callee: cf, args: cargs, rt: crt, ret_hint: Some(val: t), ctx)
         | _ -> lower_expr_to_atom(expr: e, ctx)
       end
       // A narrow (`i32`/`f32`) annotation overrides the atom's wide default so a
@@ -837,7 +915,8 @@ let lower_stmt_inner = fn (
     | MirStmtReturn(expr: e) ->
       match e do
         | MirCall(func: f, args, ret_type: rt) ->
-          let LowerCallArgsResult(ctx: ctx2, lir_args: la) = lir_lower_call_args(args, ctx)
+          let LowerCallArgsResult(ctx: ctx2, lir_args: la) =
+            lir_lower_call_args_named(callee: f, args, ret_hint: Some(val: lir_get_fn_ret_type(ctx)), ctx)
           let wt = wasm_type(typ: rt)
             let BindResult(ctx: ctx3, atom: a) = bind_expr_to_temp(ctx: ctx2,
               expr: LirExprTailCall(func: f, args: la, typ: wt), typ: wt)
