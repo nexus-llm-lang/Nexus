@@ -1,0 +1,99 @@
+import * as test_assert from "std:test/assert"
+
+/**
+ * Regression: a fixed-length list-literal pattern (`[ e ]`, `[ a, b ]`) nested
+ * inside a constructor pattern, with `.field` projection on the bound element,
+ * must lower correctly and must NOT corrupt the codegen of a neighboring
+ * function in the same module.
+ *
+ * A list-literal pattern desugars to nested `Cons(head, …Nil)`, so the element
+ * `e` binds at the `Cons` head. If the head bound at the catch-all `TyI64`
+ * instead of the real element type, a later `.field` on `e` aborted LIR with
+ * E6002 — and during self-host that mis-lowering silently damaged a neighboring
+ * function (the LIR `stmts_diverge` codepath), over-rejecting an unrelated
+ * fixture. The flat `e :: _` spelling was the original workaround; this fixture
+ * pins the `[ e ]` spelling AND a diverging-record-projection neighbor.
+ */
+
+type Inner = { tag: i64, val: i64 }
+type FInner = { n: i64, r: float }
+type Wrap = WNone | WOne(items: [ Inner ]) | WTwo(items: [ Inner ])
+type FWrap = FWNone | FWOne(items: [ FInner ])
+
+/** Single-element list-literal nested in a ctor; project `.tag` on the bound head. */
+let one_tag = fn (w: Wrap) -> i64 do
+  match w do
+    | WOne(items: [ e ]) -> return e.tag + e.val * 100
+    | _ -> return -1
+  end
+end
+
+/** Two-element list-literal nested in a ctor; project both bound elements. */
+let two_sum = fn (w: Wrap) -> i64 do
+  match w do
+    | WTwo(items: [ a, b ]) -> return a.tag + b.tag * 10 + a.val * 100 + b.val * 1000
+    | _ -> return -1
+  end
+end
+
+/**
+ * Single-element list-literal nested in a ctor whose element carries a `float`
+ * field. The bound head must derive its real element wasm-type (`f32`), so the
+ * load demotes correctly; a head bound at the catch-all `TyI64` would load the
+ * float with `i64.load` and keep full f64 precision, observably wrong.
+ */
+let one_float = fn (w: FWrap) -> float do
+  match w do
+    | FWOne(items: [ e ]) -> return e.r
+    | _ -> return 0.0
+  end
+end
+
+exception Boom
+
+/**
+ * Neighbor exercising the LIR `stmts_diverge` codepath: a binding whose value is
+ * an `if` with a diverging arm and a record-producing arm, then projected. This
+ * is the function shape that the `[ e ]` miscompile silently damaged.
+ */
+let neighbor_diverge = fn (c: bool, d: bool) -> i64 throws { Boom } do
+  let r = if c then
+    if d then throw Boom else throw Boom end
+  else
+    { tag: 7, val: 6 }
+  end
+  return r.tag + r.val * 100
+end
+
+let body = fn () -> unit throws { Exn, Boom } do
+  test_assert.assert_eq_i64(
+    actual: one_tag(w: WOne(items: [ { tag: 5, val: 3 } ])),
+    expected: 305,
+    label: "r2wjv pin1: [ e ] nested in ctor, head .field projection"
+  )
+  test_assert.assert_eq_i64(
+    actual: one_tag(w: WNone),
+    expected: -1,
+    label: "r2wjv pin1b: ctor without the list-literal arm"
+  )
+  test_assert.assert_eq_i64(
+    actual: two_sum(w: WTwo(items: [ { tag: 1, val: 2 }, { tag: 3, val: 4 } ])),
+    expected: 4231,
+    label: "r2wjv pin2: [ a, b ] nested in ctor, both elements projected"
+  )
+  test_assert.assert_eq_i64(
+    actual: neighbor_diverge(c: false, d: false),
+    expected: 607,
+    label: "r2wjv pin3: neighbor diverging-record projection uncorrupted"
+  )
+  test_assert.assert_true(
+    cond: one_float(w: FWOne(items: [ { n: 1, r: 2.5 } ])) ==. 2.5,
+    label: "r2wjv pin4: float field on [ e ]-bound ctor element"
+  )
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  body()
+  return ()
+end
