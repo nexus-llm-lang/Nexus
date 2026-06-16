@@ -1,0 +1,126 @@
+/** Unit test for the single-run imported-body typecheck cache pure logic.
+ *  The cache's SOUNDNESS rests on three invariants, all exercised here
+ *  without touching the filesystem or spawning subprocesses:
+ *
+ *    1. `imported_module_paths` returns the distinct defining modules of the
+ *       IMPORTED functions only — a function whose name is in `local_names`
+ *       (the root/local module) is NEVER reported, so it is never cached and a
+ *       real error in it is always surfaced. Duplicates collapse to one entry.
+ *
+ *    2. `defaults_digest` is CONSTANT (`"none"`) for the common collision-free
+ *       build, so every root shares the same marker namespace and reuse is
+ *       maximal; and it DIFFERS whenever the colliding-ctor default winners
+ *       differ, so two roots that would resolve a bare colliding ctor to
+ *       different enums never share a cached imported-body result.
+ *
+ *    3. The digest is ORDER-INDEPENDENT: the upstream scan order of the default
+ *       rename entries must not change the key.
+ */
+
+import * as test_assert from "std:test/assert"
+import {
+  imported_module_paths,
+  defaults_digest
+}, * as tc_cache from "src/typecheck/tc_cache.nx"
+import { HirFunction, EagerBody } from "src/ir/hir/types.nx"
+import { TyUnit, TyRow } from "src/types/type_expr.nx"
+import { Span } from "src/types/span.nx"
+import { RenameEntry } from "src/ir/shared/symtab.nx"
+import { None } from "std:option"
+import * as list from "std:list"
+
+/** Minimal HirFunction: only `name` and `file` are load-bearing for the cache
+ *  logic; the remaining fields carry trivially-valid placeholders. */
+let mkfn = fn (name: string, file: string) -> HirFunction do
+  return HirFunction(
+    name,
+    type_params: [],
+    params: [],
+    ret_type: TyUnit,
+    throw_row: TyRow(types: [], rest: None),
+    body: EagerBody(stmts: []),
+    span: Span(offset: 0, line: 0, col: 0),
+    file,
+    requires: TyRow(types: [], rest: None)
+  )
+end
+
+let str_eq = fn (a: string, b: string) -> bool do return a == b end
+
+let contains = fn (xs: [ string ], s: string) -> bool do
+  match xs do
+    | [] -> return false
+    | h :: rest -> if str_eq(a: h, b: s) then return true end
+      return contains(xs: rest, s)
+  end
+end
+
+let test_imported_modules_excludes_local = fn () -> unit throws { Exn } do
+  /** Closure: `main` + `helper` are LOCAL (root file root.nx); `lib_a`/`lib_a2`
+   *  live in a.nx, `lib_b` in b.nx (both imported). */
+  let funcs = [
+    mkfn(name: "main", file: "root.nx"),
+    mkfn(name: "helper", file: "root.nx"),
+    mkfn(name: "lib_a", file: "a.nx"),
+    mkfn(name: "lib_a2", file: "a.nx"),
+    mkfn(name: "lib_b", file: "b.nx")
+  ]
+  let local_names = [ "main", "helper" ]
+  let imported = imported_module_paths(funcs, local_names)
+
+  /** Only the two imported modules appear, deduped — root.nx (local) is absent. */
+  test_assert.assert_eq_i64(actual: list.length(xs: imported), expected: 2, label: "two distinct imported modules")
+  test_assert.assert_true(cond: contains(xs: imported, s: "a.nx"), label: "a.nx is cacheable")
+  test_assert.assert_true(cond: contains(xs: imported, s: "b.nx"), label: "b.nx is cacheable")
+  test_assert.assert_true(cond: !contains(xs: imported, s: "root.nx"), label: "root.nx (local) is NEVER cacheable")
+  return ()
+end
+
+let test_local_funcs_in_imported_file_still_local = fn () -> unit throws { Exn } do
+  /** A function whose NAME is local wins even if its `file` matches an imported
+   *  module's path — the local-name guard is the soundness floor. */
+  let funcs = [
+    mkfn(name: "main", file: "root.nx"),
+    mkfn(name: "lib_a", file: "a.nx")
+  ]
+  let imported = imported_module_paths(funcs, local_names: [ "main", "lib_a" ])
+  test_assert.assert_eq_i64(actual: list.length(xs: imported), expected: 0, label: "all names local => nothing cacheable")
+  return ()
+end
+
+let test_digest_empty_is_constant = fn () -> unit throws { Exn } do
+  /** Collision-free build: digest is the shared constant, so all roots reuse. */
+  test_assert.assert_true(cond: str_eq(a: defaults_digest(col_defaults: []), b: "none"), label: "empty default map => 'none'")
+  return ()
+end
+
+let test_digest_differs_on_winner = fn () -> unit throws { Exn } do
+  /** Two roots that resolve bare `Pair` to DIFFERENT enums have different
+   *  default maps, hence different digests, hence disjoint marker namespaces. */
+  let from_a = [ RenameEntry(original: "Pair", qualified: "a.nx#Pair") ]
+  let from_b = [ RenameEntry(original: "Pair", qualified: "b.nx#Pair") ]
+  let d_a = defaults_digest(col_defaults: from_a)
+  let d_b = defaults_digest(col_defaults: from_b)
+  test_assert.assert_true(cond: !str_eq(a: d_a, b: d_b), label: "different ctor winner => different digest")
+  test_assert.assert_true(cond: !str_eq(a: d_a, b: "none"), label: "non-empty map => not 'none'")
+  return ()
+end
+
+let test_digest_order_independent = fn () -> unit throws { Exn } do
+  /** Same set of default entries in a different order yields the same digest. */
+  let e1 = RenameEntry(original: "Pair", qualified: "a.nx#Pair")
+  let e2 = RenameEntry(original: "Node", qualified: "b.nx#Node")
+  let d_forward = defaults_digest(col_defaults: [ e1, e2 ])
+  let d_reverse = defaults_digest(col_defaults: [ e2, e1 ])
+  test_assert.assert_true(cond: str_eq(a: d_forward, b: d_reverse), label: "digest is order-independent")
+  return ()
+end
+
+let main = fn () -> unit throws { Exn } do
+  test_imported_modules_excludes_local()
+  test_local_funcs_in_imported_file_still_local()
+  test_digest_empty_is_constant()
+  test_digest_differs_on_winner()
+  test_digest_order_independent()
+  return ()
+end

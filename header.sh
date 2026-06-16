@@ -447,6 +447,24 @@ if [ "$TEST_MODE" = "1" ]; then
   RESULTS_DIR=$(mktemp -d "$TMPDIR_REAL/nexus_test.XXXXXX")
   trap 'rm -rf "$RESULTS_DIR"; cleanup' EXIT INT TERM HUP
 
+  # Single-run imported-body typecheck cache. Each per-fixture
+  # `nexus build` re-checks every imported module in its closure; across ~994
+  # subprocess compiles the overlapping stdlib/compiler modules dominate. The
+  # cache lets each imported module's bodies be checked ONCE per run and reused.
+  # The dir lives under RESULTS_DIR (a fresh mktemp -d reaped by the EXIT trap),
+  # so its lifetime is exactly this run = one fixed compiler + fixed source — no
+  # cross-version staleness. It sits under TMPDIR_REAL, which every compile
+  # invocation already mounts via --dir, so the guest can read/write markers.
+  # Pass NEXUS_TC_CACHE through to each build via --env (wasmtime does not
+  # inherit host env). Set TC_CACHE_OFF=1 to disable (A/B perf measurement).
+  TC_CACHE_ENV=""
+  if [ "${TC_CACHE_OFF:-0}" != "1" ]; then
+    TC_CACHE="$RESULTS_DIR/tc_cache"
+    mkdir -p "$TC_CACHE"
+    TC_CACHE_ENV="--env NEXUS_TC_CACHE=$TC_CACHE"
+  fi
+  export TC_CACHE_ENV
+
   # The per-fixture runner runs inline under xargs below — `xargs -L 1 sh -c
   # '...'` reads (idx, file) pairs from the plan file and invokes wasmtime
   # twice (compile, then run). Each worker prints its own PASS/FAIL line to
@@ -628,7 +646,7 @@ if [ "$TEST_MODE" = "1" ]; then
       if [ -n "$NEG_CODE" ]; then
         if wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
             ${NEXUS_WASMTIME_ARGS:-} \
-            "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
+            ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
             >/dev/null 2>"$elog"; then
           t1=$(date +%s%N 2>/dev/null || date +%s000000000)
           ms=$(( (t1 - t0) / 1000000 ))
@@ -683,7 +701,7 @@ if [ "$TEST_MODE" = "1" ]; then
       # Compile must succeed (the negative is exclusively at run time).
       if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
-          "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
+          ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
           >/dev/null 2>"$elog"; then
         t1=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t1 - t0) / 1000000 ))
@@ -743,7 +761,7 @@ if [ "$TEST_MODE" = "1" ]; then
       t0=$(date +%s%N 2>/dev/null || date +%s000000000)
       if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
-          "$PAYLOAD_WASM" build "$f" -o "$wasm" --p3-component --explain-capabilities none \
+          ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --p3-component --explain-capabilities none \
           >/dev/null 2>"$elog"; then
         t1=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t1 - t0) / 1000000 ))
@@ -889,7 +907,7 @@ if [ "$TEST_MODE" = "1" ]; then
       t0=$(date +%s%N 2>/dev/null || date +%s000000000)
       if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
-          "$PAYLOAD_WASM" build "$f" -o "$wasm" --p2-component --explain-capabilities none \
+          ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --p2-component --explain-capabilities none \
           >/dev/null 2>"$elog"; then
         t1=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t1 - t0) / 1000000 ))
@@ -1029,7 +1047,7 @@ if [ "$TEST_MODE" = "1" ]; then
     t0=$(date +%s%N 2>/dev/null || date +%s000000000)
     if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
         ${NEXUS_WASMTIME_ARGS:-} \
-        "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
+        ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
         >/dev/null 2>"$elog"; then
       t1=$(date +%s%N 2>/dev/null || date +%s000000000)
       ms=$(( (t1 - t0) / 1000000 ))

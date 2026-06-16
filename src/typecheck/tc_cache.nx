@@ -1,0 +1,250 @@
+/**
+ * typecheck/tc_cache: single-run-scoped imported-body typecheck cache.
+ *
+ * Post the imported-body typecheck gate-flip, every `nexus build` re-checks the
+ * bodies of EVERY imported module in the closure. A `nexus test` run launches
+ * ~994 `nexus build` subprocesses that re-check heavily-overlapping stdlib /
+ * compiler modules. This module lets a SINGLE `nexus test` run check each
+ * imported module's bodies ONCE and reuse the result across the subprocess
+ * compiles, by leaving a marker file per already-checked module.
+ *
+ * SCOPE & LIFETIME. The cache directory is supplied via the `NEXUS_TC_CACHE`
+ * environment variable, set by the test runner to a subdir of the per-run
+ * `mktemp -d` results dir (cleaned by the runner's EXIT trap). Its lifetime is
+ * therefore exactly one `nexus test` invocation = one fixed `./nexus` compiler +
+ * the repo's fixed source. "Module M checked OK" is valid for the whole run; a
+ * later run gets a fresh empty dir. No cross-version / cross-source staleness is
+ * possible by construction. When `NEXUS_TC_CACHE` is unset the cache is OFF and
+ * behaviour is byte-identical to the uncached path (every function checked).
+ *
+ * SOUNDNESS. An imported module M's per-function body check references only M's
+ * own scope: it sets `current_module := func.file` and resolves names against
+ * M's own signatures, M's own-module variant scope, and M's selective imports.
+ * Function signatures are canonicalised unconditionally (`source#name`), so the
+ * global signature env resolves M's callees identically regardless of root. The
+ * ONLY root/closure-dependent input is the colliding-constructor DEFAULT rename
+ * map (`bare -> first-defining-enum canonical`): when M references a colliding
+ * ctor it neither owns nor selectively imports, the winner is chosen entry-first
+ * over the root's closure, so it can differ between roots. We therefore key the
+ * marker namespace on a digest of that default map: two roots share a cached
+ * imported-body result only when their default maps match. In the common
+ * collision-free build the digest is constant, giving maximal cross-root reuse.
+ * The LOCAL (root) module is NEVER cached (see `check_all_functions`' local-name
+ * guard), so a real error in the file under compilation is always surfaced.
+ */
+
+import { Option, Some, None } from "std:option"
+import { raw_get } from "std:env"
+import { Fs, WriteError } from "std:fs"
+import * as str from "std:str"
+import * as char from "std:char"
+import * as list from "std:list"
+import { HirFunction } from "src/ir/hir/types.nx"
+import { RenameEntry } from "src/ir/shared/symtab.nx"
+import { str_list_contains } from "src/typecheck/check/occurs.nx"
+
+/** The configured cache directory, or `None` when `NEXUS_TC_CACHE` is unset
+ *  (cache OFF). Read via cap-free `raw_get` so the compile path need not inject
+ *  the `Env` capability. */
+export let cache_dir = fn () -> Option<string> do
+  match raw_get(key: "NEXUS_TC_CACHE") do
+    | None -> return None
+    | Some(val: d) ->
+      if str.length(s: d) == 0 then return None end
+      return Some(val: d)
+  end
+end
+
+/** FNV-1a-style fold over a string's bytes, returning a non-negative i64. Pure;
+ *  used only to compress the (sorted) default rename map into a short, stable,
+ *  filename-safe namespace token. */
+let hash_string = fn (s: string) -> i64 do
+  return hash_go(s, i: 0, n: str.length(s: s), h: 1469598103934665603)
+end
+
+let hash_go = fn (s: string, i: i64, n: i64, h: i64) -> i64 do
+  if i >= n then
+    if h < 0 then return 0 - h end
+    return h
+  end
+  let h2 = (h ^ char.ord(c: str.byte_at(s, idx: i))) * 1099511628211
+  return hash_go(s, i: i + 1, n, h: h2)
+end
+
+/** Insertion-sort the default entries by `original` so the digest is order
+ *  independent (the upstream scan order must not affect the cache key). */
+let sort_entries = fn (es: [ RenameEntry ]) -> [ RenameEntry ] do
+  return sort_go(es, acc: [])
+end
+
+let sort_go = fn (es: [ RenameEntry ], acc: [ RenameEntry ]) -> [ RenameEntry ] do
+  match es do
+    | [] -> return acc
+    | e :: rest -> return sort_go(es: rest, acc: insert_sorted(e, acc))
+  end
+end
+
+let insert_sorted = fn (e: RenameEntry, acc: [ RenameEntry ]) -> [ RenameEntry ] do
+  match acc do
+    | [] -> return e :: []
+    | h :: rest ->
+      let RenameEntry(original: eo, qualified: _) = e
+      let RenameEntry(original: ho, qualified: _) = h
+      if str_lt(a: eo, b: ho) then return e :: acc end
+      return h :: insert_sorted(e, acc: rest)
+  end
+end
+
+/** Lexicographic `<` over byte values. */
+let str_lt = fn (a: string, b: string) -> bool do
+  return str_lt_go(a, b, i: 0, na: str.length(s: a), nb: str.length(s: b))
+end
+
+let str_lt_go = fn (a: string, b: string, i: i64, na: i64, nb: i64) -> bool do
+  if i >= na then return i < nb end
+  if i >= nb then return false end
+  let ca = char.ord(c: str.byte_at(s: a, idx: i))
+  let cb = char.ord(c: str.byte_at(s: b, idx: i))
+  if ca < cb then return true end
+  if ca > cb then return false end
+  return str_lt_go(a, b, i: i + 1, na, nb)
+end
+
+let join_entries = fn (es: [ RenameEntry ], acc: string) -> string do
+  match es do
+    | [] -> return acc
+    | RenameEntry(original: o, qualified: q) :: rest ->
+      return join_entries(es: rest, acc: acc ++ o ++ ">" ++ q ++ "\n")
+  end
+end
+
+/** Filename-safe digest of the colliding-ctor default rename map. `"none"` for
+ *  the common collision-free build (all roots share it → maximal reuse);
+ *  otherwise a decimal hash that differs iff the default winners differ. */
+export let defaults_digest = fn (col_defaults: [ RenameEntry ]) -> string do
+  match col_defaults do
+    | [] -> return "none"
+    | _ ->
+      let joined = join_entries(es: sort_entries(es: col_defaults), acc: "")
+      return "c" ++ str.from_i64(val: hash_string(s: joined))
+  end
+end
+
+/** Sanitise a module path into a single flat filename: every byte outside
+ *  `[A-Za-z0-9._-]` becomes `_`. Distinct paths can in principle collide after
+ *  sanitisation; that only ever causes a redundant re-check (a false cache MISS
+ *  is the safe direction), never a wrong skip — a marker means "some module of
+ *  this sanitised name checked OK", and the digest namespace already pins the
+ *  root-dependent dimension. */
+let sanitize = fn (path: string) -> string do
+  return sanitize_go(path, i: 0, n: str.length(s: path), acc: "")
+end
+
+let sanitize_go = fn (path: string, i: i64, n: i64, acc: string) -> string do
+  if i >= n then return acc end
+  let c = char.ord(c: str.byte_at(s: path, idx: i))
+  let keep = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+    || c == 46 || c == 95 || c == 45
+  let ch = if keep then str.from_char(c: str.byte_at(s: path, idx: i)) else "_" end
+  return sanitize_go(path, i: i + 1, n, acc: acc ++ ch)
+end
+
+/** Directory that holds this run's markers for the given default-map digest:
+ *  `<cache_dir>/<digest>`. */
+let digest_dir = fn (dir: string, digest: string) -> string do
+  return dir ++ "/" ++ digest
+end
+
+let marker_path = fn (dir: string, digest: string, module_path: string) -> string do
+  return digest_dir(dir, digest) ++ "/" ++ sanitize(path: module_path)
+end
+
+/** Collect the distinct defining-module paths of the IMPORTED functions in
+ *  `funcs` (name not in `local_names`). These are exactly the modules whose
+ *  bodies are cacheable for this build. */
+export let imported_module_paths = fn (
+  funcs: [ HirFunction ],
+  local_names: [ string ]
+) -> [ string ] do
+  return imported_paths_go(funcs, local_names, acc: [])
+end
+
+let imported_paths_go = fn (
+  funcs: [ HirFunction ],
+  local_names: [ string ],
+  acc: [ string ]
+) -> [ string ] do
+  match funcs do
+    | [] -> return acc
+    | func :: rest ->
+      let HirFunction(name: fname, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span: _, file: ffile, _) = func
+      let acc2 = if str_list_contains(xs: local_names, s: fname) then acc
+        else if str_list_contains(xs: acc, s: ffile) then acc
+        else ffile :: acc end
+      return imported_paths_go(funcs: rest, local_names, acc: acc2)
+  end
+end
+
+/** The subset of `module_paths` whose marker already exists under this run's
+ *  digest namespace. Returns `[]` when the cache is OFF. These modules are
+ *  passed to `check_program` as `skip_modules`. */
+export let cached_modules = fn (
+  module_paths: [ string ],
+  digest: string
+) -> [ string ] require { Fs } do
+  match cache_dir() do
+    | None -> return []
+    | Some(val: dir) -> return filter_cached(module_paths, dir, digest, acc: [])
+  end
+end
+
+let filter_cached = fn (
+  module_paths: [ string ],
+  dir: string,
+  digest: string,
+  acc: [ string ]
+) -> [ string ] require { Fs } do
+  match module_paths do
+    | [] -> return acc
+    | m :: rest ->
+      let acc2 = if Fs.exists(path: marker_path(dir, digest, module_path: m)) then m :: acc else acc end
+      return filter_cached(module_paths: rest, dir, digest, acc: acc2)
+  end
+end
+
+/** After a successful check, record a marker for every imported module that was
+ *  just checked (present in `module_paths`, absent from `already_cached`).
+ *  No-op when the cache is OFF. Marker creation overwrites with identical
+ *  content, so concurrent subprocesses racing on the same marker are harmless. */
+export let record_markers = fn (
+  module_paths: [ string ],
+  already_cached: [ string ],
+  digest: string
+) -> unit require { Fs } do
+  match cache_dir() do
+    | None -> return ()
+    | Some(val: dir) ->
+      try
+        Fs.create_dir_all(path: digest_dir(dir, digest))
+        write_markers(module_paths, already_cached, dir, digest)
+        return ()
+      catch _ ->
+        return ()
+      end
+  end
+end
+
+let write_markers = fn (
+  module_paths: [ string ],
+  already_cached: [ string ],
+  dir: string,
+  digest: string
+) -> unit require { Fs } throws { WriteError } do
+  match module_paths do
+    | [] -> return ()
+    | m :: rest ->
+      if str_list_contains(xs: already_cached, s: m) then ()
+      else Fs.write_string(path: marker_path(dir, digest, module_path: m), content: "ok") end
+      return write_markers(module_paths: rest, already_cached, dir, digest)
+  end
+end

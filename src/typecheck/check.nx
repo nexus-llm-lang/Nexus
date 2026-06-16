@@ -121,11 +121,24 @@ import { ModuleImportIndex } from "src/typecheck/import_index.nx"
 
 // ─── Public entry point ─────────────────────────────────────────────────────
 
-/** Run the typechecker over an `HirProgram`: validates every function body, returns the program unchanged on success, raises `TypeError` on any mismatch. `require_main` enables main-signature checks. */
+/** Run the typechecker over an `HirProgram`: validates every function body, returns the program unchanged on success, raises `TypeError` on any mismatch. `require_main` enables main-signature checks.
+ *
+ *  `skip_modules` names imported modules whose bodies were ALREADY checked OK
+ *  within the current single-run typecheck cache scope. A function is skipped
+ *  iff its `file` is in `skip_modules` AND its `name` is NOT in `local_names` —
+ *  the local (root) module is ALWAYS checked. Body checks of an imported module
+ *  reference only that module's own scope (`current_module := func.file`, its
+ *  own signatures/imports/own-module variant scope), so a module that checked OK
+ *  once is valid for every root that imports it under the same compiler+source.
+ *  The driver guarantees this by keying the cache on the colliding-constructor
+ *  default rename map (the only root-dependent input to an imported body check),
+ *  so two roots share a cache entry only when that map matches. Default `[]`
+ *  reproduces the exact uncached behaviour (every function checked). */
 export let check_program = fn (
   hir: HirProgram,
   local_names: [ string ],
   import_index: ModuleImportIndex,
+  skip_modules: [ string ],
   require_main: bool
 ) -> HirProgram throws { TypeError } do
   let HirProgram(
@@ -225,7 +238,7 @@ export let check_program = fn (
    *  placeholder bindings, so no local check result changes). */
   let st7b = resolve_value_binding_types(state: st7, funcs)
 
-  check_all_functions(state: st7b, funcs, local_names, cont_map: cont_binder_map, safe_callees)
+  check_all_functions(state: st7b, funcs, local_names, skip_modules, cont_map: cont_binder_map, safe_callees)
 
   // Pass 2b: Check handler arm bodies (synthesised function names aren't in
   // local_names, so they're missed by check_all_functions). With-kont arms
@@ -347,10 +360,27 @@ end
 /** Sequential body-check: mirror of the original check_all_functions loop.
  *  Used for N <= tc_parallel_threshold() and as the guaranteed-safe fallback.
  */
+/** True when `func`'s body may be skipped: its defining module is in
+ *  `skip_modules` AND it is NOT a function of the local (root) module. The
+ *  local-name guard is the soundness floor — the file under compilation is never
+ *  cached, so a real error in it is always surfaced. Both lists are tiny in
+ *  practice (skip_modules ≈ already-checked imports; local_names ≈ the root
+ *  file's functions), so the linear membership scans are cheap. */
+let func_is_cached_import = fn (
+  func: HirFunction,
+  local_names: [ string ],
+  skip_modules: [ string ]
+) -> bool do
+  let HirFunction(name: fname, type_params: _, params: _, ret_type: _, throw_row: _, body: _, span: _, file: ffile, _) = func
+  if str_list_contains(xs: local_names, s: fname) then return false end
+  return str_list_contains(xs: skip_modules, s: ffile)
+end
+
 let check_all_sequential = fn (
   state: CheckState,
   funcs: [ HirFunction ],
   local_names: [ string ],
+  skip_modules: [ string ],
   cont_map: ContBinderMap,
   safe_callees: [ string ]
 ) -> unit throws { TypeError } do
@@ -360,9 +390,11 @@ let check_all_sequential = fn (
       let HirFunction(name: _, type_params: _, params: _, ret_type: _, _) = func
       match alias_src_name(func) do
         | Some(val: _) -> ()
-        | None -> check_function_bounded(state, func, cont_map, safe_callees)
+        | None ->
+          if func_is_cached_import(func, local_names, skip_modules) then ()
+          else check_function_bounded(state, func, cont_map, safe_callees) end
       end
-      return check_all_sequential(state, funcs: rest, local_names, cont_map, safe_callees)
+      return check_all_sequential(state, funcs: rest, local_names, skip_modules, cont_map, safe_callees)
   end
 end
 
@@ -375,6 +407,7 @@ let build_check_thunks = fn (
   state: CheckState,
   funcs: [ HirFunction ],
   local_names: [ string ],
+  skip_modules: [ string ],
   cont_map: ContBinderMap,
   safe_callees: [ string ],
   acc: [ @unit ]
@@ -385,17 +418,22 @@ let build_check_thunks = fn (
       let HirFunction(name: _, type_params: _, params: _, ret_type: _, _) = func
       match alias_src_name(func) do
         | Some(val: _) ->
-          return build_check_thunks(state, funcs: rest, local_names, cont_map, safe_callees, acc)
+          return build_check_thunks(state, funcs: rest, local_names, skip_modules, cont_map, safe_callees, acc)
         | None ->
-          let @t = check_function_bounded(state, func, cont_map, safe_callees)
-          return build_check_thunks(
-            state,
-            funcs: rest,
-            local_names,
-            cont_map,
-            safe_callees,
-            acc: t :: acc
-          )
+          if func_is_cached_import(func, local_names, skip_modules) then
+            return build_check_thunks(state, funcs: rest, local_names, skip_modules, cont_map, safe_callees, acc)
+          else
+            let @t = check_function_bounded(state, func, cont_map, safe_callees)
+            return build_check_thunks(
+              state,
+              funcs: rest,
+              local_names,
+              skip_modules,
+              cont_map,
+              safe_callees,
+              acc: t :: acc
+            )
+          end
       end
   end
 end
@@ -409,10 +447,11 @@ let check_all_parallel = fn (
   state: CheckState,
   funcs: [ HirFunction ],
   local_names: [ string ],
+  skip_modules: [ string ],
   cont_map: ContBinderMap,
   safe_callees: [ string ]
 ) -> unit throws { TypeError } do
-  let thunks = build_check_thunks(state, funcs, local_names, cont_map, safe_callees, acc: [])
+  let thunks = build_check_thunks(state, funcs, local_names, skip_modules, cont_map, safe_callees, acc: [])
   lazy.force_all(tasks: thunks)
   return ()
 end
@@ -425,14 +464,15 @@ let check_all_functions = fn (
   state: CheckState,
   funcs: [ HirFunction ],
   local_names: [ string ],
+  skip_modules: [ string ],
   cont_map: ContBinderMap,
   safe_callees: [ string ]
 ) -> unit throws { TypeError } do
   let n = list.length(xs: funcs)
   if n <= tc_parallel_threshold() then
-    return check_all_sequential(state, funcs, local_names, cont_map, safe_callees)
+    return check_all_sequential(state, funcs, local_names, skip_modules, cont_map, safe_callees)
   else
-    return check_all_parallel(state, funcs, local_names, cont_map, safe_callees)
+    return check_all_parallel(state, funcs, local_names, skip_modules, cont_map, safe_callees)
   end
 end
 
