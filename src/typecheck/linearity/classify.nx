@@ -1,0 +1,306 @@
+/**
+ * typecheck/linearity/classify: sig-map-aware linearity classification.
+ *
+ * Determines whether the value-RHS of a `let x = expr` would yield a linear
+ * binding (`let_binds_linear`) and the liveness-DEPENDENT branch/arm helpers
+ * it recurses through. Reads the LIVE linear set (`pre_st`) — the binding-site
+ * classifier, as opposed to the liveness-INDEPENDENT match-site classifier in
+ * binding.nx. This is the DAG leaf of the classification cluster: it calls into
+ * sig_map / state / predicates / capture / borrow_types but never back into the
+ * walker or binding.nx.
+ */
+
+import { Sigil, SigilImmutable, SigilLinear, SigilLazy } from "src/types/vocab.nx"
+import { TypeExpr, RecordDef, EnumDef } from "src/types/type_expr.nx"
+import {
+  HirStmt, HirStmtKind, HirExpr, HirExprKind,
+  HirCallArg, HirNamedExpr, HirMatchCase
+} from "src/ir/hir/types.nx"
+import { Option, Some, None } from "std:option"
+import { is_linear_binding_type } from "src/ir/shared/type_pred.nx"
+import { SigEntry, sig_lookup } from "src/typecheck/linearity/sig_map.nx"
+import { LinState, lin_member, lin_state_vars } from "src/typecheck/linearity/state.nx"
+import { lin_ctor_enum_is_linear } from "src/typecheck/linearity/predicates.nx"
+import { collect_param_names, collect_captured_linears } from "src/typecheck/linearity/capture.nx"
+import { last_stmt } from "src/typecheck/linearity/diverge.nx"
+import {
+  lookup_param_type_by_label, pt_shares_tyvar_with_rt
+} from "src/typecheck/linearity/borrow_types.nx"
+
+/** Determine whether the value-RHS of a `let x = expr` would yield a linear
+ *  binding. Classification, in priority order:
+ *  1. Sigil annotation on the let (`%`/`@`) → linear.
+ *  2. Type annotation on the let (`x: %T` / `x: @T`) → linear.
+ *  3. Otherwise inspect the value expression:
+ *     a. Call to a function whose return type is `%T` / `@T`.
+ *     b. Ctor whose owning enum has any variant with a direct linear field.
+ *     c. Ctor whose any arg expression itself produces a linear value —
+ *        catches the inferred-generic case `let p = Pair(fst: 0, snd: %b)`
+ *        where Pair has no shallow-linear variant field but the runtime
+ *        arg `b` is linear. Spec §Linearity: linear(Pair<%T,U>) = true.
+ *     d. Variable that was live in the pre-check linear set (alias of linear).
+ *     e. Array literal — always linear.
+ *     f. Record literal `{ k1: e1, ... }` whose any field expression itself
+ *        produces a linear value — parallel to (c) for record types. Catches
+ *        `let r = { val: %b }` where the record type's field is generic
+ *        (TyVar) but the runtime field expression is linear. Spec §Linearity:
+ *        linear({ val: %T, .. }) = true.
+ */
+export let let_binds_linear = fn (
+  sigil: Sigil, ann: Option<TypeExpr>, value: HirExpr, sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ], pre_st: LinState
+) -> bool do
+  match sigil do
+    | SigilLinear | SigilLazy -> return true
+    | _ ->
+      match ann do
+        | Some(val: t) -> if is_linear_binding_type(t, tdefs, enum_defs) then return true end
+        | None -> ()
+      end
+      let HirExpr(node: vnode, span: _) = value
+      match vnode do
+        | Call(func: f, args: cargs) ->
+          match sig_lookup(sigs, name: f) do
+            | Some(val: SigEntry(name: _, type_params: tps, param_labels: pls, param_types: pts, ret_type: rt, throw_row: _)) ->
+              // (a) Callee return type is itself linear (e.g. `bb.empty() -> %ByteBuffer`).
+              if is_linear_binding_type(t: rt, tdefs, enum_defs) then return true end
+              // (b) Param→result-slot flow: for any call arg paired (by
+              //     label) to a parameter whose type mentions a callee
+              //     type-parameter that also occurs in `rt`, if the runtime
+              //     arg itself binds linear, the call's result carries the
+              //     linear payload through that type-variable slot. The
+              //     `type_params` gate restricts the check to true generics
+              //     and avoids conflating concrete nominal names (e.g. `Bb`)
+              //     with type-variable references — the linearity pass runs
+              //     BEFORE typecheck's `convert_ud_to_var`, so both `TyVar`
+              //     and `TyUserDefined(α, [])` are TyVar candidates in the
+              //     raw HIR. Targeted check that avoids over-tracking calls
+              //     like `take_bb(b: %x) -> i64` where the linear is
+              //     consumed by the callee (no type-param flow into rt).
+              return any_call_arg_propagates_linear(
+                args: cargs,
+                type_params: tps,
+                param_labels: pls,
+                param_types: pts,
+                ret_type: rt,
+                sigs,
+                tdefs,
+                enum_defs,
+                pre_st
+              )
+            | None -> return false
+          end
+        | CallExpr(callee: _, args: _) ->
+          // Closure/field call: return type unknown at this level; conservative.
+          return false
+        | Ctor(variant: v, args: cargs, labels: _, sigil: _) ->
+          if lin_ctor_enum_is_linear(defs: enum_defs, variant: v) then return true end
+          // (c) above: inferred-generic case. The variant has no shallow-
+          // linear field declaration (e.g. `Pair<A,B>` with TyVar slots),
+          // but the runtime arg flowing into a TyVar slot is itself linear
+          // → the result Pair value carries a linear payload and must be
+          // use-once-tracked. Recurse with sigil=SigilImmutable, ann=None
+          // so only the value-shape contributes (the outer let's sigil
+          // already handled the explicit cases above).
+          return any_ctor_arg_linear(args: cargs, sigs, tdefs, enum_defs, pre_st)
+        | Record(fields: fs) ->
+          // (f) above: inferred-generic case for record literals. The
+          // declared record type's field is TyVar (or otherwise non-shallow-
+          // linear), but the runtime field expression itself binds linear —
+          // the resulting record carries a linear payload and must be use-
+          // once-tracked. Parallel to the Ctor branch above.
+          return any_record_field_linear(fields: fs, sigs, tdefs, enum_defs, pre_st)
+        | Variable(name: v, sigil: _) ->
+          return lin_member(st: pre_st, name: v)
+        | Array(_) -> return true
+        | Lambda(type_params: _, params: lps, ret_type: _, requires: _, throw_row: _, body: lb) ->
+          // A lambda that captures an outer linear binding is itself one-shot
+          // (linear): calling it twice would double-free the captured linear.
+          // Detect captures the same way the Lambda arm of check_expr_kind
+          // does: collect all outer linear names referenced as free vars in
+          // the body. If any are captured, the resulting closure is linear.
+          let lpnames = collect_param_names(params: lps, acc: [])
+          let outer_lins = lin_state_vars(st: pre_st)
+          let captured_lins = collect_captured_linears(
+            body: lb,
+            outer_linears: outer_lins,
+            bound: lpnames,
+            acc: []
+          )
+          match captured_lins do
+            | [] -> return false
+            | _ :: _ -> return true
+          end
+        // An `if`/`match` EXPRESSION whose value is bound (e.g.
+        // `let w = Mix(gen: if c then pick(x: %p) else … end)`): the bound
+        // value is linear iff some branch's trailing value is linear. Without
+        // this arm the `If`/`Match` falls through to `| _ -> return false`, so
+        // a `let` whose RHS launders a linear through a branch expression is
+        // not tracked as linear — and the scrutinee-linear gate at the match
+        // site never demotes/keeps its generic fields, silently dropping the
+        // payload (the binding-site half of the 44873d2d generic-field fix).
+        // The branches are alternatives → ANY linear branch makes the binding
+        // linear. Classification reads the LIVE set (`pre_st`): at the binding
+        // site the laundered linear args are still live (the construction has
+        // not yet consumed them), so the liveness-dependent classifier is the
+        // correct one here (unlike the post-consumption match site).
+        | If(cond: _, then_branch: tb, else_branch: eb) ->
+          if block_trailing_value_binds_linear(stmts: tb, sigs, tdefs, enum_defs, pre_st) then return true end
+          match eb do
+            | Some(val: ebs) -> return block_trailing_value_binds_linear(stmts: ebs, sigs, tdefs, enum_defs, pre_st)
+            | None -> return false
+          end
+        | Match(target: _, cases: cs) ->
+          return any_case_trailing_value_binds_linear(cases: cs, sigs, tdefs, enum_defs, pre_st)
+        | _ -> return false
+      end
+  end
+end
+
+/** Liveness-DEPENDENT companion of `block_trailing_value_is_linear`: the VALUE
+ *  of a branch-body block used as a bound `if`/`match` expression. Classifies
+ *  the trailing statement's expression with `let_binds_linear` (reading the
+ *  LIVE set `pre_st`, since the binding site has not yet consumed the laundered
+ *  linear). Non-value-producing trailing statements contribute no linear. */
+let block_trailing_value_binds_linear = fn (
+  stmts: [ HirStmt ], sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ], pre_st: LinState
+) -> bool do
+  match last_stmt(stmts: stmts) do
+    | None -> return false
+    | Some(val: HirStmt(node: sk, span: _)) ->
+      match sk do
+        | Expr(expr: e) ->
+          return let_binds_linear(sigil: SigilImmutable, ann: None, value: e, sigs, tdefs, enum_defs, pre_st)
+        | Return(expr: e) ->
+          return let_binds_linear(sigil: SigilImmutable, ann: None, value: e, sigs, tdefs, enum_defs, pre_st)
+        | _ -> return false
+      end
+  end
+end
+
+/** ANY `match` arm whose trailing value binds linear under `let_binds_linear`
+ *  makes the whole `match` expression's value linear. */
+let any_case_trailing_value_binds_linear = fn (
+  cases: [ HirMatchCase ], sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ], pre_st: LinState
+) -> bool do
+  match cases do
+    | [] -> return false
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      if block_trailing_value_binds_linear(stmts: b, sigs, tdefs, enum_defs, pre_st) then return true end
+      return any_case_trailing_value_binds_linear(cases: rest, sigs, tdefs, enum_defs, pre_st)
+  end
+end
+
+let any_ctor_arg_linear = fn (
+  args: [ HirExpr ], sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ], pre_st: LinState
+) -> bool do
+  match args do
+    | [] -> return false
+    | a :: rest ->
+      if let_binds_linear(
+        sigil: SigilImmutable,
+        ann: None,
+        value: a,
+        sigs,
+        tdefs,
+        enum_defs,
+        pre_st
+      ) then return true end
+      return any_ctor_arg_linear(args: rest, sigs, tdefs, enum_defs, pre_st)
+  end
+end
+
+let any_record_field_linear = fn (
+  fields: [ HirNamedExpr ], sigs: [ SigEntry ],
+  tdefs: [ RecordDef ], enum_defs: [ EnumDef ], pre_st: LinState
+) -> bool do
+  match fields do
+    | [] -> return false
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      if let_binds_linear(
+        sigil: SigilImmutable,
+        ann: None,
+        value: v,
+        sigs,
+        tdefs,
+        enum_defs,
+        pre_st
+      ) then return true end
+      return any_record_field_linear(fields: rest, sigs, tdefs, enum_defs, pre_st)
+  end
+end
+
+/** Param→result-slot linear propagation check for a Call. For each call arg
+ *  paired (by label) to its declared parameter type `pt`:
+ *    - If `pt` shares any callee-declared `type_params` slot with `rt` AND
+ *      the arg expression itself binds linear (recursive
+ *      `let_binds_linear`), the call result carries the linear payload
+ *      through that TyVar slot — the outer let must track it.
+ *  Avoids over-tracking calls like `take_bb(b: %x) -> i64` (rt has no
+ *  callee-tyvar flow) or `bb.free(buf: %x) -> bool` (rt has no tyvars). */
+let any_call_arg_propagates_linear = fn (
+  args: [ HirCallArg ],
+  type_params: [ string ],
+  param_labels: [ string ],
+  param_types: [ TypeExpr ],
+  ret_type: TypeExpr,
+  sigs: [ SigEntry ],
+  tdefs: [ RecordDef ],
+  enum_defs: [ EnumDef ],
+  pre_st: LinState
+) -> bool do
+  // Fast path: no declared type parameters → no flow possible.
+  match type_params do
+    | [] -> return false
+    | _ -> ()
+  end
+  return any_call_arg_propagates_linear_go(
+    args, type_params, param_labels, param_types, ret_type, sigs, tdefs, enum_defs, pre_st
+  )
+end
+
+let any_call_arg_propagates_linear_go = fn (
+  args: [ HirCallArg ],
+  type_params: [ string ],
+  param_labels: [ string ],
+  param_types: [ TypeExpr ],
+  ret_type: TypeExpr,
+  sigs: [ SigEntry ],
+  tdefs: [ RecordDef ],
+  enum_defs: [ EnumDef ],
+  pre_st: LinState
+) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: l, value: v) :: rest ->
+      match lookup_param_type_by_label(labels: param_labels, types: param_types, target: l) do
+        | Some(val: pt) ->
+          if pt_shares_tyvar_with_rt(pt, rt: ret_type, type_params) then
+            if let_binds_linear(
+              sigil: SigilImmutable,
+              ann: None,
+              value: v,
+              sigs,
+              tdefs,
+              enum_defs,
+              pre_st
+            ) then return true end
+          end
+        | None -> ()
+      end
+      return any_call_arg_propagates_linear_go(
+        args: rest,
+        type_params,
+        param_labels,
+        param_types,
+        ret_type,
+        sigs,
+        tdefs,
+        enum_defs,
+        pre_st
+      )
+  end
+end
