@@ -419,8 +419,27 @@ if [ "$TEST_MODE" = "1" ]; then
   if [ "$TEST_SEQ" = "1" ]; then
     JOBS=1
     LABEL="sequential"
+  elif [ -n "${NEXUS_TEST_JOBS:-}" ]; then
+    JOBS="$NEXUS_TEST_JOBS"
+    LABEL="parallel x$JOBS"
   else
-    JOBS="${NEXUS_TEST_JOBS:-$( (nproc 2>/dev/null) || echo 4 )}"
+    # Default worker count is memory-aware, not just core-bound. Each per-fixture
+    # `nexus build` of a large import closure peaks at ~4 GiB RSS, so `-P nproc`
+    # on a high-core, modest-RAM host launches enough concurrent compiles to
+    # exhaust memory — the OOM killer then reaps a compile and the fixture
+    # reports a spurious "compile" failure. Cap workers by available memory
+    # (~5 GiB budget each) and take the smaller of that and the CPU count. Falls
+    # back to the CPU count when MemAvailable is unreadable (non-Linux). Override
+    # explicitly with NEXUS_TEST_JOBS.
+    CPU_JOBS="$( (nproc 2>/dev/null) || echo 4 )"
+    MEM_AVAIL_KB="$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null || echo "")"
+    if [ -n "$MEM_AVAIL_KB" ]; then
+      MEM_JOBS=$(( MEM_AVAIL_KB / 5242880 ))   # 5 GiB per worker, in KiB
+      [ "$MEM_JOBS" -lt 1 ] && MEM_JOBS=1
+      if [ "$MEM_JOBS" -lt "$CPU_JOBS" ]; then JOBS="$MEM_JOBS"; else JOBS="$CPU_JOBS"; fi
+    else
+      JOBS="$CPU_JOBS"
+    fi
     LABEL="parallel x$JOBS"
   fi
   echo "nexus test: discovered $N file(s) under $TEST_PATH [$LABEL]" >&2
