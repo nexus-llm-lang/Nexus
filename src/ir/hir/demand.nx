@@ -26,6 +26,8 @@ import { convert_expr } from "src/ir/hir/convert/core.nx"
 import { with_body } from "src/ir/hir/func_update.nx"
 import * as reach from "src/ir/hir/reachability.nx"
 import { HirError } from "src/diagnostics/error.nx"
+import { StringMap, Found, Missing } from "std:stringmap"
+import * as smap from "std:stringmap"
 
 /** Iterative resolve: filter by reachability, resolve LazyBody, repeat.
  *  Each round discovers new reachable functions from resolved bodies.
@@ -57,14 +59,9 @@ export let resolve_all_lazy_no_filter = fn (funcs: [ HirFunction ]) -> [ HirFunc
 end
 
 let iterative_resolve_go = fn (all_funcs: [ HirFunction ], current: [ HirFunction ], current_filtered: bool,
-    hb: [ HirHandlerBindingEntry ], max_rounds: i64) -> [ HirFunction ] throws { HirError } do
+    hb: [ HirHandlerBindingEntry ], max_rounds: i64)
+    -> [ HirFunction ] throws { HirError } do
   if max_rounds <= 0 then return strip_lazy(funcs: current) end
-  // Round 1: `current` is the raw function list, so derive the reachable set via
-  // strip_lazy → collect_reachable → filter. Rounds ≥2: the prior round already
-  // handed us `merged`, which equals filter(all_funcs, new_reachable) — exactly
-  // what re-deriving would produce (filter and merge_resolved commute, and
-  // collect_reachable over the stripped `merged` reproduces new_reachable). So
-  // skip the redundant O(N²) reachability pass and resolve `current` directly.
   let filtered = if current_filtered then current else
     reach.filter_reachable_functions(functions: all_funcs,
       reachable: reach.collect_reachable(
@@ -81,9 +78,6 @@ let iterative_resolve_go = fn (all_funcs: [ HirFunction ], current: [ HirFunctio
   let grew = list_longer(a: new_filtered, b: filtered)
   let merged = merge_resolved(orig: new_filtered, resolved)
   if grew then
-    // Update all_funcs with resolved versions so next round doesn't re-resolve
-    // already-converted functions. Without this, every round re-runs convert_expr
-    // on the same LazyBody functions, duplicating EagerBody allocations on the heap.
     let updated_all = merge_resolved(orig: all_funcs, resolved)
     return iterative_resolve_go(
       all_funcs: updated_all,
@@ -112,6 +106,13 @@ end
  *  For functions in orig that are still LazyBody, keep them for the next round.
  */
 let merge_resolved = fn (orig: [ HirFunction ], resolved: [ HirFunction ]) -> [ HirFunction ] do
+  let %index = build_resolved_index(resolved, acc: smap.empty())
+  let merged = merge_resolved_go(orig, index: &index)
+  smap.free(map: %index)
+  return merged
+end
+
+let merge_resolved_go = fn (orig: [ HirFunction ], index: &StringMap<HirFunction>) -> [ HirFunction ] do
   match orig do
     | [] -> return []
     | HirFunction(
@@ -139,11 +140,11 @@ let merge_resolved = fn (orig: [ HirFunction ], resolved: [ HirFunction ]) -> [ 
             requires: req
           )
         | LazyBody(_) ->
-          // Take FULL function from resolved (params/ret_type may differ from orig
-          // after desugar_main_if_needed or infer_resolve_constant_type).
-          match lookup_resolved_func(name: n, resolved) do
-            | Some(val: rf) -> rf
-            | None -> HirFunction(
+          /* Take FULL function from resolved (params/ret_type may differ from
+           * orig after desugar_main_if_needed or infer_resolve_constant_type). */
+          match smap.get(map: index, key: n) do
+            | Found(value: rf) -> rf
+            | Missing -> HirFunction(
               name: n,
               type_params: tps,
               params: ps,
@@ -156,13 +157,25 @@ let merge_resolved = fn (orig: [ HirFunction ], resolved: [ HirFunction ]) -> [ 
             )
           end
       end
-      return merged :: merge_resolved(orig: rest, resolved)
+      return merged :: merge_resolved_go(orig: rest, index)
   end
 end
 
-let lookup_resolved_func = fn (name: string, resolved: [ HirFunction ]) -> Option<HirFunction> do
+/** Build the resolved-function index in a single pass, replacing the former
+ *  per-lookup linear scan. The original `lookup_resolved_func` returned the
+ *  FIRST `EagerBody` entry whose name matched and ignored `LazyBody` entries
+ *  entirely (a same-name `LazyBody` was skipped, and a name with only
+ *  `LazyBody` entries yielded `None`). To reproduce that exactly: insert only
+ *  `EagerBody` entries, and only when the name is not yet present, so the
+ *  first matching `EagerBody` wins. A name absent from the map corresponds to
+ *  the former `None`.
+ */
+let build_resolved_index = fn (
+  resolved: [ HirFunction ],
+  acc: %StringMap<HirFunction>
+) -> %StringMap<HirFunction> do
   match resolved do
-    | [] -> return None
+    | [] -> return acc
     | f :: rest ->
       let HirFunction(
         name: rn,
@@ -173,15 +186,13 @@ let lookup_resolved_func = fn (name: string, resolved: [ HirFunction ]) -> Optio
         body: rb,
         _
       ) = f
-      if rn == name then
-        if let EagerBody(_) = rb then
-          return Some(val: f)
-        else
-          return lookup_resolved_func(name, resolved: rest)
-        end
-      else
-        return lookup_resolved_func(name, resolved: rest)
+      let %next = match rb do
+        | EagerBody(_) ->
+          if smap.contains_key(map: &acc, key: rn) then acc
+          else smap.put(map: acc, key: rn, value: f) end
+        | LazyBody(_) -> acc
       end
+      return build_resolved_index(resolved: rest, acc: %next)
   end
 end
 
