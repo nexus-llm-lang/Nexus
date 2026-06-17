@@ -119,6 +119,8 @@ import { validate_main } from "src/typecheck/check/main_validation.nx"
 import { check_cont_no_escape_stmts } from "src/typecheck/check/cont_escape.nx"
 import { build_module_variant_index } from "src/ir/support/variant_index.nx"
 import { ModuleImportIndex } from "src/typecheck/import_index.nx"
+import { StringMap } from "std:stringmap"
+import * as smap from "std:stringmap"
 
 // ─── Public entry point ─────────────────────────────────────────────────────
 
@@ -783,26 +785,33 @@ let collect_fn_names_go = fn (funcs: [ HirFunction ], acc: [ string ]) -> [ stri
   end
 end
 
-/** True if the HirExpr contains any Raise node or any Call to a function in `can_throw`.
- *  Also returns true for calls to names NOT in `all_fns` (unknown callees — conservative). */
-let expr_can_escape = fn (expr: HirExpr, can_throw: [ string ], all_fns: [ string ]) -> bool do
+/** True if the HirExpr contains any Raise node or any Call to a function in
+ *  `can_throw`. Also returns true for calls to names NOT in `all_fns` (unknown
+ *  callees — conservative). Both sets are passed as borrowed `%StringMap<bool>`
+ *  membership tables (keys present iff the name is a member) so the per-Call
+ *  lookup is O(1) instead of an O(N) list scan; the walk only reads them. */
+let expr_can_escape = fn (
+  expr: HirExpr,
+  can_throw: &StringMap<bool>,
+  all_fns: &StringMap<bool>
+) -> bool do
   let HirExpr(node: k, span: _) = expr
   return expr_kind_can_escape(k: k, can_throw, all_fns)
 end
 
 let expr_kind_can_escape = fn (
   k: HirExprKind,
-  can_throw: [ string ],
-  all_fns: [ string ]
+  can_throw: &StringMap<bool>,
+  all_fns: &StringMap<bool>
 ) -> bool do
   match k do
     | Raise(expr: _) -> return true
     | Call(func: f, args: call_args) ->
-      // Unknown callee (not a top-level fn): conservatively treat as can-throw.
-      if !str_list_contains(xs: all_fns, s: f) then return true end
-      // Known callee in can_throw: this call can throw.
-      if str_list_contains(xs: can_throw, s: f) then return true end
-      // Otherwise check the arg expressions for nested raises/calls.
+      /** Unknown callee (not a top-level fn): conservatively treat as can-throw. */
+      if !smap.contains_key(map: all_fns, key: f) then return true end
+      /** Known callee in can_throw: this call can throw. */
+      if smap.contains_key(map: can_throw, key: f) then return true end
+      /** Otherwise check the arg expressions for nested raises/calls. */
       return call_args_can_escape(args: call_args, can_throw, all_fns)
     | BinOp(left: l, op: _, right: r) ->
       if expr_can_escape(expr: l, can_throw, all_fns) then return true end
@@ -852,7 +861,11 @@ let expr_kind_can_escape = fn (
   end
 end
 
-let exprs_can_escape = fn (es: [ HirExpr ], can_throw: [ string ], all_fns: [ string ]) -> bool do
+let exprs_can_escape = fn (
+  es: [ HirExpr ],
+  can_throw: &StringMap<bool>,
+  all_fns: &StringMap<bool>
+) -> bool do
   match es do
     | [] -> return false
     | e :: rest ->
@@ -863,8 +876,8 @@ end
 
 let call_args_can_escape = fn (
   args: [ HirCallArg ],
-  can_throw: [ string ],
-  all_fns: [ string ]
+  can_throw: &StringMap<bool>,
+  all_fns: &StringMap<bool>
 ) -> bool do
   match args do
     | [] -> return false
@@ -876,8 +889,8 @@ end
 
 let named_exprs_can_escape = fn (
   flds: [ HirNamedExpr ],
-  can_throw: [ string ],
-  all_fns: [ string ]
+  can_throw: &StringMap<bool>,
+  all_fns: &StringMap<bool>
 ) -> bool do
   match flds do
     | [] -> return false
@@ -889,8 +902,8 @@ end
 
 let cases_can_escape = fn (
   cs: [ HirMatchCase ],
-  can_throw: [ string ],
-  all_fns: [ string ]
+  can_throw: &StringMap<bool>,
+  all_fns: &StringMap<bool>
 ) -> bool do
   match cs do
     | [] -> return false
@@ -902,8 +915,8 @@ end
 
 let stmts_can_escape = fn (
   stmts: [ HirStmt ],
-  can_throw: [ string ],
-  all_fns: [ string ]
+  can_throw: &StringMap<bool>,
+  all_fns: &StringMap<bool>
 ) -> bool do
   match stmts do
     | [] -> return false
@@ -915,8 +928,8 @@ end
 
 let stmt_kind_can_escape = fn (
   s: HirStmtKind,
-  can_throw: [ string ],
-  all_fns: [ string ]
+  can_throw: &StringMap<bool>,
+  all_fns: &StringMap<bool>
 ) -> bool do
   match s do
     | Let(
@@ -946,8 +959,8 @@ end
 /** True when a function body can escape exceptions under `can_throw`+`all_fns`. */
 let fn_body_can_escape = fn (
   func: HirFunction,
-  can_throw: [ string ],
-  all_fns: [ string ]
+  can_throw: &StringMap<bool>,
+  all_fns: &StringMap<bool>
 ) -> bool do
   let HirFunction(
     name: _,
@@ -962,39 +975,83 @@ let fn_body_can_escape = fn (
     | LazyBody(
       ast_expr: _,
       entries: _
-    ) -> return true  // unknown: conservatively treat as can-throw
+    ) -> return true /** unknown: conservatively treat as can-throw */
     | EagerBody(stmts: stmts) -> return stmts_can_escape(stmts, can_throw, all_fns)
   end
 end
 
-/** One fixpoint step: add to `can_throw` any fn whose body can escape under current `can_throw`. */
+/** Build a membership table from a name list: each name maps to `true`, so a
+ *  present key denotes set membership. Returned linear map is owned by the
+ *  caller and must be freed.
+ */
+let build_name_set = fn (names: [ string ]) -> %StringMap<bool> do
+  return build_name_set_go(names, acc: smap.empty())
+end
+
+let build_name_set_go = fn (
+  names: [ string ],
+  acc: %StringMap<bool>
+) -> %StringMap<bool> do
+  match names do
+    | [] -> return acc
+    | n :: rest ->
+      let %next = smap.put(map: acc, key: n, value: true)
+      return build_name_set_go(names: rest, acc: %next)
+  end
+end
+
+/** One fixpoint step: add to `can_throw` any fn whose body can escape under
+ *  current `can_throw`. The grow-as-we-go `acc` membership test and the
+ *  per-Call `can_throw`/`all_fns` lookups are backed by O(1) maps; the
+ *  round-local `can_throw`/`acc` table is built once here and freed after.
+ */
 let fixpoint_step = fn (
   funcs: [ HirFunction ],
   can_throw: [ string ],
-  all_fns: [ string ]
+  all_fns: &StringMap<bool>
 ) -> [ string ] do
-  return fixpoint_step_go(funcs, can_throw, all_fns, acc: can_throw)
+  let can_throw_set = build_name_set(names: can_throw)
+  let acc_set = build_name_set(names: can_throw)
+  let StepAcc(names: result, set: %final_set) = fixpoint_step_go(
+    funcs,
+    can_throw: &can_throw_set,
+    all_fns,
+    acc: can_throw,
+    acc_set: %acc_set
+  )
+  smap.free(map: %can_throw_set)
+  smap.free(map: %final_set)
+  return result
 end
 
+/** Round accumulator threaded through `fixpoint_step_go`: the `names` list (in
+ *  reverse-prepend order, identical to the former `acc`) plus the linear `set`
+ *  carrying the same names for O(1) dedup. The owned map is returned so the
+ *  caller frees it exactly once.
+ */
+type StepAcc = StepAcc(names: [ string ], set: %StringMap<bool>)
+
+/** `can_throw` is the round-fixed escape table (membership computed against the
+ *  round-start set, exactly as before); `acc`/`acc_set` is the growing result
+ *  whose only role is to dedup names already added this round.
+ */
 let fixpoint_step_go = fn (
   funcs: [ HirFunction ],
-  can_throw: [ string ],
-  all_fns: [ string ],
-  acc: [ string ]
-) -> [ string ] do
+  can_throw: &StringMap<bool>,
+  all_fns: &StringMap<bool>,
+  acc: [ string ],
+  acc_set: %StringMap<bool>
+) -> %StepAcc do
   match funcs do
-    | [] -> return acc
+    | [] -> return StepAcc(names: acc, set: %acc_set)
     | func :: rest ->
       let HirFunction(name: n, _) = func
-      let new_acc = if !str_list_contains(
-        xs: acc,
-        s: n
-      ) && fn_body_can_escape(func, can_throw, all_fns) then
-        n :: acc
-      else
-        acc
+      let already = smap.contains_key(map: &acc_set, key: n)
+      if !already && fn_body_can_escape(func, can_throw, all_fns) then
+        let %next_set = smap.put(map: %acc_set, key: n, value: true)
+        return fixpoint_step_go(funcs: rest, can_throw, all_fns, acc: n :: acc, acc_set: %next_set)
       end
-      return fixpoint_step_go(funcs: rest, can_throw, all_fns, acc: new_acc)
+      return fixpoint_step_go(funcs: rest, can_throw, all_fns, acc, acc_set: %acc_set)
   end
 end
 
@@ -1002,7 +1059,7 @@ end
 let fixpoint_can_throw = fn (
   funcs: [ HirFunction ],
   can_throw: [ string ],
-  all_fns: [ string ]
+  all_fns: &StringMap<bool>
 ) -> [ string ] do
   let next = fixpoint_step(funcs, can_throw, all_fns)
   let changed = list.length(xs: next) != list.length(xs: can_throw)
@@ -1016,21 +1073,29 @@ end
  *  Returns a list of function names that cannot throw (directly or transitively).
  */
 let build_fn_pure_set = fn (funcs: [ HirFunction ], exts: [ HirExternal ]) -> [ string ] do
-  // Externals are WASM imports with no body — they can never contain a `Raise`,
-  // so an external whose declared throw row is empty/closed is provably
-  // non-throwing. Fold those names into `all_fns` so a call to (e.g.) a pure
-  // `w_proc_exit` intrinsic is treated as a known non-escaping callee rather
-  // than the conservative unknown-callee `return true`. Without this, handler
-  // arm bodies that delegate to such intrinsics under the closed throw row
-  // pinned by `check_arm_body` would be spuriously rejected.
+  /** Externals are WASM imports with no body — they can never contain a `Raise`,
+   *  so an external whose declared throw row is empty/closed is provably
+   *  non-throwing. Fold those names into `all_fns` so a call to (e.g.) a pure
+   *  `w_proc_exit` intrinsic is treated as a known non-escaping callee rather
+   *  than the conservative unknown-callee `return true`. Without this, handler
+   *  arm bodies that delegate to such intrinsics under the closed throw row
+   *  pinned by `check_arm_body` would be spuriously rejected.
+   */
   let nothrow_ext_names = collect_nothrow_external_names(exts)
   let all_fns = list_append(xs: collect_fn_names(funcs), ys: nothrow_ext_names)
-  // Initial can_throw: functions whose bodies directly contain Raise or call unknowns.
-  let initial_can_throw = initial_can_throw_set(funcs, all_fns)
-  // Fixpoint: propagate transitively.
-  let final_can_throw = fixpoint_can_throw(funcs, can_throw: initial_can_throw, all_fns)
-  // Pure set = all_fns minus can_throw. (External names carry through too — a
-  // closed-throw external call site admits them just like a pure top-level fn.)
+  /** `all_fns_set` is built once and shared (read-only) by every escape walk —
+   *  initial pass and every fixpoint round — so the per-Call callee-known test
+   *  is O(1). It outlives the whole computation and is freed at the end.
+   */
+  let all_fns_set = build_name_set(names: all_fns)
+  /** Initial can_throw: functions whose bodies directly contain Raise or call unknowns. */
+  let initial_can_throw = initial_can_throw_set(funcs, all_fns: &all_fns_set)
+  /** Fixpoint: propagate transitively. */
+  let final_can_throw = fixpoint_can_throw(funcs, can_throw: initial_can_throw, all_fns: &all_fns_set)
+  smap.free(map: %all_fns_set)
+  /** Pure set = all_fns minus can_throw. (External names carry through too — a
+   *  closed-throw external call site admits them just like a pure top-level fn.)
+   */
   return filter_not_in(xs: all_fns, exclude: final_can_throw)
 end
 
@@ -1098,37 +1163,51 @@ let list_append = fn (xs: [ string ], ys: [ string ]) -> [ string ] do
   end
 end
 
-let initial_can_throw_set = fn (funcs: [ HirFunction ], all_fns: [ string ]) -> [ string ] do
-  return initial_can_throw_go(funcs, all_fns, acc: [])
+let initial_can_throw_set = fn (
+  funcs: [ HirFunction ],
+  all_fns: &StringMap<bool>
+) -> [ string ] do
+  let empty_can_throw = smap.empty()
+  let result = initial_can_throw_go(funcs, can_throw: &empty_can_throw, all_fns, acc: [])
+  smap.free(map: %empty_can_throw)
+  return result
 end
 
 let initial_can_throw_go = fn (
   funcs: [ HirFunction ],
-  all_fns: [ string ],
+  can_throw: &StringMap<bool>,
+  all_fns: &StringMap<bool>,
   acc: [ string ]
 ) -> [ string ] do
   match funcs do
     | [] -> return acc
     | func :: rest ->
       let HirFunction(name: n, _) = func
-      let new_acc = if fn_body_can_escape(func, can_throw: [], all_fns) then
+      let new_acc = if fn_body_can_escape(func, can_throw, all_fns) then
         n :: acc
       else
         acc
       end
-      return initial_can_throw_go(funcs: rest, all_fns, acc: new_acc)
+      return initial_can_throw_go(funcs: rest, can_throw, all_fns, acc: new_acc)
   end
 end
 
 let filter_not_in = fn (xs: [ string ], exclude: [ string ]) -> [ string ] do
-  return filter_not_in_go(xs, exclude, acc: [])
+  let exclude_set = build_name_set(names: exclude)
+  let result = filter_not_in_go(xs, exclude: &exclude_set, acc: [])
+  smap.free(map: %exclude_set)
+  return result
 end
 
-let filter_not_in_go = fn (xs: [ string ], exclude: [ string ], acc: [ string ]) -> [ string ] do
+let filter_not_in_go = fn (
+  xs: [ string ],
+  exclude: &StringMap<bool>,
+  acc: [ string ]
+) -> [ string ] do
   match xs do
     | [] -> return acc
     | x :: rest ->
-      let new_acc = if str_list_contains(xs: exclude, s: x) then acc else x :: acc end
+      let new_acc = if smap.contains_key(map: exclude, key: x) then acc else x :: acc end
       return filter_not_in_go(xs: rest, exclude, acc: new_acc)
   end
 end
