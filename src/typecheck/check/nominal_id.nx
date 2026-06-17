@@ -1,0 +1,224 @@
+/**
+ * typecheck/check/nominal_id: module-qualified nominal identity for
+ * user-declared enum types.
+ *
+ * Enums are NOMINAL: two enums declared in different modules under the same
+ * bare name (`Box` in module A and `Box` in module B) are DISTINCT types, and
+ * a value of one must not be assignable to the other. The unifier compares
+ * `TyUserDefined` by name, so the bare name alone collapses two distinct
+ * declarations into one — a memory-unsafe type-confusion hole.
+ *
+ * The discriminator is the DECLARING module (matching `EnumDef.module`), not
+ * the referencing module. `qualify_enum_type` rewrites the name of every
+ * reference to a user-declared enum into the canonical form
+ * `<declaring-module>#<bare-name>`, resolving the declaring module from the
+ * REFERENCING module's view:
+ *   1. the referencing module's OWN declaration of the bare name, else
+ *   2. the module it imports the bare name from (selective-import edge), else
+ *   3. unresolved — left bare (built-ins List/Option/Result/Exn whose module is
+ *      `""`, type parameters, or names reached only through a wildcard alias).
+ *
+ * Two separately-declared same-name enums resolve (each from its own declaring
+ * module, tier 1) to DIFFERENT canonical names and no longer unify. A single
+ * enum shared by import resolves (from every referencing module, tier 1 in its
+ * home and tier 2 elsewhere) to the SAME canonical name and still unifies.
+ *
+ * The unifier (`src/typecheck/unify.nx`) treats a still-bare name as a wildcard
+ * over the module, so an unresolved reference remains as permissive as before
+ * (no over-rejection); only two names that are BOTH qualified and disagree on
+ * the declaring module are rejected.
+ */
+
+import * as list from "std:list"
+import {
+  TypeExpr,
+  TyUserDefined,
+  TyVar,
+  TyArrow,
+  TyRef,
+  TyLinear,
+  TyLazy,
+  TyBorrow,
+  TyArray,
+  TyList,
+  TyRecord,
+  TyRow,
+  TyHandler,
+  NamedType,
+  EnumDef
+} from "src/types/type_expr.nx"
+import { Option, Some, None } from "std:option"
+import {
+  ModuleImportIndex, resolve_import_source
+} from "src/typecheck/import_index.nx"
+import * as str from "std:str"
+
+/** Separator between declaring module and bare name in a canonical nominal
+ *  identity. `#` cannot appear in a source identifier, so it never collides
+ *  with a real type name. */
+export let nominal_sep = "#"
+
+/** One declared enum: bare `name` declared by module `module`. Built once from
+ *  the program's `EnumDef` list. A bare name may appear with several distinct
+ *  modules — that is exactly the same-name-different-module case this guards. */
+export type EnumDecl = EnumDecl(name: string, module: string)
+
+/** Resolution environment: every enum declaration's (name, module) plus the
+ *  per-module import edges. */
+export type NominalEnv = NominalEnv(decls: [ EnumDecl ], imports: ModuleImportIndex)
+
+let decls_of_enums = fn (defs: [ EnumDef ], acc: [ EnumDecl ]) -> [ EnumDecl ] do
+  match defs do
+    | [] -> return acc
+    | EnumDef(name: n, is_public: _, is_opaque: _, type_params: _, variants: _, layout_variants: _, module: m) :: rest ->
+      return decls_of_enums(defs: rest, acc: EnumDecl(name: n, module: m) :: acc)
+  end
+end
+
+/** Build the nominal-identity environment from the program's enum defs and the
+ *  module import index. */
+export let build_nominal_env = fn (
+  defs: [ EnumDef ],
+  imports: ModuleImportIndex
+) -> NominalEnv do
+  return NominalEnv(decls: decls_of_enums(defs, acc: []), imports)
+end
+
+/** True when bare `name` is declared by `module` (an own-module declaration). */
+let declared_in = fn (decls: [ EnumDecl ], name: string, module: string) -> bool do
+  match decls do
+    | [] -> return false
+    | EnumDecl(name: n, module: m) :: rest ->
+      if n == name && m == module && str.length(s: m) > 0 then return true end
+      return declared_in(decls: rest, name, module)
+  end
+end
+
+/** Count the DISTINCT modules that declare bare `name`. Two or more is a
+ *  cross-module same-name collision — the only case nominal qualification must
+ *  resolve. A name declared by exactly one module is unambiguous and is left
+ *  bare so qualification perturbs nothing outside the genuine collision set. */
+let distinct_decl_modules = fn (decls: [ EnumDecl ], name: string, seen: [ string ]) -> i64 do
+  match decls do
+    | [] -> return list.length(xs: seen)
+    | EnumDecl(name: n, module: m) :: rest ->
+      if n == name && str.length(s: m) > 0 && !list.str_member(xs: seen, s: m) then
+        return distinct_decl_modules(decls: rest, name, seen: m :: seen)
+      end
+      return distinct_decl_modules(decls: rest, name, seen)
+  end
+end
+
+/** True when bare `name` is declared by more than one module. */
+let is_collision = fn (decls: [ EnumDecl ], name: string) -> bool do
+  return distinct_decl_modules(decls, name, seen: []) > 1
+end
+
+/** Resolve the declaring module for bare `name` as seen from `ref_module`:
+ *  own-module declaration first, then the import source, else `None`. Only
+ *  COLLIDING names (declared by 2+ modules) are resolved; an unambiguous
+ *  single-module name returns `None` and stays bare, so qualification never
+ *  touches a type that has no same-name twin. A `None` result (built-in,
+ *  type-var, unambiguous, or wildcard-only reference) leaves the name bare. */
+export let resolve_decl_module = fn (
+  env: NominalEnv,
+  ref_module: string,
+  name: string
+) -> Option<string> do
+  let NominalEnv(decls, imports) = env
+  if !is_collision(decls, name) then return None end
+  if declared_in(decls, name, module: ref_module) then
+    return Some(val: ref_module)
+  end
+  match resolve_import_source(idx: imports, importer: ref_module, name) do
+    | Some(val: src) ->
+      if declared_in(decls, name, module: src) then return Some(val: src) end
+      return None
+    | None -> return None
+  end
+end
+
+/** Qualify the bare `name` of a user-declared enum reference into its canonical
+ *  `<module>#<name>` form, leaving a name that is already qualified, a built-in,
+ *  a type parameter, or an unresolved reference untouched. `vars` are the
+ *  type-parameter names in scope — a name matching one is a type variable, not
+ *  an enum reference, so it is left bare. */
+let qualify_name = fn (
+  name: string,
+  ref_module: string,
+  env: NominalEnv,
+  vars: [ string ]
+) -> string do
+  if str.contains(s: name, sub: nominal_sep) then return name end
+  if list.str_member(xs: vars, s: name) then return name end
+  match resolve_decl_module(env, ref_module, name) do
+    | Some(val: m) -> return m ++ nominal_sep ++ name
+    | None -> return name
+  end
+end
+
+/** Structurally rewrite every user-declared enum reference in `typ` to its
+ *  canonical module-qualified name, resolved from `ref_module`. Mirrors the
+ *  shape of `convert_ud_to_var` so every type-bearing slot is reached. */
+export let qualify_enum_type = fn (
+  typ: TypeExpr,
+  ref_module: string,
+  env: NominalEnv,
+  vars: [ string ]
+) -> TypeExpr do
+  match typ do
+    | TyUserDefined(name: n, args: targs) ->
+      return TyUserDefined(
+        name: qualify_name(name: n, ref_module, env, vars),
+        args: qualify_type_list(types: targs, ref_module, env, vars)
+      )
+    | TyArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
+      /** The `requires` / `throw_row` slots are effect rows of caps and
+       *  exceptions, NOT value types — they must NOT be qualified (an exception
+       *  is registered as an enum variant, so qualifying its name would corrupt
+       *  throws-row unification). Only the value-carrying params/ret descend. */
+      return TyArrow(
+        params: qualify_named_types(nts: ps, ref_module, env, vars),
+        ret: qualify_enum_type(typ: r, ref_module, env, vars),
+        requires: req,
+        throw_row: thr
+      )
+    | TyList(elem: e) -> return TyList(elem: qualify_enum_type(typ: e, ref_module, env, vars))
+    | TyArray(elem: e) -> return TyArray(elem: qualify_enum_type(typ: e, ref_module, env, vars))
+    | TyRef(inner: i) -> return TyRef(inner: qualify_enum_type(typ: i, ref_module, env, vars))
+    | TyLinear(inner: i) -> return TyLinear(inner: qualify_enum_type(typ: i, ref_module, env, vars))
+    | TyLazy(inner: i, require_row: rq, throw_row: thr) -> return TyLazy(
+        inner: qualify_enum_type(typ: i, ref_module, env, vars),
+        require_row: rq,
+        throw_row: thr
+      )
+    | TyBorrow(inner: i) -> return TyBorrow(inner: qualify_enum_type(typ: i, ref_module, env, vars))
+    | TyRecord(fields: fs) -> return TyRecord(fields: qualify_named_types(nts: fs, ref_module, env, vars))
+    | _ -> return typ
+  end
+end
+
+let qualify_type_list = fn (
+  types: [ TypeExpr ],
+  ref_module: string,
+  env: NominalEnv,
+  vars: [ string ]
+) -> [ TypeExpr ] do
+  match types do
+    | [] -> return []
+    | t :: rest -> return qualify_enum_type(typ: t, ref_module, env, vars) :: qualify_type_list(types: rest, ref_module, env, vars)
+  end
+end
+
+export let qualify_named_types = fn (
+  nts: [ NamedType ],
+  ref_module: string,
+  env: NominalEnv,
+  vars: [ string ]
+) -> [ NamedType ] do
+  match nts do
+    | [] -> return []
+    | NamedType(name: nm, typ: t) :: rest ->
+      return NamedType(name: nm, typ: qualify_enum_type(typ: t, ref_module, env, vars)) :: qualify_named_types(nts: rest, ref_module, env, vars)
+  end
+end

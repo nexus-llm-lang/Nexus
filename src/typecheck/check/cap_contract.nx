@@ -50,6 +50,7 @@ import * as subst from "src/typecheck/subst.nx"
 import * as occurs from "src/typecheck/check/occurs.nx"
 import { base_name_of } from "src/typecheck/tcwf.nx"
 import { alias_src_name, hir_params_to_named_types } from "src/typecheck/check/registration.nx"
+import { NominalEnv, qualify_enum_type, qualify_named_types } from "src/typecheck/check/nominal_id.nx"
 import * as infer from "src/typecheck/infer.nx"
 import { TypeError, TypeMismatch } from "src/typecheck/errors.nx"
 import { Span } from "src/types/span.nx"
@@ -62,7 +63,8 @@ import { Span } from "src/types/span.nx"
 export let derive_generic_cap_contracts = fn (
   state: CheckState,
   funcs: [ HirFunction ],
-  caps: [ HirCap ]
+  caps: [ HirCap ],
+  nominal: NominalEnv
 ) -> CheckState throws { TypeError } do
   let participants = collect_participants(funcs, caps, acc: [])
   if list.is_empty(xs: participants) then return state end
@@ -70,7 +72,7 @@ export let derive_generic_cap_contracts = fn (
   // change at most once per generic-cap entry; 2× participant count + a slack
   // term is a generous linear safety net (mirrors effect_analysis's fuel).
   let n = list.length(xs: participants)
-  return derive_fixpoint(state, participants, caps, fuel: 2 * n + 4)
+  return derive_fixpoint(state, participants, caps, fuel: 2 * n + 4, nominal)
 end
 
 /** Functions eligible for contract derivation: an eager body whose declared
@@ -138,11 +140,12 @@ let derive_fixpoint = fn (
   state: CheckState,
   participants: [ HirFunction ],
   caps: [ HirCap ],
-  fuel: i64
+  fuel: i64,
+  nominal: NominalEnv
 ) -> CheckState throws { TypeError } do
   if fuel <= 0 then return state end
-  let SweepResult(state: st1, changed) = derive_sweep(state, participants, caps, changed: false)
-  if changed then return derive_fixpoint(state: st1, participants, caps, fuel: fuel - 1) end
+  let SweepResult(state: st1, changed) = derive_sweep(state, participants, caps, changed: false, nominal)
+  if changed then return derive_fixpoint(state: st1, participants, caps, fuel: fuel - 1, nominal) end
   return st1
 end
 
@@ -152,14 +155,15 @@ let derive_sweep = fn (
   state: CheckState,
   participants: [ HirFunction ],
   caps: [ HirCap ],
-  changed: bool
+  changed: bool,
+  nominal: NominalEnv
 ) -> SweepResult throws { TypeError } do
   match participants do
     | [] -> return SweepResult(state, changed)
     | f :: rest ->
-      let DeriveOne(state: st1, changed: c1) = derive_one(state, func: f, caps)
+      let DeriveOne(state: st1, changed: c1) = derive_one(state, func: f, caps, nominal)
       let now = if c1 then true else changed end
-      return derive_sweep(state: st1, participants: rest, caps, changed: now)
+      return derive_sweep(state: st1, participants: rest, caps, changed: now, nominal)
   end
 end
 
@@ -169,18 +173,25 @@ type DeriveOne = DeriveOne(state: CheckState, changed: bool)
  *  fresh-var ambient require row, then re-publish its scheme if the contract
  *  changed. Inference failure ⇒ keep the existing scheme (real error reported by
  *  the body-check pass). */
-let derive_one = fn (state: CheckState, func: HirFunction, caps: [ HirCap ]) -> DeriveOne throws { TypeError } do
+let derive_one = fn (state: CheckState, func: HirFunction, caps: [ HirCap ], nominal: NominalEnv) -> DeriveOne throws { TypeError } do
   let HirFunction(
     name, type_params: tps, params, ret_type: ret, throw_row: tw,
-    body: fbody, span: fn_span, file: _, requires: req
+    body: fbody, span: fn_span, file: ffile, requires: req
   ) = func
   let body = match fbody do | EagerBody(stmts: s) -> s | LazyBody(_) -> [] end
   // Mirror check_function's body environment / row setup, except the require row
   // carries a fresh type var per generic-cap element arg so cap-call coverage
   // can pin it (the laundered element type is captured by the body subst).
+  /** Re-publishing this function's scheme must preserve the module-qualified
+   *  nominal identity that register_functions stamped on its parameter/return
+   *  types (else a generic-cap participant would revert to bare same-name
+   *  enums). */
   let body_params = occurs.convert_hir_params(params, vars: tps)
-  let arrow_params = occurs.convert_named_types(nts: hir_params_to_named_types(params), vars: tps)
-  let conv_ret = occurs.convert_ud_to_var(typ: ret, vars: tps)
+  let arrow_params = occurs.convert_named_types(
+    nts: qualify_named_types(nts: hir_params_to_named_types(params), ref_module: ffile, env: nominal, vars: tps),
+    vars: tps
+  )
+  let conv_ret = occurs.convert_ud_to_var(typ: qualify_enum_type(typ: ret, ref_module: ffile, env: nominal, vars: tps), vars: tps)
   let conv_tw = occurs.convert_ud_to_var(typ: tw, vars: tps)
   let conv_req = occurs.convert_ud_to_var(typ: req, vars: tps)
   let AmbientRow(state: st_a, row: ambient_fresh) =
