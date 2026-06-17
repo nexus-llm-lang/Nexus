@@ -359,6 +359,35 @@ let divergent_arm_is_strict = fn (then_branch: [ HirStmt ], st: LinState) -> boo
   end
 end
 
+/** True when a bare expression statement is a direct `Call` whose result is a
+ *  freshly-produced, non-auto-droppable linear value that the statement
+ *  discards (no binding, no consumer) — a leak, symmetric to the let-bound
+ *  `let x = mk()` rejection and the `let _ = e` discard rejection.
+ *
+ *  Restricted to the `Call` shape (the sibling `let _ = e` plug uses the same
+ *  restriction): a bare call returning a `%`-linear, non-auto-droppable type
+ *  leaves the produced resource unconsumable (nothing binds it). The return
+ *  type is read directly from the callee signature; a `%`-wrapped primitive
+ *  (`%i64`) is a linear binding type yet auto-droppable, so discarding it is
+ *  sound and excluded. Other expression shapes (Ctor/Record/Array/if/match)
+ *  are NOT inspected here: their result-linearity is liveness-dependent and a
+ *  non-tail occurrence is governed by the existing end-of-scope and branch-join
+ *  checks. */
+let stmt_expr_result_is_freshly_linear = fn (
+  expr: HirExpr, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> bool do
+  let HirExpr(node: nd, span: _) = expr
+  match nd do
+    | Call(func: f, args: _) ->
+      match sig_lookup(sigs, name: f) do
+        | Some(val: SigEntry(name: _, type_params: _, param_labels: _, param_types: _, ret_type: rt, throw_row: _)) ->
+          return is_linear_binding_type(t: rt, tdefs, enum_defs) && !is_auto_droppable(t: rt)
+        | None -> return false
+      end
+    | _ -> return false
+  end
+end
+
 // ─── Statement walk ──────────────────────────────────────────────────────────
 
 let check_stmts = fn (
@@ -367,6 +396,28 @@ let check_stmts = fn (
   match stmts do
     | [] -> return st
     | HirStmt(node: nd, span: sp) :: rest ->
+      // P-Block leak symmetry: a bare expression statement that is a direct
+      // call returning a freshly-produced, non-auto-droppable linear value
+      // (`mk() -> %B` with no binding) discards that linear without consuming
+      // it — exactly the leak the let-bound form (`let x = mk()`) and the
+      // `let _ = mk()` discard form reject (E2007). Fire only on a NON-tail
+      // statement (`rest` non-empty): the LAST statement of a block is in
+      // value position — its result flows out to the enclosing context (a
+      // `let`, another branch, or the function-end consumption check), which
+      // already governs its consumption. A common bare unit/i64-returning call
+      // (`Console.println(…)`, `foo()`) classifies as non-linear and is left
+      // untouched.
+      match rest do
+        | [] -> ()
+        | _ :: _ ->
+          match nd do
+            | Expr(expr: e) ->
+              if stmt_expr_result_is_freshly_linear(expr: e, sigs, tdefs, enum_defs) then
+                throw LinearUnused(name: "_", span: sp)
+              end
+            | _ -> ()
+          end
+      end
       let st1 = check_stmt(stmt: nd, st, sigs, tdefs, enum_defs, span: sp, at_stmt_level: true)
       return check_stmts(stmts: rest, st: st1, sigs, tdefs, enum_defs)
   end
