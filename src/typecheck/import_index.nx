@@ -25,20 +25,61 @@ import { extract_imports } from "src/ir/shared/resolve.nx"
 import { resolve_import_path } from "src/ir/shared/package.nx"
 import { Option, Some, None } from "std:option"
 import * as list from "std:list"
+import { smap_new, smap_put_str, smap_get_str, smap_has_str } from "std:runtime/collection"
+import { value_to_i64, value_of_i64 } from "std:runtime/lazy"
 
 /** One in-scope binding: module `importer` brought bare `name` into scope from
  *  module `source` (both physical paths, `source` matching `EnumDef.module`). */
 export type ImportEdge = ImportEdge(importer: string, name: string, source: string)
 
-/** All import edges of a program, flat. Resolution scans for the edge whose
- *  `importer` is the module under check and whose `name` matches. */
-export type ModuleImportIndex = ModuleImportIndex(edges: [ ImportEdge ])
+/** All import edges of a program, flat, plus an O(1) lookup map.
+ *
+ *  `edges` retains the full edge list (build provenance / debuggability).
+ *  `map_id` is a `std:runtime/collection` string-map id keyed by
+ *  `importer ++ "\0" ++ name` whose value channel holds the `source` string
+ *  (punned through `value_to_i64` / `value_of_i64`, the same idiom the global
+ *  signature map uses for its `Scheme` values). The `\0` separator cannot occur
+ *  inside a module path or a bare type/ctor name, so distinct (importer, name)
+ *  pairs never collide on a key. Built once at construction; carried unchanged
+ *  by value (every `CheckState` copy shares the one underlying map id, exactly
+ *  like `global_sigs`), and never freed. */
+export type ModuleImportIndex = ModuleImportIndex(edges: [ ImportEdge ], map_id: i64)
 
-/** An empty index: every lookup misses, so resolution falls straight through to
- *  the caller's flat fallback (byte-identical to pre-index behaviour). Carried
- *  by a freshly built `CheckState` before the real index is installed. */
+/** An empty index: a fresh (empty) lookup map, so every lookup misses and
+ *  resolution falls straight through to the caller's flat fallback
+ *  (byte-identical to pre-index behaviour). Carried by a freshly built
+ *  `CheckState` before the real index is installed. */
 export let empty_module_import_index = fn () -> ModuleImportIndex do
-  return ModuleImportIndex(edges: [])
+  return ModuleImportIndex(edges: [], map_id: smap_new())
+end
+
+/** Build an index from an explicit edge list (indexing into a fresh map). The
+ *  edge list is the build/debug provenance; the map drives O(1) resolution. */
+export let module_import_index_from_edges = fn (edges: [ ImportEdge ]) -> ModuleImportIndex do
+  let map_id = index_edges(edges, map_id: smap_new())
+  return ModuleImportIndex(edges, map_id)
+end
+
+/** Map key for an (importer, name) pair. The `\0` separator avoids collisions:
+ *  no module path or bare name contains a NUL byte, so the key is injective. */
+let edge_key = fn (importer: string, name: string) -> string do
+  return importer ++ "\0" ++ name
+end
+
+/** Index all edges into a fresh string-map, FIRST edge per key wins (matching
+ *  the old `find_edge` first-match scan). A module imports a given bare name
+ *  from at most one source, so a duplicate key is benign; the guard makes the
+ *  map a faithful replacement regardless. */
+let index_edges = fn (edges: [ ImportEdge ], map_id: i64) -> i64 do
+  match edges do
+    | [] -> return map_id
+    | ImportEdge(importer: i, name: n, source: s) :: rest ->
+      let key = edge_key(importer: i, name: n)
+      if !smap_has_str(id: map_id, key) then
+        smap_put_str(id: map_id, key, value: value_to_i64(a_x: s))
+      end
+      return index_edges(edges: rest, map_id)
+  end
 end
 
 let edges_of_import = fn (importer: string, imp: ImportDef, acc: [ ImportEdge ]) -> [ ImportEdge ] do
@@ -93,7 +134,7 @@ export let build_module_import_index = fn (
 ) -> ModuleImportIndex do
   let cache_edges = edges_of_cache(cache, acc: [])
   let all_edges = edges_of_module(importer: entry_source, defs: entry_defs, acc: cache_edges)
-  return ModuleImportIndex(edges: all_edges)
+  return module_import_index_from_edges(edges: all_edges)
 end
 
 /** Source module that `importer` imports bare `name` from, or `None` when
@@ -105,15 +146,10 @@ export let resolve_import_source = fn (
   importer: string,
   name: string
 ) -> Option<string> do
-  let ModuleImportIndex(edges) = idx
-  return find_edge(edges, importer, name)
-end
-
-let find_edge = fn (edges: [ ImportEdge ], importer: string, name: string) -> Option<string> do
-  match edges do
-    | [] -> return None
-    | ImportEdge(importer: i, name: n, source: s) :: rest ->
-      if i == importer && n == name then return Some(val: s) end
-      return find_edge(edges: rest, importer, name)
+  let ModuleImportIndex(edges: _, map_id) = idx
+  let key = edge_key(importer, name)
+  if smap_has_str(id: map_id, key) then
+    return Some(val: value_of_i64(a_x: smap_get_str(id: map_id, key, default_val: 0)))
   end
+  return None
 end
