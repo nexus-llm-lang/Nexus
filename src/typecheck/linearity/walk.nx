@@ -165,7 +165,7 @@ let check_function_with_kont = fn (
     name: fn_name,
     type_params: _,
     params: ps,
-    ret_type: _,
+    ret_type: fn_ret,
     throw_row: _,
     body: b,
     span: sp,
@@ -215,6 +215,22 @@ let check_function_with_kont = fn (
         )
         let st1 = lin_push_frame(st: st0)
         let st2 = check_stmts(stmts, st: st1, sigs, tdefs, enum_defs)
+        // Tail-statement leak: the function body's LAST statement is in value
+        // position — its result flows to the caller IFF the declared return
+        // type is itself linear. When the function returns a NON-linear type
+        // (e.g. `unit`) but the tail bare expression produces a freshly-made,
+        // non-auto-droppable linear, that result is discarded, not returned —
+        // exactly the let-bound `let x = mk()` leak. (Non-tail bare statements
+        // are caught in check_stmts.)
+        if !is_linear_binding_type(t: fn_ret, tdefs, enum_defs) then
+          match block_tail_value_expr(stmts: stmts) do
+            | None -> ()
+            | Some(val: te) ->
+              if stmt_expr_result_is_freshly_linear(expr: te, sigs, tdefs, enum_defs) then
+                throw LinearUnused(name: "_", span: sp)
+              end
+          end
+        end
         // Function-end consumption check: any linear param or local left
         // live raises Unused.
         return require_empty_or_droppable(vars: lin_state_vars(st: st2), params: ps, span: sp)
@@ -359,20 +375,42 @@ let divergent_arm_is_strict = fn (then_branch: [ HirStmt ], st: LinState) -> boo
   end
 end
 
-/** True when a bare expression statement is a direct `Call` whose result is a
- *  freshly-produced, non-auto-droppable linear value that the statement
- *  discards (no binding, no consumer) — a leak, symmetric to the let-bound
- *  `let x = mk()` rejection and the `let _ = e` discard rejection.
+/** Tail value-expression of a statement block: the `e` of a trailing
+ *  `Expr(e)` or `Return(e)`. `None` for any other tail (`Let`/`Assign`/`Try`
+ *  or empty block) whose result-linearity we cannot read off here. */
+let block_tail_value_expr = fn (stmts: [ HirStmt ]) -> Option<HirExpr> do
+  match last_stmt(stmts) do
+    | None -> return None
+    | Some(val: HirStmt(node: nd, span: _)) ->
+      match nd do
+        | Expr(expr: e) -> return Some(val: e)
+        | Return(expr: e) -> return Some(val: e)
+        | _ -> return None
+      end
+  end
+end
+
+/** True when a bare expression statement produces a freshly-produced,
+ *  non-auto-droppable linear value that the statement discards (no binding, no
+ *  consumer) — a leak, symmetric to the let-bound `let x = mk()` rejection and
+ *  the `let _ = e` discard rejection.
  *
- *  Restricted to the `Call` shape (the sibling `let _ = e` plug uses the same
- *  restriction): a bare call returning a `%`-linear, non-auto-droppable type
- *  leaves the produced resource unconsumable (nothing binds it). The return
- *  type is read directly from the callee signature; a `%`-wrapped primitive
- *  (`%i64`) is a linear binding type yet auto-droppable, so discarding it is
- *  sound and excluded. Other expression shapes (Ctor/Record/Array/if/match)
- *  are NOT inspected here: their result-linearity is liveness-dependent and a
- *  non-tail occurrence is governed by the existing end-of-scope and branch-join
- *  checks. */
+ *  The decision is on the EXPRESSION'S RESULT TYPE being a non-auto-droppable
+ *  linear, not on a single syntactic head:
+ *    • `Call f` — read the result directly from the callee signature; a
+ *      `%`-wrapped primitive (`%i64`) is a linear binding type yet
+ *      auto-droppable, so discarding it is sound and excluded.
+ *    • `If`/`Match` — a result-producing branch form. Its result is freshly
+ *      linear iff EVERY value-producing branch tail is itself freshly linear
+ *      (recursively). The all-branches requirement is conservative: a mixed
+ *      `if … then mk() else 0 end` (one non-linear arm) is NOT rejected, only
+ *      the uniformly-linear case (`if … then mk() else mk() end`) where the
+ *      produced linear is genuinely unconsumable. An `if` without an `else`
+ *      yields unit on the missing arm, so it never qualifies.
+ *
+ *  Other shapes (Ctor/Record/Array/…) are NOT inspected: their
+ *  result-linearity is liveness-dependent and a non-tail occurrence is governed
+ *  by the existing end-of-scope and branch-join checks. */
 let stmt_expr_result_is_freshly_linear = fn (
   expr: HirExpr, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
 ) -> bool do
@@ -384,7 +422,43 @@ let stmt_expr_result_is_freshly_linear = fn (
           return is_linear_binding_type(t: rt, tdefs, enum_defs) && !is_auto_droppable(t: rt)
         | None -> return false
       end
+    | If(cond: _, then_branch: tb, else_branch: eb) ->
+      // No else: missing arm yields unit → result not uniformly linear.
+      match eb do
+        | None -> return false
+        | Some(val: ebs) ->
+          let then_lin = match block_tail_value_expr(stmts: tb) do
+            | None -> false
+            | Some(val: te) -> stmt_expr_result_is_freshly_linear(expr: te, sigs, tdefs, enum_defs)
+          end
+          if !then_lin then return false end
+          match block_tail_value_expr(stmts: ebs) do
+            | None -> return false
+            | Some(val: ee) -> return stmt_expr_result_is_freshly_linear(expr: ee, sigs, tdefs, enum_defs)
+          end
+      end
+    | Match(target: _, cases: cs) -> return match_cases_all_freshly_linear(cases: cs, sigs, tdefs, enum_defs)
     | _ -> return false
+  end
+end
+
+/** True iff there is at least one case and EVERY case's value tail is itself a
+ *  freshly-produced non-auto-droppable linear. Empty match (no arms) → false. */
+let match_cases_all_freshly_linear = fn (
+  cases: [ HirMatchCase ], sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> bool do
+  match cases do
+    | [] -> return false
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      let head_lin = match block_tail_value_expr(stmts: b) do
+        | None -> false
+        | Some(val: te) -> stmt_expr_result_is_freshly_linear(expr: te, sigs, tdefs, enum_defs)
+      end
+      if !head_lin then return false end
+      match rest do
+        | [] -> return true
+        | _ :: _ -> return match_cases_all_freshly_linear(cases: rest, sigs, tdefs, enum_defs)
+      end
   end
 end
 
