@@ -19,6 +19,7 @@ import {
   TyRow,
   TyVar,
   TyUnit,
+  TyRecord,
   TyHandler,
   NamedType,
   RecordDef
@@ -41,6 +42,7 @@ import * as subst from "src/typecheck/subst.nx"
 import * as tcwf from "src/typecheck/tcwf.nx"
 import { str_list_contains, convert_ud_to_var, convert_named_types } from "src/typecheck/check/occurs.nx"
 import { hir_params_to_named_types } from "src/typecheck/check/registration.nx"
+import { find_record_def } from "src/typecheck/linearity/borrow_types.nx"
 import { SubstEntry } from "src/typecheck/types.nx"
 import * as str from "std:str"
 import * as list from "std:list"
@@ -101,7 +103,7 @@ export let register_handler_bindings = fn (
       check_handler_arm_throw_rows(arms, state, exception_groups, tdefs)
       // T-Handler arm signature cross-validation: validate throw_row, ret_type,
       // and params of each arm against the corresponding cap method declaration.
-      validate_handler_arm_throw_rows(handler_name: n, cap_name: pname, arms, caps, prefix_len)
+      validate_handler_arm_throw_rows(handler_name: n, cap_name: pname, arms, caps, prefix_len, tdefs)
       let st1 = tctypes.state_with_env(state, env: env2)
       return register_handler_bindings(state: st1, hbs: rest, caps, exception_groups, tdefs)
   end
@@ -156,11 +158,12 @@ let validate_handler_arm_throw_rows = fn (
   cap_name: string,
   arms: [ HirHandlerArm ],
   caps: [ HirCap ],
-  prefix_len: i64
+  prefix_len: i64,
+  tdefs: [ RecordDef ]
 ) -> unit throws { TypeError } do
   let cap_methods = lookup_cap_methods_tw(caps, cap_name)
   let cap_tps = lookup_cap_type_params(caps, cap_name)
-  return validate_arm_sig_go(handler_name, cap_name, arms, cap_methods, prefix_len, cap_tps)
+  return validate_arm_sig_go(handler_name, cap_name, arms, cap_methods, prefix_len, cap_tps, tdefs)
 end
 
 // ─── Generic cap instantiation (cap Foo<T>) ─────────────────────────────────
@@ -284,13 +287,38 @@ let instantiate_cap_method_for_arm = fn (
   end
 end
 
+/** A cap method return type is "unit-equivalent" — single-inhabited and
+ *  non-linear — when it is `unit` itself OR a zero-field record (`{}`),
+ *  whether written structurally as `TyRecord([])` or as a nominal alias
+ *  (`type Nothing = {}`, reaching here as `TyUserDefined(name, [])` that
+ *  resolves to an empty `RecordDef`). For such a return type, a `with @k`
+ *  arm fabricates the unique correct value at the suspended call site, so
+ *  resuming via the bare continuation is harmless and must be accepted. A
+ *  return type with one or more fields (or any other non-unit type) still
+ *  has no value channel back and is rejected. */
+let method_ret_is_unit_equiv = fn (typ: TypeExpr, tdefs: [ RecordDef ]) -> bool do
+  match typ do
+    | TyUnit -> return true
+    | TyRecord(fields: fs) ->
+      match fs do | [] -> return true | _ -> return false end
+    | TyUserDefined(name: n, args: _) ->
+      match find_record_def(defs: tdefs, name: n) do
+        | None -> return false
+        | Some(val: fs) ->
+          match fs do | [] -> return true | _ -> return false end
+      end
+    | _ -> return false
+  end
+end
+
 let validate_arm_sig_go = fn (
   handler_name: string,
   cap_name: string,
   arms: [ HirHandlerArm ],
   cap_methods: [ HirCapMethod ],
   prefix_len: i64,
-  cap_tps: [ string ]
+  cap_tps: [ string ],
+  tdefs: [ RecordDef ]
 ) -> unit throws { TypeError } do
   match arms do
     | [] -> return ()
@@ -312,7 +340,7 @@ let validate_arm_sig_go = fn (
       match lookup_cap_method(methods: cap_methods, name: original) do
         | None ->
           // Cap method not found: already caught by validate_handler_arm_sets; skip.
-          return validate_arm_sig_go(handler_name, cap_name, arms: rest, cap_methods, prefix_len, cap_tps)
+          return validate_arm_sig_go(handler_name, cap_name, arms: rest, cap_methods, prefix_len, cap_tps, tdefs)
         | Some(val: method0) ->
           // GENERIC CAP INSTANTIATION (`cap Foo<T>` + `handler Foo do fn m(v: i64) ...`):
           // the handler arm signature IS the instantiation. Derive the cap's type
@@ -393,7 +421,7 @@ let validate_arm_sig_go = fn (
           // parser's `@k(v)` rejection. Unit-returning methods (the normal
           // cooperative case, e.g. `Coop.yield() -> unit`) are accepted: there
           // is no value to channel back.
-          let method_ret_is_unit = match method_ret do | TyUnit -> true | _ -> false end
+          let method_ret_is_unit = method_ret_is_unit_equiv(typ: method_ret, tdefs)
           if is_kont_arm && !method_ret_is_unit then
             let detail = bb.concat(parts: [
               "handler '", handler_name, "' arm '", original,
@@ -405,7 +433,7 @@ let validate_arm_sig_go = fn (
             ])
             throw TypeMismatch(func_name: handler_name, detail, span: sp)
           end
-          return validate_arm_sig_go(handler_name, cap_name, arms: rest, cap_methods, prefix_len, cap_tps)
+          return validate_arm_sig_go(handler_name, cap_name, arms: rest, cap_methods, prefix_len, cap_tps, tdefs)
       end
   end
 end
