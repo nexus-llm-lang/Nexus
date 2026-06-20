@@ -19,7 +19,7 @@ import {
 }, * as err from "src/diagnostics/error.nx"
 import { get_defs, dump_import_graph } from "src/ir/shared/imports.nx"
 import { extract_function_names } from "src/ir/shared/resolve.nx"
-import { iterative_resolve, resolve_all_lazy_no_filter } from "src/ir/hir/demand.nx"
+import { resolve_all_lazy_no_filter } from "src/ir/hir/demand.nx"
 import * as reach from "src/ir/hir/reachability.nx"
 import * as canon_match from "src/ir/hir/canonicalize_match.nx"
 import * as main_wrap from "src/ir/main_wrap.nx"
@@ -460,12 +460,33 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
           ext_wasm_deps: ewds) ->
         ewds
     end
+    /* Resolve every LazyBody to EagerBody exactly once. Both the DCE'd codegen
+     * program (`hir`) and the pre-DCE typecheck program (`hir_for_tc`) derive
+     * from this single full resolution: the iterative_resolve pass that used to
+     * resolve the reachable subset over ~21 fixpoint rounds produced, for every
+     * reachable function, the same EagerBody that resolve_all_lazy_via_convert
+     * yields here — so the DCE'd program is obtained by filtering this full
+     * resolve down to the reachable set rather than resolving a second time.
+     * This removes ~1GB of retained intermediates on the non-collecting heap. */
+    let all_fs = resolve_all_lazy_no_filter(funcs: get_functions(hir: hir_raw))
+    let all_expanded = match hir_raw do
+      | HirProgram(caps: _, functions: _, externals: _, handler_bindings: _,
+          enum_defs: _, exception_groups: heg, value_binding_names: _, type_defs: _,
+          visible_enum_names: _, ext_wasm_deps: _) ->
+        expand_groups_in_functions(funcs: all_fs, groups: heg)
+    end
+    let all_hb = match hir_raw do
+      | HirProgram(caps: _, functions: _, externals: _, handler_bindings: hb,
+          enum_defs: _, exception_groups: heg, value_binding_names: _, type_defs: _,
+          visible_enum_names: _, ext_wasm_deps: _) ->
+        expand_groups_in_handler_bindings(bindings: hb, groups: heg)
+    end
     let hir_resolved = match hir_raw do
       | HirProgram(
         caps: hp,
-        functions: hf,
+        functions: _,
         externals: he,
-        handler_bindings: hb,
+        handler_bindings: _,
         enum_defs: hed,
         exception_groups: heg,
         value_binding_names: hvbns,
@@ -473,9 +494,8 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
         visible_enum_names: hven,
         ext_wasm_deps: hewds
       ) ->
-        let resolved = iterative_resolve(funcs: hf, hb, max_rounds: 100)
-        let expanded_fs = expand_groups_in_functions(funcs: resolved, groups: heg)
-        let expanded_hb = expand_groups_in_handler_bindings(bindings: hb, groups: heg)
+        let expanded_fs = all_expanded
+        let expanded_hb = all_hb
         let trimmed_reach = reach.collect_reachable_no_thread_start(
           functions: expanded_fs,
           handler_bindings: expanded_hb
@@ -511,7 +531,14 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
             handler_bindings: injected_hb
           )
         end
-        let final_fs = if has_lazy_spawn then expanded_fs
+        let final_fs = if has_lazy_spawn then
+            /* lazy_spawn keeps the WASI-threads plumbing live: filter the full
+             * resolve down to the thread-start-seeded reachable set, matching
+             * the reachable-only program the former iterative_resolve produced. */
+            reach.filter_reachable_functions(
+              functions: expanded_fs,
+              reachable: reach.collect_reachable(functions: expanded_fs, handler_bindings: expanded_hb)
+            )
           else reach.filter_reachable_functions_set(
             functions: expanded_fs,
             reachable: reach.collect_reachable_set_no_thread_start(
@@ -564,9 +591,9 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
     let hir_for_tc = match hir_raw do
       | HirProgram(
         caps: hp,
-        functions: hf,
+        functions: _,
         externals: he,
-        handler_bindings: hb,
+        handler_bindings: _,
         enum_defs: hed,
         exception_groups: heg,
         value_binding_names: hvbns,
@@ -574,9 +601,6 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
         visible_enum_names: hven,
         ext_wasm_deps: hewds
       ) ->
-        let all_fs = resolve_all_lazy_no_filter(funcs: hf)
-        let all_expanded = expand_groups_in_functions(funcs: all_fs, groups: heg)
-        let all_hb = expand_groups_in_handler_bindings(bindings: hb, groups: heg)
         HirProgram(
           caps: hp,
           functions: all_expanded,
