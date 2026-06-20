@@ -621,6 +621,69 @@ export let merge_with_stdlib = fn (
     deps: [ DepSpec(module_prefix: "nexus:std/", wasm_path: stdlib_path) ])
 end
 
+// Carries the output buffer plus every owned linear that `merge_one_dep` holds
+// live across the (sole) throwable section-emit call, so they survive the call
+// on the success path. `emit_merged_elements` is the only throwable section
+// emitter; it CONSUMES `out` (and frees it on its own throw path), but the
+// other linears are passed to it as borrows and must outlive it.
+type MergeElementsResult = MergeElementsResult(
+  out: %ByteBuffer,
+  dep: %ByteBuffer,
+  core_wasm: %ByteBuffer,
+  m_secs: %StringMap<i64>,
+  d_secs: %StringMap<i64>,
+  dep_exports: %StringMap<i64>,
+  remap_d: %ByteBuffer,
+  remap_m: %ByteBuffer
+)
+
+// Emit the merged element section. `emit_merged_elements` is throwable
+// (WasmMergeUnsupported for non-zero element kinds) and `merge_one_dep` holds
+// several linears live across it that must be freed on the throw path —
+// otherwise they leak with no runtime drop (the E0540 leak the linearity
+// checker now rejects in every call position). Take all of them by move so this
+// helper owns their disposal: on success hand them all back (the call consumes
+// and returns `out`); on a raise free the surviving linears and rethrow. `out`
+// is consumed by `emit_merged_elements`, which frees it on its own throw path,
+// so it is NOT freed here (doing so would be a double free).
+let emit_merged_elements_keep_all = fn (
+  out: %ByteBuffer,
+  dep: %ByteBuffer,
+  core_wasm: %ByteBuffer,
+  m_secs: %StringMap<i64>,
+  d_secs: %StringMap<i64>,
+  dep_exports: %StringMap<i64>,
+  remap_d: %ByteBuffer,
+  remap_m: %ByteBuffer,
+  d_sec: i64,
+  m_sec: i64
+) -> MergeElementsResult throws { WasmMergeUnsupported } do
+  try
+    let %out2 = emit_merged_elements(%out,
+      d_buf: &dep, d_sec, &remap_d,
+      m_buf: &core_wasm, m_sec, &remap_m)
+    return MergeElementsResult(
+      out: %out2,
+      dep: %dep,
+      core_wasm: %core_wasm,
+      m_secs: %m_secs,
+      d_secs: %d_secs,
+      dep_exports: %dep_exports,
+      remap_d: %remap_d,
+      remap_m: %remap_m
+    )
+  catch e ->
+    bb.free(buf: %dep)
+    bb.free(buf: %core_wasm)
+    sm.free(map: %m_secs)
+    sm.free(map: %d_secs)
+    sm.free(map: %dep_exports)
+    bb.free(buf: %remap_d)
+    bb.free(buf: %remap_m)
+    throw e
+  end
+end
+
 // Core merge logic for exactly one dep. Called by both merge_with_deps (N=1)
 // and merge_with_stdlib. Generalizable to N deps by accumulating per-dep
 // metadata and emitting section contributions in dep order.
@@ -783,10 +846,34 @@ let merge_one_dep = fn (
   let %out = emit_remapped_exports(%out,
     m_buf: &core_wasm, m_sec: get_sec(map: &m_secs, sec: 7), remap: &remap_m)
 
-  // Section 9: merged elements (dep + main, both remapped)
-  let %out = emit_merged_elements(%out,
-    d_buf: &dep, d_sec: get_sec(map: &d_secs, sec: 9), &remap_d,
-    m_buf: &core_wasm, m_sec: get_sec(map: &m_secs, sec: 9), &remap_m)
+  // Section 9: merged elements (dep + main, both remapped). This is the only
+  // throwable section emitter; the helper takes every live owned linear by move
+  // and frees them on the throw path (emit_merged_elements consumes %out and
+  // frees it itself on throw, so the helper does not). Resolve the section
+  // pointers into locals first so the maps are not borrowed and moved in the
+  // same call.
+  let d_elem_sec = get_sec(map: &d_secs, sec: 9)
+  let m_elem_sec = get_sec(map: &m_secs, sec: 9)
+  let MergeElementsResult(
+    out: %out,
+    dep: %dep,
+    core_wasm: %core_wasm,
+    m_secs: %m_secs,
+    d_secs: %d_secs,
+    dep_exports: %dep_exports,
+    remap_d: %remap_d,
+    remap_m: %remap_m
+  ) = emit_merged_elements_keep_all(
+    out: %out,
+    dep: %dep,
+    core_wasm: %core_wasm,
+    m_secs: %m_secs,
+    d_secs: %d_secs,
+    dep_exports: %dep_exports,
+    remap_d: %remap_d,
+    remap_m: %remap_m,
+    d_sec: d_elem_sec,
+    m_sec: m_elem_sec)
 
   // Section 10: merged code (stubs + dep bodies rewritten + main bodies rewritten)
   // Use actual code section counts (must match bodies written by rewrite_code_bodies)
