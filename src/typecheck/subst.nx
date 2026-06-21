@@ -35,7 +35,7 @@ import {
 import * as list from "std:list"
 import * as str from "std:text/str"
 import * as cast from "std:runtime/cast"
-import { SubstEntry, Scheme, EnvEntry } from "src/typecheck/types.nx"
+import { SubstEntry, Subst, Scheme, EnvEntry } from "src/typecheck/types.nx"
 
 // Parse "?N" -> N (>=0). Return -1 for any other shape (incl "?row_γ_N").
 //
@@ -59,13 +59,28 @@ let parse_qmark_id_go = fn (s: string, i: i64, n: i64, acc: i64) -> i64 do
 end
 
 /** Empty substitution. */
-export let subst_empty = fn () -> [ SubstEntry ] do
-  return []
+export let subst_empty = fn () -> Subst do
+  return Subst(entries: [], max_qmark: -1)
 end
 
 /** Singleton substitution binding `var` to `typ`. */
-export let subst_single = fn (var: string, typ: TypeExpr) -> [ SubstEntry ] do
-  return [SubstEntry(var, typ)]
+export let subst_single = fn (var: string, typ: TypeExpr) -> Subst do
+  return Subst(entries: [SubstEntry(var, typ)], max_qmark: parse_qmark_id(s: var))
+end
+
+/** The raw entry list of a substitution. */
+export let subst_entries = fn (s: Subst) -> [ SubstEntry ] do
+  let Subst(entries: es, max_qmark: _) = s
+  return es
+end
+
+/**
+ * Build a `Subst` from a raw entry list, computing the watermark once. Used by
+ * the few call sites that construct substitution entries directly (outside
+ * `subst_compose`), e.g. instantiation param substitutions.
+ */
+export let subst_from_list = fn (entries: [ SubstEntry ]) -> Subst do
+  return Subst(entries, max_qmark: base_max_qmark(base: entries, acc: -1))
 end
 
 let subst_lookup = fn (subst: [ SubstEntry ], var: string) -> Option<TypeExpr> do
@@ -80,7 +95,11 @@ let subst_lookup = fn (subst: [ SubstEntry ], var: string) -> Option<TypeExpr> d
 end
 
 /** Apply a substitution to a type, recursively rewriting bound TyVar names. */
-export let subst_apply = fn (subst: [ SubstEntry ], typ: TypeExpr) -> TypeExpr do
+export let subst_apply = fn (subst: Subst, typ: TypeExpr) -> TypeExpr do
+  let Subst(entries: es, max_qmark: _) = subst
+  return subst_apply_l(subst: es, typ)
+end
+let subst_apply_l = fn (subst: [ SubstEntry ], typ: TypeExpr) -> TypeExpr do
   if list.is_empty(xs: subst) then return typ end
   match typ do
     | TyVar(name: n) ->
@@ -90,38 +109,42 @@ export let subst_apply = fn (subst: [ SubstEntry ], typ: TypeExpr) -> TypeExpr d
       end
     | TyArrow(params: ps, ret: r, requires: req, throw_row: thr) ->
       return TyArrow(
-        params: apply_named_types(subst, nts: ps),
-        ret: subst_apply(subst, typ: r),
-        requires: subst_apply(subst, typ: req),
-        throw_row: subst_apply(subst, typ: thr)
+        params: apply_named_types_l(subst, nts: ps),
+        ret: subst_apply_l(subst, typ: r),
+        requires: subst_apply_l(subst, typ: req),
+        throw_row: subst_apply_l(subst, typ: thr)
       )
     | TyUserDefined(name: n, args) ->
       return TyUserDefined(name: n, args: apply_type_list(subst, types: args))
-    | TyRef(inner: i) -> return TyRef(inner: subst_apply(subst, typ: i))
-    | TyLinear(inner: i) -> return TyLinear(inner: subst_apply(subst, typ: i))
+    | TyRef(inner: i) -> return TyRef(inner: subst_apply_l(subst, typ: i))
+    | TyLinear(inner: i) -> return TyLinear(inner: subst_apply_l(subst, typ: i))
     | TyLazy(inner: i, require_row: rq, throw_row: thr) -> return TyLazy(
-        inner: subst_apply(subst, typ: i),
-        require_row: subst_apply(subst, typ: rq),
-        throw_row: subst_apply(subst, typ: thr)
+        inner: subst_apply_l(subst, typ: i),
+        require_row: subst_apply_l(subst, typ: rq),
+        throw_row: subst_apply_l(subst, typ: thr)
       )
-    | TyBorrow(inner: i) -> return TyBorrow(inner: subst_apply(subst, typ: i))
-    | TyArray(elem: e) -> return TyArray(elem: subst_apply(subst, typ: e))
-    | TyList(elem: e) -> return TyList(elem: subst_apply(subst, typ: e))
+    | TyBorrow(inner: i) -> return TyBorrow(inner: subst_apply_l(subst, typ: i))
+    | TyArray(elem: e) -> return TyArray(elem: subst_apply_l(subst, typ: e))
+    | TyList(elem: e) -> return TyList(elem: subst_apply_l(subst, typ: e))
     | TyRecord(fields: fs) ->
-      return TyRecord(fields: apply_named_types(subst, nts: fs))
+      return TyRecord(fields: apply_named_types_l(subst, nts: fs))
     | TyRow(types: ts, rest: r) ->
       let new_rest = match r do
-        | Some(val: t) -> Some(val: subst_apply(subst, typ: t))
+        | Some(val: t) -> Some(val: subst_apply_l(subst, typ: t))
         | None -> None
       end
       return TyRow(types: apply_type_list(subst, types: ts), rest: new_rest)
     | TyHandler(name: n, requires: req) ->
-      return TyHandler(name: n, requires: subst_apply(subst, typ: req))
+      return TyHandler(name: n, requires: subst_apply_l(subst, typ: req))
     | _ -> return typ
   end
 end
 
-export let apply_named_types = fn (subst: [ SubstEntry ], nts: [ NamedType ]) -> [ NamedType ] do
+export let apply_named_types = fn (subst: Subst, nts: [ NamedType ]) -> [ NamedType ] do
+  let Subst(entries: es, max_qmark: _) = subst
+  return apply_named_types_l(subst: es, nts)
+end
+let apply_named_types_l = fn (subst: [ SubstEntry ], nts: [ NamedType ]) -> [ NamedType ] do
   if list.is_empty(xs: subst) then return nts end
   return apply_named_types_go(subst, nts, acc: [])
 end
@@ -134,12 +157,13 @@ let apply_named_types_go = fn (
     | [] -> return list.reverse(xs: acc)
     | NamedType(name: n, typ: t) :: rest ->
       return apply_named_types_go(subst, nts: rest,
-        acc: NamedType(name: n, typ: subst_apply(subst, typ: t)) :: acc)
+        acc: NamedType(name: n, typ: subst_apply_l(subst, typ: t)) :: acc)
   end
 end
 /** Apply a substitution to every element of a type list. */
-export let subst_apply_each = fn (subst: [ SubstEntry ], typs: [ TypeExpr ]) -> [ TypeExpr ] do
-  return apply_type_list(subst, types: typs)
+export let subst_apply_each = fn (subst: Subst, typs: [ TypeExpr ]) -> [ TypeExpr ] do
+  let Subst(entries: es, max_qmark: _) = subst
+  return apply_type_list(subst: es, types: typs)
 end
 let apply_type_list = fn (subst: [ SubstEntry ], types: [ TypeExpr ]) -> [ TypeExpr ] do
   if list.is_empty(xs: subst) then return types end
@@ -154,13 +178,18 @@ let apply_type_list_go = fn (
     | [] -> return list.reverse(xs: acc)
     | t :: rest ->
       return apply_type_list_go(subst, types: rest,
-        acc: subst_apply(subst, typ: t) :: acc)
+        acc: subst_apply_l(subst, typ: t) :: acc)
   end
 end
 /** Compose substitutions: returns `s2 ∘ s1`, applying `s2` to `s1`'s targets then merging. */
-export let subst_compose = fn (s1: [ SubstEntry ], s2: [ SubstEntry ]) -> [ SubstEntry ] do
-  let applied = apply_subst_to_entries(entries: s1, subst: s2)
-  return merge_entries(base: applied, extra: s2)
+export let subst_compose = fn (s1: Subst, s2: Subst) -> Subst do
+  let Subst(entries: e1, max_qmark: wm1) = s1
+  let Subst(entries: e2, max_qmark: wm2) = s2
+  // `apply_subst_to_entries` rewrites only entry TARGET types; the entry domain
+  // vars (the watermark source) are untouched, so `applied`'s watermark equals
+  // s1's `wm1`.
+  let applied = apply_subst_to_entries(entries: e1, subst: e2)
+  return merge_entries(base: applied, extra: e2, base_wm: wm1, extra_wm: wm2)
 end
 
 /**
@@ -208,27 +237,49 @@ let apply_subst_to_entries_go = fn (
     | SubstEntry(var: v, typ: t) :: rest ->
       if type_mentions_any(domain, typ: t) then
         return apply_subst_to_entries_go(subst, domain, entries: rest,
-          acc: SubstEntry(var: v, typ: subst_apply(subst, typ: t)) :: acc)
+          acc: SubstEntry(var: v, typ: subst_apply_l(subst, typ: t)) :: acc)
       end
       return apply_subst_to_entries_go(subst, domain, entries: rest,
         acc: SubstEntry(var: v, typ: t) :: acc)
   end
 end
-/** Add entries from extra that are not already in base. */
-let merge_entries = fn (base: [ SubstEntry ], extra: [ SubstEntry ]) -> [ SubstEntry ] do
+/**
+ * Add entries from `extra` not already in `base`, returning a `Subst` whose
+ * `max_qmark` is the watermark of the merged result.
+ *
+ * `base_wm` is the watermark of `base` (max "?N" id over base's domain vars,
+ * maintained on the `Subst` rather than recomputed by re-scanning base on every
+ * call — that recompute was ~37% of merge time). `extra_wm` is `extra`'s
+ * watermark, used only by the empty-base fast path.
+ *
+ * Watermark invariant: the returned `max_qmark` is an over-approximation of the
+ * true max "?N" id over the result's domain vars (here it is exact). The skip
+ * test uses strict `id > wm`, so even a too-high watermark would only skip MORE
+ * scans, never wrongly accept-without-scan a duplicate; a too-low one only scans
+ * MORE. Both are safe; the danger would be a watermark BELOW the true max while
+ * claiming to be at-or-above, which cannot happen because we only ever raise it
+ * to ids we actually accept.
+ */
+let merge_entries = fn (
+  base: [ SubstEntry ],
+  extra: [ SubstEntry ],
+  base_wm: i64,
+  extra_wm: i64
+) -> Subst do
   // Empty-base fast path. When `base` is empty no extra entry can be a
   // duplicate, so every entry is accepted and the general loop would rebuild
   // `extra`'s entire spine (reverse-prepend onto `[]`) for no semantic gain:
   // the result is a permutation of `extra` whose entries all have distinct
   // domain vars, and `subst_lookup` is first-match over distinct keys, so list
   // order is unobservable. Returning `extra` shared (zero allocation, zero
-  // re-acceptance) is therefore semantics-preserving. `subst_compose` reaches
-  // this case constantly — composing a fresh per-statement / per-subexpression
-  // substitution (the big `s2`) onto an empty `applied` base (`s1` after the
-  // relevance filter) — so it removes a large share of the per-body merge
-  // allocation and re-acceptance churn.
+  // re-acceptance) is therefore semantics-preserving, and its watermark is
+  // `extra`'s own `extra_wm`. `subst_compose` reaches this case constantly —
+  // composing a fresh per-statement / per-subexpression substitution (the big
+  // `s2`) onto an empty `applied` base (`s1` after the relevance filter) — so it
+  // removes a large share of the per-body merge allocation and re-acceptance
+  // churn.
   match base do
-    | [] -> return extra
+    | [] -> return Subst(entries: extra, max_qmark: extra_wm)
     | _ -> ()
   end
   // Freshness-watermark fast path. Fresh unification vars are named "?N" where
@@ -240,16 +291,18 @@ let merge_entries = fn (base: [ SubstEntry ], extra: [ SubstEntry ]) -> [ SubstE
   // its O(|base|) dedup scan is unnecessary and is skipped.
   //
   // The vast majority of composed vars are exactly these freshly minted vars
-  // (~99.6% of dedup comparisons fall here on src/main.nx), so computing the
-  // watermark once and threading it turns the per-extra-var linear scan into an
-  // O(1) integer compare. Vars whose id is <= the watermark, or whose name is
-  // not "?N" form (id == -1), fall back to the exact original scan, so dedup
-  // semantics (base-priority, order reverse(accepted)++base) are unchanged.
-  let wm0 = base_max_qmark(base, acc: -1)
-  return merge_entries_wm(base, extra, wm: wm0)
+  // (~99.6% of dedup comparisons fall here on src/main.nx). The watermark is now
+  // carried ON the substitution (`base_wm`) and maintained incrementally as
+  // entries are accepted, so it no longer re-scans `base` on every call. Vars
+  // whose id is <= the watermark, or whose name is not "?N" form (id == -1),
+  // fall back to the exact original scan, so dedup semantics (base-priority,
+  // order reverse(accepted)++base) are unchanged.
+  return merge_entries_wm(base, extra, wm: base_wm)
 end
 
-// Maximum "?N" var id present in `base`, or -1 if none.
+// Maximum "?N" var id present in `base`, or -1 if none. Used once by
+// `subst_from_list` when wrapping a raw entry list whose watermark is unknown;
+// the hot `merge_entries` path no longer calls this (it carries the watermark).
 let base_max_qmark = fn (base: [ SubstEntry ], acc: i64) -> i64 do
   match base do
     | [] -> return acc
@@ -260,12 +313,17 @@ let base_max_qmark = fn (base: [ SubstEntry ], acc: i64) -> i64 do
   end
 end
 
-let merge_entries_wm = fn (base: [ SubstEntry ], extra: [ SubstEntry ], wm: i64) -> [ SubstEntry ] do
+// Walk `extra`, accepting non-duplicate entries onto `base`, threading the
+// running watermark. Returns the final base list plus the final watermark as a
+// `Subst`. `wm` is both the dedup skip threshold and the incrementally
+// maintained result watermark: every accepted "?N" var raises it to its id.
+let merge_entries_wm = fn (base: [ SubstEntry ], extra: [ SubstEntry ], wm: i64) -> Subst do
   match extra do
-    | [] -> return base
+    | [] -> return Subst(entries: base, max_qmark: wm)
     | SubstEntry(var: v, typ: t) :: rest ->
       let id = parse_qmark_id(s: v)
-      // Provably-fresh "?N" var (id > watermark): accept without scanning.
+      // Provably-fresh "?N" var (id > watermark): accept without scanning, and
+      // raise the watermark to this id (maintains the invariant incrementally).
       if id > wm then
         return merge_entries_wm(base: SubstEntry(var: v, typ: t) :: base, extra: rest, wm: id)
       end
@@ -301,9 +359,10 @@ end
  * once per call; the per-entry "mentions any domain var" check is an
  * allocation-free occurs-style walk that short-circuits on first hit.
  */
-export let subst_apply_env = fn (subst: [ SubstEntry ], env: [ EnvEntry ]) -> [ EnvEntry ] do
-  let domain = subst_domain(subst, acc: [])
-  return subst_apply_env_go(subst, domain, env, acc: [])
+export let subst_apply_env = fn (subst: Subst, env: [ EnvEntry ]) -> [ EnvEntry ] do
+  let Subst(entries: es, max_qmark: _) = subst
+  let domain = subst_domain(subst: es, acc: [])
+  return subst_apply_env_go(subst: es, domain, env, acc: [])
 end
 let subst_apply_env_go = fn (
   subst: [ SubstEntry ],
@@ -316,7 +375,7 @@ let subst_apply_env_go = fn (
     | EnvEntry(name: n, scheme: Scheme(vars: vs, typ: t)) :: rest ->
       if type_mentions_any(domain, typ: t) then
         return subst_apply_env_go(subst, domain, env: rest,
-          acc: EnvEntry(name: n, scheme: Scheme(vars: vs, typ: subst_apply(subst, typ: t))) :: acc)
+          acc: EnvEntry(name: n, scheme: Scheme(vars: vs, typ: subst_apply_l(subst, typ: t))) :: acc)
       end
       return subst_apply_env_go(subst, domain, env: rest,
         acc: EnvEntry(name: n, scheme: Scheme(vars: vs, typ: t)) :: acc)
