@@ -15,6 +15,7 @@ import {
   TypeExpr,
   TyLinear,
   TyVar,
+  TyArrow,
   RecordDef,
   EnumDef
 } from "src/types/type_expr.nx"
@@ -32,7 +33,7 @@ import { Option, Some, None } from "std:option"
 import { is_auto_droppable, is_linear_binding_type } from "src/ir/shared/type_pred.nx"
 import { SigEntry, sig_lookup, build_sig_map } from "src/typecheck/linearity/sig_map.nx"
 import {
-  LinState, CatchFrame,
+  LinState, CatchFrame, CtorBinding,
   lin_empty, lin_add, lin_remove, lin_member, lin_consumed_member, lin_clear_consumed, str_member,
   vars_equal, lin_push_frame, lin_pop_frame, lin_top_frame,
   join_simple, lin_set_vars, lin_get_must_consume, find_live_must_consume,
@@ -211,7 +212,14 @@ let check_function_with_kont = fn (
           // on a locally-constructed scrutinee can recover its construction
           // expression and read off how each generic field was instantiated
           // (the linearity pass carries no inferred type-args).
-          ctor_env: collect_ctor_bindings(stmts, acc: [])
+          // Seed with function-typed params (their declared throws row lets a
+          // call `g(...)` to such a param be classified as throwable by the
+          // leak guard), then layer on the body's `let` bindings — local
+          // let-bound lambdas land here too, exposing their throws row.
+          ctor_env: collect_ctor_bindings(
+            stmts,
+            acc: fn_typed_param_bindings(params: ps, acc: [])
+          )
         )
         let st1 = lin_push_frame(st: st0)
         let st2 = check_stmts(stmts, st: st1, sigs, tdefs, enum_defs)
@@ -768,9 +776,18 @@ let check_expr_kind = fn (
       return st2
     | CallExpr(callee: c, args: cargs) ->
       // Closure/field call: check callee expression (may consume a linear),
-      // then check arguments. Conservative: assume potentially throwable.
+      // then check arguments.
       let st1 = check_expr(expr: c, st, sigs, tdefs, enum_defs, at_stmt_level: false)
-      return check_call_args(args: cargs, st: st1, sigs, tdefs, enum_defs)
+      let st2 = check_call_args(args: cargs, st: st1, sigs, tdefs, enum_defs)
+      // Throwable-call leak check for the INDIRECT call — mirrors the `Call`
+      // arm. An indirect throwable call (a parenthesised closure callee, a
+      // function-typed value) abandons any still-live linear on its throw path
+      // with no runtime drop, exactly like a directly-named throwable call.
+      // `st2` already reflects consumption of the callee and the call's moved
+      // args; the CallExpr node is walked once per position so this can't
+      // double-fire.
+      check_indirect_throwable_leak(callee: c, st: st2, sigs, span)
+      return st2
     | Ctor(variant: _, args: cargs, labels: _, sigil: _) ->
       return check_exprs(exprs: cargs, st, sigs, tdefs, enum_defs)
     | Record(fields: fs) ->
@@ -1233,18 +1250,111 @@ end
  *  covered by the top frame snapshot would leak if the call raises. Raise
  *  `LinearLeakAcrossThrowableCall` listing the offending linears.
  */
-let check_throwable_leak = fn (
-  func: string, st: LinState, sigs: [ SigEntry ], span: Span
+/** Synthesize ctor_env bindings for the function-typed params of the body so a
+ *  call `g(...)` to such a param is classified as throwable by the leak guard.
+ *  Only `TyArrow` params produce a binding; the synthesized Lambda exists solely
+ *  to carry the param's declared throws row through `lin_lookup_ctor` (its body /
+ *  span are unused by the throws-row resolver). */
+let fn_typed_param_bindings = fn (
+  params: [ HirParam ], acc: [ CtorBinding ]
+) -> [ CtorBinding ] do
+  match params do
+    | [] -> return acc
+    | HirParam(label: _, name: n, sigil: _, typ: t) :: rest ->
+      match t do
+        | TyArrow(params: _, ret: rt, requires: rq, throw_row: tw) ->
+          let placeholder = HirExpr(
+            node: Lambda(
+              type_params: [],
+              params: [],
+              ret_type: rt,
+              requires: rq,
+              throw_row: tw,
+              body: []
+            ),
+            span: Span(offset: 0, line: 0, col: 0)
+          )
+          return fn_typed_param_bindings(
+            params: rest,
+            acc: CtorBinding(name: n, value: placeholder) :: acc
+          )
+        | _ -> return fn_typed_param_bindings(params: rest, acc)
+      end
+  end
+end
+
+/** Resolve the declared throws row of a callee referred to by NAME. A local
+ *  let-bound lambda (or a function-typed param, seeded into ctor_env) is found
+ *  first via `lin_lookup_ctor`; otherwise fall back to the global sig-map
+ *  (top-level functions / externals / handler arms). Returns `None` when the
+ *  callee's throws row is unknown — the guard then stays silent rather than
+ *  risk a false positive. */
+let resolve_callee_throw_row = fn (
+  func: string, st: LinState, sigs: [ SigEntry ]
+) -> Option<TypeExpr> do
+  match lin_lookup_ctor(st, name: func) do
+    | Some(val: HirExpr(node: Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: tw, body: _), span: _)) ->
+      return Some(val: tw)
+    | _ ->
+      match sig_lookup(sigs, name: func) do
+        | None -> return None
+        | Some(val: SigEntry(name: _, type_params: _, param_labels: _, param_types: _, ret_type: _, throw_row: tw)) ->
+          return Some(val: tw)
+      end
+  end
+end
+
+/** Fire LinearLeakAcrossThrowableCall when `tw_opt` is a throwable row and a
+ *  live linear is uncovered by the enclosing catch frame. Shared by the direct
+ *  (named) and indirect (callee-expression) call sites. */
+let report_throwable_leak = fn (
+  callee: string, tw_opt: Option<TypeExpr>, st: LinState, span: Span
 ) -> unit throws { TypeError } do
-  match sig_lookup(sigs, name: func) do
+  match tw_opt do
     | None -> return ()
-    | Some(val: SigEntry(name: _, type_params: _, param_labels: _, param_types: _, ret_type: _, throw_row: tw)) ->
+    | Some(val: tw) ->
       if !row_is_throwable(eff_row: tw) then return () end
       let leaked = uncovered_linears(st)
       match leaked do
         | [] -> return ()
-        | _ :: _ -> throw LinearLeakAcrossThrowableCall(callee: func, leaked, span)
+        | _ :: _ -> throw LinearLeakAcrossThrowableCall(callee, leaked, span)
       end
+  end
+end
+
+let check_throwable_leak = fn (
+  func: string, st: LinState, sigs: [ SigEntry ], span: Span
+) -> unit throws { TypeError } do
+  return report_throwable_leak(
+    callee: func,
+    tw_opt: resolve_callee_throw_row(func, st, sigs),
+    st,
+    span
+  )
+end
+
+/** Leak guard for an INDIRECT call `CallExpr(callee, args)` where the callee is
+ *  an arbitrary expression rather than a directly-named function. Only a
+ *  `Variable` callee whose throws row we can resolve (local let-bound lambda or
+ *  function-typed param, via ctor_env) is checked; an inline `Lambda` callee
+ *  reads its own throws row. Other callee shapes (field/method access, nested
+ *  expressions) carry no statically-known throws row here, so the guard stays
+ *  silent — never a false positive. */
+let check_indirect_throwable_leak = fn (
+  callee: HirExpr, st: LinState, sigs: [ SigEntry ], span: Span
+) -> unit throws { TypeError } do
+  let HirExpr(node: cn, span: _) = callee
+  match cn do
+    | Variable(name: m, sigil: _) ->
+      return report_throwable_leak(
+        callee: m,
+        tw_opt: resolve_callee_throw_row(func: m, st, sigs),
+        st,
+        span
+      )
+    | Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: tw, body: _) ->
+      return report_throwable_leak(callee: "<lambda>", tw_opt: Some(val: tw), st, span)
+    | _ -> return ()
   end
 end
 
