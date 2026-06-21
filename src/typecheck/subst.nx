@@ -33,7 +33,23 @@ import {
   NamedType
 } from "src/types/type_expr.nx"
 import * as list from "std:list"
+import * as str from "std:text/str"
 import { SubstEntry, Scheme, EnvEntry } from "src/typecheck/types.nx"
+
+// Parse "?N" -> N (>=0). Return -1 for any other shape (incl "?row_γ_N").
+let parse_qmark_id = fn (s: string) -> i64 do
+  let n = str.length(s)
+  if n < 2 then return -1 end
+  // first byte must be '?' (code 63)
+  if str.char_code(s, idx: 0) != 63 then return -1 end
+  return parse_qmark_id_go(s, i: 1, n, acc: 0)
+end
+let parse_qmark_id_go = fn (s: string, i: i64, n: i64, acc: i64) -> i64 do
+  if i >= n then return acc end
+  let c = str.char_code(s, idx: i)
+  if c < 48 || c > 57 then return -1 end
+  return parse_qmark_id_go(s, i: i + 1, n, acc: acc * 10 + (c - 48))
+end
 
 /** Empty substitution. */
 export let subst_empty = fn () -> [ SubstEntry ] do
@@ -208,13 +224,50 @@ let merge_entries = fn (base: [ SubstEntry ], extra: [ SubstEntry ]) -> [ SubstE
     | [] -> return extra
     | _ -> ()
   end
+  // Freshness-watermark fast path. Fresh unification vars are named "?N" where
+  // N is the strictly-monotonic per-body supply counter (`tc_fresh_var`). An
+  // `extra` var named "?N" with N greater than the maximum "?N" id present in
+  // `base` provably cannot occur in `base` — every "?N"-form base entry has a
+  // smaller id (hence a different name string) and every non-"?N" base entry
+  // (row tails "?row_γ_K", user type-params "a") has a different name too — so
+  // its O(|base|) dedup scan is unnecessary and is skipped.
+  //
+  // The vast majority of composed vars are exactly these freshly minted vars
+  // (~99.6% of dedup comparisons fall here on src/main.nx), so computing the
+  // watermark once and threading it turns the per-extra-var linear scan into an
+  // O(1) integer compare. Vars whose id is <= the watermark, or whose name is
+  // not "?N" form (id == -1), fall back to the exact original scan, so dedup
+  // semantics (base-priority, order reverse(accepted)++base) are unchanged.
+  let wm0 = base_max_qmark(base, acc: -1)
+  return merge_entries_wm(base, extra, wm: wm0)
+end
+
+// Maximum "?N" var id present in `base`, or -1 if none.
+let base_max_qmark = fn (base: [ SubstEntry ], acc: i64) -> i64 do
+  match base do
+    | [] -> return acc
+    | SubstEntry(var: v, typ: _) :: rest ->
+      let id = parse_qmark_id(s: v)
+      let na = if id > acc then id else acc end
+      return base_max_qmark(base: rest, acc: na)
+  end
+end
+
+let merge_entries_wm = fn (base: [ SubstEntry ], extra: [ SubstEntry ], wm: i64) -> [ SubstEntry ] do
   match extra do
     | [] -> return base
     | SubstEntry(var: v, typ: t) :: rest ->
-      if entry_exists(entries: base, var: v) then
-        return merge_entries(base, extra: rest)
+      let id = parse_qmark_id(s: v)
+      // Provably-fresh "?N" var (id > watermark): accept without scanning.
+      if id > wm then
+        return merge_entries_wm(base: SubstEntry(var: v, typ: t) :: base, extra: rest, wm: id)
       end
-      return merge_entries(base: SubstEntry(var: v, typ: t) :: base, extra: rest)
+      // Otherwise (id <= wm here, so accepting cannot raise the watermark) the
+      // exact original dedup scan.
+      if entry_exists(entries: base, var: v) then
+        return merge_entries_wm(base, extra: rest, wm)
+      end
+      return merge_entries_wm(base: SubstEntry(var: v, typ: t) :: base, extra: rest, wm)
   end
 end
 
