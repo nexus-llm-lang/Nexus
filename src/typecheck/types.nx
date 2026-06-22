@@ -552,10 +552,62 @@ export let state_enums = fn (state: CheckState) -> [ EnumEntry ] do
   return ed
 end
 
+/** Reserved key under which the scoped-enum memo for `current_module` lives on
+ *  the shared `global_sigs` map. The leading space is illegal in any source
+ *  identifier, so this namespace can never collide with a function / external /
+ *  cap-method / enum-constructor name published by `state_put_global`; the two
+ *  key spaces are provably disjoint, and a scoped-enum entry is never read back
+ *  through the `Scheme` channel (nor vice versa). */
+let scoped_enum_cache_key = fn (current_module: string) -> string do
+  return " scope_enum@" ++ current_module
+end
+
+/** Compute-and-CACHE the scoped enum list for `current_module` on the shared
+ *  `global_sigs` map (idempotent: a present entry is left untouched). Called
+ *  ONLY from `check_program`'s sequential prewarm, BEFORE the parallel body
+ *  check (`check_all_parallel`/`lazy.force_all`) begins. Concentrating every
+ *  WRITE here keeps `state_full_enums` a pure READ during the parallel phase:
+ *  the shared map is structurally frozen once body checking starts, so the
+ *  concurrent reads from worker threads never race a writer — the same
+ *  read-only-after-setup discipline the global signature map already relies on.
+ *  The `current_module == ""` (signature-registration) result is not cached:
+ *  `scope_enum_entries` early-returns `full_enum_defs` unchanged for it. */
+export let state_warm_scoped_enums = fn (state: CheckState, current_module: string) -> CheckState do
+  if current_module == "" then return state end
+  let gsi = state_global_sigs(state)
+  let cache_key = scoped_enum_cache_key(current_module)
+  if smap_has_str(id: gsi, key: cache_key) then return state end
+  let CheckState(
+    supply: _, env: _, enum_defs: _, type_defs: _, throw_row: _,
+    exception_groups: _, variant_index: _, in_catch_body: _, require_row: _,
+    fn_pure_set: _, caps: _, module_variant_index: _, current_module: _,
+    full_enum_defs: fed, module_import_index: mii, catch_rethrow_binder: _, global_sigs: _
+  ) = state
+  let scoped = scope_enum_entries(entries: fed, current_module, idx: mii)
+  smap_put_str(id: gsi, key: cache_key, value: value_to_i64(a_x: scoped))
+  return state
+end
+
 /** Accessor: the FULL (visibility-unstripped) enum declarations, consulted
  *  ONLY by the match exhaustiveness / redundancy check so imported-body
  *  coverage analysis sees an enum's real variant set (see the field doc on
- *  `CheckState.full_enum_defs`). */
+ *  `CheckState.full_enum_defs`).
+ *
+ *  The scoped result depends ONLY on `current_module`: `full_enum_defs` and
+ *  `module_import_index` are installed once in check_program (`tc_new_state` /
+ *  `state_with_module_import_index`) BEFORE any body is checked and are only
+ *  ever passed through thereafter, while `current_module` is fixed per body by
+ *  `check_function`. Every match in the same body would otherwise re-run
+ *  `scope_enum_entries`, re-allocating an identical list. So we memoize per
+ *  `current_module`: `check_program` prewarms the cache (via
+ *  `state_warm_scoped_enums`) for every module's body BEFORE the parallel body
+ *  check, and this accessor is then a pure READ — computing once per module and
+ *  reusing the byte-identical list. A cache MISS here is the fallback path (a
+ *  body whose module was not prewarmed): it recomputes WITHOUT writing, so the
+ *  shared map stays structurally frozen during the parallel phase and the read
+ *  never races a writer. Behaviour is byte-identical to recomputing every time.
+ *  The `current_module == ""` signature-registration path returns
+ *  `full_enum_defs` unchanged via `scope_enum_entries`'s early return. */
 export let state_full_enums = fn (state: CheckState) -> [ EnumEntry ] do
   let CheckState(
     supply: _,
@@ -576,6 +628,13 @@ export let state_full_enums = fn (state: CheckState) -> [ EnumEntry ] do
     catch_rethrow_binder: crb,
     global_sigs: gsi
   ) = state
+  if cm == "" then
+    return scope_enum_entries(entries: fed, current_module: cm, idx: mii)
+  end
+  let cache_key = scoped_enum_cache_key(current_module: cm)
+  if smap_has_str(id: gsi, key: cache_key) then
+    return value_of_i64(a_x: smap_get_str(id: gsi, key: cache_key, default_val: 0))
+  end
   return scope_enum_entries(entries: fed, current_module: cm, idx: mii)
 end
 
