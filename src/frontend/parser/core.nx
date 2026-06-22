@@ -80,6 +80,7 @@ import {
   parse_optional_with_kont
 } from "src/frontend/parser/args.nx"
 import * as list from "std:list"
+import * as str from "std:str"
 
 export let parse_expr = fn (toks: [ SpannedToken ]) -> ParsedExpr throws { ParseError } do
   return parse_prec_expr(toks, min_prec: 1)
@@ -176,14 +177,83 @@ let parse_prec_loop = fn (
   end
 end
 
+/** Surface width (in source columns) of `tok`. Token spans record only the
+ *  start position, so the end offset of a token is `span.offset + token_width`.
+ *  Fixed tokens (punctuation, keywords, `()`) use their canonical surface tag
+ *  length; identifiers use their name length. Literal kinds (int/float/string/
+ *  char) cannot legally precede a chained-call suffix, so their (approximate)
+ *  width never gates a chaining decision — only closers (`)` `]` `}` `()`) and
+ *  field identifiers do. */
+let token_width = fn (tok: Token) -> i64 do
+  match tok do
+    | TkIdent(name: n) -> return str.length(s: n)
+    | TkUident(name: n) -> return str.length(s: n)
+    | TkInt(_) | TkFloat(_) | TkString(_) | TkChar(_) | TkImportPath(_) | TkError(_) ->
+      return str.length(s: pcore.token_tag(tok))
+    | _ -> return str.length(s: pcore.token_tag(tok))
+  end
+end
+
+/** End offset (one past the last column) of a spanned token. */
+let spanned_end = fn (st: SpannedToken) -> i64 do
+  let SpannedToken(token: tk, span: Span(offset: o, line: _, col: _)) = st
+  return o + token_width(tok: tk)
+end
+
+/** End offset of the last token consumed between `before` and its structural
+ *  suffix `after`. Walks `before` until its head token has the same source
+ *  offset as `after`'s head (token offsets are unique and strictly increasing,
+ *  so this identifies the suffix boundary in O(consumed) without comparing
+ *  whole lists), returning the end offset of the token immediately preceding
+ *  that boundary. Returns -1 when nothing was consumed (the lists coincide) —
+ *  a sentinel that disables adjacency-based chaining for that position. */
+let last_consumed_end = fn (before: [ SpannedToken ], after: [ SpannedToken ]) -> i64 do
+  let next_off = match after do
+    | SpannedToken(token: _, span: Span(offset: o, line: _, col: _)) :: _ -> o
+    | [] -> 0 - 1
+  end
+  return last_consumed_end_go(before, next_off, prev_end: 0 - 1)
+end
+
+let last_consumed_end_go = fn (
+  before: [ SpannedToken ],
+  next_off: i64,
+  prev_end: i64
+) -> i64 do
+  match before do
+    | st :: rest ->
+      let SpannedToken(token: _, span: Span(offset: o, line: _, col: _)) = st
+      // -1 next_off means `after` is empty (EOF reached) — the last token of
+      // `before` is the boundary, so keep walking to the end.
+      if next_off >= 0 && o == next_off then return prev_end end
+      return last_consumed_end_go(before: rest, next_off, prev_end: spanned_end(st))
+    | [] -> return prev_end
+  end
+end
+
 let parse_postfix_expr = fn (toks: [ SpannedToken ]) -> ParsedExpr throws { ParseError } do
   let ParsedExpr(expr: base, rest: r) = parse_atom(toks)
-  return parse_postfix_loop(toks: r, base)
+  let prev_end = last_consumed_end(before: toks, after: r)
+  return parse_postfix_loop(toks: r, base, prev_end)
+end
+
+/** True when the head of `toks` begins exactly at `prev_end` (zero-gap, same
+ *  source position as the end of the preceding expression). A trailing call
+ *  suffix `()` / `(args)` is chained onto the callee only when it abuts the
+ *  previous `)` with no intervening whitespace or newline, so that `mk()()`
+ *  chains while `mk() ()` and `mk()` ⏎ `()` stay as a call followed by a
+ *  separate unit-expression statement. `prev_end < 0` (unknown boundary)
+ *  never chains. */
+let suffix_is_adjacent = fn (toks: [ SpannedToken ], prev_end: i64) -> bool do
+  if prev_end < 0 then return false end
+  let Span(offset: o, line: _, col: _) = pcore.peek_span(toks)
+  return o == prev_end
 end
 
 let parse_postfix_loop = fn (
   toks: [ SpannedToken ],
-  base: SpannedExpr
+  base: SpannedExpr,
+  prev_end: i64
 ) -> ParsedExpr throws { ParseError } do
   match pcore.peek_token(toks) do
     | TkDot ->
@@ -191,7 +261,8 @@ let parse_postfix_loop = fn (
       let SpannedExpr(node: _, span: sp) = base
       return parse_postfix_loop(
         toks: r2,
-        base: SpannedExpr(node: ExprFieldAccess(target: base, field: n), span: sp)
+        base: SpannedExpr(node: ExprFieldAccess(target: base, field: n), span: sp),
+        prev_end: last_consumed_end(before: toks, after: r2)
       )
     | TkLBracket ->
       let ParsedExpr(expr: idx, rest: r2) = parse_expr(toks: pcore.skip(toks))
@@ -199,8 +270,51 @@ let parse_postfix_loop = fn (
       let SpannedExpr(node: _, span: sp) = base
       return parse_postfix_loop(
         toks: r3,
-        base: SpannedExpr(node: ExprIndex(target: base, index: idx), span: sp)
+        base: SpannedExpr(node: ExprIndex(target: base, index: idx), span: sp),
+        prev_end: last_consumed_end(before: toks, after: r3)
       )
+    // Chained application: a `()` / `(args)` call suffix directly abutting the
+    // previous expression (no whitespace/newline gap) applies the result again,
+    // producing `ExprCallExpr(callee: base, args)`. The adjacency gate keeps a
+    // bare `()` on a separate line a distinct unit-expression statement (the
+    // lexer emits no statement terminator, so only span adjacency distinguishes
+    // `mk()()` from `mk()` ⏎ `()`). `(expr)()` on a parenthesised callee is
+    // still handled eagerly in parse_paren_expr.
+    | TkUnit ->
+      if suffix_is_adjacent(toks, prev_end) then
+        let SpannedExpr(node: _, span: sp) = base
+        let r2 = pcore.skip(toks)
+        return parse_postfix_loop(
+          toks: r2,
+          base: SpannedExpr(node: ExprCallExpr(callee: base, args: []), span: sp),
+          prev_end: last_consumed_end(before: toks, after: r2)
+        )
+      else
+        return ParsedExpr(expr: base, rest: toks)
+      end
+    | TkLParen ->
+      if suffix_is_adjacent(toks, prev_end) then
+        let SpannedExpr(node: _, span: sp) = base
+        let r2 = pcore.skip(toks)
+        if pcore.is_tok(toks: r2, expected: ")") then
+          let r3 = pcore.skip(toks: r2)
+          return parse_postfix_loop(
+            toks: r3,
+            base: SpannedExpr(node: ExprCallExpr(callee: base, args: []), span: sp),
+            prev_end: last_consumed_end(before: toks, after: r3)
+          )
+        else
+          let ParsedCallArgs(args, rest: r3) = parse_fn_call_args(toks: r2, acc: [])
+          let r4 = pcore.expect(toks: r3, expected: ")")
+          return parse_postfix_loop(
+            toks: r4,
+            base: SpannedExpr(node: ExprCallExpr(callee: base, args), span: sp),
+            prev_end: last_consumed_end(before: toks, after: r4)
+          )
+        end
+      else
+        return ParsedExpr(expr: base, rest: toks)
+      end
     | _ -> return ParsedExpr(expr: base, rest: toks)
   end
 end
