@@ -32,6 +32,7 @@ import {
   TyFloatLit,
   TyUserDefined,
   TyUnit,
+  TyRecord,
   VariantField,
   NamedType,
   VariantDef,
@@ -267,7 +268,7 @@ let check_ctor_args = fn (
               if declared_field_may_carry_cap_arrow(typ: ftyp) then
                 match check_stored_fn_caps_covered(
                   declared_resolved: expected,
-                  arg_typ: subst.subst_apply(subst: sm, typ: at),
+                  arg_typ: peel_value_binding_thunk(typ: subst.subst_apply(subst: sm, typ: at)),
                   ambient_row: tctypes.state_require_row(state: st1),
                   tdefs
                 ) do
@@ -325,10 +326,73 @@ let declared_field_may_carry_cap_arrow = fn (typ: TypeExpr) -> bool do
     | TyArrow(params: _, ret: _, requires: _, throw_row: _) -> return true
     | TyList(elem: e) -> return declared_field_may_carry_cap_arrow(typ: e)
     | TyArray(elem: e) -> return declared_field_may_carry_cap_arrow(typ: e)
+    // A STRUCTURAL record whose field is (or, under list/array layers, contains)
+    // a cap-bearing closure launders the element commitment just as a direct
+    // arrow field or list element does: a ctor field declared
+    // `rec: { g: (..) -> .. require { Box } }` admits a record VALUE built under
+    // the wrong handler, erasing a concrete `Box<i64>` element commitment at the
+    // construction boundary. Descend the fields so `check_stored_fn_caps_covered`
+    // (whose `cap_arrow_require_row` already has the matching TyRecord arm) is
+    // invoked for such fields.
+    | TyRecord(fields: fs) -> return record_field_may_carry_cap_arrow(fields: fs)
     | TyUserDefined(name: n, args: targs) ->
       if n == "List" || n == "Array" then
         match targs do
           | e :: _ -> return declared_field_may_carry_cap_arrow(typ: e)
+          | [] -> return false
+        end
+      end
+      return false
+    | _ -> return false
+  end
+end
+
+/** True when any field of a structural-record declared field type is (or, under
+ *  list/array layers / nested records, contains) a cap-bearing arrow. Mirrors
+ *  control_flow.nx's `record_field_cap_require_row` so the cheap ctor-field gate
+ *  and the coverage helper agree on which record shapes carry a commitment. */
+let record_field_may_carry_cap_arrow = fn (fields: [ NamedType ]) -> bool do
+  match fields do
+    | [] -> return false
+    | NamedType(name: _, typ: ft) :: rest ->
+      if declared_field_may_carry_cap_arrow(typ: ft) then return true end
+      return record_field_may_carry_cap_arrow(fields: rest)
+  end
+end
+
+/** Strip a leading value-binding nullary-thunk placeholder `TyArrow([], inner)`
+ *  off a constructor-argument's inferred type WHEN the inner shape is (or, under
+ *  list/array layers, contains) a structural RECORD. A bare reference to a
+ *  top-level `let r = { g: need_i64 }` registers with that placeholder shape, so
+ *  the inner record VALUE — which still carries its concrete `Box<i64>` element
+ *  commitment — is hidden one arrow-layer deep: `cap_arrow_require_row` would
+ *  otherwise match the placeholder's own (empty) require row and admit the
+ *  laundered commitment. Peeling recovers the record so the coverage helper sees
+ *  the concrete element args. Restricted to record-valued placeholders so a
+ *  genuine `() -> scalar` cap thunk (whose require row IS the thing to cover) is
+ *  left untouched, and so a non-thunk value (a directly-referenced function,
+ *  whose arrow has real params) is never stripped. */
+let peel_value_binding_thunk = fn (typ: TypeExpr) -> TypeExpr do
+  match typ do
+    | TyArrow(params: [], ret: inner, requires: _, throw_row: _) ->
+      if inner_is_record_carrier(typ: inner) then return inner end
+      return typ
+    | _ -> return typ
+  end
+end
+
+/** True when a type is a structural record, or a list/array (both spellings)
+ *  whose element is itself a record carrier. Gate for `peel_value_binding_thunk`:
+ *  only these container shapes launder a cap commitment through a record value. */
+let inner_is_record_carrier = fn (typ: TypeExpr) -> bool do
+  match typ do
+    | TyRecord(fields: _) -> return true
+    | TyList(elem: e) -> return inner_is_record_carrier(typ: e)
+    | TyArray(elem: e) -> return inner_is_record_carrier(typ: e)
+    | TyUserDefined(name: n, args: targs) ->
+      if n == "List" || n == "Array" then
+        match targs do
+          | e :: _ -> return inner_is_record_carrier(typ: e)
           | [] -> return false
         end
       end
