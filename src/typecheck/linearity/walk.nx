@@ -9,6 +9,7 @@
  * Divergence detection lives in diverge.nx.
  */
 
+import * as list from "std:list"
 import { Span } from "src/types/span.nx"
 import { Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilLazy } from "src/types/vocab.nx"
 import { TypeExpr, TyLinear, TyVar, TyArrow, RecordDef, EnumDef } from "src/types/type_expr.nx"
@@ -16,7 +17,8 @@ import {
   HirProgram, HirFunction, HirHandlerArm, HirHandlerBindingEntry,
   HirHandlerBinding, EagerBody, LazyBody, HirStmt, HirStmtKind,
   HirExpr, HirExprKind, HirCallArg, HirNamedExpr, HirMatchCase, HirParam,
-  HirPatternKind, HirPatternField, HirRecordPatField
+  HirPatternKind, HirPatternField, HirRecordPatField,
+  HirCap, HirCapMethod
 } from "src/ir/hir/types.nx"
 import {
   TypeError,
@@ -65,7 +67,15 @@ import { let_binds_linear } from "src/typecheck/linearity/classify.nx"
 
 /** Run the linearity pass over every function and handler-arm in `prog`: each linear binding consumed exactly once, no leaks across throwable calls. Raises TypeError on the first violation. */
 export let check_program = fn (prog: HirProgram) -> unit throws { TypeError } do
-  let sigs = build_sig_map(prog)
+  // The base sig-map covers functions / externals / handler-binding arms. A
+  // `Cap.method(...)` call lowers to a direct `Call` whose mangled func name is
+  // `<cap_qname>.<method>` (registration.register_cap_method_schemes); that name
+  // is NOT in the base sig-map, so the throwable-leak guard could never resolve
+  // a cap-method's throws row and stayed silent — leaking a linear held live
+  // across a throwing cap call. Seed the cap methods into the sig-map so the
+  // existing direct-call leak guard fires for them too.
+  let base_sigs = build_sig_map(prog)
+  let sigs = sigs_from_caps(caps: prog_caps(prog), acc: base_sigs)
   // whole-program caught-variant set. Computed once and threaded
   // (via LinState.caught_set) into every function check; consulted at each
   // divergent throw to decide strict-vs-relaxed leak checking.
@@ -83,6 +93,70 @@ export let check_program = fn (prog: HirProgram) -> unit throws { TypeError } do
   ) = prog
   check_functions(funcs: fs, sigs, tdefs, enum_defs: edefs, caught_set)
     return check_handler_bindings(bindings: hbs, sigs, tdefs, enum_defs: edefs, caught_set)
+end
+
+/** Extract the cap declarations of a program. */
+let prog_caps = fn (prog: HirProgram) -> [ HirCap ] do
+  let HirProgram(
+    caps: cs,
+    functions: _,
+    externals: _,
+    handler_bindings: _,
+    enum_defs: _,
+    exception_groups: _,
+    value_binding_names: _,
+    type_defs: _,
+    visible_enum_names: _
+  ) = prog
+  return cs
+end
+
+/** Append one SigEntry per cap method to `acc`, keyed by the call-site mangled
+ *  name `<cap_qname>.<method>` (registration.register_cap_method_schemes). Only
+ *  the declared `throw_row` is load-bearing for the throwable-leak guard; the
+ *  param info is carried faithfully but cap methods don't drive linear-result
+ *  propagation here. */
+let sigs_from_caps = fn (caps: [ HirCap ], acc: [ SigEntry ]) -> [ SigEntry ] do
+  match caps do
+    | [] -> return acc
+    | HirCap(name: cqname, type_params: tps, methods: ms) :: rest ->
+      let acc2 = sigs_from_cap_methods(cap_qname: cqname, type_params: tps, methods: ms, acc)
+      return sigs_from_caps(caps: rest, acc: acc2)
+  end
+end
+
+let sigs_from_cap_methods = fn (
+  cap_qname: string, type_params: [ string ], methods: [ HirCapMethod ], acc: [ SigEntry ]
+) -> [ SigEntry ] do
+  match methods do
+    | [] -> return acc
+    | HirCapMethod(name: mname, requires: _, span: _, throw_row: mtw, typ_params: mps, typ_ret: mret) :: rest ->
+      let entry = SigEntry(
+        name: cap_qname ++ "." ++ mname,
+        type_params,
+        param_labels: cap_method_labels(params: mps, acc: []),
+        param_types: cap_method_types(params: mps, acc: []),
+        ret_type: mret,
+        throw_row: mtw
+      )
+      return sigs_from_cap_methods(cap_qname, type_params, methods: rest, acc: entry :: acc)
+  end
+end
+
+let cap_method_labels = fn (params: [ HirParam ], acc: [ string ]) -> [ string ] do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | HirParam(label: l, name: _, sigil: _, typ: _) :: rest ->
+      return cap_method_labels(params: rest, acc: l :: acc)
+  end
+end
+
+let cap_method_types = fn (params: [ HirParam ], acc: [ TypeExpr ]) -> [ TypeExpr ] do
+  match params do
+    | [] -> return list.reverse(xs: acc)
+    | HirParam(label: _, name: _, sigil: _, typ: t) :: rest ->
+      return cap_method_types(params: rest, acc: t :: acc)
+  end
 end
 
 let check_functions = fn (
@@ -1358,13 +1432,77 @@ let check_throwable_leak = fn (
   )
 end
 
+/** Resolve the throws row of a record/struct-field callee `rec.field()`. The
+ *  field's declared arrow type is not annotated on the HIR `FieldAccess` node,
+ *  but when the receiver is a locally let-bound record literal we can read the
+ *  field's bound `Lambda` value (and its throws row) out of the ctor_env. Other
+ *  receivers carry no statically-known field arrow here → None (stay silent). */
+let resolve_field_callee_throw_row = fn (
+  target: HirExpr, field: string, st: LinState
+) -> Option<TypeExpr> do
+  let HirExpr(node: tn, span: _) = target
+  match tn do
+    | Variable(name: recname, sigil: _) ->
+      match lin_lookup_ctor(st, name: recname) do
+        | Some(val: HirExpr(node: Record(fields: fs), span: _)) ->
+          return record_field_throw_row(fields: fs, field)
+        | _ -> return None
+      end
+    | _ -> return None
+  end
+end
+
+/** Find the field named `field` in a record literal's fields and, if its value
+ *  is a `Lambda`, return that lambda's declared throws row. */
+let record_field_throw_row = fn (
+  fields: [ HirNamedExpr ], field: string
+) -> Option<TypeExpr> do
+  match fields do
+    | [] -> return None
+    | HirNamedExpr(name: fname, value: HirExpr(node: vn, span: _)) :: rest ->
+      if fname == field then
+        match vn do
+          | Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: tw, body: _) ->
+            return Some(val: tw)
+          | _ -> return None
+        end
+      end
+      return record_field_throw_row(fields: rest, field)
+  end
+end
+
+/** Resolve the throws row PRODUCED by calling `func` — i.e. the throws row of
+ *  `func`'s RETURN type when that return is itself an arrow. This is the row a
+ *  CHAINED call `func()()` may raise at its OUTER application: the inner call
+ *  returns a closure and the outer call invokes it. Returns None when `func`'s
+ *  signature is unknown or its return is not an arrow. */
+let resolve_call_result_throw_row = fn (
+  func: string, sigs: [ SigEntry ]
+) -> Option<TypeExpr> do
+  match sig_lookup(sigs, name: func) do
+    | None -> return None
+    | Some(val: SigEntry(name: _, type_params: _, param_labels: _, param_types: _, ret_type: rt, throw_row: _)) ->
+      match rt do
+        | TyArrow(params: _, ret: _, requires: _, throw_row: tw) -> return Some(val: tw)
+        | _ -> return None
+      end
+  end
+end
+
 /** Leak guard for an INDIRECT call `CallExpr(callee, args)` where the callee is
- *  an arbitrary expression rather than a directly-named function. Only a
- *  `Variable` callee whose throws row we can resolve (local let-bound lambda or
- *  function-typed param, via ctor_env) is checked; an inline `Lambda` callee
- *  reads its own throws row. Other callee shapes (field/method access, nested
- *  expressions) carry no statically-known throws row here, so the guard stays
- *  silent — never a false positive. */
+ *  an arbitrary expression rather than a directly-named function. We resolve a
+ *  statically-known throws row for each supported callee shape and run the leak
+ *  check; any unresolvable shape stays silent (None) — never a false positive:
+ *    - `Variable`     : local let-bound lambda / function-typed param (ctor_env)
+ *                       or global sig-map.
+ *    - `Lambda`       : inline closure reads its own throws row.
+ *    - `FieldAccess`  : `rec.field()` — the field's bound lambda throws row,
+ *                       resolved from a locally let-bound record literal.
+ *    - `Call`         : `mk()()` chained call — the throws row of `mk`'s RETURN
+ *                       arrow (the closure the outer application invokes).
+ *    - `CallExpr`     : deeper chain `mk()()()` — recurse on the inner indirect
+ *                       call's result arrow (best-effort; stays silent when the
+ *                       inner result row is not statically known). */
 let check_indirect_throwable_leak = fn (
   callee: HirExpr, st: LinState, sigs: [ SigEntry ], span: Span
 ) -> unit throws { TypeError } do
@@ -1379,7 +1517,42 @@ let check_indirect_throwable_leak = fn (
       )
     | Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: tw, body: _) ->
       return report_throwable_leak(callee: "<lambda>", tw_opt: Some(val: tw), st, span)
+    | FieldAccess(target: t, field: f) ->
+      return report_throwable_leak(
+        callee: "." ++ f,
+        tw_opt: resolve_field_callee_throw_row(target: t, field: f, st),
+        st,
+        span
+      )
+    | Call(func: f, args: _) ->
+      return report_throwable_leak(
+        callee: f,
+        tw_opt: resolve_call_result_throw_row(func: f, sigs),
+        st,
+        span
+      )
+    | CallExpr(callee: inner, args: _) ->
+      return report_throwable_leak(
+        callee: "<chained>",
+        tw_opt: resolve_indirect_result_throw_row(callee: inner, st, sigs),
+        st,
+        span
+      )
     | _ -> return ()
+  end
+end
+
+/** Best-effort throws row of the value PRODUCED by an indirect call whose
+ *  callee is `callee` — used for a doubly-chained outer application
+ *  `inner()()`. Only resolves shapes whose result arrow is statically known
+ *  (a named `Call`'s return arrow); otherwise None (stay silent). */
+let resolve_indirect_result_throw_row = fn (
+  callee: HirExpr, st: LinState, sigs: [ SigEntry ]
+) -> Option<TypeExpr> do
+  let HirExpr(node: cn, span: _) = callee
+  match cn do
+    | Call(func: f, args: _) -> return resolve_call_result_throw_row(func: f, sigs)
+    | _ -> return None
   end
 end
 
