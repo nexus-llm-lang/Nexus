@@ -17,12 +17,13 @@ import { Span } from "src/types/span.nx"
 import { Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilLazy } from "src/types/vocab.nx"
 import { EnumDef, RecordDef } from "src/types/type_expr.nx"
 import {
-  HirStmt, HirStmtKind, HirExpr, HirExprKind, HirCallArg, HirNamedExpr, HirParam
+  HirStmt, HirStmtKind, HirExpr, HirExprKind, HirCallArg, HirNamedExpr, HirParam,
+  HirMatchCase, HirPatternKind, HirPatternField, HirRecordPatField
 } from "src/ir/hir/types.nx"
 import { TypeError, RefEscapes } from "src/typecheck/errors.nx"
 import { Option, Some, None } from "std:option"
 import { SigEntry, sig_lookup } from "src/typecheck/linearity/sig_map.nx"
-import { str_member } from "src/typecheck/linearity/state.nx"
+import { str_member, append_consumed } from "src/typecheck/linearity/state.nx"
 import { ret_type_bears_borrow } from "src/typecheck/linearity/borrow_types.nx"
 
 // ─── Form-B borrow-escape: record/ADT holding a borrow of a LOCAL linear ─────
@@ -111,6 +112,28 @@ let collect_local_nonlinear_lets = fn (stmts: [ HirStmt ], acc: [ string ]) -> [
         | _ -> acc
       end
       return collect_local_nonlinear_lets(stmts: rest, acc: acc1)
+  end
+end
+
+/** Local `let`-bound borrow aliases: a `let b = &owner` whose owner is a
+ *  binding owned by THIS frame (a local linear in `owned` OR a local
+ *  non-linear in `nl_locals`). `b` then *is* a borrow of a frame-owned local,
+ *  so capturing `b` in a returned closure escapes the borrow just as a direct
+ *  `&owner` capture would. Borrows of a `&`-typed PARAMETER (a non-local owner
+ *  that outlives this frame) are deliberately excluded: they may legally
+ *  escape, matching the record-field rule. */
+let collect_borrow_aliases = fn (
+  stmts: [ HirStmt ], frame_locals: [ string ], acc: [ string ]
+) -> [ string ] do
+  match stmts do
+    | [] -> return acc
+    | HirStmt(node: nd, span: _) :: rest ->
+      let acc1 = match nd do
+        | Let(name: n, sigil: _, typ: _, value: HirExpr(node: Borrow(name: owner, sigil: _), span: _)) ->
+          if str_member(xs: frame_locals, target: owner) then n :: acc else acc end
+        | _ -> acc
+      end
+      return collect_borrow_aliases(stmts: rest, frame_locals, acc: acc1)
   end
 end
 
@@ -212,6 +235,240 @@ let call_borrows_member = fn (args: [ HirCallArg ], locals: [ string ]) -> bool 
   end
 end
 
+// ─── Closure-captured borrow of a frame-owned local ─────────────────────────
+//
+// A `&σ` borrow also escapes when it is captured by a RETURNED CLOSURE: the
+// closure's free variables outlive this frame via the returned arrow value, so
+// a captured borrow of a frame-owned local dangles after the function returns —
+// the exact owner-locality violation the record-field rule already screens.
+//
+//   let leak = fn () -> (() -> i64) do
+//     let x = 1
+//     let b = &x                          // b borrows frame-local x
+//     let g = fn () -> i64 do return b end // closure captures borrow-alias b
+//     return g                            // ← escape: borrow of x outlives leak
+//   end
+//
+// The lambda's `escapesRef` return type is borrow-FREE (it returns `i64`), so
+// the type-level gravity rule never fires; we must inspect the captured free
+// variables directly. A capture is unsafe when the lambda body references a
+// `Borrow(local)` of a frame-owned binding, OR a `Variable(b)` for a
+// borrow-alias `b` (`let b = &local`). Borrows of a `&`-param (owner outlives
+// the frame) are NOT in frame_locals/borrow_aliases, so closures forwarding a
+// borrowed parameter stay accepted (positive companion test).
+//
+// Shadowing is honoured: the lambda's own params and any inner `let` that
+// rebinds a name hide the outer binding, so they are not treated as captures.
+
+/** True iff `name` names a frame-owned borrow capture (a frame-local that is
+ *  directly borrowed, or a borrow-alias variable) AND is not shadowed. */
+let is_frame_borrow_var = fn (
+  name: string, is_borrow: bool, frame_locals: [ string ],
+  borrow_aliases: [ string ], shadowed: [ string ]
+) -> bool do
+  if str_member(xs: shadowed, target: name) then return false end
+  if is_borrow then return str_member(xs: frame_locals, target: name) end
+  return str_member(xs: borrow_aliases, target: name)
+end
+
+/** Walk a lambda body's statements; true if any captures a borrow of a
+ *  frame-owned local. `shadowed` grows with the lambda's inner `let` bindings. */
+let lambda_stmts_capture = fn (
+  stmts: [ HirStmt ], frame_locals: [ string ], borrow_aliases: [ string ], shadowed: [ string ]
+) -> bool do
+  match stmts do
+    | [] -> return false
+    | HirStmt(node: nd, span: _) :: rest ->
+      match nd do
+        | Let(name: ln, sigil: _, typ: _, value: lv) ->
+          if lambda_expr_captures(expr: lv, frame_locals, borrow_aliases, shadowed) then return true end
+          // A `let ln = ...` inside the lambda shadows any outer `ln` for the
+          // remaining statements.
+          return lambda_stmts_capture(stmts: rest, frame_locals, borrow_aliases, shadowed: ln :: shadowed)
+        | Expr(expr: e) ->
+          if lambda_expr_captures(expr: e, frame_locals, borrow_aliases, shadowed) then return true end
+          return lambda_stmts_capture(stmts: rest, frame_locals, borrow_aliases, shadowed)
+        | Return(expr: e) ->
+          if lambda_expr_captures(expr: e, frame_locals, borrow_aliases, shadowed) then return true end
+          return lambda_stmts_capture(stmts: rest, frame_locals, borrow_aliases, shadowed)
+        | Assign(target: t, value: v) ->
+          if lambda_expr_captures(expr: t, frame_locals, borrow_aliases, shadowed) then return true end
+          if lambda_expr_captures(expr: v, frame_locals, borrow_aliases, shadowed) then return true end
+          return lambda_stmts_capture(stmts: rest, frame_locals, borrow_aliases, shadowed)
+        | Try(body: tb, catch_param: cp, catch_body: cb) ->
+          if lambda_stmts_capture(stmts: tb, frame_locals, borrow_aliases, shadowed) then return true end
+          if lambda_stmts_capture(stmts: cb, frame_locals, borrow_aliases, shadowed: cp :: shadowed) then return true end
+          return lambda_stmts_capture(stmts: rest, frame_locals, borrow_aliases, shadowed)
+      end
+  end
+end
+
+/** Walk a lambda body's expression; true if it references a frame-owned borrow
+ *  capture (directly, or nested in any sub-expression / inner block). */
+let lambda_expr_captures = fn (
+  expr: HirExpr, frame_locals: [ string ], borrow_aliases: [ string ], shadowed: [ string ]
+) -> bool do
+  match expr do
+    | HirExpr(node: en, span: _) ->
+      match en do
+        | Variable(name: vn, sigil: _) ->
+          return is_frame_borrow_var(name: vn, is_borrow: false, frame_locals, borrow_aliases, shadowed)
+        | Borrow(name: bn, sigil: _) ->
+          return is_frame_borrow_var(name: bn, is_borrow: true, frame_locals, borrow_aliases, shadowed)
+        | BinOp(left: l, op: _, right: r) ->
+          if lambda_expr_captures(expr: l, frame_locals, borrow_aliases, shadowed) then return true end
+          return lambda_expr_captures(expr: r, frame_locals, borrow_aliases, shadowed)
+        | UnOp(op: _, operand: o) ->
+          return lambda_expr_captures(expr: o, frame_locals, borrow_aliases, shadowed)
+        | Call(func: _, args: cargs) ->
+          return lambda_args_capture(args: cargs, frame_locals, borrow_aliases, shadowed)
+        | CallExpr(callee: c, args: cargs) ->
+          if lambda_expr_captures(expr: c, frame_locals, borrow_aliases, shadowed) then return true end
+          return lambda_args_capture(args: cargs, frame_locals, borrow_aliases, shadowed)
+        | Ctor(variant: _, args: cargs, labels: _, sigil: _) ->
+          return lambda_exprs_capture(args: cargs, frame_locals, borrow_aliases, shadowed)
+        | Record(fields: fs) ->
+          return lambda_named_capture(fields: fs, frame_locals, borrow_aliases, shadowed)
+        | Array(elems: es) ->
+          return lambda_exprs_capture(args: es, frame_locals, borrow_aliases, shadowed)
+        | Index(target: t, index: i) ->
+          if lambda_expr_captures(expr: t, frame_locals, borrow_aliases, shadowed) then return true end
+          return lambda_expr_captures(expr: i, frame_locals, borrow_aliases, shadowed)
+        | FieldAccess(target: t, field: _) ->
+          return lambda_expr_captures(expr: t, frame_locals, borrow_aliases, shadowed)
+        | If(cond: c, then_branch: tb, else_branch: eb) ->
+          if lambda_expr_captures(expr: c, frame_locals, borrow_aliases, shadowed) then return true end
+          if lambda_stmts_capture(stmts: tb, frame_locals, borrow_aliases, shadowed) then return true end
+          match eb do
+            | Some(val: es) -> return lambda_stmts_capture(stmts: es, frame_locals, borrow_aliases, shadowed)
+            | None -> return false
+          end
+        | Match(target: t, cases: cs) ->
+          if lambda_expr_captures(expr: t, frame_locals, borrow_aliases, shadowed) then return true end
+          return lambda_cases_capture(cases: cs, frame_locals, borrow_aliases, shadowed)
+        | While(cond: c, body: wb) ->
+          if lambda_expr_captures(expr: c, frame_locals, borrow_aliases, shadowed) then return true end
+          return lambda_stmts_capture(stmts: wb, frame_locals, borrow_aliases, shadowed)
+        | For(var: fv, start: s, end_expr: e, body: fb) ->
+          if lambda_expr_captures(expr: s, frame_locals, borrow_aliases, shadowed) then return true end
+          if lambda_expr_captures(expr: e, frame_locals, borrow_aliases, shadowed) then return true end
+          return lambda_stmts_capture(stmts: fb, frame_locals, borrow_aliases, shadowed: fv :: shadowed)
+        // A nested lambda still captures the SAME outer frame's locals; its own
+        // params shadow them. Descend with the inner params added to `shadowed`.
+        | Lambda(type_params: _, params: lps, ret_type: _, requires: _, throw_row: _, body: lb) ->
+          return lambda_stmts_capture(stmts: lb, frame_locals, borrow_aliases, shadowed: add_param_names(params: lps, acc: shadowed))
+        | Raise(expr: e) -> return lambda_expr_captures(expr: e, frame_locals, borrow_aliases, shadowed)
+        | Force(expr: e) -> return lambda_expr_captures(expr: e, frame_locals, borrow_aliases, shadowed)
+        | Thunk(body: e) -> return lambda_expr_captures(expr: e, frame_locals, borrow_aliases, shadowed)
+        | Inject(handlers: _, body: ib) ->
+          return lambda_stmts_capture(stmts: ib, frame_locals, borrow_aliases, shadowed)
+        | _ -> return false
+      end
+  end
+end
+
+let lambda_args_capture = fn (
+  args: [ HirCallArg ], frame_locals: [ string ], borrow_aliases: [ string ], shadowed: [ string ]
+) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: _, value: v) :: rest ->
+      if lambda_expr_captures(expr: v, frame_locals, borrow_aliases, shadowed) then return true end
+      return lambda_args_capture(args: rest, frame_locals, borrow_aliases, shadowed)
+  end
+end
+
+let lambda_exprs_capture = fn (
+  args: [ HirExpr ], frame_locals: [ string ], borrow_aliases: [ string ], shadowed: [ string ]
+) -> bool do
+  match args do
+    | [] -> return false
+    | e :: rest ->
+      if lambda_expr_captures(expr: e, frame_locals, borrow_aliases, shadowed) then return true end
+      return lambda_exprs_capture(args: rest, frame_locals, borrow_aliases, shadowed)
+  end
+end
+
+let lambda_named_capture = fn (
+  fields: [ HirNamedExpr ], frame_locals: [ string ], borrow_aliases: [ string ], shadowed: [ string ]
+) -> bool do
+  match fields do
+    | [] -> return false
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      if lambda_expr_captures(expr: v, frame_locals, borrow_aliases, shadowed) then return true end
+      return lambda_named_capture(fields: rest, frame_locals, borrow_aliases, shadowed)
+  end
+end
+
+let lambda_cases_capture = fn (
+  cases: [ HirMatchCase ], frame_locals: [ string ], borrow_aliases: [ string ], shadowed: [ string ]
+) -> bool do
+  match cases do
+    | [] -> return false
+    | HirMatchCase(pattern: pat, body: cb) :: rest ->
+      // Pattern-bound names shadow outer captures within the arm body.
+      let sh = add_pattern_names(pat, acc: shadowed)
+      if lambda_stmts_capture(stmts: cb, frame_locals, borrow_aliases, shadowed: sh) then return true end
+      return lambda_cases_capture(cases: rest, frame_locals, borrow_aliases, shadowed)
+  end
+end
+
+/** Append a parameter list's names onto a shadow set. */
+let add_param_names = fn (params: [ HirParam ], acc: [ string ]) -> [ string ] do
+  match params do
+    | [] -> return acc
+    | HirParam(label: _, name: pn, sigil: _, typ: _) :: rest ->
+      return add_param_names(params: rest, acc: pn :: acc)
+  end
+end
+
+/** Append a pattern's bound variable names onto a shadow set. */
+let add_pattern_names = fn (pat: HirPatternKind, acc: [ string ]) -> [ string ] do
+  match pat do
+    | PVar(name: n, sigil: _) -> return n :: acc
+    | PCtor(variant: _, fields: fs, sigil: _) -> return add_pat_field_names(fields: fs, acc: acc)
+    | PRec(fields: rfs, is_partial: _) -> return add_rec_pat_field_names(fields: rfs, acc: acc)
+    | POr(alts: alts) -> return add_pattern_names_list(pats: alts, acc: acc)
+    | _ -> return acc
+  end
+end
+
+let add_pat_field_names = fn (fields: [ HirPatternField ], acc: [ string ]) -> [ string ] do
+  match fields do
+    | [] -> return acc
+    | HirPatternField(name: _, pattern: p) :: rest ->
+      return add_pat_field_names(fields: rest, acc: add_pattern_names(pat: p, acc: acc))
+  end
+end
+
+let add_rec_pat_field_names = fn (fields: [ HirRecordPatField ], acc: [ string ]) -> [ string ] do
+  match fields do
+    | [] -> return acc
+    | HirRecordPatField(name: _, pattern: p) :: rest ->
+      return add_rec_pat_field_names(fields: rest, acc: add_pattern_names(pat: p, acc: acc))
+  end
+end
+
+let add_pattern_names_list = fn (pats: [ HirPatternKind ], acc: [ string ]) -> [ string ] do
+  match pats do
+    | [] -> return acc
+    | p :: rest -> return add_pattern_names_list(pats: rest, acc: add_pattern_names(pat: p, acc: acc))
+  end
+end
+
+/** True iff `expr` is a lambda whose captured free variables include a borrow
+ *  of a binding owned by THIS frame — the closure-escape analog of a returned
+ *  record/ADT field holding such a borrow. */
+let lambda_captures_frame_borrow = fn (
+  expr: HirExprKind, frame_locals: [ string ], borrow_aliases: [ string ]
+) -> bool do
+  match expr do
+    | Lambda(type_params: _, params: lps, ret_type: _, requires: _, throw_row: _, body: lb) ->
+      return lambda_stmts_capture(stmts: lb, frame_locals, borrow_aliases, shadowed: add_param_names(params: lps, acc: []))
+    | _ -> return false
+  end
+end
+
 /** Is `expr` a record/ADT construction (direct or call-laundered) that stores
  *  a borrow of a LOCAL NON-LINEAR binding in `locals`? Mirrors
  *  is_borrow_laundering_call but covers the DIRECT Record/Ctor forms too, since
@@ -240,10 +497,12 @@ let constructs_borrow_of_nonlinear_local = fn (
 end
 
 /** Build the set of `let`-bound names tainted by a borrow-laundering call
- *  (linear owners) OR a record/ADT construction holding a borrow of a local
- * non-linear. Either taint marks the binding as escape-unsafe. */
+ *  (linear owners), a record/ADT construction holding a borrow of a local
+ *  non-linear, OR a closure capturing a borrow of a frame-owned local. Any
+ *  taint marks the binding as escape-unsafe. */
 let collect_tainted_names = fn (
-  stmts: [ HirStmt ], owned: [ string ], nl_locals: [ string ], sigs: [ SigEntry ],
+  stmts: [ HirStmt ], owned: [ string ], nl_locals: [ string ], frame_locals: [ string ],
+  borrow_aliases: [ string ], sigs: [ SigEntry ],
   enum_defs: [ EnumDef ], tdefs: [ RecordDef ], acc: [ string ]
 ) -> [ string ] do
   match stmts do
@@ -259,6 +518,7 @@ let collect_tainted_names = fn (
             enum_defs,
             tdefs
           ) then n :: acc
+          else if lambda_captures_frame_borrow(expr: vn, frame_locals, borrow_aliases) then n :: acc
           // Alias of an already-tainted name: `let w2 = w1`.
           else match vn do
             | Variable(name: src, sigil: _) ->
@@ -267,7 +527,7 @@ let collect_tainted_names = fn (
           end end
         | _ -> acc
       end
-      return collect_tainted_names(stmts: rest, owned, nl_locals, sigs, enum_defs, tdefs, acc: acc1)
+      return collect_tainted_names(stmts: rest, owned, nl_locals, frame_locals, borrow_aliases, sigs, enum_defs, tdefs, acc: acc1)
   end
 end
 
@@ -275,7 +535,8 @@ end
  *  (linear owner), or a direct record/ADT construction holding a borrow of a
  * local non-linear. Recurses into nested blocks (Try / Inject). */
 let check_borrow_escape_stmts = fn (
-  stmts: [ HirStmt ], tainted: [ string ], owned: [ string ], nl_locals: [ string ], sigs: [ SigEntry ],
+  stmts: [ HirStmt ], tainted: [ string ], owned: [ string ], nl_locals: [ string ],
+  frame_locals: [ string ], borrow_aliases: [ string ], sigs: [ SigEntry ],
   enum_defs: [ EnumDef ], tdefs: [ RecordDef ], fn_name: string
 ) -> unit throws { TypeError } do
   match stmts do
@@ -287,6 +548,7 @@ let check_borrow_escape_stmts = fn (
             | Variable(name: rn, sigil: _) -> str_member(xs: tainted, target: rn)
             | _ ->
               if is_borrow_laundering_call(expr: en, owned, sigs, enum_defs, tdefs) then true
+              else if lambda_captures_frame_borrow(expr: en, frame_locals, borrow_aliases) then true
               else constructs_borrow_of_nonlinear_local(
                 expr: en,
                 locals: nl_locals,
@@ -308,6 +570,8 @@ let check_borrow_escape_stmts = fn (
             tainted,
             owned,
             nl_locals,
+            frame_locals,
+            borrow_aliases,
             sigs,
             enum_defs,
             tdefs,
@@ -318,6 +582,8 @@ let check_borrow_escape_stmts = fn (
             tainted,
             owned,
             nl_locals,
+            frame_locals,
+            borrow_aliases,
             sigs,
             enum_defs,
             tdefs,
@@ -332,6 +598,8 @@ let check_borrow_escape_stmts = fn (
             tainted,
             owned,
             nl_locals,
+            frame_locals,
+            borrow_aliases,
             sigs,
             enum_defs,
             tdefs,
@@ -344,6 +612,8 @@ let check_borrow_escape_stmts = fn (
         tainted,
         owned,
         nl_locals,
+        frame_locals,
+        borrow_aliases,
         sigs,
         enum_defs,
         tdefs,
@@ -361,38 +631,32 @@ export let check_borrow_escape_form_b = fn (
 ) -> unit throws { TypeError } do
   let owned = collect_owned_linears(params, stmts, acc: [])
   let nl_locals = collect_local_nonlinear_lets(stmts, acc: [])
-  match owned do
-    | [] ->
-      match nl_locals do
-        | [] -> return ()
-        | _ ->
-          let tainted = collect_tainted_names(
-            stmts,
-            owned,
-            nl_locals,
-            sigs,
-            enum_defs,
-            tdefs,
-            acc: []
-          )
-          return check_borrow_escape_stmts(
-            stmts,
-            tainted,
-            owned,
-            nl_locals,
-            sigs,
-            enum_defs,
-            tdefs,
-            fn_name
-          )
-      end
+  // Bindings owned by THIS frame (linear + non-linear locals) and the `let`
+  // borrow-aliases (`let b = &owner`) over them; both feed the returned-closure
+  // capture check. No frame-owned locals ⇒ nothing can escape, so we bail early.
+  let frame_locals = append_consumed(xs: owned, ys: nl_locals)
+  match frame_locals do
+    | [] -> return ()
     | _ ->
-      let tainted = collect_tainted_names(stmts, owned, nl_locals, sigs, enum_defs, tdefs, acc: [])
+      let borrow_aliases = collect_borrow_aliases(stmts, frame_locals, acc: [])
+      let tainted = collect_tainted_names(
+        stmts,
+        owned,
+        nl_locals,
+        frame_locals,
+        borrow_aliases,
+        sigs,
+        enum_defs,
+        tdefs,
+        acc: []
+      )
       return check_borrow_escape_stmts(
         stmts,
         tainted,
         owned,
         nl_locals,
+        frame_locals,
+        borrow_aliases,
         sigs,
         enum_defs,
         tdefs,
