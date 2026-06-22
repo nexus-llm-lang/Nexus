@@ -469,6 +469,94 @@ let lambda_captures_frame_borrow = fn (
   end
 end
 
+// ─── Closure-in-aggregate-field escape (hw2wf, residual of drerq) ────────────
+//
+// drerq screens a closure capturing a frame-owned borrow only when the closure
+// is DIRECTLY returned (`return g` / `return fn..`) or `let`-tainted then
+// returned. The residual hole: a closure escapes JUST AS MUCH when it is stored
+// inside a RETURNED Record/Ctor field —
+//
+//   type W = { f: (() -> i64) }
+//   let leak = fn () -> W do
+//     let x = 1
+//     let b = &x
+//     let g = fn () -> i64 do return b end
+//     return { f: g }                 // ← closure escapes inside a record field
+//   end
+//
+// Two HIR shapes carry the closure into the field:
+//   • an INLINE `Lambda` field value (`return { f: fn..b.. }`), detected via the
+//     same `lambda_captures_frame_borrow` machinery drerq uses; and
+//   • a `Variable(g)` reference to a `let g = fn..b..` that `collect_tainted_names`
+//     already marked escape-unsafe (drerq taints it), detected by membership in
+//     `tainted`.
+// The walk descends nested Record/Ctor carriers (`{ i: { f: g } }`,
+// `Wrap(i: {f: g})`) so a buried closure is found, not just the flat field.
+//
+// Owner-locality is honoured exactly as drerq: only captures of a frame-owned
+// binding (a local linear/non-linear, or a `let`-alias of one) escape; a closure
+// forwarding a borrow of a `&`-PARAMETER (owner outlives the frame) is NOT in
+// frame_locals/borrow_aliases nor tainted, so it stays accepted (positive
+// companion test).
+
+/** True iff `expr`, when it appears as a RETURNED Record/Ctor field value,
+ *  holds an escaping closure: an inline `Lambda` capturing a frame-owned borrow,
+ *  a `Variable` referencing an already-tainted let-closure, or such a closure
+ *  buried in a nested Record/Ctor carrier. */
+let aggregate_field_holds_escaping_closure = fn (
+  expr: HirExprKind, tainted: [ string ], frame_locals: [ string ], borrow_aliases: [ string ]
+) -> bool do
+  match expr do
+    | Variable(name: vn, sigil: _) -> return str_member(xs: tainted, target: vn)
+    | Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: _) ->
+      return lambda_captures_frame_borrow(expr, frame_locals, borrow_aliases)
+    | Record(fields: fs) ->
+      return aggregate_named_fields_hold_escaping_closure(fields: fs, tainted, frame_locals, borrow_aliases)
+    | Ctor(variant: _, args: cargs, labels: _, sigil: _) ->
+      return aggregate_exprs_hold_escaping_closure(args: cargs, tainted, frame_locals, borrow_aliases)
+    | _ -> return false
+  end
+end
+
+let aggregate_named_fields_hold_escaping_closure = fn (
+  fields: [ HirNamedExpr ], tainted: [ string ], frame_locals: [ string ], borrow_aliases: [ string ]
+) -> bool do
+  match fields do
+    | [] -> return false
+    | HirNamedExpr(name: _, value: HirExpr(node: vn, span: _)) :: rest ->
+      if aggregate_field_holds_escaping_closure(expr: vn, tainted, frame_locals, borrow_aliases) then return true end
+      return aggregate_named_fields_hold_escaping_closure(fields: rest, tainted, frame_locals, borrow_aliases)
+  end
+end
+
+let aggregate_exprs_hold_escaping_closure = fn (
+  args: [ HirExpr ], tainted: [ string ], frame_locals: [ string ], borrow_aliases: [ string ]
+) -> bool do
+  match args do
+    | [] -> return false
+    | HirExpr(node: vn, span: _) :: rest ->
+      if aggregate_field_holds_escaping_closure(expr: vn, tainted, frame_locals, borrow_aliases) then return true end
+      return aggregate_exprs_hold_escaping_closure(args: rest, tainted, frame_locals, borrow_aliases)
+  end
+end
+
+/** True iff `expr` is a Record/Ctor construction whose fields (transitively)
+ *  hold an escaping closure (inline lambda or tainted let-closure variable).
+ *  A bare top-level `Lambda` / `Variable` is NOT matched here — those are the
+ *  drerq direct-return forms already screened by `lambda_captures_frame_borrow`
+ *  / the tainted-name check; this covers only the AGGREGATE-field residual. */
+let returned_aggregate_holds_escaping_closure = fn (
+  expr: HirExprKind, tainted: [ string ], frame_locals: [ string ], borrow_aliases: [ string ]
+) -> bool do
+  match expr do
+    | Record(fields: fs) ->
+      return aggregate_named_fields_hold_escaping_closure(fields: fs, tainted, frame_locals, borrow_aliases)
+    | Ctor(variant: _, args: cargs, labels: _, sigil: _) ->
+      return aggregate_exprs_hold_escaping_closure(args: cargs, tainted, frame_locals, borrow_aliases)
+    | _ -> return false
+  end
+end
+
 /** Is `expr` a record/ADT construction (direct or call-laundered) that stores
  *  a borrow of a LOCAL NON-LINEAR binding in `locals`? Mirrors
  *  is_borrow_laundering_call but covers the DIRECT Record/Ctor forms too, since
@@ -519,6 +607,12 @@ let collect_tainted_names = fn (
             tdefs
           ) then n :: acc
           else if lambda_captures_frame_borrow(expr: vn, frame_locals, borrow_aliases) then n :: acc
+          // A returned Record/Ctor field holding an escaping closure (inline
+          // lambda or a reference to an already-tainted let-closure): taint the
+          // aggregate binding so `return w` is rejected. `acc` carries the taint
+          // of prior `let g = fn..` statements (source order: `g` is bound
+          // before `w`), so the `Variable(g)` field reference resolves here.
+          else if returned_aggregate_holds_escaping_closure(expr: vn, tainted: acc, frame_locals, borrow_aliases) then n :: acc
           // Alias of an already-tainted name: `let w2 = w1`.
           else match vn do
             | Variable(name: src, sigil: _) ->
@@ -549,6 +643,7 @@ let check_borrow_escape_stmts = fn (
             | _ ->
               if is_borrow_laundering_call(expr: en, owned, sigs, enum_defs, tdefs) then true
               else if lambda_captures_frame_borrow(expr: en, frame_locals, borrow_aliases) then true
+              else if returned_aggregate_holds_escaping_closure(expr: en, tainted, frame_locals, borrow_aliases) then true
               else constructs_borrow_of_nonlinear_local(
                 expr: en,
                 locals: nl_locals,
