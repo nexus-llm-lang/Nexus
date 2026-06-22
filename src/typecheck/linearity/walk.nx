@@ -1110,30 +1110,73 @@ let check_expr_kind = fn (
   end
 end
 
+// Shared sibling throwable-leak guard for any left-to-right multi-operand form
+// (call arguments, constructor arguments, record-literal fields, array elements).
+//
+// `prior_consumed` is the set of linears consumed by EARLIER siblings of THIS
+// operand list. Their consumers (a call's parameter binders / a constructor or
+// record's field stores) only run once the WHOLE operand list has evaluated and
+// the enclosing form is actually built — so they have NOT run yet while a LATER
+// sibling is being evaluated. If a later sibling is (or contains) a throwable
+// call that raises, the enclosing form is never built and every linear moved by
+// an earlier sibling leaks on that throw path with no runtime drop. The
+// left-to-right fold has already `lin_remove`d those linears from `st`'s live
+// set, so the throwable-leak guard fired while walking the later sibling would
+// miss them. This re-walks the sibling for the guard ONLY, against a view where
+// the earlier-sibling-consumed linears are restored to live (and cleared from
+// `consumed`, so reuse short-circuits harmlessly instead of firing).
+//
+// Gated on `prior_consumed` being non-empty: with no earlier sibling consumption
+// the primary walk's guard already sees the full live set, so the re-walk is
+// unnecessary. The re-walk only adds outer-scope vars uniformly, so it cannot
+// cause a spurious LinearMismatch; its result is discarded — it exists solely
+// for the leak guard's side effect (it may throw E0540).
+let sibling_leak_rewalk = fn (
+  v: HirExpr, st: LinState, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ],
+  prior_consumed: [ string ]
+) -> unit throws { TypeError } do
+  match prior_consumed do
+    | [] -> return ()
+    | _ :: _ ->
+      let leak_view = lin_restore_state(
+        st,
+        vs: append_consumed(xs: lin_state_vars(st), ys: prior_consumed),
+        co: filter_not_in(xs: lin_state_consumed(st), exclude: prior_consumed, acc: [])
+      )
+      let _discard = check_expr(expr: v, st: leak_view, sigs, tdefs, enum_defs, at_stmt_level: false)
+      return ()
+  end
+end
+
 let check_exprs = fn (
   exprs: [ HirExpr ], st: LinState, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> LinState throws { TypeError } do
+  return check_exprs_go(exprs, st, sigs, tdefs, enum_defs, prior_consumed: [])
+end
+
+let check_exprs_go = fn (
+  exprs: [ HirExpr ], st: LinState, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ],
+  prior_consumed: [ string ]
 ) -> LinState throws { TypeError } do
   match exprs do
     | [] -> return st
     | e :: rest ->
+      sibling_leak_rewalk(v: e, st, sigs, tdefs, enum_defs, prior_consumed)
+      // Primary walk: threads real consumption + reuse detection forward.
       let st1 = check_expr(expr: e, st, sigs, tdefs, enum_defs, at_stmt_level: false)
-      return check_exprs(exprs: rest, st: st1, sigs, tdefs, enum_defs)
+      // Fold the linears THIS sibling just consumed into `prior_consumed` for
+      // the remaining siblings. The delta is start-live minus still-live.
+      let consumed_here = filter_not_in(xs: lin_state_vars(st), exclude: lin_state_vars(st: st1), acc: [])
+      return check_exprs_go(
+        exprs: rest, st: st1, sigs, tdefs, enum_defs,
+        prior_consumed: append_consumed(xs: prior_consumed, ys: consumed_here)
+      )
   end
 end
 
 let check_call_args = fn (
   args: [ HirCallArg ], st: LinState, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
 ) -> LinState throws { TypeError } do
-  // `prior_consumed` accumulates the linears consumed by EARLIER sibling
-  // arguments of THIS call. Those consumers (the call's parameter binders /
-  // the callee body) only run once the WHOLE argument list has evaluated and
-  // the call is actually invoked — so they have NOT run yet while a LATER
-  // sibling argument is being evaluated. If a later sibling is (or contains) a
-  // throwable call that raises, the enclosing call never runs and every linear
-  // moved by an earlier sibling leaks on that throw path. The left-to-right
-  // fold has already `lin_remove`d those linears from `st`'s live set, so the
-  // throwable-leak guard fired while walking the later sibling would miss them.
-  // We restore them for the leak check via a re-walk against `leak_view` below.
   return check_call_args_go(args, st, sigs, tdefs, enum_defs, prior_consumed: [])
 end
 
@@ -1144,25 +1187,7 @@ let check_call_args_go = fn (
   match args do
     | [] -> return st
     | HirCallArg(label: _, value: v) :: rest ->
-      // Re-walk this sibling for the throwable-leak guard ONLY, against a view
-      // where the earlier-sibling-consumed linears are restored to live (and
-      // cleared from `consumed`, so reuse short-circuits harmlessly instead of
-      // firing). Gated on `prior_consumed` being non-empty: with no earlier
-      // sibling consumption the primary walk's guard already sees the full live
-      // set, so the re-walk is unnecessary. The re-walk only adds outer-scope
-      // vars uniformly, so it cannot cause a spurious LinearMismatch; its
-      // result is discarded — it exists solely for the leak guard's side effect.
-      match prior_consumed do
-        | [] -> ()
-        | _ :: _ ->
-          let leak_view = lin_restore_state(
-            st,
-            vs: append_consumed(xs: lin_state_vars(st), ys: prior_consumed),
-            co: filter_not_in(xs: lin_state_consumed(st), exclude: prior_consumed, acc: [])
-          )
-          let _discard = check_expr(expr: v, st: leak_view, sigs, tdefs, enum_defs, at_stmt_level: false)
-          ()
-      end
+      sibling_leak_rewalk(v, st, sigs, tdefs, enum_defs, prior_consumed)
       // Primary walk: threads real consumption + reuse detection forward.
       let st1 = check_expr(expr: v, st, sigs, tdefs, enum_defs, at_stmt_level: false)
       // Fold the linears THIS sibling just consumed into `prior_consumed` for
@@ -1178,11 +1203,26 @@ end
 let check_named_exprs = fn (
   fields: [ HirNamedExpr ], st: LinState, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
 ) -> LinState throws { TypeError } do
+  return check_named_exprs_go(fields, st, sigs, tdefs, enum_defs, prior_consumed: [])
+end
+
+let check_named_exprs_go = fn (
+  fields: [ HirNamedExpr ], st: LinState, sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ],
+  prior_consumed: [ string ]
+) -> LinState throws { TypeError } do
   match fields do
     | [] -> return st
     | HirNamedExpr(name: _, value: v) :: rest ->
+      sibling_leak_rewalk(v, st, sigs, tdefs, enum_defs, prior_consumed)
+      // Primary walk: threads real consumption + reuse detection forward.
       let st1 = check_expr(expr: v, st, sigs, tdefs, enum_defs, at_stmt_level: false)
-      return check_named_exprs(fields: rest, st: st1, sigs, tdefs, enum_defs)
+      // Fold the linears THIS sibling just consumed into `prior_consumed` for
+      // the remaining siblings. The delta is start-live minus still-live.
+      let consumed_here = filter_not_in(xs: lin_state_vars(st), exclude: lin_state_vars(st: st1), acc: [])
+      return check_named_exprs_go(
+        fields: rest, st: st1, sigs, tdefs, enum_defs,
+        prior_consumed: append_consumed(xs: prior_consumed, ys: consumed_here)
+      )
   end
 end
 
