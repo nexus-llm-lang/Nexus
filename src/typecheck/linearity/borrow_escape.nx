@@ -15,7 +15,11 @@
 
 import { Span } from "src/types/span.nx"
 import { Sigil, SigilImmutable, SigilMutable, SigilLinear, SigilLazy } from "src/types/vocab.nx"
-import { EnumDef, RecordDef } from "src/types/type_expr.nx"
+import {
+  EnumDef, RecordDef, TypeExpr, NamedType, TyBorrow, TyI32, TyI64, TyF32, TyF64, TyBool, TyChar,
+  TyString, TyUnit, TyList, TyRecord
+} from "src/types/type_expr.nx"
+import * as list from "std:list"
 import {
   HirStmt, HirStmtKind, HirExpr, HirExprKind, HirCallArg, HirNamedExpr, HirParam,
   HirMatchCase, HirPatternKind, HirPatternField, HirRecordPatField
@@ -119,9 +123,9 @@ end
  *  binding owned by THIS frame (a local linear in `owned` OR a local
  *  non-linear in `nl_locals`). `b` then *is* a borrow of a frame-owned local,
  *  so capturing `b` in a returned closure escapes the borrow just as a direct
- *  `&owner` capture would. Borrows of a `&`-typed PARAMETER (a non-local owner
- *  that outlives this frame) are deliberately excluded: they may legally
- *  escape, matching the record-field rule. */
+ *  `&owner` capture would. `&`-typed PARAMETERS are not collected here; the
+ *  entry point adds those whose pointee is not plain data
+ *  (`collect_resource_borrow_params`). */
 let collect_borrow_aliases = fn (
   stmts: [ HirStmt ], frame_locals: [ string ], acc: [ string ]
 ) -> [ string ] do
@@ -465,6 +469,35 @@ let lambda_captures_frame_borrow = fn (
   match expr do
     | Lambda(type_params: _, params: lps, ret_type: _, requires: _, throw_row: _, body: lb) ->
       return lambda_stmts_capture(stmts: lb, frame_locals, borrow_aliases, shadowed: add_param_names(params: lps, acc: []))
+    // A thunk (`let @t = e`) captures the free variables of `e` the same way.
+    | Thunk(body: tb) -> return lambda_expr_captures(expr: tb, frame_locals, borrow_aliases, shadowed: [])
+    | _ -> return false
+  end
+end
+
+/** Names of `&T` parameters whose pointee `T` is not plain data (see
+ *  `is_plain_data`): their owner may be a linear resource the caller frees. */
+let collect_resource_borrow_params = fn (params: [ HirParam ], acc: [ string ]) -> [ string ] do
+  match params do
+    | [] -> return acc
+    | HirParam(label: _, name: pn, sigil: _, typ: TyBorrow(inner)) :: rest ->
+      if is_plain_data(typ: inner) then return collect_resource_borrow_params(params: rest, acc) end
+      return collect_resource_borrow_params(params: rest, acc: pn :: acc)
+    | _ :: rest -> return collect_resource_borrow_params(params: rest, acc)
+  end
+end
+
+/** Primitive scalars, strings, and lists / records built only from them:
+ *  values no owner can free. */
+let is_plain_data = fn (typ: TypeExpr) -> bool do
+  match typ do
+    | TyI32 | TyI64 | TyF32 | TyF64 | TyBool | TyChar | TyString | TyUnit -> return true
+    | TyList(elem: e) -> return is_plain_data(typ: e)
+    | TyRecord(fields: fs) ->
+      return list.all(xs: fs, p: fn (val: NamedType) -> bool do
+        let NamedType(name: _, typ: t) = val
+        return is_plain_data(typ: t)
+      end)
     | _ -> return false
   end
 end
@@ -493,11 +526,11 @@ end
 // The walk descends nested Record/Ctor carriers (`{ i: { f: g } }`,
 // `Wrap(i: {f: g})`) so a buried closure is found, not just the flat field.
 //
-// Owner-locality is honoured exactly as drerq: only captures of a frame-owned
-// binding (a local linear/non-linear, or a `let`-alias of one) escape; a closure
-// forwarding a borrow of a `&`-PARAMETER (owner outlives the frame) is NOT in
-// frame_locals/borrow_aliases nor tainted, so it stays accepted (positive
-// companion test).
+// Captures that count as escaping: a frame-owned binding (a local
+// linear/non-linear, or a `let`-alias of one) and a `&`-PARAMETER whose pointee
+// is not plain data (its owner may be a resource the caller frees after the
+// call). A closure forwarding a borrow of a plain-data `&`-parameter stays
+// accepted (positive companion test).
 
 /** True iff `expr`, when it appears as a RETURNED Record/Ctor field value,
  *  holds an escaping closure: an inline `Lambda` capturing a frame-owned borrow,
@@ -730,10 +763,17 @@ export let check_borrow_escape_form_b = fn (
   // borrow-aliases (`let b = &owner`) over them; both feed the returned-closure
   // capture check. No frame-owned locals ⇒ nothing can escape, so we bail early.
   let frame_locals = append_consumed(xs: owned, ys: nl_locals)
-  match frame_locals do
+  // Borrow parameters of a resource type: the caller may consume the owner
+  // after this call returns, so a closure / thunk capturing one must not
+  // escape either. They join the borrow-alias set the capture check uses.
+  let resource_borrows = collect_resource_borrow_params(params, acc: [])
+  match append_consumed(xs: frame_locals, ys: resource_borrows) do
     | [] -> return ()
     | _ ->
-      let borrow_aliases = collect_borrow_aliases(stmts, frame_locals, acc: [])
+      let borrow_aliases = append_consumed(
+        xs: collect_borrow_aliases(stmts, frame_locals, acc: []),
+        ys: resource_borrows
+      )
       let tainted = collect_tainted_names(
         stmts,
         owned,
