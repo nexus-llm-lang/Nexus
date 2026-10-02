@@ -1,47 +1,22 @@
 /**
- * typecheck/check/value_binding: top-level value-binding real-type resolution.
+ * typecheck/check/value_binding: top-level value-binding types.
  *
  * A top-level `let x = <expr>` (a value binding, not a `fn`) is lowered to a
  * nullary HirFunction `HirFunction(params: [], ret_type: rt, body:
- * [Return(<expr>)])` and registered in the env with the nullary-thunk scheme
- * `TyArrow(params: [], ret: rt)` — the shape that keeps `x` forceable while a
- * bare `x` reference in value position denotes the value of type `rt`.
+ * [Return(<expr>)])` and registered by `register_functions` with the nullary
+ * arrow `() -> rt`. MIR lowers a bare reference `x` to a read of the value, so
+ * this pass re-publishes each binding's scheme as its value type before any
+ * body is checked.
  *
- * When the binding carries no explicit type annotation and its initializer is
- * NOT a literal, HIR build cannot run inference (the env is not yet populated)
- * and defaults `rt` to the `TyI64` placeholder (see hir/build/defs.nx
- * infer_constant_type). The real type — e.g. `Span` for `let zero_span =
- * Span(offset: 0, line: 0, col: 0)` — is only known once the initializer is
- * inferred. Every referrer therefore sees a value of declared type `i64` where
- * the real value is a `Span`: a ctor-field / call-arg / if-branch use of `x`
- * resolves its forced type to `i64`, clashing with the real `Span` expectation
- * ("expected arrow type" / type-mismatch). The clash is order-independent: it
- * is the stale declared type, not a check-ordering artifact.
- *
- * This pass closes that gap. For each value binding whose registered return
- * type is the `TyI64` placeholder, it infers the initializer's real type and,
- * when that type is a STRUCTURED type (user-defined / record / list / array /
- * tuple — never a scalar), re-publishes the env scheme as `TyArrow(params: [],
- * ret: realT)`. Scalar results (`i64`, `bool`, …) are left untouched: a scalar
- * placeholder already matches every scalar use through the existing auto-force
- * peels, and narrowing it could only reduce, never improve, accuracy.
- *
- * Soundness / inertness:
- *   - Best-effort: an initializer whose inference FAILS keeps its existing
- *     scheme, so the pass never introduces a new diagnostic. On the live
- *     (gate-on) path no root-local body references these bindings, so no
- *     local body's result changes — `./nexus test` is unaffected.
- *   - Only `TyI64`-placeholder bindings are touched, so an explicitly typed
- *     binding (`let t: @T = @e`, `let n: i64 = 0`) keeps its declared scheme
- *     and is checked against it as before.
- *   - The pass only ever moves a scheme from the placeholder toward the type
- *     the body check itself would assign, so a referrer sees the SAME type a
- *     local reference would. Cross-binding references (`let a = pair(zero_span,
- *     zero_span)`) converge under a fixpoint that re-runs until no scheme
- *     changes; each scheme moves placeholder → resolved at most once.
+ * When the binding has no annotation and its initializer is not a literal,
+ * HIR build cannot infer `rt` (the env is not populated yet) and stores the
+ * `vb_inferred` placeholder (src/types/type_expr.nx). Those initializers are
+ * inferred here under a fixpoint, since one binding's initializer may
+ * reference another, and their types are generalized over free type
+ * variables (top-level bindings are immutable).
  *
  * Runs after register_functions / register_caps / register_enum_constructors
- * and before body checking. A no-op for programs with no such value bindings.
+ * and before body checking.
  */
 
 import * as list from "std:list"
@@ -56,43 +31,90 @@ import {
 import * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
 import { alias_src_name } from "src/typecheck/check/registration.nx"
+import { collect_tyvars } from "src/typecheck/linearity/borrow_types.nx"
+import { is_vb_inferred } from "src/types/type_expr.nx"
+import * as option from "std:option"
 import * as infer from "src/typecheck/infer.nx"
 import { TypeError } from "src/typecheck/errors.nx"
 
-/** Resolve each placeholder-typed value binding's real type and re-publish its
- *  scheme. Returns the state with refined schemes; bindings with a non-`TyI64`
- *  declared type, a non-structured result, or a failing initializer are left
- *  untouched. */
+/** Give every top-level value binding its value type in the env. A binding is
+ *  registered as the nullary arrow `() -> T`; afterwards its scheme is `T`,
+ *  so a bare reference denotes the value (MIR lowers it to a value read).
+ *    - annotated / literal bindings: `T` is the declared type;
+ *    - unannotated non-literal bindings (`vb_inferred` return): `T` is the
+ *      initializer's inferred type, generalized over its free variables,
+ *      found by a fixpoint because initializers may reference each other;
+ *    - aliases `let g = f`: the final scheme of `f`.
+ *  A binding whose initializer fails to infer keeps its arrow scheme; its own
+ *  body check reports the error. */
 export let resolve_value_binding_types = fn (
   state: CheckState,
-  funcs: [ HirFunction ]
+  funcs: [ HirFunction ],
+  vb_names: [ string ]
 ) -> CheckState do
-  let participants = collect_participants(funcs, acc: [])
-  if list.is_empty(xs: participants) then return state end
+  let vbs = list.filter(xs: funcs, p: fn (val: HirFunction) -> bool do
+    return list.str_member(xs: vb_names, s: fn_name(f: val))
+  end)
+  let st1 = unthunk_declared(state, vbs)
+  let participants = list.filter(xs: vbs, p: is_participant)
   let n = list.length(xs: participants)
-  return resolve_fixpoint(state, participants, fuel: n + 4)
+  let st2 = resolve_fixpoint(state: st1, participants, fuel: n + 4)
+  let aliases = list.filter(xs: vbs, p: fn (val: HirFunction) -> bool do
+    return option.is_some(opt: alias_src_name(func: val))
+  end)
+  return resolve_aliases(state: resolve_aliases(state: st2, aliases), aliases)
 end
 
-/** Value bindings eligible for resolution: a nullary, non-alias eager binding
- *  whose declared return type is the `TyI64` placeholder. */
-let collect_participants = fn (funcs: [ HirFunction ], acc: [ HirFunction ]) -> [ HirFunction ] do
-  match funcs do
-    | [] -> return list.reverse(xs: acc)
+let fn_name = fn (f: HirFunction) -> string do
+  let HirFunction(name, type_params: _, params: _, ret_type: _, _) = f
+  return name
+end
+
+/** Re-publish each non-alias binding with a declared (non-placeholder) return
+ *  type `R` as the scheme `R`. */
+let unthunk_declared = fn (state: CheckState, vbs: [ HirFunction ]) -> CheckState do
+  match vbs do
+    | [] -> return state
     | f :: rest ->
-      let acc1 = if is_participant(f) then f :: acc else acc end
-      return collect_participants(funcs: rest, acc: acc1)
+      let HirFunction(name, type_params: _, params: _, ret_type: ret, _) = f
+      if is_vb_inferred(typ: ret) || option.is_some(opt: alias_src_name(func: f)) then
+        return unthunk_declared(state, vbs: rest)
+      end
+      let st1 = match tctypes.state_lookup_scheme(state, name) do
+        | Some(val: Scheme(vars, typ: TyArrow(params: [], ret: r, requires: _, throw_row: _))) ->
+          tctypes.state_put_global(state, name, scheme: Scheme(vars, typ: r))
+        | _ -> state
+      end
+      return unthunk_declared(state: st1, vbs: rest)
   end
 end
 
-let is_participant = fn (f: HirFunction) -> bool do
+/** Copy each alias's source scheme onto the alias. */
+let resolve_aliases = fn (state: CheckState, aliases: [ HirFunction ]) -> CheckState do
+  match aliases do
+    | [] -> return state
+    | f :: rest ->
+      let st1 = match alias_src_name(func: f) do
+        | Some(val: src) ->
+          match tctypes.state_lookup_scheme(state, name: src) do
+            | Some(val: sc) -> tctypes.state_put_global(state, name: fn_name(f), scheme: sc)
+            | None -> state
+          end
+        | None -> state
+      end
+      return resolve_aliases(state: st1, aliases: rest)
+  end
+end
+
+/** Unannotated, non-literal, non-alias eager bindings: their return type is
+ *  the `vb_inferred` placeholder. */
+let is_participant = fn (val: HirFunction) -> bool do
   let HirFunction(
-    name: _, type_params: tps, params, ret_type: ret, throw_row: _,
+    name: _, type_params: _, params: _, ret_type: ret, throw_row: _,
     body: fbody, span: _, file: _, requires: _
-  ) = f
-  match tps do | [] -> () | _ -> return false end
-  match params do | [] -> () | _ -> return false end
-  match ret do | TyI64 -> () | _ -> return false end
-  match alias_src_name(func: f) do | Some(_) -> return false | None -> () end
+  ) = val
+  if !is_vb_inferred(typ: ret) then return false end
+  if option.is_some(opt: alias_src_name(func: val)) then return false end
   match fbody do
     | EagerBody(stmts: _) -> return true
     | LazyBody(_) -> return false
@@ -132,9 +154,8 @@ end
 
 type ResolveOne = ResolveOne(state: CheckState, changed: bool)
 
-/** Infer one value binding's initializer; if it yields a structured type,
- *  re-publish the env scheme as `() -> realT`. Inference failure or a scalar
- *  result keeps the existing placeholder scheme. */
+/** Infer one value binding's initializer and publish its generalized type as
+ *  the binding's scheme. Inference failure keeps the existing scheme. */
 let resolve_one = fn (state: CheckState, func: HirFunction) -> ResolveOne do
   let HirFunction(
     name, type_params: _, params: _, ret_type: _, throw_row: _,
@@ -146,20 +167,20 @@ let resolve_one = fn (state: CheckState, func: HirFunction) -> ResolveOne do
       match try_infer_expr(state, expr) do
         | None -> return ResolveOne(state, changed: false)
         | Some(val: real_t) ->
-          if !is_structured(typ: real_t) then return ResolveOne(state, changed: false) end
           if already_resolved(state, name, real_t) then return ResolveOne(state, changed: false) end
-          let new_scheme = Scheme(
-            vars: [],
-            typ: TyArrow(
-              params: [],
-              ret: real_t,
-              requires: TyRow(types: [], rest: None),
-              throw_row: TyRow(types: [], rest: None)
-            )
-          )
+          let new_scheme = Scheme(vars: dedup(xs: collect_tyvars(t: real_t, acc: []), acc: []), typ: real_t)
           let st1 = tctypes.state_put_global(state, name, scheme: new_scheme)
           return ResolveOne(state: st1, changed: true)
       end
+  end
+end
+
+let dedup = fn (xs: [ string ], acc: [ string ]) -> [ string ] do
+  match xs do
+    | [] -> return list.reverse(xs: acc)
+    | x :: rest ->
+      if list.str_member(xs: acc, s: x) then return dedup(xs: rest, acc) end
+      return dedup(xs: rest, acc: x :: acc)
   end
 end
 
@@ -189,29 +210,34 @@ let try_infer_expr = fn (state: CheckState, expr: HirExpr) -> Option<TypeExpr> d
   end
 end
 
-/** True for a STRUCTURED type that the `TyI64` scalar placeholder cannot
- *  represent — the only case worth re-publishing. Scalars, type variables, and
- *  arrows are left to the existing scalar/auto-force handling. */
-let is_structured = fn (typ: TypeExpr) -> bool do
-  match typ do
-    | TyUserDefined(name: _, args: _) -> return true
-    | TyRecord(fields: _) -> return true
-    | TyList(elem: _) -> return true
-    | TyArray(elem: _) -> return true
-    | _ -> return false
-  end
-end
-
-/** True when the env scheme for `name` is already the resolved `() -> real_t`
- *  (so a re-sweep does not report a spurious change). */
+/** True when the env scheme for `name` already has type `real_t` (so a
+ *  re-sweep does not report a spurious change). */
 let already_resolved = fn (state: CheckState, name: string, real_t: TypeExpr) -> bool do
   match tctypes.state_lookup_scheme(state, name) do
-    | Some(val: Scheme(vars: [], typ: TyArrow(params: [], ret: cur, requires: _, throw_row: _))) ->
-      return types_equal(a: cur, b: real_t)
-    | _ -> return false
+    | Some(val: Scheme(vars: _, typ: cur)) -> return types_equal(a: cur, b: real_t)
+    | None -> return false
   end
 end
 
 let types_equal = fn (a: TypeExpr, b: TypeExpr) -> bool do
-  return tctypes.type_to_string(typ: a) == tctypes.type_to_string(typ: b)
+  return subst.type_eq(a, b)
+end
+
+/** `funcs` with each `vb_inferred` return type replaced by the binding's type
+ *  in `state` (the scheme `resolve_value_binding_types` published), so later
+ *  passes see the value's real type. Unresolved bindings are left as is. */
+export let patch_inferred_value_binding_rets = fn (
+  state: CheckState,
+  funcs: [ HirFunction ]
+) -> [ HirFunction ] do
+  return list.map(xs: funcs, f: fn (val: HirFunction) -> HirFunction do
+    let HirFunction(name, type_params, params, ret_type, throw_row, body, span, file, requires) = val
+    if !is_vb_inferred(typ: ret_type) then return val end
+    match tctypes.state_lookup_scheme(state, name) do
+      | Some(val: Scheme(vars: _, typ: TyArrow(params: [], ret: _, requires: _, throw_row: _))) -> return val
+      | Some(val: Scheme(vars: _, typ: t)) ->
+        return HirFunction(name, type_params, params, ret_type: t, throw_row, body, span, file, requires)
+      | None -> return val
+    end
+  end)
 end

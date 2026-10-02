@@ -49,7 +49,6 @@ import * as subst from "src/typecheck/subst.nx"
 import * as unify from "src/typecheck/unify.nx"
 import { FreshenResult, freshen_type_params } from "src/typecheck/infer/literals.nx"
 import { TypeError, UnknownConstructor } from "src/typecheck/errors.nx"
-import { peel_value_binding_arrows } from "src/typecheck/infer/peel.nx"
 import {
   check_stored_fn_caps_covered, CapArgMismatch, CapArgOk
 } from "src/typecheck/infer/control_flow.nx"
@@ -268,7 +267,7 @@ let check_ctor_args = fn (
               if declared_field_may_carry_cap_arrow(typ: ftyp) then
                 match check_stored_fn_caps_covered(
                   declared_resolved: expected,
-                  arg_typ: peel_value_binding_thunk(typ: subst.subst_apply(subst: sm, typ: at)),
+                  arg_typ: subst.subst_apply(subst: sm, typ: at),
                   ambient_row: tctypes.state_require_row(state: st1),
                   tdefs
                 ) do
@@ -284,29 +283,7 @@ let check_ctor_args = fn (
                     param_subst, enum_type,
                     subst: subst.subst_compose(s1: sm, s2), span, infer_expr_fn
                   )
-                | UnifyErr(message: m) ->
-                  match peel_ctor_field_thunk_side(at, expected, declared: ftyp) do
-                    | Some(val: NamedPeel(a: la, e: le)) ->
-                      match unify.unify(t1: la, t2: le, tdefs) do
-                        | UnifyOk(subst: s2) ->
-                          return check_ctor_args(
-                            state: st1, fields: rf, args: ra, labels: labels_tail,
-                            param_subst, enum_type,
-                            subst: subst.subst_compose(s1: sm, s2), span, infer_expr_fn
-                          )
-                        | UnifyErr(_) -> return InferExprErr(message: "ctor field: " ++ m, span)
-                      end
-                    | None ->
-                      match peel_value_binding_arrows(actual: at, expected, tdefs) do
-                        | Some(val: UnifyOk(subst: s2)) ->
-                          return check_ctor_args(
-                            state: st1, fields: rf, args: ra, labels: labels_tail,
-                            param_subst, enum_type,
-                            subst: subst.subst_compose(s1: sm, s2), span, infer_expr_fn
-                          )
-                        | _ -> return InferExprErr(message: "ctor field: " ++ m, span)
-                      end
-                  end
+                | UnifyErr(message: m) -> return InferExprErr(message: "ctor field: " ++ m, span)
               end
           end
       end
@@ -360,93 +337,3 @@ let record_field_may_carry_cap_arrow = fn (fields: [ NamedType ]) -> bool do
   end
 end
 
-/** Strip a leading value-binding nullary-thunk placeholder `TyArrow([], inner)`
- *  off a constructor-argument's inferred type WHEN the inner shape is (or, under
- *  list/array layers, contains) a structural RECORD. A bare reference to a
- *  top-level `let r = { g: need_i64 }` registers with that placeholder shape, so
- *  the inner record VALUE — which still carries its concrete `Box<i64>` element
- *  commitment — is hidden one arrow-layer deep: `cap_arrow_require_row` would
- *  otherwise match the placeholder's own (empty) require row and admit the
- *  laundered commitment. Peeling recovers the record so the coverage helper sees
- *  the concrete element args. Restricted to record-valued placeholders so a
- *  genuine `() -> scalar` cap thunk (whose require row IS the thing to cover) is
- *  left untouched, and so a non-thunk value (a directly-referenced function,
- *  whose arrow has real params) is never stripped. */
-let peel_value_binding_thunk = fn (typ: TypeExpr) -> TypeExpr do
-  match typ do
-    | TyArrow(params: [], ret: inner, requires: _, throw_row: _) ->
-      if inner_is_record_carrier(typ: inner) then return inner end
-      return typ
-    | _ -> return typ
-  end
-end
-
-/** True when a type is a structural record, or a list/array (both spellings)
- *  whose element is itself a record carrier. Gate for `peel_value_binding_thunk`:
- *  only these container shapes launder a cap commitment through a record value. */
-let inner_is_record_carrier = fn (typ: TypeExpr) -> bool do
-  match typ do
-    | TyRecord(fields: _) -> return true
-    | TyList(elem: e) -> return inner_is_record_carrier(typ: e)
-    | TyArray(elem: e) -> return inner_is_record_carrier(typ: e)
-    | TyUserDefined(name: n, args: targs) ->
-      if n == "List" || n == "Array" then
-        match targs do
-          | e :: _ -> return inner_is_record_carrier(typ: e)
-          | [] -> return false
-        end
-      end
-      return false
-    | _ -> return false
-  end
-end
-
-/** The actual/expected leaf types to retry after peeling a nullary-thunk
- *  placeholder off whichever ctor-field side carried it. */
-type NamedPeel = NamedPeel(a: TypeExpr, e: TypeExpr)
-
-/** Recover from a ctor-field unify failure caused by a top-level value-binding's
- *  nullary-thunk placeholder shape `TyArrow([], inner)` on EITHER side. A bare
- *  reference to `let x = e` registers with that shape; when it lands in a `Cons`
- *  element column whose type was already fixed by a sibling — `[0, x]` fixes the
- *  column to the int literal, so `x`'s `() -> i64` placeholder is the EXPECTED
- *  side, while `[x, 0]` puts it on the ACTUAL side — the placeholder clashes.
- *  Peeling whichever side is the nullary thunk and retrying recovers the real
- *  value type. The existing `peel_value_binding_arrows` only descends the ACTUAL
- *  side through list/array layers, missing the expected-side case.
- *
- *  Soundness: the ACTUAL-side peel (`at` is the nullary thunk) is the original,
- *  always-safe behaviour. The EXPECTED-side peel fires only when BOTH (a) the
- *  actual is a numeric LITERAL (`TyIntLit`/`TyFloatLit`) — never a genuine
- *  nullary-function value — AND (b) the field's DECLARED type is NOT itself a
- *  nullary arrow, i.e. the `() -> scalar` in `expected` was produced by
- *  substituting an inferred type variable (a `Cons` element column bound to a
- *  value-binding placeholder), not by a real `f: () -> T` field declaration.
- *  This keeps a genuine `Ctor(f: () -> i64)` field rejecting a bare literal
- *  while still un-wrapping the sibling-induced placeholder. */
-let peel_ctor_field_thunk_side = fn (
-  at: TypeExpr, expected: TypeExpr, declared: TypeExpr
-) -> Option<NamedPeel> do
-  match at do
-    | TyArrow(params: [], ret: ainner, requires: _, throw_row: _) ->
-      return Some(val: NamedPeel(a: ainner, e: expected))
-    | TyIntLit | TyFloatLit ->
-      if declared_is_nullary_arrow(declared) then return None end
-      match expected do
-        | TyArrow(params: [], ret: einner, requires: _, throw_row: _) ->
-          return Some(val: NamedPeel(a: at, e: einner))
-        | _ -> return None
-      end
-    | _ -> return None
-  end
-end
-
-/** True when a constructor's DECLARED field type is literally a nullary arrow
- *  `() -> T` (a genuine zero-arg-function-typed field), as opposed to a type
- *  variable that merely got SUBSTITUTED to such an arrow during inference. */
-let declared_is_nullary_arrow = fn (declared: TypeExpr) -> bool do
-  match declared do
-    | TyArrow(params: [], ret: _, requires: _, throw_row: _) -> return true
-    | _ -> return false
-  end
-end

@@ -38,10 +38,12 @@ import {
   EnumDef,
   RecordDef,
   VariantDef,
-  VariantField
+  VariantField,
+  is_vb_inferred
 } from "src/types/type_expr.nx"
 import {
   HirProgram,
+  ExtWasmDep,
   HirFunction,
   HirHandlerArm,
   HirParam,
@@ -109,7 +111,9 @@ import {
   alias_src_name, resolve_alias_registrations
 } from "src/typecheck/check/registration.nx"
 import { derive_generic_cap_contracts } from "src/typecheck/check/cap_contract.nx"
-import { resolve_value_binding_types } from "src/typecheck/check/value_binding.nx"
+import {
+  resolve_value_binding_types, patch_inferred_value_binding_rets
+} from "src/typecheck/check/value_binding.nx"
 import {
   register_handler_bindings, validate_handler_arm_sets
 } from "src/typecheck/check/handler_validation.nx"
@@ -153,7 +157,7 @@ export let check_program = fn (
     handler_bindings: hbs,
     enum_defs: edefs,
     exception_groups: egs,
-    value_binding_names: _,
+    value_binding_names: vb_names,
     type_defs: tdefs,
     visible_enum_names: venms
   ) = hir
@@ -238,15 +242,10 @@ export let check_program = fn (
   // programs with no generic caps.
   let st7 = derive_generic_cap_contracts(state: st6, funcs, caps, nominal)
 
-  /** Resolve each top-level value binding's REAL type. A `let x = <non-literal>`
-   *  with no annotation is registered with the `() -> i64` placeholder (HIR
-   *  build cannot infer without an env); referrers of such a binding would
-   *  otherwise see a value of declared type `i64` where the real value is e.g. a
-   *  `Span`. This pass infers the initializer and re-publishes the scheme as
-   *  `() -> realT` for STRUCTURED results, before any referrer body is checked.
-   *  Best-effort and inert on the live path (no root-local body references these
-   *  placeholder bindings, so no local check result changes). */
-  let st7b = resolve_value_binding_types(state: st7, funcs)
+  /** Publish every top-level value binding at its value type (registered as a
+   *  nullary arrow above); unannotated non-literal initializers are inferred
+   *  here, before any referrer body is checked. */
+  let st7b = resolve_value_binding_types(state: st7, funcs, vb_names)
 
   // Warm the per-module scoped-enum memo on the shared map BEFORE body checking,
   // so the parallel phase (check_all_parallel) only reads the cache and never
@@ -266,7 +265,7 @@ export let check_program = fn (
   // local_names, so they're missed by check_all_functions). With-kont arms
   // need their body re-checked with the cont binder bound in env so that
   // forcing @k at the wrong type is a TypeMismatch.
-  check_handler_arm_bodies(state: st7, hbs, safe_callees)
+  check_handler_arm_bodies(state: st7b, hbs, safe_callees)
 
   // Validate main exists and has correct signature. Skipped for library-only
   // typecheck (require_main=false): files with only exports are legitimate
@@ -275,7 +274,27 @@ export let check_program = fn (
     validate_main(state: st7, funcs)
   end
 
-  return hir
+  return HirProgram(
+    caps,
+    functions: patch_inferred_value_binding_rets(state: st7b, funcs),
+    externals: exts,
+    handler_bindings: hbs,
+    enum_defs: edefs,
+    exception_groups: egs,
+    value_binding_names: vb_names,
+    type_defs: tdefs,
+    visible_enum_names: venms,
+    ext_wasm_deps: hir_ext_wasm_deps(hir)
+  )
+end
+
+let hir_ext_wasm_deps = fn (hir: HirProgram) -> [ ExtWasmDep ] do
+  let HirProgram(
+    caps: _, functions: _, externals: _, handler_bindings: _, enum_defs: _,
+    exception_groups: _, value_binding_names: _, type_defs: _, visible_enum_names: _,
+    ext_wasm_deps
+  ) = hir
+  return ext_wasm_deps
 end
 
 // ─── Continuation-binder map ─────────────────────────────────────────────────
@@ -719,14 +738,10 @@ let check_arm_body = fn (
   end
 end
 
-/** Resolved return type for a top-level value binding whose declared type is
- *  the `TyI64` placeholder. Returns `Some(structuredRet)` only when `func` is a
- *  nullary, non-type-param binding (params == [], tps == []) whose declared
- *  return type is exactly `TyI64` AND the value-binding pre-pass has published a
- *  structured `() -> ret` scheme for it in the env. `None` for every other
- *  function, and for placeholder bindings whose initializer stayed scalar /
- *  failed inference (their scheme is still the `() -> i64` placeholder, which
- *  `cur == TyI64` filters out). */
+/** Return type to check an unannotated value binding's body against: the
+ *  type the value-binding pass published (or a fresh variable when inference
+ *  failed). `None` for every function whose declared return type is not the
+ *  `vb_inferred` placeholder. */
 let resolved_value_binding_ret = fn (
   state: CheckState,
   name: string,
@@ -736,18 +751,15 @@ let resolved_value_binding_ret = fn (
 ) -> Option<TypeExpr> do
   match tps do | [] -> () | _ -> return None end
   match params do | [] -> () | _ -> return None end
-  match declared do | TyUnit -> return None | _ -> () end
-  let is_placeholder = if let TyVar(name: _) = declared then false else
-    match declared do | TyI64 -> true | _ -> false end
-  end
-  if !is_placeholder then return None end
+  if !is_vb_inferred(typ: declared) then return None end
   match tctypes.state_lookup_scheme(state, name) do
-    | Some(val: Scheme(vars: [], typ: TyArrow(params: [], ret: cur, requires: _, throw_row: _))) ->
-      match cur do
-        | TyI64 -> return None
-        | _ -> return Some(val: cur)
-      end
-    | _ -> return None
+    | Some(val: Scheme(vars: _, typ: TyArrow(params: [], ret: cur, requires: _, throw_row: _))) ->
+      // Initializer inference failed: check the body against a fresh variable
+      // so the body check reports the initializer's own error.
+      if is_vb_inferred(typ: cur) then return Some(val: TyVar(name: "__vb_ret")) end
+      return Some(val: cur)
+    | Some(val: Scheme(vars: _, typ: t)) -> return Some(val: t)
+    | None -> return Some(val: TyVar(name: "__vb_ret"))
   end
 end
 
@@ -839,14 +851,9 @@ let check_function = fn (
     params, ref_module: fn_file, nominal: nominal_env_of_state(state), vars: tps
   )
   let conv_params = convert_hir_params(params: q_params, vars: tps)
-  /** A top-level value binding `let x = <non-literal>` carries the `TyI64`
-   *  placeholder in its `ret_type` field (HIR build could not infer it). The
-   *  value-binding pre-pass (resolve_value_binding_types) has, by now, inferred
-   *  the real type and re-published the env scheme as `() -> realT`. Use that
-   *  resolved return type when checking the binding's OWN body so a `return
-   *  Span(...)` is validated against `Span` rather than the stale `i64`. Only
-   *  nullary, non-type-param bindings whose scheme was resolved to a structured
-   *  ret are affected; every other function uses its declared return type. */
+  /** An unannotated non-literal value binding carries the `vb_inferred`
+   *  placeholder as its return type; check its body against the type the
+   *  value-binding pass inferred instead. */
   let conv_ret = match resolved_value_binding_ret(state, name, tps, params, declared: ret) do
     | Some(val: r) -> r
     | None -> convert_ud_to_var(typ: ret, vars: tps)
