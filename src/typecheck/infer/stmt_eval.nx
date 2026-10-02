@@ -31,14 +31,19 @@ import {
   TyArray,
   TyArrow,
   TyRow,
-  TyUserDefined
+  TyUserDefined,
+  TyList,
+  TyRecord,
+  NamedType,
+  EnumDef
 } from "src/types/type_expr.nx"
 import { HirExpr, HirExprKind, HirStmt, HirStmtKind } from "src/ir/hir/types.nx"
 import {
-  SubstEntry, Scheme, CheckState, FreshResult, CatchBinderInfo,
+  SubstEntry, Scheme, CheckState, FreshResult, CatchBinderInfo, EnumEntry,
   InferExprResult, InferExprOk, InferExprErr,
   UnifyOk, UnifyErr
 }, * as tctypes from "src/typecheck/types.nx"
+import { build_nominal_env, qualify_enum_type } from "src/typecheck/check/nominal_id.nx"
 import * as subst from "src/typecheck/subst.nx"
 import * as unify from "src/typecheck/unify.nx"
 import * as tcwf from "src/typecheck/tcwf.nx"
@@ -60,6 +65,7 @@ import { build_param_named_types } from "src/typecheck/infer/closure.nx"
 import * as capture from "src/typecheck/capture.nx"
 import { TypeError, LinearUnused } from "src/typecheck/errors.nx"
 import { Option, Some, None } from "std:option"
+import * as list from "std:list"
 
 export let infer_stmt_impl = fn (
   state: CheckState, stmt: HirStmtKind, ret_type: TypeExpr, span: Span,
@@ -271,6 +277,46 @@ export let infer_inject_expr = fn (
   return infer_inject_body(state, handlers, body, ret_type, span, infer_stmts_fn)
 end
 
+/** Qualify the user enum names in a `let` annotation with their declaring
+ *  module, resolved from the current module, as registration does for
+ *  parameter and return types, so `let x: Sh = ...` keeps two same-named enums
+ *  of different modules apart. */
+let qualify_let_annotation = fn (state: CheckState, ann: Option<TypeExpr>) -> Option<TypeExpr> do
+  match ann do
+    | None -> return None
+    | Some(val: t) ->
+      if !mentions_user_type(typ: t) then return ann end
+      let defs = list.map(xs: tctypes.state_full_enums(state), f: fn (val: EnumEntry) -> EnumDef do
+        let EnumEntry(name: _, def: d) = val
+        return d
+      end)
+      let env = build_nominal_env(defs, imports: tctypes.state_module_import_index(state))
+      return Some(val: qualify_enum_type(typ: t, ref_module: tctypes.state_current_module(state), env, vars: []))
+  end
+end
+
+let mentions_user_type = fn (typ: TypeExpr) -> bool do
+  match typ do
+    | TyUserDefined(name: _, args: _) -> return true
+    | TyList(elem: e) | TyArray(elem: e) | TyRef(inner: e) | TyLinear(inner: e) | TyBorrow(inner: e) ->
+      return mentions_user_type(typ: e)
+    | TyLazy(inner: e, require_row: _, throw_row: _) -> return mentions_user_type(typ: e)
+    | TyRecord(fields: fs) | TyArrow(params: fs, ret: _, requires: _, throw_row: _) ->
+      return list.any(xs: fs, p: fn (val: NamedType) -> bool do
+        let NamedType(name: _, typ: ft) = val
+        return mentions_user_type(typ: ft)
+      end) || arrow_ret_mentions(typ)
+    | _ -> return false
+  end
+end
+
+let arrow_ret_mentions = fn (typ: TypeExpr) -> bool do
+  match typ do
+    | TyArrow(params: _, ret: r, requires: _, throw_row: _) -> return mentions_user_type(typ: r)
+    | _ -> return false
+  end
+end
+
 export let infer_let_impl = fn (
   state: CheckState, name: string, sigil: Sigil, ann: Option<TypeExpr>, value: HirExpr, ret_type: TypeExpr, span: Span,
   infer_expr_fn: (
@@ -287,6 +333,7 @@ export let infer_let_impl = fn (
     expected: Option<TypeExpr>
   ) -> InferExprResult throws { TypeError }
 ) -> InferExprResult throws { TypeError } do
+  let ann = qualify_let_annotation(state, ann)
   let HirExpr(node: val_node, span: val_span) = value
   match val_node do
     | Borrow(name: target, sigil: _) ->

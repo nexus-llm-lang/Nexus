@@ -54,6 +54,8 @@ import {
 } from "src/typecheck/infer/control_flow.nx"
 import { suggest_names } from "src/diagnostics/levenshtein.nx"
 import * as list from "std:list"
+import * as str from "std:str"
+import { resolve_import_source } from "src/typecheck/import_index.nx"
 import { Option, Some, None } from "std:option"
 
 let variant_field_name = fn (f: VariantField) -> string throws { TypeError } do
@@ -104,6 +106,76 @@ export let build_enum_type = fn (
 ) -> TypeExpr throws { TypeError } do
   let args = build_type_args(params, param_subst)
   return TyUserDefined(name, args)
+end
+
+/** Module-qualified name (`<module>#<enum>`, the form nominal_id produces for
+ *  annotations) of the enum named `enum_name` that declares constructor
+ *  `variant`. Like nominal_id, only a name declared by two or more modules is
+ *  qualified. The declaring module is, in order: the current module, the
+ *  module `variant` is imported from, the module `enum_name` is imported from,
+ *  or the only module whose `enum_name` declares `variant`; otherwise the name stays bare (the unifier treats a
+ *  bare name as matching any module). */
+export let ctor_enum_name = fn (state: CheckState, enum_name: string, variant: string) -> string do
+  if str.contains(s: enum_name, sub: "#") then return enum_name end
+  let decls = list.filter(xs: tctypes.state_full_enums(state), p: fn (val: EnumEntry) -> bool do
+    let EnumEntry(name: _, def: EnumDef(name: n, is_public: _, is_opaque: _, type_params: _, variants: _, layout_variants: _, module: m)) = val
+    return n == enum_name && m != ""
+  end)
+  let all_mods = list.fold_left(xs: decls, init: [], f: fn (acc: [ string ], val: EnumEntry) -> [ string ] do
+    let m = entry_module(e: val)
+    return if list.str_member(xs: acc, s: m) then acc else m :: acc end
+  end)
+  if list.length(xs: all_mods) < 2 then return enum_name end
+  let with_variant = list.fold_left(xs: decls, init: [], f: fn (acc: [ string ], val: EnumEntry) -> [ string ] do
+    let m = entry_module(e: val)
+    if list.str_member(xs: acc, s: m) || !entry_has_variant(e: val, variant) then return acc end
+    return m :: acc
+  end)
+  let cur = tctypes.state_current_module(state)
+  if list.str_member(xs: with_variant, s: cur) then return cur ++ "#" ++ enum_name end
+  let idx = tctypes.state_module_import_index(state)
+  match resolve_import_source(idx, importer: cur, name: bare_ctor(name: variant)) do
+    | Some(val: src) ->
+      if list.str_member(xs: with_variant, s: src) then return src ++ "#" ++ enum_name end
+    | None -> ()
+  end
+  match resolve_import_source(idx, importer: cur, name: enum_name) do
+    | Some(val: src) ->
+      if list.str_member(xs: with_variant, s: src) then return src ++ "#" ++ enum_name end
+    | None -> ()
+  end
+  match with_variant do
+    | [ m ] -> return m ++ "#" ++ enum_name
+    | _ -> return enum_name
+  end
+end
+
+let entry_module = fn (e: EnumEntry) -> string do
+  let EnumEntry(name: _, def: EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: _, layout_variants: _, module: m)) = e
+  return m
+end
+
+let entry_has_variant = fn (e: EnumEntry, variant: string) -> bool do
+  let EnumEntry(name: _, def: EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs, layout_variants: _, module: _)) = e
+  return list.any(xs: vs, p: fn (val: VariantDef) -> bool do
+    let VariantDef(name: vn, fields: _) = val
+    // A constructor colliding across modules is stored renamed
+    // (`<module>#<Ctor>`), and `variant` may be such a renamed name of
+    // another module's constructor; compare the bare constructor names.
+    return bare_ctor(name: vn) == bare_ctor(name: variant)
+  end)
+end
+
+let bare_ctor = fn (name: string) -> string do
+  let i = last_hash(s: name, at: str.byte_length(s: name) - 1)
+  if i < 0 then return name end
+  return str.byte_substring(s: name, start: i + 1, len: str.byte_length(s: name) - i - 1)
+end
+
+let last_hash = fn (s: string, at: i64) -> i64 do
+  if at < 0 then return -1 end
+  if str.byte_at(s, idx: at) == '#' then return at end
+  return last_hash(s, at: at - 1)
 end
 
 export let build_type_args = fn (
@@ -216,7 +288,7 @@ export let infer_constructor = fn (
       let fr = freshen_type_params(state, params: tps)
       let FreshenResult(state: st1, param_subst: psubst) = fr
       let sorted_fields = sort_variant_fields(fields)
-      let enum_type = build_enum_type(name: ename, params: tps, param_subst: psubst)
+      let enum_type = build_enum_type(name: ctor_enum_name(state: st1, enum_name: ename, variant), params: tps, param_subst: psubst)
       return check_ctor_args(
         state: st1,
         fields: sorted_fields,
