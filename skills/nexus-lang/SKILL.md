@@ -146,11 +146,11 @@ let @result = expensive_call(data: input)  // deferred thunk
 // ... other work ...
 let val = @result                          // force: runs the thunk now (synchronous)
 ```
-A single `@x` force is synchronous. For real parallelism use `std:lazy`'s
-`force_all([@a, @b, ...])` (each thunk runs on its own OS thread, WASI threads;
-results returned in input order) or `std:lazy_host`'s `host_spawn` / `host_join`
-for explicit per-thunk control. Run threaded programs via the bundled `nexus`
-launcher (it passes `-W threads=y,shared-memory=y -S threads` to wasmtime).
+A single `@x` force is synchronous. `std:lazy`'s `force_all(tasks: [a, b, ...])`
+forces a list of thunks and returns the results in input order, and
+`std:concurrency/task`'s `host_spawn` / `host_join` give per-thunk handles; both
+currently force each thunk sequentially on the calling thread (no OS threads),
+and a thunk's exception surfaces at its join.
 
 Thunk-creation vs force: `let @x = e` (let-binding sigil) is the **only**
 thunk-creation form — it wraps `e` into an `@T` thunk. Every `@e` in
@@ -305,7 +305,7 @@ Omit `require { ... }` entirely when the body needs no caps.
 | Generic | `Option<T>`, `Result<T, E>` | Explicit type params |
 | Linear | `%T` | Must consume exactly once |
 | Borrow | `&T` | Immutable view |
-| Lazy | `@T` | Deferred thunk; `@x` forces synchronously, `std:lazy.force_all` / `std:lazy_host` run in parallel |
+| Lazy | `@T` | Deferred thunk; `@x` forces synchronously; `std:lazy.force_all` / `std:concurrency/task` force several thunks (sequentially) |
 | Opaque | `opaque type X = ...` | Hidden constructors |
 
 ## Common Patterns

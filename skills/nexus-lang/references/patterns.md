@@ -425,9 +425,9 @@ cap).
 
 The `@` sigil marks lazy bindings. A lazy binding defers evaluation until forced.
 A single `@expr` force is **synchronous** — it runs the thunk on the calling
-thread. Real parallelism comes from forcing many thunks at once via the
-`std:lazy` / `std:lazy_host` combinators (each thunk then runs on its own OS
-thread, via WASI threads).
+thread. The `std:lazy` (`force_all`) and `std:concurrency/task`
+(`host_spawn` / `host_join`) combinators also force on the calling thread,
+sequentially, deferring each force to its join.
 
 **Thunk-creation vs force.** The only surface form that *creates* a thunk is
 the let-binding sigil `let @x = e` — it wraps `e : T` into a thunk of type
@@ -439,7 +439,7 @@ T-Force on expressions.
 
 Working examples:
 - [lazy_force.nx](../../../examples/feature/lazy_force.nx) — single thunk creation and synchronous force.
-- [lazy_parallel.nx](../../../examples/feature/lazy_parallel.nx) — `lazy.force_all` on multiple thunks (WASI threads).
+- [lazy_parallel.nx](../../../examples/feature/lazy_parallel.nx) — `lazy.force_all` on multiple thunks.
 
 Run threaded programs via the bundled `nexus` launcher (it passes
 `-W threads=y,shared-memory=y -S threads` to wasmtime).
@@ -461,12 +461,10 @@ end
   whose word 0 is its funcref-table index); the captured free variables ride in
   the closure object
 - `@x` is a synchronous `call_indirect` on that closure
-- `std:lazy.force_all` / `std:lazy_host.host_spawn` allocate a small task struct
-  in shared linear memory and call the `wasi.thread-spawn` import; the spawned
-  thread re-enters at the `wasi_thread_start` export, forces the closure against
-  the same shared memory, parks the result, and `notify`s the joiner — which is
-  parked in `memory.atomic.wait32`
-- Thunks with no side effects parallelise cleanly; combinators do not insulate
-  observable effects (`race` / `cancel` / `detach` in `std:lazy` are still
-  sequential — see their docstrings)
+- `std:lazy.force_all` / `std:concurrency/task.host_spawn` record each thunk's
+  closure in a small task struct without forcing it; the join
+  (`force_all`'s join phase / `host_join`) forces it inline, so a thunk's
+  exception surfaces at the join
+- `race` / `cancel` / `detach` in `std:lazy` are likewise sequential — see
+  their docstrings
 
