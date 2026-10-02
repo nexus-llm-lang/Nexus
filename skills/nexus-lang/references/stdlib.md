@@ -34,6 +34,9 @@ The standard library is the `std` package, rooted at `nxlib/stdlib/`. Every modu
 | `"std:lazy_host"` | [concurrency/lazy_host.nx](../../../nxlib/stdlib/concurrency/lazy_host.nx) | `host_spawn(@T) -> %Task<T>`, `host_join(%Task<T>) -> T` | [lazy_parallel.nx](../../../examples/feature/lazy_parallel.nx) |
 | `"std:json"` | [encoding/json.nx](../../../nxlib/stdlib/encoding/json.nx) | `parse`, `serialize`, `get_field`, `JsonValue` algebra | [json_basics.nx](../../../examples/feature/json_basics.nx) |
 | `"std:jsonrpc"` | [encoding/jsonrpc.nx](../../../nxlib/stdlib/encoding/jsonrpc.nx) | JSON-RPC 2.0 framing — `frame_message`/`unframe_one`, `read_message`/`write_message` | — |
+| `"std:toml"` | [encoding/toml.nx](../../../nxlib/stdlib/encoding/toml.nx) | `parse`, `serialize`, `TomlValue` algebra | — |
+| `"std:yaml"` | [encoding/yaml.nx](../../../nxlib/stdlib/encoding/yaml.nx) | `parse`, `serialize`, `YamlValue` algebra | — |
+| `"std:hcl"` | [encoding/hcl.nx](../../../nxlib/stdlib/encoding/hcl.nx) | `parse` to `HclBody` (attributes, blocks; expressions kept as `HTemplate`) | — |
 | `"std:pbt"` | [meta/pbt.nx](../../../nxlib/stdlib/meta/pbt.nx) | `Gen<T>` generators, `forall` runner, `small_int`/`bool_gen`/`string_gen` | [pbt_basics.nx](../../../examples/feature/pbt_basics.nx) |
 | `"std:argparse"` | [meta/argparse.nx](../../../nxlib/stdlib/meta/argparse.nx) | CLI argument parser — spec builder, `parse`, `render_help` | — |
 
