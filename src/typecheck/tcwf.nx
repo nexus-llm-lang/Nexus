@@ -44,7 +44,8 @@ import {
   EnumDef,
   VariantDef,
   VariantField,
-  RecordDef
+  RecordDef,
+  is_vb_inferred
 } from "src/types/type_expr.nx"
 import {
   HirCap,
@@ -77,8 +78,11 @@ import {
   DuplicateDeclaration,
   InvalidGroupMember,
   DuplicateCapMethod,
-  ReservedBuiltinConstructor
+  ReservedBuiltinConstructor,
+  TypeMismatch
 } from "src/typecheck/errors.nx"
+import { EnumEntry } from "src/typecheck/types.nx"
+import { Map }, * as map from "std:collection/map"
 import { VariantIndex, VariantInfo }, * as vidx from "src/ir/support/variant_index.nx"
 import { Option, Some, None } from "std:option"
 import * as str from "std:str"
@@ -1388,6 +1392,30 @@ let check_user_enum_ctor_names = fn (defs: [ EnumDef ]) -> unit throws { TypeErr
   end
 end
 
+/** Reject two different enums of one module declaring the same constructor
+ *  name. `seen` maps `module#ctor` to the declaring enum's name; built-in
+ *  enums (empty module) are skipped. */
+let check_duplicate_ctors = fn (defs: [ EnumDef ], seen: Map<string, string>) -> unit throws { TypeError } do
+  match defs do
+    | [] -> return ()
+    | EnumDef(name: n, is_public: _, is_opaque: _, type_params: _, variants: vs, layout_variants: _, module: m) :: rest ->
+      if m == "" then return check_duplicate_ctors(defs: rest, seen) end
+      let seen2 = list.fold_left(xs: vs, init: seen, f: fn (acc: Map<string, string>, val: VariantDef) -> Map<string, string> throws { TypeError } do
+        let VariantDef(name: vn, fields: _) = val
+        let key = m ++ "#" ++ vn
+        match map.get(m: acc, k: key) do
+          | Some(val: other) ->
+            if other != n then
+              throw DuplicateDeclaration(kind: "constructor", name: vn, span: Span(offset: 0, line: 0, col: 0))
+            end
+            return acc
+          | None -> return map.insert(m: acc, k: key, v: n)
+        end
+      end)
+      return check_duplicate_ctors(defs: rest, seen: seen2)
+  end
+end
+
 let check_enum_variant_names = fn (
   enum_name: string,
   variants: [ VariantDef ]
@@ -1477,6 +1505,7 @@ export let check_program_wf_rows = fn (prog: HirProgram) -> unit throws { TypeEr
   // check, a user 'type T = Nil | Cons(head,tail)' silently drops 'Cons' from
   // the index and produces a phantom 'rest' field error at use sites.
   check_user_enum_ctor_names(defs: edefs)
+  check_duplicate_ctors(defs: edefs, seen: map.string_map())
   check_group_decls(groups: egs, vidx_: vi)
   walk_caps(caps, all_caps: caps, vidx_: vi, groups: egs)
   // Gravity rule (¬escapesRef) + wfRef on D-Cap method signatures.
@@ -1577,4 +1606,96 @@ export let check_program_wf_let_annots = fn (prog: HirProgram) -> unit throws { 
   ) = prog
   walk_funcs_let_annots(funcs, tdefs)
   return walk_handler_bindings_let_annots(hbs, tdefs)
+end
+
+// ─── Known type names in signatures ─────────────────────────────────────────
+
+/** Declared type-parameter counts of every enum and record/alias type, keyed
+ *  by type name (several modules may declare the same name). */
+export let type_arity_map = fn (enums: [ EnumEntry ], records: [ RecordDef ]) -> Map<string, [ i64 ]> do
+  let m1 = list.fold_left(xs: enums, init: map.string_map(), f: fn (acc: Map<string, [ i64 ]>, val: EnumEntry) -> Map<string, [ i64 ]> do
+    let EnumEntry(name, def: EnumDef(name: _, is_public: _, is_opaque: _, type_params: tps, _)) = val
+    return add_arity(m: acc, name, k: list.length(xs: tps))
+  end)
+  return list.fold_left(xs: records, init: m1, f: fn (acc: Map<string, [ i64 ]>, val: RecordDef) -> Map<string, [ i64 ]> do
+    let RecordDef(name, is_public: _, type_params: tps, _) = val
+    return add_arity(m: acc, name, k: list.length(xs: tps))
+  end)
+end
+
+let add_arity = fn (m: Map<string, [ i64 ]>, name: string, k: i64) -> Map<string, [ i64 ]> do
+  let ks = map.get_or(m, k: name, default: [])
+  return map.insert(m, k: name, v: k :: ks)
+end
+
+/** Reject a named type in `typ` that is neither a type parameter in `tps` nor
+ *  a declared enum/record type, or that is applied to a different number of
+ *  type arguments than it declares. Effect rows are not inspected (their
+ *  entries are caps and exceptions, checked by wf_cap / wf_throw). */
+export let enforce_known_types = fn (
+  typ: TypeExpr,
+  arities: Map<string, [ i64 ]>,
+  tps: [ string ],
+  func_name: string,
+  span: Span
+) -> unit throws { TypeError } do
+  match typ do
+    | TyUserDefined(name: n, args) ->
+      if is_vb_inferred(typ) then return () end
+      if list.str_member(xs: tps, s: n) then return enforce_known_types_list(types: args, arities, tps, func_name, span) end
+      match map.get(m: arities, k: n) do
+        | None -> throw TypeMismatch(func_name, detail: "unknown type `" ++ n ++ "`", span)
+        | Some(val: ks) ->
+          let got = list.length(xs: args)
+          if !list.contains(xs: ks, val: got) then
+            let k = match ks do | k0 :: _ -> k0 | [] -> 0 end
+            throw TypeMismatch(
+              func_name,
+              detail: "`" ++ n ++ "` expects " ++ str.from_i64(val: k) ++ " type argument(s), got " ++ str.from_i64(val: got),
+              span
+            )
+          end
+          return enforce_known_types_list(types: args, arities, tps, func_name, span)
+      end
+    | TyArrow(params: ps, ret: r, requires: _, throw_row: _) ->
+      enforce_known_types_list(types: list.map(xs: ps, f: named_type_typ), arities, tps, func_name, span)
+      return enforce_known_types(typ: r, arities, tps, func_name, span)
+    | TyRecord(fields: fs) ->
+      return enforce_known_types_list(types: list.map(xs: fs, f: named_type_typ), arities, tps, func_name, span)
+    | TyList(elem: t) | TyArray(elem: t) | TyRef(inner: t) | TyLinear(inner: t) | TyBorrow(inner: t) ->
+      return enforce_known_types(typ: t, arities, tps, func_name, span)
+    | TyLazy(inner: t, require_row: _, throw_row: _) ->
+      return enforce_known_types(typ: t, arities, tps, func_name, span)
+    | _ -> return ()
+  end
+end
+
+export let enforce_known_types_list_pub = fn (
+  types: [ TypeExpr ],
+  arities: Map<string, [ i64 ]>,
+  tps: [ string ],
+  func_name: string,
+  span: Span
+) -> unit throws { TypeError } do
+  return enforce_known_types_list(types, arities, tps, func_name, span)
+end
+
+let enforce_known_types_list = fn (
+  types: [ TypeExpr ],
+  arities: Map<string, [ i64 ]>,
+  tps: [ string ],
+  func_name: string,
+  span: Span
+) -> unit throws { TypeError } do
+  match types do
+    | [] -> return ()
+    | t :: rest ->
+      enforce_known_types(typ: t, arities, tps, func_name, span)
+      return enforce_known_types_list(types: rest, arities, tps, func_name, span)
+  end
+end
+
+let named_type_typ = fn (val: NamedType) -> TypeExpr do
+  let NamedType(name: _, typ) = val
+  return typ
 end
