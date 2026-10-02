@@ -36,7 +36,7 @@
 
 import { Span } from "src/types/span.nx"
 import { BinaryOp, UnaryOp, OpNeg, OpFNeg, OpNot, LitInt } from "src/types/vocab.nx"
-import { TypeExpr, TyUnit, TyBool, TyHandler, TyLazy, TyRow, TyArrow, TyIntLit } from "src/types/type_expr.nx"
+import { TypeExpr, TyUnit, TyBool, TyHandler, TyLazy, TyRow, TyArrow, TyIntLit, TyVar } from "src/types/type_expr.nx"
 import {
   HirExprKind,
   HirExpr,
@@ -50,7 +50,7 @@ import {
 import { convert_ud_to_var } from "src/typecheck/check/occurs.nx"
 import { validate_inline_handler_arm_set } from "src/typecheck/check/handler_validation.nx"
 import {
-  CheckState, EnvEntry,
+  CheckState, EnvEntry, SubstEntry,
   InferExprResult, InferExprOk, InferExprErr,
   UnifyOk, UnifyErr
 }, * as tctypes from "src/typecheck/types.nx"
@@ -82,6 +82,7 @@ import {
   HandlerLinearCrossArm
 } from "src/typecheck/errors.nx"
 import { Option, Some, None } from "std:option"
+import * as str from "std:str"
 
 /** Infer the type of a HIR expression in `state`. `ret_type` is the enclosing function's return type (used to type-check `return`). Threads a substitution and updated state through the result. */
 export let infer_expr = fn (
@@ -206,6 +207,7 @@ export let infer_expr = fn (
             | Some(val: dup_name) -> throw HandlerLinearCrossArm(name: dup_name, span: sp)
             | None ->
               check_inline_kont_arm_tails(state, arms: hms)
+              check_inline_arm_bodies(state, arms: hms)
               return InferExprOk(
                 state,
                 subst: subst.subst_empty(),
@@ -222,6 +224,71 @@ export let infer_expr = fn (
         span: sp,
         infer_stmts_fn: infer_stmts
       )
+  end
+end
+
+/** Typecheck the body of every inline handler arm without a `with @k` binder
+ *  (those are checked by check_inline_kont_arm_tails) against its declared
+ *  return type and throws row, in the enclosing scope. The enclosing
+ *  function's type parameters are flexible `TyVar`s in that scope, so a body
+ *  substitution binding a non-fresh (non-`?N`) variable to a concrete type
+ *  instantiates one of them and is rejected. */
+let check_inline_arm_bodies = fn (
+  state: CheckState,
+  arms: [ HirHandlerArm ]
+) -> unit throws { TypeError } do
+  match arms do
+    | [] -> return ()
+    | HirHandlerArm(arm: _, cont_binder: Some(_)) :: rest ->
+      return check_inline_arm_bodies(state, arms: rest)
+    | HirHandlerArm(
+      arm: HirFunction(
+        name,
+        type_params: tps,
+        params,
+        ret_type: ret,
+        throw_row: tw,
+        body: hir_body,
+        span: fn_span,
+        _
+      ),
+      cont_binder: None
+    ) :: rest ->
+      let body = match hir_body do | EagerBody(stmts: s) -> s | _ -> [] end
+      let conv_ret = convert_ud_to_var(typ: ret, vars: tps)
+      let arm_state = tctypes.state_with_env(state, env: add_inline_arm_params(env: tctypes.state_env(state), params))
+      let arm_state2 = tctypes.state_with_throw_row(state: arm_state, throw_row: convert_ud_to_var(typ: tw, vars: tps))
+      match infer_stmts(state: arm_state2, stmts: body, ret_type: conv_ret) do
+        | InferExprErr(message: m, span: err_span) ->
+          throw TypeMismatch(func_name: name, detail: m, span: err_span)
+        | InferExprOk(state: _, subst: s, typ: _) ->
+          match instantiated_rigid_var(entries: subst.subst_entries(s)) do
+            | Some(val: v) ->
+              throw TypeMismatch(
+                func_name: name,
+                detail: "type parameter `" ++ v ++ "` of the enclosing function is rigid in this handler arm, but the arm instantiates it to `" ++ tctypes.type_to_string(typ: subst.subst_apply(subst: s, typ: TyVar(name: v))) ++ "`",
+                span: fn_span
+              )
+            | None -> ()
+          end
+      end
+      return check_inline_arm_bodies(state, arms: rest)
+  end
+end
+
+/** The first substitution entry binding a user-named type variable to a
+ *  concrete (non-variable, non-row) type. */
+let instantiated_rigid_var = fn (entries: [ SubstEntry ]) -> Option<string> do
+  match entries do
+    | [] -> return None
+    | SubstEntry(var: v, typ: t) :: rest ->
+      // `?N` are fresh inference variables and `__`-prefixed ones are
+      // internal (e.g. the implicit throws-row tail); row images belong to
+      // row-kind parameters, which are not checked (as in check_function).
+      let internal = str.starts_with(s: v, prefix: "?") || str.starts_with(s: v, prefix: "__")
+      let benign = match t do | TyVar(name: _) | TyRow(types: _, rest: _) -> true | _ -> false end
+      if !internal && !benign then return Some(val: v) end
+      return instantiated_rigid_var(entries: rest)
   end
 end
 
