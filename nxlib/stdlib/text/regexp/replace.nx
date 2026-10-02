@@ -7,7 +7,7 @@ import * as str from "std:str"
 import * as list from "std:list"
 import { Option, Some, None } from "std:option"
 import { Match, Regexp } from "std:text/regexp/types"
-import { find_from } from "std:text/regexp/exec"
+import { find_from, scalar_width } from "std:text/regexp/exec"
 
 // ─── Replacement helpers ─────────────────────────────────────────────────────
 //
@@ -86,8 +86,9 @@ export let sub = fn (re: Regexp, s: string, repl: string) -> string do
 end
 
 /**
-Replace every non-overlapping match in `s`. Zero-width matches consume
-one byte each (copied verbatim) so the loop always makes progress.
+Replace every non-overlapping match in `s`. After a zero-width match the
+UTF-8 scalar at that position is copied verbatim, so the loop always makes
+progress and never splits a character.
 */
 export let gsub = fn (re: Regexp, s: string, repl: string) -> string do
   let slen = str.byte_length(s)
@@ -107,12 +108,13 @@ let gsub_go = fn (
       let prefix = str.byte_substring(s, start: start_pos, len: a - start_pos)
       let replaced = expand_template(repl, m)
       let acc2 = acc ++ prefix ++ replaced
-      // Zero-width: advance by one and copy that byte verbatim so we make
-      // progress without dropping content.
+      // Zero-width: copy the UTF-8 scalar at `a` verbatim and continue after
+      // it, so the loop makes progress without splitting a character.
       if b <= a then
         if a >= slen then return acc2 end
-        let one = str.byte_substring(s, start: a, len: 1)
-        return gsub_go(re, s, slen, start_pos: a + 1, repl, acc: acc2 ++ one)
+        let w = scalar_width(s, at: a)
+        let one = str.byte_substring(s, start: a, len: w)
+        return gsub_go(re, s, slen, start_pos: a + w, repl, acc: acc2 ++ one)
       end
       return gsub_go(re, s, slen, start_pos: b, repl, acc: acc2)
   end
@@ -143,8 +145,9 @@ let gsub_with_go = fn (
       let acc2 = acc ++ prefix ++ replaced
       if b <= a then
         if a >= slen then return acc2 end
-        let one = str.byte_substring(s, start: a, len: 1)
-        return gsub_with_go(re, s, slen, start_pos: a + 1, f, acc: acc2 ++ one)
+        let w = scalar_width(s, at: a)
+        let one = str.byte_substring(s, start: a, len: w)
+        return gsub_with_go(re, s, slen, start_pos: a + w, f, acc: acc2 ++ one)
       end
       return gsub_with_go(re, s, slen, start_pos: b, f, acc: acc2)
   end
@@ -165,42 +168,36 @@ export let split = fn (re: Regexp, s: string) -> [ string ] do
   // separator).
   if str.byte_length(s: src) == 0 then return [ s ] end
   let slen = str.byte_length(s)
-  return list.reverse(xs: split_go(re, s, slen, start_pos: 0, acc: []))
+  return list.reverse(xs: split_go(re, s, slen, seg_start: 0, search_pos: 0, acc: []))
 end
 
+/** `seg_start` is where the current output segment begins, `search_pos` where
+ *  the next match search starts. An empty match at `seg_start` does not split
+ *  (the search moves one UTF-8 scalar on), so splitting "abc" on `x*` yields
+ *  `["a","b","c"]` and on `^` yields `["abc"]`; an empty match at the end of
+ *  the input ends the split. */
 let split_go = fn (
-  re: Regexp, s: string, slen: i64, start_pos: i64, acc: [ string ]
+  re: Regexp, s: string, slen: i64, seg_start: i64, search_pos: i64, acc: [ string ]
 ) -> [ string ] do
-  match find_from(re, s, slen, start_pos) do
-    | None ->
-      let tail = str.byte_substring(s, start: start_pos, len: slen - start_pos)
-      return tail :: acc
+  let tail = fn () -> [ string ] do
+    return str.byte_substring(s, start: seg_start, len: slen - seg_start) :: acc
+  end
+  if search_pos > slen then return tail() end
+  match find_from(re, s, slen, start_pos: search_pos) do
+    | None -> return tail()
     | Some(val: m) ->
       let Match(start: a, end_pos: b, text: _, groups: _) = m
-      // Zero-width match: we must advance to make progress, but unlike the
-      // old code (which dropped the byte at `a`), emit the segment from
-      // `start_pos` through the byte at `a` inclusive so single characters
-      // survive — `split(/x*/, "abc")` yields `["a","b","c"]`, mirroring
-      // how `gsub` copies the skipped byte verbatim.
       if b <= a then
-        if a >= slen then
-          // Zero-width match at end-of-input. Emit the remaining tail unless
-          // we've already consumed the whole string (which would append a
-          // spurious empty field); keep one empty element only when nothing
-          // has been emitted yet, so `split(re, "")` still yields `[""]`.
-          if start_pos >= slen then
-            match acc do
-              | [] -> return "" :: acc
-              | _ :: _ -> return acc
-            end
-          end
-          let tail = str.byte_substring(s, start: start_pos, len: slen - start_pos)
-          return tail :: acc
+        if a >= slen then return tail() end
+        let next = a + scalar_width(s, at: a)
+        if a == seg_start then
+          return split_go(re, s, slen, seg_start, search_pos: next, acc)
         end
-        let piece = str.byte_substring(s, start: start_pos, len: a + 1 - start_pos)
-        return split_go(re, s, slen, start_pos: a + 1, acc: piece :: acc)
+        let piece = str.byte_substring(s, start: seg_start, len: a - seg_start)
+        return split_go(re, s, slen, seg_start: a, search_pos: next, acc: piece :: acc)
       end
-      let prefix = str.byte_substring(s, start: start_pos, len: a - start_pos)
-      return split_go(re, s, slen, start_pos: b, acc: prefix :: acc)
+      let piece = str.byte_substring(s, start: seg_start, len: a - seg_start)
+      return split_go(re, s, slen, seg_start: b, search_pos: b, acc: piece :: acc)
   end
 end
+
