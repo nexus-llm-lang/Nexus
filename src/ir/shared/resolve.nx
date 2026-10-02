@@ -14,7 +14,17 @@ import {
   ImportDef,
   ImportItem,
   EnumDef,
-  VariantDef
+  VariantDef,
+  RecordDef,
+  ExceptionDef,
+  ExceptionGroupDef,
+  TLLet,
+  TLCap,
+  TLTypeDef,
+  TLEnum,
+  TLException,
+  TLExceptionGroup,
+  TLImport
 } from "src/syntax/ast.nx"
 import { RenameEntry }, * as symtab from "src/ir/shared/symtab.nx"
 import { ImportNotExported } from "src/ir/shared/errors.nx"
@@ -443,6 +453,85 @@ let add_selected_variant_entries = fn (
   end
 end
 
+/** Every name a selective import may name: exported lets and caps, public
+ *  type names (opaque included), constructors of public non-opaque enums,
+ *  public exceptions and exception groups, and the names the module itself
+ *  selectively imports. */
+let collect_importable_names = fn (defs: [ SpannedTopLevel ], acc: [ string ]) -> [ string ] do
+  match defs do
+    | [] -> return acc
+    | SpannedTopLevel(node: d, span: _) :: rest ->
+      let acc2 = match d do
+        | TLLet(def: GlobalLet(name, is_public: true, typ: _, value: _)) -> name :: acc
+        | TLCap(def: Cap(name, is_public: true, type_params: _, functions: _)) -> name :: acc
+        | TLTypeDef(def: RecordDef(name, is_public: true, type_params: _, fields: _)) -> name :: acc
+        | TLEnum(def: EnumDef(name, is_public: true, is_opaque: opq, type_params: _, variants: vs)) ->
+          if opq then name :: acc else collect_variant_names(variants: vs, acc: name :: acc) end
+        | TLException(def: ExceptionDef(name, is_public: true, fields: _)) -> name :: acc
+        | TLExceptionGroup(def: ExceptionGroupDef(name, is_public: true, members: _)) -> name :: acc
+        // A name the module itself selectively imports can be imported from it.
+        | TLImport(def: ImportDef(path: _, alias: _, items: its, is_external: _)) ->
+          list.fold_left(xs: its, init: acc, f: fn (a: [ string ], val: ImportItem) -> [ string ] do
+            let ImportItem(name: n, item_alias: al) = val
+            return match al do | Some(val: v) -> v :: a | None -> n :: a end
+          end)
+        | _ -> acc
+      end
+      return collect_importable_names(defs: rest, acc: acc2)
+  end
+end
+
+/** D-Export: reject a selective import item naming a declaration of the
+ *  module that is not exported, or, when the module has no wildcard import
+ *  (`complete`, so `importable` lists every name reachable through it), a
+ *  name the module neither declares nor imports. */
+let check_selected_items_importable = fn (
+  items: [ ImportItem ],
+  importable: [ string ],
+  declared: [ string ],
+  complete: bool,
+  source: string
+) -> unit throws { ImportNotExported } do
+  match items do
+    | [] -> return ()
+    | ImportItem(name, item_alias: _) :: rest ->
+      if !str_member(xs: importable, s: name) && (complete || str_member(xs: declared, s: name)) then
+        throw ImportNotExported(name, module_path: source, suggestions: suggest_names(typo: name, candidates: importable))
+      end
+      return check_selected_items_importable(items: rest, importable, declared, complete, source)
+  end
+end
+
+/** Every name the module declares at top level, exported or not (enum
+ *  constructors included). */
+let collect_declared_names = fn (defs: [ SpannedTopLevel ], acc: [ string ]) -> [ string ] do
+  match defs do
+    | [] -> return acc
+    | SpannedTopLevel(node: d, span: _) :: rest ->
+      let acc2 = match d do
+        | TLLet(def: GlobalLet(name, is_public: _, typ: _, value: _)) -> name :: acc
+        | TLCap(def: Cap(name, is_public: _, type_params: _, functions: _)) -> name :: acc
+        | TLTypeDef(def: RecordDef(name, is_public: _, type_params: _, fields: _)) -> name :: acc
+        | TLEnum(def: EnumDef(name, is_public: _, is_opaque: _, type_params: _, variants: vs)) ->
+          collect_variant_names(variants: vs, acc: name :: acc)
+        | TLException(def: ExceptionDef(name, is_public: _, fields: _)) -> name :: acc
+        | TLExceptionGroup(def: ExceptionGroupDef(name, is_public: _, members: _)) -> name :: acc
+        | _ -> acc
+      end
+      return collect_declared_names(defs: rest, acc: acc2)
+  end
+end
+
+/** True when the module has an `import * as m` (alone or combined). */
+let has_wildcard_import = fn (defs: [ SpannedTopLevel ]) -> bool do
+  return list.any(xs: defs, p: fn (val: SpannedTopLevel) -> bool do
+    match val do
+      | SpannedTopLevel(node: TLImport(def: ImportDef(path: _, alias: Some(_), items: _, is_external: false)), span: _) -> return true
+      | _ -> return false
+    end
+  end)
+end
+
 /** Build the importer-view rename entries for an import: the entries that
  *  the importing scope needs so its own calls (alias.foo or bare visible
  *  names from selective imports) rename to the canonical target.
@@ -472,6 +561,13 @@ export let build_importer_entries = fn (
             )
           | _ :: _ ->
             let exported = collect_exported_names(defs: imported_defs)
+            check_selected_items_importable(
+              items,
+              importable: collect_importable_names(defs: imported_defs, acc: []),
+              declared: collect_declared_names(defs: imported_defs, acc: []),
+              complete: !has_wildcard_import(defs: imported_defs),
+              source: physical
+            )
             let selective = build_selective_importer_go(
               defs: imported_defs,
               items,
