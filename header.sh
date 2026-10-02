@@ -648,6 +648,11 @@ if [ "$TEST_MODE" = "1" ]; then
             ${NEXUS_WASMTIME_ARGS:-} \
             ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
             >/dev/null 2>"$elog"; then
+          neg_rc=0
+        else
+          neg_rc=$?
+        fi
+        if [ "$neg_rc" -eq 0 ]; then
           t1=$(date +%s%N 2>/dev/null || date +%s000000000)
           ms=$(( (t1 - t0) / 1000000 ))
           msg="compiled successfully — expected diagnostic $NEG_CODE"
@@ -659,6 +664,16 @@ if [ "$TEST_MODE" = "1" ]; then
         fi
         t1=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t1 - t0) / 1000000 ))
+        # A diagnostic exits 1; any other status (a wasmtime panic is 101, a
+        # trap 134) is a compiler crash even when the code was printed first.
+        if [ "$neg_rc" -ne 1 ]; then
+          msg="compiler exited with status $neg_rc (a diagnostic exits 1)"
+          printf "FAIL\t%s\tnegative-compile\t%s\t%s\n" "$ms" "$f" "$msg" \
+            > "$RESULTS_DIR/result_$idx.tsv"
+          printf "FAIL  %s  (%sms, negative-compile)\n" "$f" "$ms" >&2
+          rm -f "$wasm"
+          exit 0
+        fi
         # Verify diagnostic code: a `[E####]` substring must appear in
         # the captured stderr.
         if ! grep -q -- "\\[$NEG_CODE\\]" "$elog"; then
