@@ -373,8 +373,13 @@ if [ "$TEST_MODE" = "1" ]; then
       --junit) TEST_JUNIT="${2:-}"; shift 2 ;;
       --coverage) TEST_COVERAGE=1; shift ;;
       --lcov) TEST_LCOV="${2:-}"; shift 2 ;;
-      --*) shift ;;
-      *) TEST_PATH="$1"; shift ;;
+      --*) echo "nexus test: unknown option: $1" >&2; exit 2 ;;
+      *)
+        if [ -n "${TEST_PATH_SET:-}" ]; then
+          echo "nexus test: expected one path, got '$TEST_PATH' and '$1'" >&2
+          exit 2
+        fi
+        TEST_PATH="$1"; TEST_PATH_SET=1; shift ;;
     esac
   done
   # --lcov implies --coverage; warn if --coverage absent so users notice.
