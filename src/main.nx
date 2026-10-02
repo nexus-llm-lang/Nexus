@@ -23,7 +23,7 @@ import { resolve_all_lazy_no_filter } from "src/ir/hir/demand.nx"
 import * as reach from "src/ir/hir/reachability.nx"
 import * as canon_match from "src/ir/hir/canonicalize_match.nx"
 import * as main_wrap from "src/ir/main_wrap.nx"
-import { HirProgram, ExtWasmDep } from "src/ir/hir/types.nx"
+import { HirProgram, HirFunction, ExtWasmDep } from "src/ir/hir/types.nx"
 import { merge_with_deps, DepSpec } from "src/backend/wasm/merge.nx"
 import {
   expand_groups_in_functions,
@@ -121,6 +121,45 @@ let str_list_has = fn (xs: [ string ], s: string) -> bool do
       if x == s then return true end
       return str_list_has(xs: rest, s)
   end
+end
+
+/** `prog` with the functions of `all` that are named in `local_names` but
+ *  missing from `prog` (dropped by DCE) appended, match-canonicalized the same
+ *  way as `prog`'s own functions. */
+let with_dropped_local_functions = fn (
+  prog: HirProgram,
+  all: [ HirFunction ],
+  local_names: [ string ]
+) -> HirProgram do
+  let kept = list.map(xs: get_functions(hir: prog), f: hir_function_name)
+  let dropped = list.filter(xs: all, p: fn (val: HirFunction) -> bool do
+    let name = hir_function_name(val)
+    return str_list_has(xs: local_names, s: name) && !str_list_has(xs: kept, s: name)
+  end)
+  match dropped do
+    | [] -> return prog
+    | _ :: _ -> ()
+  end
+  let HirProgram(
+    caps, functions, externals, handler_bindings, enum_defs, exception_groups,
+    value_binding_names, type_defs, visible_enum_names, ext_wasm_deps
+  ) = prog
+  let canon_dropped = get_functions(hir: canon_match.canonicalize_program(
+    prog: HirProgram(
+      caps, functions: dropped, externals, handler_bindings, enum_defs, exception_groups,
+      value_binding_names, type_defs, visible_enum_names, ext_wasm_deps
+    ),
+    reorder: true
+  ))
+  return HirProgram(
+    caps, functions: list.concat(xs: functions, ys: canon_dropped), externals, handler_bindings,
+    enum_defs, exception_groups, value_binding_names, type_defs, visible_enum_names, ext_wasm_deps
+  )
+end
+
+let hir_function_name = fn (val: HirFunction) -> string do
+  let HirFunction(name, type_params: _, params: _, ret_type: _, _) = val
+  return name
 end
 
 // Convert a list of ExtWasmDep to DepSpec list for merge_with_deps.
@@ -581,8 +620,13 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
     // before the linearity pass so the precise E2033 diagnostic (generic
     // instantiation at a linear type) surfaces ahead of the downstream
     // LinearUnused/LinearReuse signals.
-    tcwf.check_program_wf_let_annots(prog: hir)
-    linearity.check_program(prog: hir)
+    let local_names = main_wrap.user_main_name()
+      :: extract_function_names(defs: get_defs(prog), source: input_path)
+    // Linearity covers the reachable program plus the root module's functions
+    // that DCE dropped, matching the set of root functions typecheck checks.
+    let hir_lin = with_dropped_local_functions(prog: hir, all: all_expanded, local_names)
+    tcwf.check_program_wf_let_annots(prog: hir_lin)
+    linearity.check_program(prog: hir_lin)
     let t4c = Clock.now()
     if verbose then Console.eprintln(val: "[nexus] linearity (" ++ str.from_i64(val: t4c - t4b) ++ "ms)") end
 
@@ -622,8 +666,6 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
       prog: hir_for_tc_canon,
       component_target: p3_component_enabled || p2_component_enabled
     )
-    let local_names = main_wrap.user_main_name()
-      :: extract_function_names(defs: get_defs(prog), source: input_path)
     let tc_import_index = iidx.build_module_import_index(
       cache: tc_import_cache,
       entry_defs: get_defs(prog),
@@ -656,7 +698,7 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
     let t5 = Clock.now()
     if verbose then Console.eprintln(val: "[nexus] typecheck (" ++ str.from_i64(val: t5 - t4c) ++ "ms)") end
 
-    tc_linearity.check_program(prog: hir)
+    tc_linearity.check_program(prog: hir_lin)
     let t5b = Clock.now()
     if verbose then Console.eprintln(val: "[nexus] tc-linearity (" ++ str.from_i64(val: t5b - t5) ++ "ms)") end
 
