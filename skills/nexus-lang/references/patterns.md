@@ -458,6 +458,9 @@ end
   whose word 0 is its funcref-table index); the captured free variables ride in
   the closure object
 - `@x` is a synchronous `call_indirect` on that closure
+- `@e` on a container of thunks (`[@T]`, `[| @T |]`, a record with `@T`
+  fields, an enum whose type arguments are `@T`) forces every thunk one level
+  deep and yields the container of values, e.g. `let xs = @[ a, b ]`
 - `std:lazy.force_all` / `std:concurrency/task.host_spawn` record each thunk's
   closure without forcing it; the join
   (`force_all`'s join phase / `host_join`) forces it inline, so a thunk's

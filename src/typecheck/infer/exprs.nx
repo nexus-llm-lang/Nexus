@@ -32,8 +32,12 @@ import {
   TyArrow,
   TyRow,
   TyVar,
+  TyList,
   NamedType,
-  RecordDef
+  RecordDef,
+  EnumDef,
+  VariantDef,
+  VariantField
 } from "src/types/type_expr.nx"
 import {
   HirExpr,
@@ -48,7 +52,7 @@ import {
   SubstEntry, Subst, Scheme, CheckState, FreshResult, CatchBinderInfo,
   InferExprResult, InferExprOk, InferExprErr,
   UnifyResult, UnifyOk, UnifyErr, TypeDefEntry,
-  BindResult, BindOk, BindErr
+  BindResult, BindOk, BindErr, EnumEntry
 }, * as tctypes from "src/typecheck/types.nx"
 import * as subst from "src/typecheck/subst.nx"
 import * as unify from "src/typecheck/unify.nx"
@@ -77,6 +81,7 @@ import {
 } from "src/typecheck/errors.nx"
 import { suggest_names } from "src/diagnostics/levenshtein.nx"
 import * as list from "std:list"
+import * as str from "std:str"
 import { Option, Some, None } from "std:option"
 
 export let infer_record = fn (
@@ -982,6 +987,311 @@ let lazy_empty_row = fn () -> TypeExpr do
   return TyRow(types: [], rest: None)
 end
 
+/** T-Force row checks for forcing a thunk `@(u; rq; thr)` under `s1`: the
+ *  thunk's throws must be admitted by the caller's throws row and its require
+ *  row must be within the ambient one. Returns the forced value type `u`. */
+let force_rows = fn (
+  state: CheckState, s1: Subst, u: TypeExpr, rq: TypeExpr, thr: TypeExpr, span: Span
+) -> InferExprResult throws { TypeError } do
+  let surfaced_thr = subst.subst_apply(subst: s1, typ: thr)
+  let caller_row = subst.subst_apply(subst: s1, typ: tctypes.state_throw_row(state))
+  let groups = tctypes.state_exception_groups(state)
+  let fn_pure_set = tctypes.state_fn_pure_set(state)
+  match check_call_throw_row_admitted(
+    callee_row: surfaced_thr,
+    caller_row,
+    groups,
+    func: "force",
+    fn_pure_set
+  ) do
+    | RaiseRejected(message: m2) -> return InferExprErr(message: m2, span)
+    | RaiseOk ->
+      let PinResult(state: st_pt, subst: pin_t) =
+        pin_surfaced_throws_into_row(state, surfaced_row: surfaced_thr, active_row: caller_row)
+      let s_pt = subst.subst_compose(s1, s2: pin_t)
+      let ambient_rq = subst.subst_apply(subst: s_pt, typ: tctypes.state_require_row(state: st_pt))
+      let resolved_rq = subst.subst_apply(subst: s_pt, typ: rq)
+      if require_row_is_collecting(row: ambient_rq) then
+        let PinResult(state: st_pr, subst: pin_r) =
+          pin_surfaced_require_into_row(
+            state: st_pt,
+            surfaced_row: resolved_rq,
+            active_row: ambient_rq
+          )
+        let s_pr = subst.subst_compose(s1: s_pt, s2: pin_r)
+        return InferExprOk(state: st_pr, subst: s_pr, typ: subst.subst_apply(subst: s_pr, typ: u))
+      end
+      match check_force_require_row(
+        thunk_require_row: resolved_rq,
+        ambient_require_row: ambient_rq
+      ) do
+        | Some(val: missing) ->
+          return InferExprErr(
+            message: "force: thunk requires capability '" ++ missing
+              ++ "' which is not in the ambient require row (T-Force: ρ_q' ⊆ ρ_q)",
+            span
+          )
+        | None -> return InferExprOk(
+          state: st_pt,
+          subst: s_pt,
+          typ: subst.subst_apply(subst: s_pt, typ: u)
+        )
+      end
+  end
+end
+
+/** Result of forcing every thunk in a list of component types. */
+type ForceTypes =
+  ForceTypesOk(state: CheckState, subst: Subst, types: [ TypeExpr ], forced: i64)
+  | ForceTypesErr(message: string, span: Span)
+
+/** Force each component of `ts` that is a thunk (after `subst`), threading the
+ *  state and substitution; non-thunk components are kept. */
+let force_types = fn (
+  state: CheckState, s: Subst, ts: [ TypeExpr ], span: Span
+) -> ForceTypes throws { TypeError } do
+  match ts do
+    | [] -> return ForceTypesOk(state, subst: s, types: [], forced: 0)
+    | t :: rest ->
+      let resolved = subst.subst_apply(subst: s, typ: t)
+      let ForceOne(
+        state: st1,
+        subst: s1,
+        typ: t1,
+        forced: f1,
+        err
+      ) = force_component(state, s, t: resolved, span)
+      match err do
+        | Some(val: InferExprErr(message: m, span: sp)) -> return ForceTypesErr(
+          message: m,
+          span: sp
+        )
+        | _ -> ()
+      end
+      match force_types(state: st1, s: s1, ts: rest, span) do
+        | ForceTypesErr(message: m, span: sp) -> return ForceTypesErr(message: m, span: sp)
+        | ForceTypesOk(state: st2, subst: s2, types: rest_ts, forced: fr) ->
+          return ForceTypesOk(state: st2, subst: s2, types: t1 :: rest_ts, forced: f1 + fr)
+      end
+  end
+end
+
+type ForceOne = ForceOne(
+  state: CheckState, subst: Subst, typ: TypeExpr, forced: i64, err: Option<InferExprResult>
+)
+
+let force_component = fn (
+  state: CheckState, s: Subst, t: TypeExpr, span: Span
+) -> ForceOne throws { TypeError } do
+  match strip_linear_ty(t) do
+    | TyLazy(inner: u, require_row: rq, throw_row: thr) ->
+      match force_rows(state, s1: s, u, rq, thr, span) do
+        | InferExprOk(state: st1, subst: s1, typ: ut) ->
+          return ForceOne(state: st1, subst: s1, typ: ut, forced: 1, err: None)
+        | other -> return ForceOne(state, subst: s, typ: t, forced: 0, err: Some(val: other))
+      end
+    | _ -> return ForceOne(state, subst: s, typ: t, forced: 0, err: None)
+  end
+end
+
+let strip_linear_ty = fn (t: TypeExpr) -> TypeExpr do
+  match t do
+    | TyLinear(inner) -> return strip_linear_ty(t: inner)
+    | _ -> return t
+  end
+end
+
+/** T-Force over a container of thunks, one level: `[@σ]` → `[σ]`,
+ *  `[| @σ |]` → `[| σ |]`, a record's `@σ` fields → `σ`, and an enum's `@σ`
+ *  type arguments → `σ`. `None` when `t` is not a container with a thunk
+ *  component. */
+let infer_force_container = fn (
+  state: CheckState, s1: Subst, t: TypeExpr, span: Span
+) -> Option<InferExprResult> throws { TypeError } do
+  match strip_linear_ty(t) do
+    | TyList(elem) ->
+      match force_types(state, s: s1, ts: [ elem ], span) do
+        | ForceTypesErr(
+          message: m,
+          span: sp
+        ) -> return Some(val: InferExprErr(message: m, span: sp))
+        | ForceTypesOk(state: st, subst: s, types: [ e2 ], forced: f) ->
+          if f == 0 then return None end
+          return Some(val: InferExprOk(state: st, subst: s, typ: TyList(elem: e2)))
+        | ForceTypesOk(_) -> return None
+      end
+    | TyArray(elem) ->
+      match force_types(state, s: s1, ts: [ elem ], span) do
+        | ForceTypesErr(
+          message: m,
+          span: sp
+        ) -> return Some(val: InferExprErr(message: m, span: sp))
+        | ForceTypesOk(state: st, subst: s, types: [ e2 ], forced: f) ->
+          if f == 0 then return None end
+          return Some(val: InferExprOk(state: st, subst: s, typ: TyArray(elem: e2)))
+        | ForceTypesOk(_) -> return None
+      end
+    | TyRecord(fields) ->
+      let ftypes = list.map(xs: fields, f: fn (val: NamedType) -> TypeExpr do
+        let NamedType(name: _, typ) = val
+        return typ
+      end)
+      match force_types(state, s: s1, ts: ftypes, span) do
+        | ForceTypesErr(
+          message: m,
+          span: sp
+        ) -> return Some(val: InferExprErr(message: m, span: sp))
+        | ForceTypesOk(state: st, subst: s, types: new_ts, forced: f) ->
+          if f == 0 then return None end
+          return Some(val: InferExprOk(state: st, subst: s, typ: TyRecord(fields: rezip_fields(fields, ts: new_ts))))
+      end
+    | TyUserDefined(name: "List", args: [ elem ]) ->
+      return infer_force_container(state, s1, t: TyList(elem), span)
+    | TyUserDefined(name, args) ->
+      match force_types(state, s: s1, ts: args, span) do
+        | ForceTypesErr(
+          message: m,
+          span: sp
+        ) -> return Some(val: InferExprErr(message: m, span: sp))
+        | ForceTypesOk(state: st, subst: s, types: new_args, forced: f) ->
+          if f == 0 then return None end
+          match nested_lazy_param(state: st, s, name, args) do
+            | Some(val: m) -> return Some(val: InferExprErr(message: m, span))
+            | None -> return Some(val: InferExprOk(state: st, subst: s, typ: TyUserDefined(name, args: new_args)))
+          end
+      end
+    | _ -> return None
+  end
+end
+
+let rezip_fields = fn (fields: [ NamedType ], ts: [ TypeExpr ]) -> [ NamedType ] do
+  match fields do
+    | [] -> return []
+    | NamedType(name, typ: _) :: frest ->
+      match ts do
+        | [] -> return []
+        | t :: trest -> return NamedType(name, typ: t) :: rezip_fields(fields: frest, ts: trest)
+      end
+  end
+end
+
+/** For a force over enum `name` instantiated with `args`: an error message when
+ *  a type parameter instantiated with a thunk occurs inside a constructor field
+ *  other than as the whole field type (one-level forcing cannot reach it), or
+ *  when `name` is not a known enum. */
+let nested_lazy_param = fn (
+  state: CheckState, s: Subst, name: string, args: [ TypeExpr ]
+) -> Option<string> do
+  let bare = enum_bare_name(name)
+  let found = list.find(xs: tctypes.state_full_enums(state), p: fn (val: EnumEntry) -> bool do
+    let EnumEntry(name: n, def: _) = val
+    return n == name || enum_bare_name(name: n) == bare
+  end)
+  match found do
+    | None -> return Some(val: "force: `" ++ name ++ "` is not an enum whose constructors `@` can rebuild")
+    | Some(val: EnumEntry(name: _, def: EnumDef(name: _, is_public: _, is_opaque: _, type_params, variants, layout_variants, _))) ->
+      let lazy_params = lazy_params_of(params: type_params, args, s)
+      let vs = if list.is_empty(xs: variants) then layout_variants else variants end
+      return first_nested_param(variants: vs, lazy_params, enum_name: name)
+  end
+end
+
+let enum_bare_name = fn (name: string) -> string do
+  let idx = str.index_of(s: name, sub: "#")
+  if idx < 0 then return name end
+  return str.substring(s: name, start: idx + 1, len: str.length(s: name) - idx - 1)
+end
+
+let lazy_params_of = fn (params: [ string ], args: [ TypeExpr ], s: Subst) -> [ string ] do
+  match params do
+    | [] -> return []
+    | p :: prest ->
+      match args do
+        | [] -> return []
+        | a :: arest ->
+          let rest = lazy_params_of(params: prest, args: arest, s)
+          if let TyLazy(_) = strip_linear_ty(t: subst.subst_apply(subst: s, typ: a)) then return p :: rest end
+          return rest
+      end
+  end
+end
+
+let first_nested_param = fn (
+  variants: [ VariantDef ], lazy_params: [ string ], enum_name: string
+) -> Option<string> do
+  match variants do
+    | [] -> return None
+    | VariantDef(name: vname, fields) :: rest ->
+      match first_nested_in_fields(fields, lazy_params) do
+        | Some(val: p) ->
+          return Some(val: "force: type parameter `" ++ p ++ "` of `" ++ enum_name ++ "` is nested inside a field of `"
+            ++ vname ++ "`; `@` forces only fields whose whole type is the parameter")
+        | None -> return first_nested_param(variants: rest, lazy_params, enum_name)
+      end
+  end
+end
+
+let first_nested_in_fields = fn (
+  fields: [ VariantField ],
+  lazy_params: [ string ]
+) -> Option<string> do
+  match fields do
+    | [] -> return None
+    | VariantField(name: _, typ) :: rest ->
+      let direct = match typ do
+        | TyVar(_) -> true
+        | TyUserDefined(name: _, args: []) -> true
+        | _ -> false
+      end
+      if !direct then
+        match first_param_in_type(t: typ, params: lazy_params) do
+          | Some(val: p) -> return Some(val: p)
+          | None -> ()
+        end
+      end
+      return first_nested_in_fields(fields: rest, lazy_params)
+  end
+end
+
+/** The first of `params` that `t` mentions as a type variable / bare name. */
+let first_param_in_type = fn (t: TypeExpr, params: [ string ]) -> Option<string> do
+  match t do
+    | TyVar(name) | TyUserDefined(name, args: []) ->
+      if list.any(
+        xs: params,
+        p: fn (val: string) -> bool do return val == name end
+      ) then return Some(val: name) end
+      return None
+    | TyUserDefined(name: _, args) -> return first_param_in_types(ts: args, params)
+    | TyList(elem) | TyArray(elem) | TyRef(inner: elem) | TyLinear(inner: elem) | TyBorrow(inner: elem) ->
+      return first_param_in_type(t: elem, params)
+    | TyLazy(inner, require_row: _, throw_row: _) -> return first_param_in_type(t: inner, params)
+    | TyRecord(fields) ->
+      return first_param_in_types(ts: list.map(xs: fields, f: fn (val: NamedType) -> TypeExpr do
+        let NamedType(name: _, typ) = val
+        return typ
+      end), params)
+    | TyArrow(params: ps, ret, requires: _, throw_row: _) ->
+      let pts = list.map(xs: ps, f: fn (val: NamedType) -> TypeExpr do
+        let NamedType(name: _, typ) = val
+        return typ
+      end)
+      return first_param_in_types(ts: ret :: pts, params)
+    | _ -> return None
+  end
+end
+
+let first_param_in_types = fn (ts: [ TypeExpr ], params: [ string ]) -> Option<string> do
+  match ts do
+    | [] -> return None
+    | t :: rest ->
+      match first_param_in_type(t, params) do
+        | Some(val: p) -> return Some(val: p)
+        | None -> return first_param_in_types(ts: rest, params)
+      end
+  end
+end
+
 export let infer_force = fn (
   state: CheckState, inner: HirExpr, ret_type: TypeExpr, span: Span,
   infer_expr_fn: (
@@ -995,63 +1305,21 @@ export let infer_force = fn (
     | InferExprOk(state: st1, subst: s1, typ: t) ->
       match t do
         | TyLazy(inner: u, require_row: rq, throw_row: thr) ->
-          let surfaced_thr = subst.subst_apply(subst: s1, typ: thr)
-          let caller_row = subst.subst_apply(subst: s1, typ: tctypes.state_throw_row(state: st1))
-          let groups = tctypes.state_exception_groups(state: st1)
-          let fn_pure_set = tctypes.state_fn_pure_set(state: st1)
-          match check_call_throw_row_admitted(
-            callee_row: surfaced_thr,
-            caller_row,
-            groups,
-            func: "force",
-            fn_pure_set
-          ) do
-            | RaiseRejected(message: m2) -> return InferExprErr(message: m2, span)
-            | RaiseOk ->
-              let PinResult(state: st_pt, subst: pin_t) =
-                pin_surfaced_throws_into_row(
-                  state: st1,
-                  surfaced_row: surfaced_thr,
-                  active_row: caller_row
-                )
-              let s_pt = subst.subst_compose(s1, s2: pin_t)
-              let ambient_rq = subst.subst_apply(
-                subst: s_pt,
-                typ: tctypes.state_require_row(state: st_pt)
-              )
-              let resolved_rq = subst.subst_apply(subst: s_pt, typ: rq)
-              if require_row_is_collecting(row: ambient_rq) then
-                let PinResult(state: st_pr, subst: pin_r) =
-                  pin_surfaced_require_into_row(
-                    state: st_pt,
-                    surfaced_row: resolved_rq,
-                    active_row: ambient_rq
-                  )
-                let s_pr = subst.subst_compose(s1: s_pt, s2: pin_r)
-                return InferExprOk(
-                  state: st_pr,
-                  subst: s_pr,
-                  typ: subst.subst_apply(subst: s_pr, typ: u)
-                )
-              end
-              match check_force_require_row(
-                thunk_require_row: resolved_rq,
-                ambient_require_row: ambient_rq
-              ) do
-                | Some(val: missing) ->
-                  return InferExprErr(
-                    message: "force: thunk requires capability '" ++ missing
-                      ++ "' which is not in the ambient require row (T-Force: ρ_q' ⊆ ρ_q)",
-                    span
-                  )
-                | None -> return InferExprOk(
-                  state: st_pt,
-                  subst: s_pt,
-                  typ: subst.subst_apply(subst: s_pt, typ: u)
-                )
-              end
-          end
+          return force_rows(state: st1, s1, u, rq, thr, span)
         | _ ->
+          let operand = subst.subst_apply(subst: s1, typ: t)
+          match infer_force_container(state: st1, s1, t: operand, span) do
+            | Some(val: InferExprOk(state: stc, subst: sc, typ: tc)) ->
+              let Span(offset, line: _, col: _) = span
+              tctypes.state_record_force_operand(
+                state: stc,
+                offset,
+                typ: subst.subst_apply(subst: sc, typ: operand)
+              )
+              return InferExprOk(state: stc, subst: sc, typ: tc)
+            | Some(val: err) -> return err
+            | None -> ()
+          end
           let FreshResult(state: st2, typ: tv) = tctypes.tc_fresh_var(state: st1)
           let FreshResult(state: st3, typ: tv_rq) = tctypes.tc_fresh_var(state: st2)
           let FreshResult(state: st4, typ: tv_thr) = tctypes.tc_fresh_var(state: st3)
@@ -1065,67 +1333,14 @@ export let infer_force = fn (
                 message: "force: expected lazy type '@T', got non-lazy value",
                 span)
             | UnifyOk(subst: s2) ->
-              let sc = subst.subst_compose(s1, s2)
-              let resolved_thr = subst.subst_apply(subst: sc, typ: tv_thr)
-              let caller_row = subst.subst_apply(
-                subst: sc,
-                typ: tctypes.state_throw_row(state: st4)
+              return force_rows(
+                state: st4,
+                s1: subst.subst_compose(s1, s2),
+                u: tv,
+                rq: tv_rq,
+                thr: tv_thr,
+                span
               )
-              let groups = tctypes.state_exception_groups(state: st4)
-              let fn_pure_set = tctypes.state_fn_pure_set(state: st4)
-              match check_call_throw_row_admitted(
-                callee_row: resolved_thr,
-                caller_row,
-                groups,
-                func: "force",
-                fn_pure_set
-              ) do
-                | RaiseRejected(message: m2) -> return InferExprErr(message: m2, span)
-                | RaiseOk ->
-                  let PinResult(state: st_pt, subst: pin_t) =
-                    pin_surfaced_throws_into_row(
-                      state: st4,
-                      surfaced_row: resolved_thr,
-                      active_row: caller_row
-                    )
-                  let sc_pt = subst.subst_compose(s1: sc, s2: pin_t)
-                  let ambient_rq = subst.subst_apply(
-                    subst: sc_pt,
-                    typ: tctypes.state_require_row(state: st_pt)
-                  )
-                  let resolved_rq = subst.subst_apply(subst: sc_pt, typ: tv_rq)
-                  if require_row_is_collecting(row: ambient_rq) then
-                    let PinResult(state: st_pr, subst: pin_r) =
-                      pin_surfaced_require_into_row(
-                        state: st_pt,
-                        surfaced_row: resolved_rq,
-                        active_row: ambient_rq
-                      )
-                    let sc_pr = subst.subst_compose(s1: sc_pt, s2: pin_r)
-                    return InferExprOk(
-                      state: st_pr,
-                      subst: sc_pr,
-                      typ: subst.subst_apply(subst: sc_pr, typ: tv)
-                    )
-                  end
-                  match check_force_require_row(
-                    thunk_require_row: resolved_rq,
-                    ambient_require_row: ambient_rq
-                  ) do
-                    | Some(val: missing) ->
-                      return InferExprErr(
-                        message: "force: thunk requires capability '" ++ missing
-                          ++ "' which is not in the ambient require row (T-Force: ρ_q' ⊆ ρ_q)",
-                        span
-                      )
-                    | None ->
-                      return InferExprOk(
-                        state: st_pt,
-                        subst: sc_pt,
-                        typ: subst.subst_apply(subst: sc_pt, typ: tv)
-                      )
-                  end
-              end
           end
       end
   end

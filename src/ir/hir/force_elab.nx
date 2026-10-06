@@ -1,0 +1,568 @@
+/**
+ * ir/hir/force_elab: expands a force `@e` whose operand is a container of
+ * thunks, one level deep:
+ *
+ *   `[ @σ ]`        → a call to the runtime `force_list` helper
+ *   `[| @σ |]`      → a call to the runtime `force_array` helper
+ *   `{ ℓ: @σ, … }`  → `match e do | { ℓ: v, … } -> { ℓ: @v, … } end`
+ *   `D<…, @σ, …>`   → a match over D's constructors that rebuilds each one,
+ *                     forcing the fields typed by the lazy type argument
+ *
+ * The typechecker records the resolved operand type of every container force
+ * in a runtime string map keyed by `force_key(file, offset)`; a force with no
+ * entry is left as a plain thunk force.
+ */
+
+import {
+  HirProgram, HirFunction, HirExpr, HirExprKind, HirStmt, HirStmtKind, HirMatchCase,
+  HirPatternKind, HirPatternField, HirRecordPatField, HirCallArg, HirNamedExpr,
+  HirHandlerArm, HirHandlerBinding, HirHandlerBindingEntry, HirBody, EagerBody, LazyBody
+} from "src/ir/hir/types.nx"
+import { with_body } from "src/ir/hir/func_update.nx"
+import { TypeExpr, NamedType, EnumDef, VariantDef, VariantField } from "src/types/type_expr.nx"
+import { Span } from "src/types/span.nx"
+import { SigilImmutable } from "src/types/vocab.nx"
+import { smap_get_str, smap_has_str } from "std:runtime/collection"
+import { value_of_i64 } from "std:runtime/lazy"
+import { Option, Some, None } from "std:option"
+import * as list from "std:list"
+import * as str from "std:str"
+
+/** Key of the force at `offset` in `file` in the operand-type map. */
+export let force_key = fn (file: string, offset: i64) -> string do
+  return file ++ ":" ++ str.from_i64(val: offset)
+end
+
+/** Names of the runtime helpers a list / array force calls. */
+export type ForceHelpers = ForceHelpers(list_fn: string, array_fn: string)
+
+/** Context threaded through the rewrite. */
+type Ctx = Ctx(types_id: i64, file: string, helpers: ForceHelpers, enums: [ EnumDef ])
+
+// ─── detection ──────────────────────────────────────────────────────────────
+
+/** True when `f`'s body contains a force node anywhere. */
+export let function_has_force = fn (f: HirFunction) -> bool do
+  let HirFunction(name: _, type_params: _, params: _, ret_type: _, throw_row: _, body: b, _) = f
+  match b do
+    | LazyBody(_) -> return false
+    | EagerBody(stmts: ss) -> return stmts_have_force(stmts: ss)
+  end
+end
+
+let stmts_have_force = fn (stmts: [ HirStmt ]) -> bool do
+  match stmts do
+    | [] -> return false
+    | HirStmt(node: s, span: _) :: rest ->
+      if stmt_has_force(s) then return true end
+      return stmts_have_force(stmts: rest)
+  end
+end
+
+let stmt_has_force = fn (s: HirStmtKind) -> bool do
+  match s do
+    | Let(name: _, sigil: _, typ: _, value: v) -> return expr_has_force(e: v)
+    | Expr(expr: e) | Return(expr: e) -> return expr_has_force(e)
+    | Assign(target: t, value: v) -> return expr_has_force(e: t) || expr_has_force(e: v)
+    | Try(body: b, catch_param: _, catch_body: cb) ->
+      return stmts_have_force(stmts: b) || stmts_have_force(stmts: cb)
+  end
+end
+
+let exprs_have_force = fn (es: [ HirExpr ]) -> bool do
+  match es do
+    | [] -> return false
+    | e :: rest ->
+      if expr_has_force(e) then return true end
+      return exprs_have_force(es: rest)
+  end
+end
+
+let args_have_force = fn (args: [ HirCallArg ]) -> bool do
+  match args do
+    | [] -> return false
+    | HirCallArg(label: _, value: v) :: rest ->
+      if expr_has_force(e: v) then return true end
+      return args_have_force(args: rest)
+  end
+end
+
+let named_have_force = fn (fs: [ HirNamedExpr ]) -> bool do
+  match fs do
+    | [] -> return false
+    | HirNamedExpr(name: _, value: v) :: rest ->
+      if expr_has_force(e: v) then return true end
+      return named_have_force(fs: rest)
+  end
+end
+
+let cases_have_force = fn (cs: [ HirMatchCase ]) -> bool do
+  match cs do
+    | [] -> return false
+    | HirMatchCase(pattern: _, body: b) :: rest ->
+      if stmts_have_force(stmts: b) then return true end
+      return cases_have_force(cs: rest)
+  end
+end
+
+let arms_have_force = fn (arms: [ HirHandlerArm ]) -> bool do
+  match arms do
+    | [] -> return false
+    | HirHandlerArm(arm: f, cont_binder: _) :: rest ->
+      if function_has_force(f) then return true end
+      return arms_have_force(arms: rest)
+  end
+end
+
+let expr_has_force = fn (e: HirExpr) -> bool do
+  let HirExpr(node: k, span: _) = e
+  match k do
+    | Force(expr: _) -> return true
+    | Literal(_) | Variable(_) | Borrow(_) | ExternalRef(_) -> return false
+    | BinOp(left: l, op: _, right: r) -> return expr_has_force(e: l) || expr_has_force(e: r)
+    | UnOp(op: _, operand: o) -> return expr_has_force(e: o)
+    | Call(func: _, args) -> return args_have_force(args)
+    | CallExpr(callee: c, args) -> return expr_has_force(e: c) || args_have_force(args)
+    | Ctor(variant: _, args, labels: _, sigil: _) -> return exprs_have_force(es: args)
+    | Record(fields: fs) -> return named_have_force(fs)
+    | Array(elems: es) -> return exprs_have_force(es)
+    | Index(target: t, index: i) -> return expr_has_force(e: t) || expr_has_force(e: i)
+    | FieldAccess(target: t, field: _) -> return expr_has_force(e: t)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      if expr_has_force(e: c) || stmts_have_force(stmts: tb) then return true end
+      match eb do
+        | None -> return false
+        | Some(val: s) -> return stmts_have_force(stmts: s)
+      end
+    | Match(target: t, cases: cs) -> return expr_has_force(e: t) || cases_have_force(cs)
+    | While(cond: c, body: b) -> return expr_has_force(e: c) || stmts_have_force(stmts: b)
+    | For(var: _, start: s, end_expr: ee, body: b) ->
+      return expr_has_force(e: s) || expr_has_force(e: ee) || stmts_have_force(stmts: b)
+    | Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: b) ->
+      return stmts_have_force(stmts: b)
+    | Raise(expr: x) -> return expr_has_force(e: x)
+    | Thunk(body: b) -> return expr_has_force(e: b)
+    | Handler(cap_name: _, requires: _, arms) -> return arms_have_force(arms)
+    | Inject(handlers: _, body: b) -> return stmts_have_force(stmts: b)
+  end
+end
+
+// ─── rewrite ────────────────────────────────────────────────────────────────
+
+/** Expand every recorded container force in `prog`. `types_id` is the
+ *  operand-type map filled by the typechecker. */
+export let elaborate_forces = fn (
+  prog: HirProgram,
+  types_id: i64,
+  helpers: ForceHelpers
+) -> HirProgram do
+  let HirProgram(
+    caps, functions, externals, handler_bindings, enum_defs, exception_groups,
+    value_binding_names, type_defs, visible_enum_names, ext_wasm_deps
+  ) = prog
+  let funcs = list.map(xs: functions, f: fn (val: HirFunction) -> HirFunction do
+    return rw_function(f: val, types_id, helpers, enums: enum_defs)
+  end)
+  let hbs = list.map(
+    xs: handler_bindings,
+    f: fn (val: HirHandlerBindingEntry) -> HirHandlerBindingEntry do
+      let HirHandlerBindingEntry(name, binding: HirHandlerBinding(cap_name, requires, arms)) = val
+      return HirHandlerBindingEntry(
+        name,
+        binding: HirHandlerBinding(
+          cap_name,
+          requires,
+          arms: rw_arms(arms, types_id, helpers, enums: enum_defs)
+        )
+      )
+    end
+  )
+  return HirProgram(
+    caps, functions: funcs, externals, handler_bindings: hbs, enum_defs, exception_groups,
+    value_binding_names, type_defs, visible_enum_names, ext_wasm_deps
+  )
+end
+
+let rw_function = fn (
+  f: HirFunction,
+  types_id: i64,
+  helpers: ForceHelpers,
+  enums: [ EnumDef ]
+) -> HirFunction do
+  if !function_has_force(f) then return f end
+  let HirFunction(
+    name: _,
+    type_params: _,
+    params: _,
+    ret_type: _,
+    throw_row: _,
+    body: b,
+    span: _,
+    file,
+    requires: _
+  ) = f
+  match b do
+    | LazyBody(_) -> return f
+    | EagerBody(stmts: ss) ->
+      let ctx = Ctx(types_id, file, helpers, enums)
+      return with_body(f, body: EagerBody(stmts: rw_stmts(stmts: ss, ctx)))
+  end
+end
+
+let rw_arms = fn (
+  arms: [ HirHandlerArm ],
+  types_id: i64,
+  helpers: ForceHelpers,
+  enums: [ EnumDef ]
+) -> [ HirHandlerArm ] do
+  return list.map(xs: arms, f: fn (val: HirHandlerArm) -> HirHandlerArm do
+    let HirHandlerArm(arm: af, cont_binder: cb) = val
+    return HirHandlerArm(arm: rw_function(f: af, types_id, helpers, enums), cont_binder: cb)
+  end)
+end
+
+let rw_stmts = fn (stmts: [ HirStmt ], ctx: Ctx) -> [ HirStmt ] do
+  return list.map(xs: stmts, f: fn (val: HirStmt) -> HirStmt do
+    let HirStmt(node: s, span: sp) = val
+    return HirStmt(node: rw_stmt(s, ctx), span: sp)
+  end)
+end
+
+let rw_stmt = fn (s: HirStmtKind, ctx: Ctx) -> HirStmtKind do
+  match s do
+    | Let(name: n, sigil: sig, typ: t, value: v) ->
+      return Let(name: n, sigil: sig, typ: t, value: rw_expr(e: v, ctx))
+    | Expr(expr: e) -> return Expr(expr: rw_expr(e, ctx))
+    | Return(expr: e) -> return Return(expr: rw_expr(e, ctx))
+    | Assign(
+      target: t,
+      value: v
+    ) -> return Assign(target: rw_expr(e: t, ctx), value: rw_expr(e: v, ctx))
+    | Try(body: b, catch_param: cp, catch_body: cb) ->
+      return Try(
+        body: rw_stmts(stmts: b, ctx),
+        catch_param: cp,
+        catch_body: rw_stmts(stmts: cb, ctx)
+      )
+  end
+end
+
+let rw_exprs = fn (es: [ HirExpr ], ctx: Ctx) -> [ HirExpr ] do
+  return list.map(xs: es, f: fn (val: HirExpr) -> HirExpr do return rw_expr(e: val, ctx) end)
+end
+
+let rw_args = fn (args: [ HirCallArg ], ctx: Ctx) -> [ HirCallArg ] do
+  return list.map(xs: args, f: fn (val: HirCallArg) -> HirCallArg do
+    let HirCallArg(label: l, value: v) = val
+    return HirCallArg(label: l, value: rw_expr(e: v, ctx))
+  end)
+end
+
+let rw_named = fn (fs: [ HirNamedExpr ], ctx: Ctx) -> [ HirNamedExpr ] do
+  return list.map(xs: fs, f: fn (val: HirNamedExpr) -> HirNamedExpr do
+    let HirNamedExpr(name: n, value: v) = val
+    return HirNamedExpr(name: n, value: rw_expr(e: v, ctx))
+  end)
+end
+
+let rw_cases = fn (cs: [ HirMatchCase ], ctx: Ctx) -> [ HirMatchCase ] do
+  return list.map(xs: cs, f: fn (val: HirMatchCase) -> HirMatchCase do
+    let HirMatchCase(pattern: p, body: b) = val
+    return HirMatchCase(pattern: p, body: rw_stmts(stmts: b, ctx))
+  end)
+end
+
+let rw_expr = fn (e: HirExpr, ctx: Ctx) -> HirExpr do
+  let HirExpr(node: k, span: sp) = e
+  match k do
+    | Force(expr: inner) -> return expand_force(operand: rw_expr(e: inner, ctx), span: sp, ctx)
+    | Literal(_) | Variable(_) | Borrow(_) | ExternalRef(_) -> return e
+    | BinOp(left: l, op, right: r) ->
+      return HirExpr(node: BinOp(left: rw_expr(e: l, ctx), op, right: rw_expr(e: r, ctx)), span: sp)
+    | UnOp(op, operand: o) -> return HirExpr(node: UnOp(op, operand: rw_expr(e: o, ctx)), span: sp)
+    | Call(func: f, args) -> return HirExpr(node: Call(func: f, args: rw_args(args, ctx)), span: sp)
+    | CallExpr(callee: c, args) ->
+      return HirExpr(node: CallExpr(callee: rw_expr(e: c, ctx), args: rw_args(args, ctx)), span: sp)
+    | Ctor(variant: v, args, labels, sigil: sig) ->
+      return HirExpr(
+        node: Ctor(variant: v, args: rw_exprs(es: args, ctx), labels, sigil: sig),
+        span: sp
+      )
+    | Record(fields: fs) -> return HirExpr(node: Record(fields: rw_named(fs, ctx)), span: sp)
+    | Array(elems: es) -> return HirExpr(node: Array(elems: rw_exprs(es, ctx)), span: sp)
+    | Index(target: t, index: i) ->
+      return HirExpr(node: Index(target: rw_expr(e: t, ctx), index: rw_expr(e: i, ctx)), span: sp)
+    | FieldAccess(target: t, field: f) ->
+      return HirExpr(node: FieldAccess(target: rw_expr(e: t, ctx), field: f), span: sp)
+    | If(cond: c, then_branch: tb, else_branch: eb) ->
+      let new_eb = match eb do
+        | None -> None
+        | Some(val: s) -> Some(val: rw_stmts(stmts: s, ctx))
+      end
+      return HirExpr(
+        node: If(
+          cond: rw_expr(e: c, ctx),
+          then_branch: rw_stmts(stmts: tb, ctx),
+          else_branch: new_eb
+        ),
+        span: sp
+      )
+    | Match(target: t, cases: cs) ->
+      return HirExpr(node: Match(target: rw_expr(e: t, ctx), cases: rw_cases(cs, ctx)), span: sp)
+    | While(cond: c, body: b) ->
+      return HirExpr(node: While(cond: rw_expr(e: c, ctx), body: rw_stmts(stmts: b, ctx)), span: sp)
+    | For(var: v, start: s, end_expr: ee, body: b) ->
+      return HirExpr(
+        node: For(
+          var: v,
+          start: rw_expr(e: s, ctx),
+          end_expr: rw_expr(e: ee, ctx),
+          body: rw_stmts(stmts: b, ctx)
+        ),
+        span: sp
+      )
+    | Lambda(type_params: tp, params, ret_type: rt, requires: req, throw_row: tw, body: b) ->
+      return HirExpr(
+        node: Lambda(
+          type_params: tp,
+          params,
+          ret_type: rt,
+          requires: req,
+          throw_row: tw,
+          body: rw_stmts(stmts: b, ctx)
+        ),
+        span: sp
+      )
+    | Raise(expr: x) -> return HirExpr(node: Raise(expr: rw_expr(e: x, ctx)), span: sp)
+    | Thunk(body: b) -> return HirExpr(node: Thunk(body: rw_expr(e: b, ctx)), span: sp)
+    | Handler(cap_name: pn, requires: req, arms) ->
+      let Ctx(types_id, file: _, helpers, enums) = ctx
+      return HirExpr(
+        node: Handler(cap_name: pn, requires: req, arms: rw_arms(arms, types_id, helpers, enums)),
+        span: sp
+      )
+    | Inject(
+      handlers: hs,
+      body: b
+    ) -> return HirExpr(node: Inject(handlers: hs, body: rw_stmts(stmts: b, ctx)), span: sp)
+  end
+end
+
+// ─── expansion ──────────────────────────────────────────────────────────────
+
+let expand_force = fn (operand: HirExpr, span: Span, ctx: Ctx) -> HirExpr do
+  let Ctx(types_id, file, helpers, enums) = ctx
+  let Span(offset, line: _, col: _) = span
+  let key = force_key(file, offset)
+  if types_id == 0 || !smap_has_str(id: types_id, key) then
+    return HirExpr(node: Force(expr: operand), span)
+  end
+  let typ: TypeExpr = value_of_i64(a_x: smap_get_str(id: types_id, key, default_val: 0))
+  let ForceHelpers(list_fn, array_fn) = helpers
+  let prefix = "__nx_forced_" ++ str.from_i64(val: offset) ++ "_"
+  match strip_linear(t: typ) do
+    | TyList(_) -> return call_helper(func: list_fn, label: "xs", operand, span)
+    | TyArray(_) -> return call_helper(func: array_fn, label: "arr", operand, span)
+    | TyRecord(fields) -> return expand_record(operand, fields, prefix, span)
+    | TyUserDefined(name, args) ->
+      if name == "List" then return call_helper(func: list_fn, label: "xs", operand, span) end
+      match find_enum(enums, name) do
+        | None -> return HirExpr(node: Force(expr: operand), span)
+        | Some(val: def) -> return expand_enum(operand, def, args, prefix, span)
+      end
+    | _ -> return HirExpr(node: Force(expr: operand), span)
+  end
+end
+
+let strip_linear = fn (t: TypeExpr) -> TypeExpr do
+  match t do
+    | TyLinear(inner) -> return strip_linear(t: inner)
+    | _ -> return t
+  end
+end
+
+let is_lazy = fn (t: TypeExpr) -> bool do
+  match strip_linear(t) do
+    | TyLazy(inner: _, require_row: _, throw_row: _) -> return true
+    | _ -> return false
+  end
+end
+
+let call_helper = fn (func: string, label: string, operand: HirExpr, span: Span) -> HirExpr do
+  return HirExpr(node: Call(func, args: [ HirCallArg(label, value: operand) ]), span)
+end
+
+let var = fn (name: string, span: Span) -> HirExpr do
+  return HirExpr(node: Variable(name, sigil: SigilImmutable), span)
+end
+
+let forced_var = fn (name: string, lazy: bool, span: Span) -> HirExpr do
+  if lazy then return HirExpr(node: Force(expr: var(name, span)), span) end
+  return var(name, span)
+end
+
+let single_case_match = fn (
+  operand: HirExpr,
+  pattern: HirPatternKind,
+  result: HirExpr,
+  span: Span
+) -> HirExpr do
+  return HirExpr(
+    node: Match(
+      target: operand,
+      cases: [ HirMatchCase(pattern, body: [ HirStmt(node: Expr(expr: result), span) ]) ]
+    ),
+    span
+  )
+end
+
+/** `match e do | { ℓ: v_ℓ, … } -> { ℓ: @v_ℓ (lazy ℓ) / v_ℓ, … } end` */
+let expand_record = fn (
+  operand: HirExpr,
+  fields: [ NamedType ],
+  prefix: string,
+  span: Span
+) -> HirExpr do
+  let pat_fields = list.map(xs: fields, f: fn (val: NamedType) -> HirRecordPatField do
+    let NamedType(name, typ: _) = val
+    return HirRecordPatField(name, pattern: PVar(name: prefix ++ name, sigil: SigilImmutable))
+  end)
+  let out_fields = list.map(xs: fields, f: fn (val: NamedType) -> HirNamedExpr do
+    let NamedType(name, typ) = val
+    return HirNamedExpr(name, value: forced_var(name: prefix ++ name, lazy: is_lazy(t: typ), span))
+  end)
+  return single_case_match(
+    operand,
+    pattern: PRec(fields: pat_fields, is_partial: false),
+    result: HirExpr(node: Record(fields: out_fields), span),
+    span
+  )
+end
+
+/** A match over every constructor of `def` that rebuilds it, forcing each
+ *  field whose declared type is a type parameter instantiated with a thunk. */
+let expand_enum = fn (
+  operand: HirExpr,
+  def: EnumDef,
+  args: [ TypeExpr ],
+  prefix: string,
+  span: Span
+) -> HirExpr do
+  let EnumDef(name: _, is_public: _, is_opaque: _, type_params, variants, layout_variants, _) = def
+  let lazy_params = lazy_type_params(params: type_params, args)
+  let vs = if list.is_empty(xs: variants) then layout_variants else variants end
+  let cases = list.map(xs: vs, f: fn (val: VariantDef) -> HirMatchCase do
+    return rebuild_case(variant: val, lazy_params, prefix, span)
+  end)
+  return HirExpr(node: Match(target: operand, cases), span)
+end
+
+let lazy_type_params = fn (params: [ string ], args: [ TypeExpr ]) -> [ string ] do
+  match params do
+    | [] -> return []
+    | p :: prest ->
+      match args do
+        | [] -> return []
+        | a :: arest ->
+          let rest = lazy_type_params(params: prest, args: arest)
+          if is_lazy(t: a) then return p :: rest end
+          return rest
+      end
+  end
+end
+
+let field_is_param = fn (t: TypeExpr, params: [ string ]) -> bool do
+  match t do
+    | TyVar(name) -> return has_name(names: params, name)
+    | TyUserDefined(name, args: []) -> return has_name(names: params, name)
+    | _ -> return false
+  end
+end
+
+let has_name = fn (names: [ string ], name: string) -> bool do
+  return list.any(xs: names, p: fn (val: string) -> bool do return val == name end)
+end
+
+let rebuild_case = fn (
+  variant: VariantDef,
+  lazy_params: [ string ],
+  prefix: string,
+  span: Span
+) -> HirMatchCase do
+  let VariantDef(name: vname, fields) = variant
+  let RebuiltFields(pats: pat_fields, args, labels) = rebuild_fields(
+    fields,
+    lazy_params,
+    prefix: prefix ++ vname ++ "_",
+    idx: 0,
+    span
+  )
+  return HirMatchCase(
+    pattern: PCtor(variant: vname, fields: pat_fields, sigil: SigilImmutable),
+    body: [ HirStmt(
+      node: Expr(expr: HirExpr(node: Ctor(variant: vname, args, labels, sigil: SigilImmutable), span)),
+      span
+    ) ]
+  )
+end
+
+type RebuiltFields = RebuiltFields(pats: [ HirPatternField ], args: [ HirExpr ], labels: [ string ])
+
+/** Pattern binders, rebuilt constructor arguments and labels for `fields`. */
+let rebuild_fields = fn (
+  fields: [ VariantField ],
+  lazy_params: [ string ],
+  prefix: string,
+  idx: i64,
+  span: Span
+) -> RebuiltFields do
+  match fields do
+    | [] -> return RebuiltFields(pats: [], args: [], labels: [])
+    | VariantField(name: label, typ) :: rest ->
+      let RebuiltFields(
+        pats,
+        args,
+        labels
+      ) = rebuild_fields(fields: rest, lazy_params, prefix, idx: idx + 1, span)
+      let binder = prefix ++ str.from_i64(val: idx)
+      let label_str = match label do
+        | Some(val: l) -> l
+        | None -> ""
+      end
+      return RebuiltFields(
+        pats: HirPatternField(
+          name: label,
+          pattern: PVar(name: binder, sigil: SigilImmutable)
+        ) :: pats,
+        args: forced_var(
+          name: binder,
+          lazy: field_is_param(t: typ, params: lazy_params),
+          span
+        ) :: args,
+        labels: label_str :: labels
+      )
+  end
+end
+
+/** The enum named `name`, matching either the exact name or, for a
+ *  module-qualified `<module>#<Enum>`, its bare enum name. */
+let find_enum = fn (enums: [ EnumDef ], name: string) -> Option<EnumDef> do
+  let bare = bare_name(name)
+  match list.find(xs: enums, p: fn (val: EnumDef) -> bool do
+    let EnumDef(name: n, _) = val
+    return n == name
+  end) do
+    | Some(val: d) -> return Some(val: d)
+    | None ->
+      return list.find(xs: enums, p: fn (val: EnumDef) -> bool do
+        let EnumDef(name: n, _) = val
+        return bare_name(name: n) == bare
+      end)
+  end
+end
+
+let bare_name = fn (name: string) -> string do
+  let idx = str.index_of(s: name, sub: "#")
+  if idx < 0 then return name end
+  return str.substring(s: name, start: idx + 1, len: str.length(s: name) - idx - 1)
+end

@@ -146,7 +146,9 @@ let @result = expensive_call(data: input)  // deferred thunk
 // ... other work ...
 let val = @result                          // force: runs the thunk now (synchronous)
 ```
-A single `@x` force is synchronous. `std:lazy`'s `force_all(tasks: [a, b, ...])`
+A single `@x` force is synchronous. `@` on a container of thunks forces every
+thunk in it one level deep: `@[a, b]` : `[T]`, `@{ x: a, y: b }`, an array, or an
+enum value whose type arguments are thunks (`@Some(val: a)`). `std:lazy`'s `force_all(tasks: [a, b, ...])`
 forces a list of thunks and returns the results in input order, and
 `std:concurrency/task`'s `host_spawn` / `host_join` give per-thunk handles; both
 force each thunk sequentially on the calling thread, and a thunk's exception
