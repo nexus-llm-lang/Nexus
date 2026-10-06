@@ -24,15 +24,8 @@
  * is one stdout entry; multiple files separate cleanly because every line
  * is prefixed with the file path.
  *
- * Parallelism: when more than PARALLEL_THRESHOLD files are requested, the
- * analysis phase (read + tokenize + parse + lint_program) runs in parallel
- * via `lazy.force_all` / WASI threads, mirroring `test_runner.nx`'s
- * `run_all` + `build_test_thunks`.  The emit phase (Console output + exit
- * code tallying) is always sequential so output order matches input order.
- *
- * Small invocations (N <= PARALLEL_THRESHOLD, e.g. the 1-file
- * lint_check_mode_test fixture) take a sequential path that never calls
- * `lazy.force_all`, so they work in wasm contexts without `-S threads`.
+ * Files are analysed (read + tokenize + parse + lint_program) one at a time,
+ * then the results are emitted in input order.
  *
  * Note: `--fix` / `--fix-diff` (the heavier front-end coupling) are
  * confined to fix mode only. Plain `lint` / `--check` remain AST-only,
@@ -40,7 +33,6 @@
  */
 
 import * as list from "std:list"
-import * as lazy from "std:lazy"
 import * as str from "std:str"
 import { Fs, FileNotFound } from "std:fs"
 import { Console } from "std:stdio"
@@ -185,10 +177,7 @@ let emit_findings = fn (file: string, fs: [ LintFinding ]) -> unit require { Con
   end
 end
 
-/** Sequential collect: map lint_collect_one over paths in order.
- *  Used for small invocations (N <= PARALLEL_THRESHOLD) and any wasm
- *  context without WASI threads (e.g. the lint_check_mode_test fixture).
- */
+/** Map lint_collect_one over paths in order. */
 let collect_sequential = fn (
   paths: [ string ],
   acc: [ LintFileResult ]
@@ -200,45 +189,6 @@ let collect_sequential = fn (
       return collect_sequential(paths: rest, acc: r :: acc)
   end
 end
-
-/** Parallel collect: bind each lint_collect_one call as an @LintFileResult
- *  thunk, then hand the list to lazy.force_all.  Results arrive in input
- *  order (force_all joins left-to-right), so output order is deterministic.
- *  Requires WASI threads; only called when N > PARALLEL_THRESHOLD.
- */
-let collect_parallel = fn (paths: [ string ]) -> [ LintFileResult ] require { Fs } do
-  let thunks = build_lint_thunks(paths, acc: [])
-  return lazy.force_all(tasks: thunks)
-end
-
-let build_lint_thunks = fn (
-  paths: [ string ],
-  acc: [ @(LintFileResult require { Fs }) ]
-) -> [ @(LintFileResult require { Fs }) ] require { Fs } do
-  match paths do
-    | [] -> return list.reverse(xs: acc)
-    | p :: rest ->
-      let @t = lint_collect_one(path: p)
-      return build_lint_thunks(paths: rest, acc: t :: acc)
-  end
-end
-
-/** File-count threshold below which the sequential path is taken.
- *  Set to 2 so that the 1-file lint_check_mode_test fixture never
- *  reaches force_all (which requires WASI threads).  The CI gate runs
- *  over ~150 files and always takes the parallel path.
- */
-let parallel_threshold = fn () -> i64 do return 2 end
-
-//
-// Argument resolution: positional args may be files or directories. A
-// directory is walked recursively, collecting every `*.nx` file outside the
-// hardcoded ignore set (mirrors `nexus fmt` / `nexus test` discovery). Files
-// passed directly pass through verbatim (extension not enforced — preserves
-// the single-file contract `lint_check_mode_test` relies on). Without this
-// expansion a directory path reached `lint_collect_one`, read as empty, and
-// silently exited 0 — defeating the advertised `nexus lint --check src/` CI
-// gate.
 
 // Directory basenames that are never descended into. Hidden dotfiles are
 // caught by the dot-prefix check; this list covers VCS / build scratch dirs
@@ -362,10 +312,6 @@ end
  *   --fix                 apply fix-its in place (lint + E2005/E2007; loops to fixpoint)
  *   --fix-diff            show before/after diff without writing
  *
- * Parallelism: analysis runs in parallel (via lazy.force_all / WASI threads)
- * when list.length(paths) > parallel_threshold(); sequential otherwise.
- * Note: --fix / --fix-diff always runs sequentially (the pipeline is heavy
- * enough that parallel overhead outweighs the benefit for fix workloads).
  */
 export let run_lint_subcommand = fn (args: [ string ]) -> i64 require { Console, Fs } do
   try
@@ -384,12 +330,7 @@ export let run_lint_subcommand = fn (args: [ string ]) -> i64 require { Console,
     // `nexus lint --check src/` CI gate (specs.nx) actually scan the tree
     // instead of silently exiting 0 on a directory.
     let expanded = collect_lint_inputs(paths)
-    let n = list.length(xs: expanded)
-    let results = if n <= parallel_threshold() then
-      collect_sequential(paths: expanded, acc: [])
-    else
-      collect_parallel(paths: expanded)
-    end
+    let results = collect_sequential(paths: expanded, acc: [])
     let total = emit_results(results, total: 0)
     if check_mode && total > 0 then return 1 else return 0 end
   catch

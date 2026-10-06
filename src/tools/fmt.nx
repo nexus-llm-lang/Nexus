@@ -26,13 +26,8 @@
  *     trusts the author's depth. (Needs full keyword tracking to be correct.)
  *   - Array literal `[|a|]` → `[| a |]` inner spacing.
  *
- * Parallelism: when more than PARALLEL_THRESHOLD files are requested, the
- * read+format phase runs in parallel via `lazy.force_all` / WASI threads,
- * mirroring `lint.nx`'s `collect_parallel` / `parallel_threshold` design.
- * The write / check-report phase is always sequential so output order
- * matches input order.  Small invocations (N <= PARALLEL_THRESHOLD, e.g.
- * a 1-file direct test import) take the sequential path and never call
- * `lazy.force_all`, so they work in wasm contexts without `-S threads`.
+ * Files are read and formatted one at a time, then written / reported in
+ * input order.
  */
 
 import { InvalidUsage } from "src/diagnostics/error.nx"
@@ -40,7 +35,6 @@ import { Fs, FileNotFound, WriteError, FsThrow } from "std:fs"
 import { Console } from "std:stdio"
 import * as str from "std:str"
 import * as list from "std:list"
-import * as lazy from "std:lazy"
 import * as bb from "std:bytebuffer"
 import { Option, Some, None } from "std:option"
 // `format_source` lives in fmt_core.nx so consumers like the LSP can
@@ -138,8 +132,7 @@ end
  */
 type FmtFileResult = FmtFileResult(path: string, src: string, formatted: string, exists: bool)
 
-/** Collect one file: read + format.  No Console dependency — safe to run in
- *  parallel.  A missing file records `exists: false` so the emit phase can
+/** Collect one file: read + format (no Console dependency).  A missing file records `exists: false` so the emit phase can
  *  report the error and count it as a failure.
  */
 let fmt_collect_one = fn (path: string) -> FmtFileResult require { Fs } throws { FsThrow } do
@@ -174,10 +167,7 @@ let emit_fmt_result = fn (
     return true
 end
 
-/** Sequential collect: map fmt_collect_one over paths in order.
- *  Used for small invocations (N <= PARALLEL_THRESHOLD) and any wasm
- *  context without WASI threads (e.g. direct test imports).
- */
+/** Map fmt_collect_one over paths in order. */
 let collect_fmt_sequential = fn (
   paths: [ string ],
   acc: [ FmtFileResult ]
@@ -189,36 +179,6 @@ let collect_fmt_sequential = fn (
       return collect_fmt_sequential(paths: rest, acc: r :: acc)
   end
 end
-
-/** Parallel collect: bind each fmt_collect_one call as an @FmtFileResult
- *  thunk, then hand the list to lazy.force_all.  Results arrive in input
- *  order (force_all joins left-to-right), so output order is deterministic.
- *  Requires WASI threads; only called when N > PARALLEL_THRESHOLD.
- */
-let collect_fmt_parallel = fn (paths: [ string ]) -> [ FmtFileResult ] require { Fs } throws { FsThrow } do
-  let thunks = build_fmt_thunks(paths, acc: [])
-  return lazy.force_all(tasks: thunks)
-end
-
-let build_fmt_thunks = fn (
-  paths: [ string ],
-  acc: [ @(FmtFileResult require { Fs }) ]
-) -> [ @(FmtFileResult require { Fs }) ] require { Fs } throws { FsThrow } do
-  match paths do
-    | [] -> return list.reverse(xs: acc)
-    | p :: rest ->
-      let @t = fmt_collect_one(path: p)
-      return build_fmt_thunks(paths: rest, acc: t :: acc)
-  end
-end
-
-/** File-count threshold below which the sequential path is taken.
- *  Set to 2 so that 1-file direct invocations (e.g. test fixtures that
- *  import fmt functions directly) never reach force_all, which requires
- *  WASI threads.  The CI whole-tree gate runs over many files and always
- *  takes the parallel path.
- */
-let parallel_threshold = fn () -> i64 do return 2 end
 
 /** Emit all results in order (always sequential so output is deterministic).
  *  Returns `true` when every file was OK, `false` if any failed.
@@ -419,22 +379,14 @@ export let run_fmt_subcommand = fn (args: [ string ]) -> i64 require {
     return fmt_each(paths: expanded, check_mode)
 end
 
-/** Format all expanded paths.  For N > parallel_threshold(), the collect
- *  (read + format) phase runs in parallel via lazy.force_all; for small N
- *  it runs sequentially (no thread spawn).  The emit phase (write / check
- *  reporting) is always sequential so output order matches input order and
- *  Console writes are deterministic.
+/** Format all expanded paths: read + format each in order, then write /
+ *  report each in input order.
  */
 let fmt_each = fn (
   paths: [ string ],
   check_mode: bool
 ) -> i64 require { Console, Fs } throws { FsThrow } do
-  let n = list.length(xs: paths)
-  let results = if n <= parallel_threshold() then
-    collect_fmt_sequential(paths, acc: [])
-  else
-    collect_fmt_parallel(paths)
-  end
+  let results = collect_fmt_sequential(paths, acc: [])
   let all_ok = emit_fmt_results(results, check_mode, all_ok: true)
   if all_ok then return 0 else return 1 end
 end

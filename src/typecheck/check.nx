@@ -16,7 +16,6 @@
  */
 
 import * as list from "std:list"
-import * as lazy from "std:lazy"
 import { heap_mark, heap_reset } from "std:runtime/arena"
 import {
   TypeExpr,
@@ -250,11 +249,10 @@ export let check_program = fn (
   let st7b = resolve_value_binding_types(state: st7, funcs, vb_names)
 
   // Warm the per-module scoped-enum memo on the shared map BEFORE body checking,
-  // so the parallel phase (check_all_parallel) only reads the cache and never
-  // writes it concurrently — concurrent writes to the shared map corrupt it.
+  // so body checking only reads the cache.
   prewarm_scoped_enums(state: st7b, funcs)
 
-  check_all_functions(
+  check_all_sequential(
     state: st7b,
     funcs,
     local_names,
@@ -264,7 +262,7 @@ export let check_program = fn (
   )
 
   // Pass 2b: Check handler arm bodies (synthesised function names aren't in
-  // local_names, so they're missed by check_all_functions). With-kont arms
+  // local_names, so they're missed by check_all_sequential). With-kont arms
   // need their body re-checked with the cont binder bound in env so that
   // forcing @k at the wrong type is a TypeMismatch.
   check_handler_arm_bodies(state: st7b, hbs, safe_callees)
@@ -359,23 +357,6 @@ let lookup_cont_binder_in = fn (fname: string, entries: [ ContBinderEntry ]) -> 
 end
 
 // ─── Check all function bodies ──────────────────────────────────────────────
-//
-// Parallelism: when list.length(funcs) > tc_parallel_threshold(), function
-// bodies are dispatched as `@bool` thunks via `lazy.force_all` (WASI threads
-// / sequential-force fallback), mirroring `nexus lint`'s `collect_parallel` /
-// `parallel_threshold` design.  `@bool` (not `@unit`) avoids the unit-closure
-// codegen gap: unit closures produce no i64 on the WASM value stack.
-// For N <= threshold the sequential path is taken so that small files and any
-// wasm context without threads never reach force_all.  Results arrive in input
-// order (force_all joins left-to-right), so TypeError diagnostics are reported
-// in the same deterministic order as the sequential path.
-
-/** File-count threshold below which the sequential path is taken.
- *  Set to 2 so that single-function files never call force_all, which requires
- *  WASI threads.  Large programs (the compiler itself etc.) take the parallel
- *  path.
- */
-let tc_parallel_threshold = fn () -> i64 do return 2 end
 
 /** Check one function body, reclaiming its transient typecheck allocations
  *  before returning. A `check_function` call returns `unit` and reads only the
@@ -400,9 +381,6 @@ let check_function_bounded = fn (
   return ()
 end
 
-/** Sequential body-check: mirror of the original check_all_functions loop.
- *  Used for N <= tc_parallel_threshold() and as the guaranteed-safe fallback.
- */
 /** True when `func`'s body may be skipped: its defining module is in
  *  `skip_modules` AND it is NOT a function of the local (root) module. The
  *  local-name guard is the soundness floor — the file under compilation is never
@@ -429,6 +407,7 @@ let func_is_cached_import = fn (
   return str_list_contains(xs: skip_modules, s: ffile)
 end
 
+/** Body-check every local, non-alias function in order. */
 let check_all_sequential = fn (
   state: CheckState,
   funcs: [ HirFunction ],
@@ -458,96 +437,13 @@ let check_all_sequential = fn (
   end
 end
 
-/** Build a list of `@unit` thunks — one per qualifying function (local, non-alias).
- *  Alias-pattern functions and non-local functions are silently skipped.
- *  The `throws { TypeError }` annotation propagates from the deferred
- *  `check_function` calls captured inside each thunk.
- */
-let build_check_thunks = fn (
-  state: CheckState,
-  funcs: [ HirFunction ],
-  local_names: [ string ],
-  skip_modules: [ string ],
-  cont_map: ContBinderMap,
-  safe_callees: [ string ],
-  acc: [ @unit ]
-) -> [ @unit ] throws { TypeError } do
-  match funcs do
-    | [] -> return list.reverse(xs: acc)
-    | func :: rest ->
-      let HirFunction(name: _, type_params: _, params: _, ret_type: _, _) = func
-      match alias_src_name(func) do
-        | Some(val: _) ->
-          return build_check_thunks(
-            state,
-            funcs: rest,
-            local_names,
-            skip_modules,
-            cont_map,
-            safe_callees,
-            acc
-          )
-        | None ->
-          if func_is_cached_import(func, local_names, skip_modules) then
-            return build_check_thunks(
-              state,
-              funcs: rest,
-              local_names,
-              skip_modules,
-              cont_map,
-              safe_callees,
-              acc
-            )
-          else
-            let @t = check_function_bounded(state, func, cont_map, safe_callees)
-            return build_check_thunks(
-              state,
-              funcs: rest,
-              local_names,
-              skip_modules,
-              cont_map,
-              safe_callees,
-              acc: t :: acc
-            )
-          end
-      end
-  end
-end
-
-/** Parallel body-check: bind each qualifying check_function call as an @unit
- *  thunk, then hand the list to lazy.force_all.  Results arrive in input
- *  order (force_all joins left-to-right), so diagnostic order is deterministic.
- *  Requires WASI threads; only called when N > tc_parallel_threshold().
- */
-let check_all_parallel = fn (
-  state: CheckState,
-  funcs: [ HirFunction ],
-  local_names: [ string ],
-  skip_modules: [ string ],
-  cont_map: ContBinderMap,
-  safe_callees: [ string ]
-) -> unit throws { TypeError } do
-  let thunks = build_check_thunks(
-    state,
-    funcs,
-    local_names,
-    skip_modules,
-    cont_map,
-    safe_callees,
-    acc: []
-  )
-  lazy.force_all(tasks: thunks)
-  return ()
-end
-
-/** Sequentially warm the per-module scoped-enum memo for every function's
- *  module, so the parallel body check (`check_all_parallel`) only ever READS
- *  the shared cache and never writes it — the shared `global_sigs` map stays
- *  structurally frozen once concurrent checking starts. `current_module` during
- *  a body check is `func.file` (see `check_function`), so warming each distinct
- *  `func.file` covers every key `state_full_enums` can be asked for in the
- *  parallel phase. `state_warm_scoped_enums` is idempotent, so duplicate files
- *  are computed once. Must run BEFORE `check_all_functions`. */
+/** Warm the per-module scoped-enum memo for every function's module, so the
+ *  body check only ever READS the shared cache and never writes it — the
+ *  shared `global_sigs` map stays structurally frozen once body checking
+ *  starts. `current_module` during a body check is `func.file` (see
+ *  `check_function`), so warming each distinct `func.file` covers every key
+ *  `state_full_enums` can be asked for. `state_warm_scoped_enums` is idempotent, so duplicate files
+ *  are computed once. Must run BEFORE `check_all_sequential`. */
 let prewarm_scoped_enums = fn (state: CheckState, funcs: [ HirFunction ]) -> unit do
   match funcs do
     | [] -> return ()
@@ -557,26 +453,6 @@ let prewarm_scoped_enums = fn (state: CheckState, funcs: [ HirFunction ]) -> uni
       ) :: rest ->
       let warmed = tctypes.state_warm_scoped_enums(state, current_module: f)
       return prewarm_scoped_enums(state: warmed, funcs: rest)
-  end
-end
-
-/** Dispatch to sequential or parallel body-check depending on function count.
- *  For N <= tc_parallel_threshold(), uses the sequential path (safe in all
- *  wasm contexts).  For N > threshold, uses the parallel path via force_all.
- */
-let check_all_functions = fn (
-  state: CheckState,
-  funcs: [ HirFunction ],
-  local_names: [ string ],
-  skip_modules: [ string ],
-  cont_map: ContBinderMap,
-  safe_callees: [ string ]
-) -> unit throws { TypeError } do
-  let n = list.length(xs: funcs)
-  if n <= tc_parallel_threshold() then
-    return check_all_sequential(state, funcs, local_names, skip_modules, cont_map, safe_callees)
-  else
-    return check_all_parallel(state, funcs, local_names, skip_modules, cont_map, safe_callees)
   end
 end
 
@@ -609,7 +485,7 @@ let check_arm_bodies = fn (
     | [] -> return ()
     | HirHandlerArm(arm: f, cont_binder: kb) :: rest ->
       // Every arm body is checked here: synthesised arm function names are not
-      // in `local_names`, so `check_all_functions` never visits them. With-kont
+      // in `local_names`, so `check_all_sequential` never visits them. With-kont
       // arms additionally bind @k in env. Both paths must pin the handler's
       // require row as ambient ρ_q.
       check_arm_body(state, func: f, cont_binder: kb, handler_req, safe_callees)
