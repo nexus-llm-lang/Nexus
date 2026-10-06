@@ -30,8 +30,8 @@ The standard library is the `std` package, rooted at `nxlib/stdlib/`. Every modu
 | `"std:result"` | [core/result.nx](../../../nxlib/stdlib/core/result.nx) | `Result<T, E>` = `Ok(val) \| Err(err)`; `map`, `and_then`, `is_err` | [result_basics.nx](../../../examples/feature/result_basics.nx) |
 | `"std:exn"` | [core/exn.nx](../../../nxlib/stdlib/core/exn.nx) | Exception helpers, `todo()`, `backtrace()` | [exn_todo.nx](../../../examples/feature/exn_todo.nx) |
 | `"std:core"` | [core/core.nx](../../../nxlib/stdlib/core/core.nx) | `id` (polymorphic identity) | — |
-| `"std:lazy"` | [concurrency/lazy.nx](../../../nxlib/stdlib/concurrency/lazy.nx) | `force_all` (forces thunks in order, sequentially), `race`/`cancel`/`detach` | [lazy_parallel.nx](../../../examples/feature/lazy_parallel.nx) |
-| `"std:concurrency/task"` | [concurrency/task.nx](../../../nxlib/stdlib/concurrency/task.nx) | `host_spawn(@T) -> %Task<T>`, `host_join(%Task<T>) -> T` (forced at the join) | [lazy_parallel.nx](../../../examples/feature/lazy_parallel.nx) |
+| `"std:lazy"` | [concurrency/lazy.nx](../../../nxlib/stdlib/concurrency/lazy.nx) | `force_all` (forces thunks in order, sequentially), `race`/`cancel`/`detach` | [lazy_force_all.nx](../../../examples/feature/lazy_force_all.nx) |
+| `"std:concurrency/task"` | [concurrency/task.nx](../../../nxlib/stdlib/concurrency/task.nx) | `host_spawn(@T) -> %Task<T>`, `host_join(%Task<T>) -> T` (forced at the join) | [lazy_force_all.nx](../../../examples/feature/lazy_force_all.nx) |
 | `"std:json"` | [encoding/json.nx](../../../nxlib/stdlib/encoding/json.nx) | `parse`, `serialize`, `get_field`, `JsonValue` algebra | [json_basics.nx](../../../examples/feature/json_basics.nx) |
 | `"std:jsonrpc"` | [encoding/jsonrpc.nx](../../../nxlib/stdlib/encoding/jsonrpc.nx) | JSON-RPC 2.0 framing — `frame_message`/`unframe_one`, `read_message`/`write_message` | — |
 | `"std:toml"` | [encoding/toml.nx](../../../nxlib/stdlib/encoding/toml.nx) | `parse`, `serialize`, `TomlValue` algebra | — |

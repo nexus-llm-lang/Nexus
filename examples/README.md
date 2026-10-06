@@ -2,7 +2,7 @@
 
 Minimal, runnable demonstrations of Nexus features. Each file is
 self-contained; build any one with `nexus build <path> -o out.wasm` and
-execute it with `wasmtime run -S threads --dir=. out.wasm`.
+execute it with `wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. out.wasm`.
 
 This corpus is **positive-only** — every file here compiles and runs.
 Intentionally-broken snippets used as compiler regression tests live
@@ -21,7 +21,6 @@ They are not example material and are not indexed here.
 | [`module_test.nx`](./module_test.nx) | `import` from a sibling module |
 | [`di_cap.nx`](./di_cap.nx) | Define a `cap`, write a `handler`, `inject` it |
 | [`network_access.nx`](./network_access.nx) | Network I/O + `try/catch` |
-| [`bench_parallel.nx`](./bench_parallel.nx) | Lazy thunks + `lazy.force_all` parallelism |
 
 ## Feature corpus — one file per language surface
 
@@ -74,7 +73,7 @@ tag.
 | File | What it shows |
 | ---- | --- |
 | [`feature/lazy_force.nx`](./feature/lazy_force.nx) | `@t` thunk + force |
-| [`feature/lazy_parallel.nx`](./feature/lazy_parallel.nx) | `lazy.force_all` parallel dispatch |
+| [`feature/lazy_force_all.nx`](./feature/lazy_force_all.nx) | `lazy.force_all` over a list of thunks |
 
 ### FFI
 
@@ -95,5 +94,5 @@ tag.
    a short prose explanation. Close with `// require: { ... }` and
    `// difficulty: <level>` tags so the file is grep-friendly.
 3. Build and run it: `nexus build examples/feature/your_file.nx -o out.wasm`
-   and `wasmtime run -S threads --dir=. out.wasm`.
+   and `wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. out.wasm`.
 4. Add a row to the table above.

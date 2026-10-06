@@ -421,7 +421,7 @@ The disambiguation logic lives in `src/frontend/parser/core.nx::parse_prec_loop`
 via `pcore.pipe_starts_arm` (depth-tracking lookahead scan, 64-token fuel
 cap).
 
-## Lazy Evaluation & Parallel Execution
+## Lazy Evaluation
 
 The `@` sigil marks lazy bindings. A lazy binding defers evaluation until forced.
 A single `@expr` force is **synchronous** — it runs the thunk on the calling
@@ -439,10 +439,7 @@ T-Force on expressions.
 
 Working examples:
 - [lazy_force.nx](../../../examples/feature/lazy_force.nx) — single thunk creation and synchronous force.
-- [lazy_parallel.nx](../../../examples/feature/lazy_parallel.nx) — `lazy.force_all` on multiple thunks.
-
-Run threaded programs via the bundled `nexus` launcher (it passes
-`-W threads=y,shared-memory=y -S threads` to wasmtime).
+- [lazy_force_all.nx](../../../examples/feature/lazy_force_all.nx) — `lazy.force_all` on multiple thunks.
 
 ### Type: `@T`
 
@@ -462,7 +459,7 @@ end
   the closure object
 - `@x` is a synchronous `call_indirect` on that closure
 - `std:lazy.force_all` / `std:concurrency/task.host_spawn` record each thunk's
-  closure in a small task struct without forcing it; the join
+  closure without forcing it; the join
   (`force_all`'s join phase / `host_join`) forces it inline, so a thunk's
   exception surfaces at the join
 - `race` / `cancel` / `detach` in `std:lazy` are likewise sequential — see

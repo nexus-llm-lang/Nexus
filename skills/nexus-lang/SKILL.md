@@ -149,8 +149,8 @@ let val = @result                          // force: runs the thunk now (synchro
 A single `@x` force is synchronous. `std:lazy`'s `force_all(tasks: [a, b, ...])`
 forces a list of thunks and returns the results in input order, and
 `std:concurrency/task`'s `host_spawn` / `host_join` give per-thunk handles; both
-currently force each thunk sequentially on the calling thread (no OS threads),
-and a thunk's exception surfaces at its join.
+force each thunk sequentially on the calling thread, and a thunk's exception
+surfaces at its join.
 
 Thunk-creation vs force: `let @x = e` (let-binding sigil) is the **only**
 thunk-creation form — it wraps `e` into an `@T` thunk. Every `@e` in

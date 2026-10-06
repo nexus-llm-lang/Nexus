@@ -43,7 +43,7 @@ Total: **45 examples**.
 | [`feature/let_destructure.nx`](./feature/let_destructure.nx) | Irrefutable `let Ctor(...) = expr` |
 | [`feature/mutable_ref.nx`](./feature/mutable_ref.nx) | Mutable reference cells |
 | [`feature/lazy_force.nx`](./feature/lazy_force.nx) | `@t` single-thunk lazy bindings |
-| [`feature/lazy_parallel.nx`](./feature/lazy_parallel.nx) | `lazy.force_all` for parallel WASI-thread dispatch |
+| [`feature/lazy_force_all.nx`](./feature/lazy_force_all.nx) | `lazy.force_all` over a list of thunks |
 | [`feature/try_catch.nx`](./feature/try_catch.nx) | `try / catch | Exn -> ...` and `throws { ... }` rows |
 | [`feature/exception_group.nx`](./feature/exception_group.nx) | `exception group G = A | B` closed sums |
 | [`feature/exn_todo.nx`](./feature/exn_todo.nx) | `exn.todo()` typed placeholder |
@@ -76,7 +76,7 @@ Total: **45 examples**.
 | `std:bytebuffer` | [`feature/bytebuffer_basics.nx`](./feature/bytebuffer_basics.nx) (linear) |
 | `std:regexp` | [`feature/regexp_basics.nx`](./feature/regexp_basics.nx) |
 | `std:pbt` | [`feature/pbt_basics.nx`](./feature/pbt_basics.nx) |
-| `std:lazy` | [`feature/lazy_parallel.nx`](./feature/lazy_parallel.nx) |
+| `std:lazy` | [`feature/lazy_force_all.nx`](./feature/lazy_force_all.nx) |
 | `std:exn` | [`feature/exn_todo.nx`](./feature/exn_todo.nx) |
 
 ## Negative fixtures

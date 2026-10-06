@@ -183,7 +183,7 @@ end
 
 The [examples](./examples) folder ships minimal, runnable demos of every language surface. The demos cover linear types and borrowing, mutable references, generics, pattern matching, exceptions, caps and handlers, lazy evaluation, and FFI.
 
-Each file builds on its own with `nexus build` and runs under wasmtime (`wasmtime run -S threads --dir=. out.wasm`). The README inside that folder gives an indexed listing.
+Each file builds on its own with `nexus build` and runs under wasmtime (`wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. out.wasm`). The README inside that folder gives an indexed listing.
 
 ## AI coding agent support
 
