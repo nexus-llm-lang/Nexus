@@ -19,7 +19,7 @@
 #
 # To execute a compiled program, build it and invoke wasmtime directly, e.g.
 #   nexus build prog.nx -o prog.wasm
-#   wasmtime run -W max-wasm-stack=67108864,tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y,shared-memory=y -S threads --dir=. prog.wasm
+#   wasmtime run -W max-wasm-stack=67108864,tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. prog.wasm
 # Determinism hooks are read from the env at runtime: --env NEXUS_SEED=N and
 # --env NEXUS_FROZEN_CLOCK=EPOCH_MS.
 #
@@ -69,7 +69,7 @@ if [ "$#" -gt 0 ]; then
       ;;
     test)
       # `nexus test` cannot be implemented inside the wasm: WASI preview1
-      # (forced by `-S threads`) has no subprocess-spawn API, so the
+      # has no subprocess-spawn API, so the
       # in-wasm runner cannot invoke the per-test `nexus build` /
       # `wasmtime run`. Drive the loop from the shell instead, reusing
       # this same launcher (the compiler payload) for every per-test
@@ -354,7 +354,7 @@ fi
 
 # Compose the wasmtime feature flag set. Both payloads are self-contained
 # core WASM with preview1 imports satisfied by --dir mounts.
-W_FLAGS="max-wasm-stack=${NEXUS_MAX_WASM_STACK:-67108864},tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y,shared-memory=y"
+W_FLAGS="max-wasm-stack=${NEXUS_MAX_WASM_STACK:-67108864},tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y"
 
 if [ "$TEST_MODE" = "1" ]; then
   # ─── nexus test: host-driven loop ─────────────────────────────────────
@@ -549,7 +549,7 @@ if [ "$TEST_MODE" = "1" ]; then
       # Errors go to a separate log so they do not pollute the golden diff.
       actual="$RESULTS_DIR/repl_actual_$idx.txt"
       elog="$RESULTS_DIR/err_$idx.log"
-      if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+      if ! wasmtime run -W "$W_FLAGS" --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
           "$PAYLOAD_WASM" repl \
           < "$f" > "$actual" 2>"$elog"; then
@@ -649,7 +649,7 @@ if [ "$TEST_MODE" = "1" ]; then
 
       # ── flavor A: compile-fail diagnostic ───────────────────────────
       if [ -n "$NEG_CODE" ]; then
-        if wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+        if wasmtime run -W "$W_FLAGS" --dir=. --dir="$TMPDIR_REAL" \
             ${NEXUS_WASMTIME_ARGS:-} \
             ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
             >/dev/null 2>"$elog"; then
@@ -719,7 +719,7 @@ if [ "$TEST_MODE" = "1" ]; then
 
       # ── flavor B: runtime-throw ─────────────────────────────────────
       # Compile must succeed (the negative is exclusively at run time).
-      if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+      if ! wasmtime run -W "$W_FLAGS" --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
           ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
           >/dev/null 2>"$elog"; then
@@ -734,7 +734,7 @@ if [ "$TEST_MODE" = "1" ]; then
         exit 0
       fi
       t1=$(date +%s%N 2>/dev/null || date +%s000000000)
-      if wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$scratch::/tmp" \
+      if wasmtime run -W "$W_FLAGS" --dir=. --dir="$scratch::/tmp" \
           ${NEXUS_WASMTIME_ARGS:-} \
           "$wasm" \
           >"$elog" 2>&1; then
@@ -779,7 +779,7 @@ if [ "$TEST_MODE" = "1" ]; then
     # ── p3_component fixture ───────────────────────────────────────────
     if [ "$P3C" = "1" ]; then
       t0=$(date +%s%N 2>/dev/null || date +%s000000000)
-      if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+      if ! wasmtime run -W "$W_FLAGS" --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
           ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --p3-component --explain-capabilities none \
           >/dev/null 2>"$elog"; then
@@ -925,7 +925,7 @@ if [ "$TEST_MODE" = "1" ]; then
       IFS=$IFS_BAK2
 
       t0=$(date +%s%N 2>/dev/null || date +%s000000000)
-      if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+      if ! wasmtime run -W "$W_FLAGS" --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
           ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --p2-component --explain-capabilities none \
           >/dev/null 2>"$elog"; then
@@ -1065,7 +1065,7 @@ if [ "$TEST_MODE" = "1" ]; then
 
     # ── positive fixture (existing path) ──────────────────────────────
     t0=$(date +%s%N 2>/dev/null || date +%s000000000)
-    if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+    if ! wasmtime run -W "$W_FLAGS" --dir=. --dir="$TMPDIR_REAL" \
         ${NEXUS_WASMTIME_ARGS:-} \
         ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none ${COMPILE_EXTRA_ARGS:-} \
         >/dev/null 2>"$elog"; then
@@ -1079,7 +1079,7 @@ if [ "$TEST_MODE" = "1" ]; then
       exit 0
     fi
     t1=$(date +%s%N 2>/dev/null || date +%s000000000)
-    if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$scratch::/tmp" \
+    if ! wasmtime run -W "$W_FLAGS" --dir=. --dir="$scratch::/tmp" \
         ${NEXUS_WASMTIME_ARGS:-} \
         "$wasm" \
         >/dev/null 2>"$elog"; then
@@ -1283,8 +1283,7 @@ if [ "$BENCH_MODE" = "1" ]; then
   cleanup_bench() { rm -f "$BENCH_WASM"; }
   trap 'cleanup_bench; cleanup' EXIT INT TERM HUP
 
-  # Use the same W_FLAGS set earlier in this script (includes threads,
-  # shared-memory etc. required by the stdlib allocator).
+  # Use the same W_FLAGS set earlier in this script.
 
   # Discover bench_*.nx files in the directory (sorted by find).
   BENCH_FILES=$(find "$BENCH_DIR" -maxdepth 1 -name 'bench_*.nx' 2>/dev/null | sort)
@@ -1305,7 +1304,7 @@ if [ "$BENCH_MODE" = "1" ]; then
     bench_name="${bench_stem%.nx}"
 
     # Compile via the compiler payload (same pattern as nexus test loop).
-    if ! wasmtime run -W "$W_FLAGS" -S threads --dir=. --dir="$TMPDIR_REAL" \
+    if ! wasmtime run -W "$W_FLAGS" --dir=. --dir="$TMPDIR_REAL" \
         ${NEXUS_WASMTIME_ARGS:-} \
         "$PAYLOAD_WASM" build "$bench_file" -o "$BENCH_WASM" --explain-capabilities none \
         2>/dev/null; then
@@ -1321,7 +1320,6 @@ if [ "$BENCH_MODE" = "1" ]; then
     while [ "$_i" -lt "$BENCH_ITERS" ]; do
       _out=$(wasmtime run \
         -W "$W_FLAGS" \
-        -S threads \
         --dir=. --dir="${TMPDIR_REAL}" \
         "$BENCH_WASM" 2>/dev/null)
       _ec=$?
@@ -1516,7 +1514,6 @@ fi
 # shellcheck disable=SC2086  # NEXUS_WASMTIME_ARGS is intentionally word-split.
 exec wasmtime run \
   -W "$W_FLAGS" \
-  -S threads \
   --dir=. --dir="${TMPDIR:-/tmp}" \
   ${NEXUS_WASMTIME_ARGS:-} \
   "$PAYLOAD_WASM" "$@"
