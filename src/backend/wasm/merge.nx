@@ -418,34 +418,16 @@ end
 // assembler. All helpers thread %out linearly and free their temp buffers
 // before returning.
 
-/** Section 2 (imports): env.memory + dep imports (type-offset) + main
- *  non-dep imports. `pages` is the chosen initial-page count for the
- *  shared memory import; `dep_imp_count` counts dep import entries.
+/** Section 2 (imports): dep imports (type-offset) + main non-dep imports.
+ *  `dep_imp_count` counts dep import entries.
  */
 let emit_merged_imports = fn (out: %ByteBuffer, dep: &ByteBuffer, core_wasm: &ByteBuffer,
                               d_imp_pk: i64, m_imp_sec_pk: i64,
                               dep_imp_count: i64, m_kept_all: i64,
-                              pages: i64, d_type_off: i64, m_type_off: i64,
+                              d_type_off: i64, m_type_off: i64,
                               dep_pfs: [ string ]) -> %ByteBuffer do
-  let total_imp_count = dep_imp_count + m_kept_all + 1
   let %tmp_i = bb.empty()
-  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: total_imp_count)
-  // env.memory import (memory 0)
-  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 3)
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 101)  // 'e'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 110)  // 'n'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 118)  // 'v'
-  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 6)
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 109)  // 'm'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 101)  // 'e'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 109)  // 'm'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 111)  // 'o'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 114)  // 'r'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 121)  // 'y'
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 2)    // import desc: memory
-  let %tmp_i = bb.push_byte(buf: %tmp_i, byte: 3)    // limits flags: has-max | shared
-  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: pages)
-  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: 65536)
+  let %tmp_i = bb.push_uleb128(buf: %tmp_i, val: dep_imp_count + m_kept_all)
   // Copy dep imports with type offset
   let %tmp_i = if d_imp_pk > 0 then
     copy_imports_with_type_off(out: %tmp_i, buf: dep,
@@ -589,9 +571,8 @@ end
 // has all dep[0..i] imports inlined. dep[i+1]'s imports survive as
 // "kept" host imports in each intermediate output, so they are resolved
 // by the next pass without any cross-dep index collision.
-// Memory: after the first merge, env.memory is an import in the accumulator;
-// merge_one_dep emits a fresh env.memory import and skips any memory
-// kind (2) imports from the core side, so there is no duplicate memory.
+// Memory: each merge defines one memory (section 5) and drops memory-kind (2)
+// imports from both sides, so the accumulator never carries two memories.
 let fold_deps = fn (
   acc: %ByteBuffer,
   deps: [ DepSpec ]
@@ -767,8 +748,7 @@ let merge_one_dep = fn (
     d_buf: &core_wasm, d_sec: get_sec(map: &m_secs, sec: 1))
 
   // Initial-page count for the merged memory — cover both dep and main static
-  // data; floor at 256 pages (16 MiB). Computed early because the memory is
-  // emitted as an import in section 2 (see below).
+  // data and both modules' own memory minimums; floor at 256 pages (16 MiB).
   let d_data_end = find_data_end(buf: &dep, sec_pk: get_sec(map: &d_secs, sec: 11))
   let m_data_end = find_data_end(buf: &core_wasm, sec_pk: get_sec(map: &m_secs, sec: 11))
   let max_data = if d_data_end > m_data_end then d_data_end else m_data_end end
@@ -778,24 +758,24 @@ let merge_one_dep = fn (
     let pk_min = rd_uleb(buf: &dep, pos: ppos(pk: pk_mem) + 1)
     pval(pk: pk_min)
   else 0 end
-  let pages_raw = if dep_pages > min_pages then dep_pages else min_pages end
+  let core_pages = if get_sec(map: &m_secs, sec: 5) > 0 then
+    let pk_mem = rd_uleb(buf: &core_wasm, pos: sec_off(pk: get_sec(map: &m_secs, sec: 5)))
+    let pk_min = rd_uleb(buf: &core_wasm, pos: ppos(pk: pk_mem) + 1)
+    pval(pk: pk_min)
+  else 0 end
+  let module_pages = if dep_pages > core_pages then dep_pages else core_pages end
+  let pages_raw = if module_pages > min_pages then module_pages else min_pages end
   let pages = if pages_raw < default_initial_pages then default_initial_pages else pages_raw end
 
-  // Section 2: merged imports (env.memory + dep WASI imports + main non-dep).
-  // The merged module imports its (shared) linear memory from "env" rather than
-  // defining it, so the WASI-threads host hands every worker instance the SAME
-  // backing — a *defined* `shared` memory is per-instance under `-S threads`,
-  // which would silently un-share the heap. The memory index space is separate
-  // from the function index space, so prepending this import does not shift any
-  // function index. The defined memory section (5) is skipped below; "memory"
-  // is still exported (now pointing at the imported memory 0). Limits flags
-  // byte 0x03 = has-max (0x01) | shared (0x02); max = 65536 pages (4 GiB).
+  // Section 2: merged imports (dep WASI imports + main non-dep). Memory
+  // imports from either side are dropped; the merged module defines its own
+  // memory in section 5 below.
   let d_imp_pk = get_sec(map: &d_secs, sec: 2)
   let dep_imp_count = count_sec(buf: &dep, sec_pk: d_imp_pk)
   let %out = emit_merged_imports(%out, dep: &dep, core_wasm: &core_wasm,
     d_imp_pk, m_imp_sec_pk,
     dep_imp_count, m_kept_all,
-    pages, d_type_off, m_type_off, dep_pfs)
+    d_type_off, m_type_off, dep_pfs)
 
   // Section 3: merged func types (count + dep with type offset + main)
   // Invariant (WASM spec §5.5.6/§5.5.10): function-section count must equal
@@ -823,9 +803,12 @@ let merge_one_dep = fn (
   let m_tbl_total = count_sec(buf: &core_wasm, sec_pk: m_tbl_pk)
   let %out = emit_merged_tables(%out, dep: &dep, core_wasm: &core_wasm,
     d_tbl_pk, m_tbl_pk, d_tbl_count, m_tbl_total, m_type_off)
-  // Section 5 (defined memory) is intentionally omitted — the merged module's
-  // memory is the `env.memory` import declared in section 2 above (shared, so
-  // WASI-threads workers see the same backing).
+  // Section 5: one non-shared memory (flags 0x01 = has-max), max 65536 pages.
+  let %mem_sec = bb.push_bytes(buf: bb.empty(), bytes: [ 1, 1 ])
+  let %mem_sec = bb.push_uleb128(buf: %mem_sec, val: pages)
+  let %mem_sec = bb.push_uleb128(buf: %mem_sec, val: 65536)
+  let %out = emit_sec(%out, sec_id: 5, content: &mem_sec)
+  bb.free(buf: %mem_sec)
   // Section 13: merged tags (dep tags offset by d_type_off=0, main tags offset by m_type_off).
   // Canonical wasm section order (per the EH proposal binary format) places
   // tag(13) between table(4) and global(6), exactly here. wasm-tools validate

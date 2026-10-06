@@ -107,10 +107,8 @@ import { binary_operand_type, emit_binary } from "src/backend/codegen/emit/binop
 import {
   is_closure_lift,
   is_inject_lift,
-  filter_intrinsic_externals,
-  filter_externals_p3
+  filter_intrinsic_externals
 } from "src/backend/codegen/intrinsics.nx"
-import { wasi_thread_start_export } from "src/backend/codegen/intrinsics/sched.nx"
 import {
   emit_bt_push_prologue,
   emit_bt_raise_snapshot
@@ -1229,27 +1227,21 @@ end
  *
  *  Bit layout:
  *    bit 0 (value 1): coverage_enabled — emit coverage counters
- *    bit 1 (value 2): p3_enabled — WASI preview3 mode (non-shared memory,
- *                     sequential lazy, no wasi.thread-spawn export)
+ *    bit 1 (value 2): unused
  *    bit 2 (value 4): p3_component_enabled — wrap core wasm in a component
- *                     model binary with future<T> canon ABI (implies p3_enabled)
+ *                     model binary with future<T> canon ABI
  *    bit 3 (value 8): p2_component_enabled — WASI preview2 component mode;
- *                     uses defined (non-shared) memory so it is exported
+ *                     imports its memory from the `env` stub module
  */
 export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_data_base: i64,
                                        effect_map: &EffectMap,
                                        coverage_flag: i64,
                                        memo_unsafe_names: [ string ]) -> %ByteBuffer throws { CodegenError } do
   let coverage_enabled = (coverage_flag & 1) != 0
-  let p3_enabled = (coverage_flag & 2) != 0
   let p3_component_enabled = (coverage_flag & 4) != 0
   let p2_component_enabled = (coverage_flag & 8) != 0
   let LirProgram(functions: funcs, externals: all_exts) = program
-  let intrinsic_filtered = if p3_enabled then
-          filter_externals_p3(exts: all_exts)
-        else
-          filter_intrinsic_externals(exts: all_exts)
-        end
+  let intrinsic_filtered = filter_intrinsic_externals(exts: all_exts)
       let has_intrinsics = list.length(xs: all_exts) != list.length(xs: intrinsic_filtered)
       // Diamond imports can register the same WASM function under multiple Nexus
       // names; collapse them so the import section has one entry per WASM target.
@@ -1301,11 +1293,6 @@ export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_d
       let closure_arities = collect_closure_arities(funcs)
 
       let main_idx = wdefs.lookup_func_fast(name: "main", map: &internal_func_map)
-      // Implicit `wasi_thread_start` export when the lazy/threads runtime is
-      // linked (so wasi-threads workers can find the trampoline). `[]` otherwise.
-      // In p3 mode, wasi-threads is not used so we suppress this export.
-      let wasi_ts_exports = wasi_thread_start_export(funcs, &internal_func_map)
-      let extra_exports = if p3_enabled || p2_component_enabled then [] else wasi_ts_exports end
       let main_ret = match wdefs.lookup_function_fast(
         name: "main",
         funcs,
@@ -1345,23 +1332,19 @@ export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_d
       )
       let has_strings = !list.is_empty(xs: string_entries)
 
-      // p2 builds share memory with the adapter via an "env" stub module,
-      // so they use the same MemoryImported("env") path as normal p1 builds.
-      // Only p3 needs MemoryDefined (no env.memory from the host).
-      let mem_mode_raw = if p3_enabled then
-          wcollect.choose_memory_mode_p3(externals: exts, has_strings, has_heap: heap_enabled)
+      // p2 builds share memory with the adapter via an "env" stub module.
+      let mem_mode_raw = if p2_component_enabled then
+          wcollect.choose_memory_mode_p2(externals: exts, has_strings, has_heap: heap_enabled)
         else
           wcollect.choose_memory_mode(externals: exts, has_strings, has_heap: heap_enabled)
         end
-      // Coverage instrumentation needs a memory for the atomic
-      // counter array at page 17. Force `MemoryImported("env")` when --coverage
-      // is on for programs that wouldn't otherwise declare/import one.
-      // In p3 mode, force `MemoryDefined` instead of `MemoryImported`.
+      // Coverage instrumentation needs a memory for the atomic counter array
+      // at page 17, so a program that would otherwise have no memory gets one.
       let mem_mode_cov = if coverage_enabled then
           match mem_mode_raw do
             | MemoryNone ->
-              if p3_enabled then MemoryDefined
-              else MemoryImported(name: "env") end
+              if p2_component_enabled then MemoryImported(name: "env")
+              else MemoryDefined end
             | _ -> mem_mode_raw
           end
         else mem_mode_raw end
@@ -1414,8 +1397,7 @@ export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_d
                                  mem_mode, has_alloc,
                                  alloc_type_idx,
                                  alloc_mark_type_idx, alloc_reset_type_idx,
-                                 alloc_module: mem_mode_to_module_name(mode: mem_mode),
-                                 p2_component: p2_component_enabled))
+                                 alloc_module: mem_mode_to_module_name(mode: mem_mode)))
       else %m end
 
       let %m = wdefs.emit_section(buf: %m, id: sec_function,
@@ -1432,21 +1414,17 @@ export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_d
         )
       else %m end
 
-      let mem_min_pages = if coverage_enabled then
+      let cov_pages = if coverage_enabled then
           wdefs.cov_base_pages + wdefs.cov_extra_pages
         else wdefs.cov_base_pages end
-      // p3 (non-shared defined memory) needs to cover through page 18 (the
-      // backtrace ring) since the BT prologue accesses bt_page_base without
-      // a grow-check. Preview1 imports shared memory with min=256 so this
-      // is not an issue there. Use p3_base_pages (19) as the floor.
-      let p3_mem_min_pages = if mem_min_pages > wdefs.p3_base_pages then mem_min_pages else wdefs.p3_base_pages end
+      let mem_min_pages = if cov_pages > wdefs.defined_mem_base_pages then cov_pages
+        else wdefs.defined_mem_base_pages end
       let %m = if let MemoryDefined = mem_mode then
-        let mem_sec = if p3_enabled || p2_component_enabled then
-          wsect.build_memory_section_unshared(min_pages: p3_mem_min_pages)
-        else
-          wsect.build_memory_section(min_pages: mem_min_pages)
-        end
-        wdefs.emit_section(buf: %m, id: sec_memory, content: mem_sec)
+        wdefs.emit_section(
+          buf: %m,
+          id: sec_memory,
+          content: wsect.build_memory_section(min_pages: mem_min_pages)
+        )
       else %m end
 
       // Tag section must come after memory and before global.
@@ -1522,8 +1500,7 @@ export let compile_lir_to_wasm_with_coverage = fn (program: LirProgram, string_d
                                                            has_cabi_realloc: has_cabi,
                                                            mem_mode,
                                                            has_table: n_closures > 0,
-                                                           has_ss,
-                                                           extra_exports))
+                                                           has_ss))
 
       let %m = if n_closures > 0 then
         wdefs.emit_section(
