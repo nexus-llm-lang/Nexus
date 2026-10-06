@@ -505,7 +505,7 @@ end
 
 // Find the highest data-segment end (offset + length) in a data section.
 // Returns 0 if no data segments.
-/** Scan all active data segments in section `sec_pk` and return the maximum `offset + length` — i.e. the first free byte past every dep data segment. Used as the relocation base when laying the main module's data section after the dep's. */
+/** Scan the active data segments in section `sec_pk` (passive ones have no address) and return the maximum `offset + length` — i.e. the first free byte past every dep data segment. Used as the relocation base when laying the main module's data section after the dep's. */
 export let find_data_end = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
   if sec_pk == 0 then return 0 end
   let pk = rd_uleb(buf, pos: sec_off(pk: sec_pk))
@@ -513,26 +513,36 @@ export let find_data_end = fn (buf: &ByteBuffer, sec_pk: i64) -> i64 do
 end
 let find_data_end_go = fn (buf: &ByteBuffer, pos: i64, remaining: i64, max_end: i64) -> i64 do
   if remaining <= 0 then return max_end end
-  // Active segment: flags=0x00, i32.const(0x41), uleb128(offset), end(0x0B), uleb128(len), data
-  let _flags = bb.get_byte(buf, idx: pos)
-  let _opcode = bb.get_byte(buf, idx: pos + 1)
-  let pk_off = rd_uleb(buf, pos: pos + 2)
-  let offset = pval(pk: pk_off)
-  let end_expr = ppos(pk: pk_off) + 1
-  let pk_len = rd_uleb(buf, pos: end_expr)
-  let data_len = pval(pk: pk_len)
-  let data_start = ppos(pk: pk_len)
-  let seg_end = offset + data_len
-  let new_max = if seg_end > max_end then seg_end else max_end end
-  return find_data_end_go(
-    buf,
-    pos: data_start + data_len,
-    remaining: remaining - 1,
-    max_end: new_max
-  )
+  let DataSeg(flags: _, offset_pos, data_start, data_len) = data_seg_at(buf, pos)
+  let new_max = if offset_pos < 0 then max_end else
+    let seg_end = pval(pk: rd_uleb(buf, pos: offset_pos)) + data_len
+    if seg_end > max_end then seg_end else max_end end
+  end
+  return find_data_end_go(buf, pos: data_start + data_len, remaining: remaining - 1, max_end: new_max)
 end
 
-// Copy main data segments with offset relocation: each segment's i32.const offset += reloc.
+/** Layout of one data segment starting at `pos`: its flag byte, the
+ *  position of the `i32.const` offset value (-1 for a passive segment), and
+ *  where its bytes start and how many there are. Flag 0 is active in memory
+ *  0, flag 1 passive, flag 2 active with an explicit memory index. */
+type DataSeg = DataSeg(flags: i64, offset_pos: i64, data_start: i64, data_len: i64)
+
+let data_seg_at = fn (buf: &ByteBuffer, pos: i64) -> DataSeg do
+  let flags = bb.get_byte(buf, idx: pos)
+  if flags == 1 then
+    let pk_len = rd_uleb(buf, pos: pos + 1)
+    return DataSeg(flags, offset_pos: -1, data_start: ppos(pk: pk_len), data_len: pval(pk: pk_len))
+  end
+  // The offset expression `i32.const <n> end` follows the flag (and, for
+  // flag 2, the memory index).
+  let expr_pos = if flags == 2 then ppos(pk: rd_uleb(buf, pos: pos + 1)) else pos + 1 end
+  let offset_pos = expr_pos + 1
+  let end_expr = ppos(pk: rd_uleb(buf, pos: offset_pos)) + 1
+  let pk_len = rd_uleb(buf, pos: end_expr)
+  return DataSeg(flags, offset_pos, data_start: ppos(pk: pk_len), data_len: pval(pk: pk_len))
+end
+
+// Copy main data segments, moving each active segment's i32.const offset by reloc.
 let copy_data_relocated = fn (
   out: %ByteBuffer,
   src: &ByteBuffer,
@@ -551,25 +561,20 @@ let copy_data_relocated_go = fn (
   reloc: i64
 ) -> %ByteBuffer do
   if remaining <= 0 then return %out end
-  let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos))
-  let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: pos + 1))
-  let pk_off = rd_uleb(buf: src, pos: pos + 2)
-  let new_offset = pval(pk: pk_off) + reloc
-  let %out = bb.push_sleb128(buf: %out, val: new_offset)
-  let %out = bb.push_byte(buf: %out, byte: bb.get_byte(buf: src, idx: ppos(pk: pk_off)))
-  let end_expr = ppos(pk: pk_off) + 1
-  let pk_len = rd_uleb(buf: src, pos: end_expr)
-  let data_len = pval(pk: pk_len)
-  let data_start = ppos(pk: pk_len)
-  let %out = bb.push_uleb128(buf: %out, val: data_len)
-  let %out = bb.copy_range(dst: %out, src, start: data_start, end_pos: data_start + data_len)
-  return copy_data_relocated_go(
-    %out,
-    src,
-    pos: data_start + data_len,
-    remaining: remaining - 1,
-    reloc
-  )
+  let DataSeg(flags: _, offset_pos, data_start, data_len) = data_seg_at(buf: src, pos)
+  let seg_end = data_start + data_len
+  // Passive: no offset to move; copy the segment unchanged.
+  if offset_pos < 0 then
+    let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: seg_end)
+    return copy_data_relocated_go(%out, src, pos: seg_end, remaining: remaining - 1, reloc)
+  end
+  // Active: copy flag (+ memory index) and the `i32.const` opcode, write the
+  // relocated offset, then copy `end`, the length and the bytes.
+  let %out = bb.copy_range(dst: %out, src, start: pos, end_pos: offset_pos)
+  let pk_off = rd_uleb(buf: src, pos: offset_pos)
+  let %out = bb.push_sleb128(buf: %out, val: pval(pk: pk_off) + reloc)
+  let %out = bb.copy_range(dst: %out, src, start: ppos(pk: pk_off), end_pos: seg_end)
+  return copy_data_relocated_go(%out, src, pos: seg_end, remaining: remaining - 1, reloc)
 end
 
 /** Emit a merged wasm data section: dep segments first (unchanged), then main-module segments with each active-segment `i32.const` offset relocated by `reloc` so they sit past the dep's data without overlap. */
