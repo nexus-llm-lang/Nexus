@@ -51,6 +51,7 @@ import {
 import * as subst from "src/typecheck/subst.nx"
 import { type_carries_linear } from "src/typecheck/infer/collections.nx"
 import * as str from "std:str"
+import * as list from "std:list"
 
 // UnifyResultS is module-internal only. It mirrors UnifyResult but also carries
 // the advanced supply counter so sequential row unifications can share the
@@ -99,6 +100,86 @@ let nominal_names_match = fn (n1: string, n2: string) -> bool do
   return nominal_bare(n: n1) == nominal_bare(n: n2)
 end
 
+/** Bind the type variable `n` to `t`. A plain variable (a function type
+ *  parameter's instantiation, see `tctypes.is_plain_var`) only takes a
+ *  sigil-free type; binding it to a type that still has ordinary variables
+ *  binds each of those to its plain twin, so the constraint carries over. An
+ *  ordinary variable unified with a plain one is bound to the plain one. */
+let bind_var = fn (n: string, t: TypeExpr, supply: i64) -> UnifyResultS do
+  if !tctypes.is_plain_var(name: n) then
+    return UnifyOkS(subst: subst.subst_single(var: n, typ: t), supply)
+  end
+  match t do
+    | TyVar(name: m) ->
+      if tctypes.is_plain_var(name: m) then
+        return UnifyOkS(subst: subst.subst_single(var: n, typ: t), supply)
+      end
+      return UnifyOkS(subst: subst.subst_single(var: m, typ: TyVar(name: n)), supply)
+    | _ -> ()
+  end
+  if has_sigil(t) then
+    return UnifyErrS(
+      message: "a type parameter cannot be instantiated with `" ++ tctypes.type_to_string(typ: t)
+        ++ "`, which contains a sigil (%, @, &, ~ or [| |]); type parameters range over sigil-free types"
+    )
+  end
+  let twins = subst.subst_from_list(entries: list.map(xs: ordinary_vars(t, acc: []), f: fn (val: string) -> SubstEntry do
+    return SubstEntry(var: val, typ: TyVar(name: plain_twin(name: val)))
+  end))
+  let bound = subst.subst_single(var: n, typ: subst.subst_apply(subst: twins, typ: t))
+  return UnifyOkS(subst: subst.subst_compose(s1: twins, s2: bound), supply)
+end
+
+/** True when `t` has a modality wrapper or a linear array anywhere outside a
+ *  function type. */
+let has_sigil = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyLinear(_) | TyLazy(_) | TyBorrow(_) | TyRef(_) | TyArray(_) -> return true
+    | TyList(elem) -> return has_sigil(t: elem)
+    | TyUserDefined(
+      name: _,
+      args
+    ) -> return list.any(xs: args, p: fn (val: TypeExpr) -> bool do return has_sigil(t: val) end)
+    | TyRecord(fields) ->
+      return list.any(xs: fields, p: fn (val: NamedType) -> bool do
+        let NamedType(name: _, typ) = val
+        return has_sigil(t: typ)
+      end)
+    | _ -> return false
+  end
+end
+
+/** Ordinary (non-plain) "?N" variables in `t` outside function types and rows. */
+let ordinary_vars = fn (t: TypeExpr, acc: [ string ]) -> [ string ] do
+  match t do
+    | TyVar(name) ->
+      if str.parse_qmark_id(s: name) >= 0 && !tctypes.is_plain_var(name) && !list.any(
+        xs: acc,
+        p: fn (val: string) -> bool do return val == name end
+      ) then
+        return name :: acc
+      end
+      return acc
+    | TyList(elem) -> return ordinary_vars(t: elem, acc)
+    | TyUserDefined(name: _, args) ->
+      return list.fold_left(xs: args, init: acc, f: fn (acc: [ string ], val: TypeExpr) -> [ string ] do
+        return ordinary_vars(t: val, acc)
+      end)
+    | TyRecord(fields) ->
+      return list.fold_left(xs: fields, init: acc, f: fn (acc: [ string ], val: NamedType) -> [ string ] do
+        let NamedType(name: _, typ) = val
+        return ordinary_vars(t: typ, acc)
+      end)
+    | _ -> return acc
+  end
+end
+
+/** The plain variable paired with the ordinary "?N" (N even): "?N+1". Only one
+ *  variable is ever minted per supply slot, so the twin is otherwise unused. */
+let plain_twin = fn (name: string) -> string do
+  return "?" ++ str.from_i64(val: str.parse_qmark_id(s: name) + 1)
+end
+
 /** First-order Robinson unification of `t1` and `t2` under typedef environment `tdefs`. Returns UnifyOk with the most-general substitution, or UnifyErr with a diagnostic message. Handles occurs check, type-var binding, numeric-literal promotion, row unification, and borrow asymmetry. */
 export let unify = fn (t1: TypeExpr, t2: TypeExpr, tdefs: [ TypeDefEntry ]) -> UnifyResult do
   return result_from_s(r: unify_i(t1, t2, tdefs, supply: 0))
@@ -119,13 +200,13 @@ let unify_i = fn (
     if subst.occurs_check(var: n, typ: t2) then
       return UnifyErrS(message: "recursive type: " ++ n)
     end
-    return UnifyOkS(subst: subst.subst_single(var: n, typ: t2), supply)
+    return bind_var(n, t: t2, supply)
   end
   if let TyVar(name: n) = t2 then
     if subst.occurs_check(var: n, typ: t1) then
       return UnifyErrS(message: "recursive type: " ++ n)
     end
-    return UnifyOkS(subst: subst.subst_single(var: n, typ: t1), supply)
+    return bind_var(n, t: t1, supply)
   end
 
   match t1 do
