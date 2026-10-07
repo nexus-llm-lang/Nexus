@@ -269,6 +269,12 @@ irrelevant to the typechecker. List entries alphabetically (e.g.
 `require { Console, Fs }`, `require { PermClock, PermConsole, PermFs, PermProc }`).
 Omit `require { ... }` entirely when the body needs no caps.
 
+A lambda does not inherit the enclosing function's caps: its body is checked
+against its own `require` row, so a lambda that calls `Console.println` must say
+`fn () -> unit require { Console } do ... end`. Such a lambda cannot be passed
+where the parameter type has no `require` row (e.g. `test_assert.assert_raises`);
+call the code through a named helper function instead.
+
 ## Type System Summary
 
 | Type | Syntax | Notes |
