@@ -44,6 +44,8 @@ import {
   HirStmt,
   HirNamedExpr,
   HirMatchCase,
+  HirPatternKind,
+  HirPatternField,
   HirParam,
   HirCallArg,
   ExceptionGroupEntry
@@ -60,7 +62,7 @@ import * as exhaustive from "src/typecheck/exhaustive.nx"
 import * as capture from "src/typecheck/capture.nx"
 import * as tcwf from "src/typecheck/tcwf.nx"
 import { lookup_named_type, find_linear_field } from "src/typecheck/infer/collections.nx"
-import { append_env, bind_pattern } from "src/typecheck/infer/statements.nx"
+import { append_env, bind_pattern, linear_through_enums } from "src/typecheck/infer/statements.nx"
 import {
   infer_stmts_tail_diverges,
   check_raise_admitted, exception_name_of_raised, is_residual_rethrow_var,
@@ -455,6 +457,7 @@ export let infer_match = fn (
             ret_type,
             result_type: None,
             span,
+            prior: [],
             infer_stmts_fn
           )
         | exhaustive.NonExhaustive(witness: w) ->
@@ -476,10 +479,86 @@ export let infer_match = fn (
   end
 end
 
+/** True when `pat` is a top-level `_` over an enum scrutinee whose variants
+ *  left unmatched by the earlier arms (`prior`) carry no linear field, so the
+ *  wildcard discards nothing linear. A variant counts as matched only when an
+ *  earlier arm matches it with irrefutable sub-patterns. */
+let wild_drops_nothing_linear = fn (
+  state: CheckState, pat: HirPatternKind, scrutinee: TypeExpr, prior: [ HirPatternKind ]
+) -> bool do
+  match pat do
+    | PWild -> ()
+    | _ -> return false
+  end
+  // An owned `%τ` scrutinee is linear as a whole; P-Wild applies as usual.
+  match scrutinee do
+    | TyUserDefined(name, args) ->
+      let bare = enum_bare_name(name)
+      match list.find(xs: tctypes.state_full_enums(state), p: fn (val: EnumEntry) -> bool do
+        let EnumEntry(name: n, def: _) = val
+        return n == name || enum_bare_name(name: n) == bare
+      end) do
+        | None -> return false
+        | Some(val: EnumEntry(name: _, def: EnumDef(name: _, is_public: _, is_opaque: _, type_params: tps, variants: vs, _))) ->
+          return list.all(xs: vs, p: fn (val: VariantDef) -> bool do
+            let VariantDef(name: vname, fields) = val
+            if variant_matched(vname, prior) then return true end
+            return list.all(xs: fields, p: fn (val: VariantField) -> bool do
+              let VariantField(name: _, typ: ft) = val
+              return !linear_through_enums(state, t: instantiate_params(t: ft, params: tps, args))
+            end)
+          end)
+      end
+    | _ -> return false
+  end
+end
+
+let variant_matched = fn (vname: string, prior: [ HirPatternKind ]) -> bool do
+  return list.any(xs: prior, p: fn (val: HirPatternKind) -> bool do
+    return pattern_matches_variant(p: val, vname)
+  end)
+end
+
+let pattern_matches_variant = fn (p: HirPatternKind, vname: string) -> bool do
+  match p do
+    | PCtor(variant: v, fields, sigil: _) ->
+      if enum_bare_name(name: v) != enum_bare_name(name: vname) then return false end
+      return list.all(xs: fields, p: fn (val: HirPatternField) -> bool do
+        let HirPatternField(name: _, pattern: fp) = val
+        match fp do
+          | PVar(_) | PWild -> return true
+          | _ -> return false
+        end
+      end)
+    | POr(alts) -> return list.any(xs: alts, p: fn (val: HirPatternKind) -> bool do
+        return pattern_matches_variant(p: val, vname)
+      end)
+    | _ -> return false
+  end
+end
+
+/** `t` with the enum's type parameters replaced by the scrutinee's arguments. */
+let instantiate_params = fn (t: TypeExpr, params: [ string ], args: [ TypeExpr ]) -> TypeExpr do
+  match params do
+    | [] -> return t
+    | p :: prest ->
+      match args do
+        | [] -> return t
+        | a :: arest ->
+          let s1 = subst.subst_single(var: p, typ: a)
+          return instantiate_params(
+            t: subst.subst_apply(subst: s1, typ: t),
+            params: prest,
+            args: arest
+          )
+      end
+  end
+end
+
 export let infer_match_cases = fn (
   state: CheckState, cases: [ HirMatchCase ],
   target_type: TypeExpr, subst: Subst, ret_type: TypeExpr,
-  result_type: Option<TypeExpr>, span: Span,
+  result_type: Option<TypeExpr>, span: Span, prior: [ HirPatternKind ],
   infer_stmts_fn: (
     state: CheckState,
     stmts: [ HirStmt ],
@@ -495,7 +574,13 @@ export let infer_match_cases = fn (
       return InferExprOk(state, subst, typ: final_type)
     | HirMatchCase(pattern: pat, body) :: rest ->
       let tt = subst.subst_apply(subst, typ: target_type)
-      match bind_pattern(state, pattern: pat, target_type: tt, pat_span: span) do
+      // A top-level `_` only discards the variants earlier arms leave
+      // unmatched; when none of those carries a linear field it drops nothing
+      // linear, whatever the scrutinee type.
+      let bound = if wild_drops_nothing_linear(state, pat, scrutinee: tt, prior) then
+          BindOk(state, subst: subst.subst_empty(), env: [])
+        else bind_pattern(state, pattern: pat, target_type: tt, pat_span: span) end
+      match bound do
         | BindErr(message: m) -> return InferExprErr(message: "match pattern: " ++ m, span)
         | BindOk(state: st1, subst: ps, env: bindings) ->
           let sm = subst.subst_compose(s1: subst, s2: ps)
@@ -529,7 +614,7 @@ export let infer_match_cases = fn (
               return infer_match_cases(
                 state: st4, cases: rest,
                 target_type, subst: all_subst,
-                ret_type, result_type: Some(val: new_result), span, infer_stmts_fn
+                ret_type, result_type: Some(val: new_result), span, prior: pat :: prior, infer_stmts_fn
               )
           end
       end
