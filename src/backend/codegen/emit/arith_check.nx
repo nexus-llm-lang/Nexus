@@ -1,0 +1,138 @@
+/**
+ * codegen/emit/arith_check: runtime checks that turn an integer division or
+ * remainder by zero, an `i64::MIN / -1` overflow, and an out-of-bounds array
+ * index into a call to the matching std:runtime/panic function, which raises
+ * a catchable `RuntimeError`.
+ *
+ * The panic functions are registered in the internal function index map under
+ * the aliases below (`panic_aliases`); a program without them (the map has no
+ * alias) gets no check, and wasm traps as before.
+ */
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { BinaryOp, OpDiv, OpMod } from "src/types/vocab.nx"
+import { TypeExpr, TyI32, TyI64, TyBool, TyChar } from "src/types/type_expr.nx"
+import { LirAtom, LirAtomInt } from "src/ir/lir/types.nx"
+import { CodegenCtx, ctx_func_index } from "src/backend/codegen/ctx/context.nx"
+import { emit_atom, emit_coercion } from "src/backend/codegen/emit/atom.nx"
+import { FuncEntry, bt_void, op_if, op_end, op_call, op_unreachable,
+         op_i32_const, op_i64_const, op_i32_eq, op_i64_eq, op_i32_and }, * as wdefs from "src/backend/wasm/defs.nx"
+import { CodegenError } from "src/backend/errors.nx"
+import * as str from "std:str"
+import * as list from "std:list"
+
+let division_by_zero_alias = "__nx_panic_division_by_zero"
+let integer_overflow_alias = "__nx_panic_integer_overflow"
+let index_out_of_bounds_alias = "__nx_panic_index_out_of_bounds"
+
+/** Entries registering the std:runtime/panic functions present in `entries`
+ *  under the aliases the checks look up. */
+export let panic_aliases = fn (entries: [ FuncEntry ]) -> [ FuncEntry ] do
+  return list.concat(
+    xs: alias_for(
+      entries,
+      suffix: "runtime_panic_nx#division_by_zero",
+      alias: division_by_zero_alias
+    ),
+    ys: list.concat(
+      xs: alias_for(
+        entries,
+        suffix: "runtime_panic_nx#integer_overflow",
+        alias: integer_overflow_alias
+      ),
+      ys: alias_for(
+        entries,
+        suffix: "runtime_panic_nx#index_out_of_bounds",
+        alias: index_out_of_bounds_alias
+      )
+    )
+  )
+end
+
+let alias_for = fn (entries: [ FuncEntry ], suffix: string, alias: string) -> [ FuncEntry ] do
+  match list.find(xs: entries, p: fn (val: FuncEntry) -> bool do
+    let FuncEntry(name, index: _) = val
+    return str.ends_with(s: name, suffix)
+  end) do
+    | Some(val: FuncEntry(name: _, index)) -> return [ FuncEntry(name: alias, index) ]
+    | None -> return []
+  end
+end
+
+/** Emit `if cond then call panic; unreachable end` where the i32 condition is
+ *  already on the stack. */
+let emit_panic_if = fn (buf: %ByteBuffer, panic_idx: i64) -> %ByteBuffer do
+  let %buf = bb.push_bytes(buf: %buf, bytes: [ op_if, bt_void, op_call ])
+  let %buf = bb.push_uleb128(buf: %buf, val: panic_idx)
+  return bb.push_bytes(buf: %buf, bytes: [ op_unreachable, op_end ])
+end
+
+let is_i32_operand = fn (t: TypeExpr) -> bool do
+  match wdefs.peel_linear(typ: t) do
+    | TyI32 | TyBool | TyChar -> return true
+    | _ -> return false
+  end
+end
+
+let is_int_operand = fn (t: TypeExpr) -> bool do
+  match wdefs.peel_linear(typ: t) do
+    | TyI32 | TyI64 | TyBool | TyChar -> return true
+    | _ -> return false
+  end
+end
+
+/** Push the integer constant `v` at the operand width. */
+let push_const = fn (buf: %ByteBuffer, v: i64, i32_op: bool) -> %ByteBuffer do
+  let %buf = bb.push_byte(buf: %buf, byte: if i32_op then op_i32_const else op_i64_const end)
+  return bb.push_sleb128(buf: %buf, val: v)
+end
+
+/** Push `atom == v` (an i32 boolean) at the operand width. */
+let push_atom_eq = fn (
+  buf: %ByteBuffer, atom: LirAtom, v: i64, op_type: TypeExpr, ctx: CodegenCtx
+) -> %ByteBuffer throws { CodegenError } do
+  let i32_op = is_i32_operand(t: op_type)
+  let %buf = emit_atom(atom, %buf, ctx)
+  let %buf = emit_coercion(from_type: wdefs.atom_type(atom), to_type: op_type, %buf)
+  let %buf = push_const(%buf, v, i32_op)
+  return bb.push_byte(buf: %buf, byte: if i32_op then op_i32_eq else op_i64_eq end)
+end
+
+let is_other_const = fn (atom: LirAtom, v: i64) -> bool do
+  match atom do
+    | LirAtomInt(val) -> return val != v
+    | _ -> return false
+  end
+end
+
+/** Checks before the integer `lhs op rhs` (op `/` or `%`): a zero divisor
+ *  raises division_by_zero; for `/`, the minimum value divided by -1 raises
+ *  integer_overflow. Constant operands that rule a case out skip its check. */
+export let emit_div_checks = fn (
+  op: BinaryOp, op_type: TypeExpr, lhs: LirAtom, rhs: LirAtom, buf: %ByteBuffer, ctx: CodegenCtx
+) -> %ByteBuffer throws { CodegenError } do
+  let is_div = match op do | OpDiv -> true | _ -> false end
+  let is_rem = match op do | OpMod -> true | _ -> false end
+  if !is_div && !is_rem then return %buf end
+  if !is_int_operand(t: op_type) then return %buf end
+  let dz = ctx_func_index(ctx, name: division_by_zero_alias)
+  let %buf = if dz >= 0 && !is_other_const(atom: rhs, v: 0) then
+      emit_panic_if(buf: push_atom_eq(%buf, atom: rhs, v: 0, op_type, ctx), panic_idx: dz)
+    else %buf end
+  let ov = ctx_func_index(ctx, name: integer_overflow_alias)
+  let min = if is_i32_operand(t: op_type) then 0 - 2147483648 else (0 - 9223372036854775807) - 1 end
+  if !is_div || ov < 0 || is_other_const(
+    atom: rhs,
+    v: 0 - 1
+  ) || is_other_const(atom: lhs, v: min) then
+    return %buf
+  end
+  let %buf = push_atom_eq(%buf, atom: lhs, v: min, op_type, ctx)
+  let %buf = push_atom_eq(%buf, atom: rhs, v: 0 - 1, op_type, ctx)
+  let %buf = bb.push_byte(buf: %buf, byte: op_i32_and)
+  return emit_panic_if(%buf, panic_idx: ov)
+end
+
+/** The function index index_out_of_bounds is registered under, or -1. */
+export let index_out_of_bounds_idx = fn (ctx: CodegenCtx) -> i64 do
+  return ctx_func_index(ctx, name: index_out_of_bounds_alias)
+end

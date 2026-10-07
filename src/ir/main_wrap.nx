@@ -7,7 +7,8 @@
  *   2. Synthesises a fresh `main` whose body is
  *        try
  *          __nx_user_main()
- *        catch _ ->
+ *        catch e ->
+ *          report_uncaught(e)   // std:runtime/panic, when present
  *          wasi_snapshot_preview1::proc_exit(1)
  *        end
  *   3. Adds the WASI proc_exit external the wrapper needs.
@@ -17,20 +18,14 @@
  *
  * The pass is a no-op when `main` already has an empty throws-row.
  *
- * The catch arm calls `proc_exit(1)` directly rather than printing the
- * exception variant first: the stdlib is inlined per-program, so there is
- * no `nexus:std/stdio` host provider for an `eprint` import to resolve
- * against, and a suffix lookup against inlined `eprint_str` only works
- * for programs whose source already pulls in `std:stdio` transitively.
- * `proc_exit` is universal (wasmtime supplies `wasi_snapshot_preview1`
- * natively), so the wrapper trades the variant-name stderr line for an
- * unconditionally working non-zero exit. The test runner reports the
- * exit code; an inline `fd_write` intrinsic could re-add the variant name
- * later.
+ * `report_uncaught` (std:runtime/panic, which every program loads) prints
+ * the exception to stderr through the runtime's capability-free stderr
+ * write; `proc_exit` then ends the process with a non-zero exit code.
  */
 
 import { Span } from "src/types/span.nx"
 import * as list from "std:list"
+import * as str from "std:str"
 import { Literal, LitInt, SigilImmutable } from "src/types/vocab.nx"
 import {
   TypeExpr,
@@ -278,18 +273,31 @@ let stmt_expr = fn (e: HirExpr, sp: Span) -> HirStmt do
   return HirStmt(node: Expr(expr: e), span: sp)
 end
 
-/** Build the catch body: `proc_exit(cast_to_i32(1))`. The caught exception
- *  value (bound to `catch_var`) is intentionally discarded — the wrapper
- *  only needs to terminate with a non-zero exit code so the test runner
- *  records FAIL. See the file-level docstring for why printing the
- *  variant name was dropped.
+/** Build the catch body: `report(e: caught)` when std:runtime/panic's
+ *  `report_uncaught` is in the program (`report` is its name), then
+ *  `proc_exit(cast_to_i32(1))`.
  */
-let synth_catch_body = fn (catch_var: string, sp: Span) -> [ HirStmt ] do
-  // proc_exit takes i32; lift the i64 literal 1 through cast-to-i32. The
-  // caught exception (bound at `catch_var`) is intentionally discarded.
+let synth_catch_body = fn (catch_var: string, report: Option<string>, sp: Span) -> [ HirStmt ] do
+  // proc_exit takes i32; lift the i64 literal 1 through cast-to-i32.
   let code_i32 = call1(fname: sym_cast_i32, label: "x", arg: lit_i64(n: 1, sp), sp)
   let exit_call = stmt_expr(e: call1(fname: sym_proc_exit, label: "a_code", arg: code_i32, sp), sp)
-  return [exit_call]
+  match report do
+    | None -> return [exit_call]
+    | Some(val: rf) ->
+      let caught = HirExpr(node: Variable(name: catch_var, sigil: SigilImmutable), span: sp)
+      return [ stmt_expr(e: call1(fname: rf, label: "e", arg: caught, sp), sp), exit_call ]
+  end
+end
+
+/** Name of std:runtime/panic's `report_uncaught` in `funcs`, if present. */
+let find_report_uncaught = fn (funcs: [ HirFunction ]) -> Option<string> do
+  match list.find(xs: funcs, p: fn (val: HirFunction) -> bool do
+    let HirFunction(name, type_params: _, params: _, ret_type: _, _) = val
+    return str.ends_with(s: name, suffix: "runtime_panic_nx#report_uncaught")
+  end) do
+    | Some(val: HirFunction(name, type_params: _, params: _, ret_type: _, _)) -> return Some(val: name)
+    | None -> return None
+  end
 end
 
 /** HIR-level name used for the user's original `main` after the wrap pass
@@ -299,7 +307,7 @@ end
  * silently un-typechecked.
  */
 export let user_main_name = "__nx_user_main"
-let make_wrapper_main = fn (orig_main: HirFunction) -> HirFunction do
+let make_wrapper_main = fn (orig_main: HirFunction, report: Option<string>) -> HirFunction do
   let HirFunction(
     name: _,
     type_params: _,
@@ -318,7 +326,7 @@ let make_wrapper_main = fn (orig_main: HirFunction) -> HirFunction do
     node: Expr(expr: HirExpr(node: Call(func: user_main_name, args: forward_args), span: sp)),
     span: sp
   ) ]
-  let catch_body = synth_catch_body(catch_var: "__nx_main_caught", sp)
+  let catch_body = synth_catch_body(catch_var: "__nx_main_caught", report, sp)
   let try_stmt = HirStmt(
     node: Try(body: try_body, catch_param: "__nx_main_caught", catch_body),
     span: sp
@@ -439,7 +447,7 @@ export let wrap_main_if_needed_opts = fn (prog: HirProgram, component_target: bo
         return prog
       end
       let renamed_user = rename_main_to_user(f: m)
-      let wrapper = make_wrapper_main(orig_main: m)
+      let wrapper = make_wrapper_main(orig_main: m, report: find_report_uncaught(funcs))
       let new_funcs = wrapper :: renamed_user :: rest_funcs
       let new_exts = append_exts(a: synth_externals(), b: externals)
       return HirProgram(
