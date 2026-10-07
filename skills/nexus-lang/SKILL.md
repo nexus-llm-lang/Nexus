@@ -140,6 +140,21 @@ element access is only via `&[| T |]` borrow parameters as shown. For ordinary c
 prefer the immutable `[T]` list (recursion / `std:list`). Reach for `[| T |]` only
 when you genuinely need in-place mutation.
 
+**Linearity rules that most often trip generated code:**
+- A linear value (`%T`, a closure that captured one, a list/record/enum holding
+  one) cannot be passed where a non-linear `T` is expected; declare the
+  parameter `%x: T` (scalars like `%i64` are exempt).
+- Generic type parameters range over sigil-free types: `list.reverse`,
+  `list.map`, … cannot take `[%T]`, `[@T]` or `[| T |]`. Build such lists in
+  order with direct recursion instead of reversing an accumulator.
+- `%C(...)` builds a linear value; destructuring it makes every non-scalar
+  field linear too.
+- Matching a borrowed value (`xs: &[%T]`) binds linear elements as borrows
+  (`&T`), never as owned values.
+- A thunk (`let @t = …`) cannot capture a borrow (`&x`).
+- A `_` arm (and `if let` without a matching arm) cannot drop a variant that
+  carries a linear field — match it explicitly and consume the payload.
+
 ### 5. Lazy evaluation with `@`
 ```nexus
 let @result = expensive_call(data: input)  // deferred thunk
@@ -214,46 +229,6 @@ Both `//` and `/* ... */` comment forms are supported. Block comments
 **nest correctly** — the lexer counts `/*` / `*/` depth, so nested blocks
 close in the right order. Useful for commenting out a region that already
 contains block-comment'd code.
-
-## Statement-typing deltas
-
-Points where the in-tree implementation matches user expectation but the
-canonical `type-system-formal.md` spec is incomplete. Code behaves as
-documented here; the spec is being tightened separately.
-
-> Note: the formal spec writes the throw-term as `raise e`; the **surface
-> keyword you actually type is `throw`** (see Error Handling above). Spec rule
-> names below quote the spec's `raise` spelling, but any code you write uses
-> `throw`.
-
-### Expression statements (T-ExprStmt) — nexus-ka1m
-
-The term grammar `s ::= ... | e` admits a bare expression as a statement,
-but the spec has no rule lifting `Γ; ρ_q ⊢_e e : τ ! ρ_e` into the
-statement judgement `Γ; ρ_q; τ_r ⊢_s e : Γ ! ρ_e`. The implementation
-*does* lift expressions: `infer_stmt` dispatches the `Expr(e)` HIR
-statement straight to `infer_expr` (`src/typecheck/infer.nx`,
-`infer_stmt`'s `Expr` arm). A future spec patch will add a `T-ExprStmt`
-rule with output `Γ` unchanged and `tail(...) = τ`. Until then, treat
-`s ::= e` derivations as "typed by `infer_expr` with the surrounding
-`τ_r`".
-
-### `tail` and divergent destructuring let — nexus-1t8n
-
-The `tail(s̄)` predicate (§Expressions) classifies the last statement
-of a block as ⊥ when it is `return`, an expression-statement `raise e`,
-or a single-binder `let μx = raise e'`. The destructuring form
-`let p = raise e` (handled by `T-LetPat-Diverge`) is **not** in the ⊥
-list and currently falls into the `unit` "otherwise" arm. In practice
-a match arm whose body is exactly `let Some(y) = raise NotFound(...) end`
-types as `unit` rather than ⊥, and `T-Match`'s divergent-arm carve-out
-does not fire — HIR desugars the form to
-`match (raise e) do | p -> end` (`src/ir/hir/hir.nx`, `StmtLetPattern`
-case), and the trailing `infer_stmts([])` yields `TyUnit`. Workaround
-when you want the arm classified as divergent: write `throw e` as an
-expression-statement (or precede with `return`) instead of binding it.
-The pending spec fix extends the ⊥ clause to `let p = raise e'` so both
-binding shapes behave uniformly.
 
 ## Effect System (Caps & Handlers)
 
@@ -350,6 +325,12 @@ end
 
 Working example: [exception_group.nx](../../examples/feature/exception_group.nx) (declare a group, throw members, catch by variant).
 
+**Runtime errors.** Integer division or remainder by zero, `i64::MIN / -1`, and an
+out-of-bounds array index raise `RuntimeError` (`"division by zero"`,
+`"integer overflow"`, `"index out of bounds"`). A `try`/`catch` observes them, but
+they do not appear in throws rows. An exception that escapes `main` is printed to
+stderr (`uncaught exception: …`) and the program exits with status 1.
+
 ### List Recursion
 
 Working example: [list_basics.nx](../../examples/feature/list_basics.nx) (recursive sum, `std:list` combinators, cons patterns).
@@ -405,6 +386,8 @@ end
 ```
 
 Combine with rule #1: if the `else` branch is unreachable (single-constructor type), prefer `let PAT = EXPR` instead of `if let ... else`.
+
+Do not use `if let` when another variant of a linear scrutinee carries a linear payload: the implicit `_` arm would drop it, which is rejected. Use a `match` that consumes every linear payload.
 
 ### 3. Collapse staircase `match` — nest patterns + aggressive `_`
 Fuse nested `match` arms into a single pattern. Use a trailing bare `_` to ignore all remaining record/constructor fields rather than binding and discarding them.

@@ -40,7 +40,7 @@ The standard library is the `std` package, rooted at `nxlib/stdlib/`. Every modu
 | `"std:pbt"` | [meta/pbt.nx](../../../nxlib/stdlib/meta/pbt.nx) | `Gen<T>` generators, `forall` runner, `small_int`/`bool_gen`/`string_gen` | [pbt_basics.nx](../../../examples/feature/pbt_basics.nx) |
 | `"std:argparse"` | [meta/argparse.nx](../../../nxlib/stdlib/meta/argparse.nx) | CLI argument parser — spec builder, `parse`, `render_help` | — |
 
-Modules occasionally referenced by name elsewhere — `std:chan`, `std:sched`, `std:string`, `std:_nx` — are intentionally omitted: they're either duplicates of an existing module under a different label or speculative names with no `nxlib/stdlib/<name>.nx` source (see nexus-ds7e / nexus-xqzl).
+Modules occasionally referenced by name elsewhere — `std:chan`, `std:sched`, `std:string`, `std:_nx` — are intentionally omitted: they're either duplicates of an existing module under a different label or speculative names with no `nxlib/stdlib/<name>.nx` source.
 
 ### Runtime intrinsics (compiler-internal)
 
