@@ -15,7 +15,7 @@
  */
 
 import { Span } from "src/types/span.nx"
-import { TyLinear, TyLazy, TyArray, TyRef } from "src/types/type_expr.nx"
+import { TyLinear, TyLazy, TyArray, TyRef, TyBorrow } from "src/types/type_expr.nx"
 import {
   HirStmt, HirExpr,
   HirCallArg, HirNamedExpr, HirMatchCase, HirParam,
@@ -28,11 +28,15 @@ import { Option, Some, None } from "std:option"
 /** Record of an illegal `ref`-typed capture: which name and where, so the error can point at the source. */
 export type RefCaptureHit = RefCaptureHit(name: string, span: Span)
 
-/** Result of a closure-capture scan: `linear` is set if any captured outer binding makes the closure linear; `ref_hit` is non-None if a `ref` binding was captured (an error). */
-export type CaptureScan = CaptureScan(linear: bool, ref_hit: Option<RefCaptureHit>)
+/** Result of a closure-capture scan: `linear` is set if any captured outer binding makes the closure linear; `ref_hit` is non-None if a `ref` binding was captured (an error); `borrow_hit` is non-None if an outer binding is borrowed (`&x`) or has a borrow type (an error for a thunk). */
+export type CaptureScan = CaptureScan(
+  linear: bool,
+  ref_hit: Option<RefCaptureHit>,
+  borrow_hit: Option<RefCaptureHit>
+)
 
 let empty_scan = fn () -> CaptureScan do
-  return CaptureScan(linear: false, ref_hit: None)
+  return CaptureScan(linear: false, ref_hit: None, borrow_hit: None)
 end
 
 /** Walk a lambda body to classify its captures: flags linearity-inducing captures and reports any captured `ref` binding. `outer_env` is the env visible before the lambda's params bind. */
@@ -82,16 +86,51 @@ let visit_var = fn (
   match env_lookup(env: outer_env, name) do
     | None -> return acc
     | Some(val: Scheme(vars: _, typ: t)) ->
-      let CaptureScan(linear: lin, ref_hit: rh) = acc
+      let CaptureScan(linear: lin, ref_hit: rh, borrow_hit: bh) = acc
       match t do
-        | TyLinear(_) | TyLazy(_) | TyArray(_) -> return CaptureScan(linear: true, ref_hit: rh)
+        | TyLinear(_) | TyLazy(_) | TyArray(_) -> return CaptureScan(
+          linear: true,
+          ref_hit: rh,
+          borrow_hit: bh
+        )
         | TyRef(_) ->
           match rh do
             | Some(_) -> return acc
-            | None -> return CaptureScan(linear: lin, ref_hit: Some(val: RefCaptureHit(name, span)))
+            | None -> return CaptureScan(
+              linear: lin,
+              ref_hit: Some(val: RefCaptureHit(name, span)),
+              borrow_hit: bh
+            )
           end
+        | TyBorrow(_) -> return with_borrow_hit(acc, name, span)
         | _ -> return acc
       end
+  end
+end
+
+/** `acc` recording a borrow of the outer binding `name` (first hit wins). */
+let with_borrow_hit = fn (acc: CaptureScan, name: string, span: Span) -> CaptureScan do
+  let CaptureScan(linear: lin, ref_hit: rh, borrow_hit: bh) = acc
+  match bh do
+    | Some(_) -> return acc
+    | None -> return CaptureScan(
+      linear: lin,
+      ref_hit: rh,
+      borrow_hit: Some(val: RefCaptureHit(name, span))
+    )
+  end
+end
+
+/** `&name` inside the scanned body: a borrow of an outer binding. */
+let visit_borrow = fn (
+  name: string, span: Span,
+  outer_env: [ EnvEntry ], bound: [ string ], acc: CaptureScan
+) -> CaptureScan do
+  let acc1 = visit_var(name, span, outer_env, bound, acc)
+  if str_member(xs: bound, target: name) then return acc1 end
+  match env_lookup(env: outer_env, name) do
+    | None -> return acc1
+    | Some(_) -> return with_borrow_hit(acc: acc1, name, span)
   end
 end
 
@@ -126,10 +165,8 @@ let scan_expr = fn (
   let HirExpr(node: nd, span: sp) = expr
   match nd do
     | Literal(_) -> return acc
-    | Variable(
-      name: n,
-      sigil: _
-    ) | Borrow(name: n, sigil: _) -> return visit_var(name: n, span: sp, outer_env, bound, acc)
+    | Variable(name: n, sigil: _) -> return visit_var(name: n, span: sp, outer_env, bound, acc)
+    | Borrow(name: n, sigil: _) -> return visit_borrow(name: n, span: sp, outer_env, bound, acc)
     | BinOp(left: l, op: _, right: r) ->
       let acc1 = scan_expr(expr: l, outer_env, bound, acc)
       return scan_expr(expr: r, outer_env, bound, acc: acc1)
