@@ -8,7 +8,7 @@
  *        try
  *          __nx_user_main()
  *        catch e ->
- *          report_uncaught(e)   // std:runtime/panic, when present
+ *          report_uncaught_named(e, name: <ctor name of e>)  // std:runtime/panic
  *          wasi_snapshot_preview1::proc_exit(1)
  *        end
  *   3. Adds the WASI proc_exit external the wrapper needs.
@@ -18,15 +18,16 @@
  *
  * The pass is a no-op when `main` already has an empty throws-row.
  *
- * `report_uncaught` (std:runtime/panic, which every program loads) prints
- * the exception to stderr through the runtime's capability-free stderr
+ * `report_uncaught_named` (std:runtime/panic, which every program loads)
+ * prints the exception (or, for an exception `exn.to_string` does not
+ * describe, its constructor name) to stderr through the runtime's capability-free stderr
  * write; `proc_exit` then ends the process with a non-zero exit code.
  */
 
 import { Span } from "src/types/span.nx"
 import * as list from "std:list"
 import * as str from "std:str"
-import { Literal, LitInt, SigilImmutable } from "src/types/vocab.nx"
+import { Literal, LitInt, LitString, SigilImmutable } from "src/types/vocab.nx"
 import {
   TypeExpr,
   TyI32,
@@ -36,12 +37,17 @@ import {
   TyList,
   TyRow,
   TyVar,
-  TyUserDefined
+  TyUserDefined,
+  EnumDef,
+  VariantDef,
+  VariantField
 } from "src/types/type_expr.nx"
 import {
   HirProgram, HirFunction, HirParam, HirExternal, HirExpr, HirStmt,
   HirCallArg,
-  EagerBody
+  EagerBody,
+  HirMatchCase,
+  HirPatternField
 } from "src/ir/hir/types.nx"
 import { with_name } from "src/ir/hir/func_update.nx"
 import { Option, Some, None } from "std:option"
@@ -196,15 +202,8 @@ export let bt_capture_symbol_name = fn () -> string do return sym_bt_capture end
 let synth_externals = fn () -> [ HirExternal ] do
   // proc_exit: WASI's process-terminate primitive. The signature is `(i32) ->
   // ()` at the wasm level (never returns; wasmtime satisfies it natively).
-  // We use it as the catch arm's only side-effect: on any uncaught throw the
-  // wrapper exits with status 1. Previous versions printed the exception
-  // variant name first via `nexus:std/stdio::eprint`, but that import has no
-  // host provider since the stdlib became inlined per-program (Phase 7 of
-  // ), and falling back to the inlined `eprint_str` by canonical
-  // name only works for programs that already transitively import std:stdio
-  // — tests that just `throw` and have no stdlib uses never load sysio. The
-  // proc_exit-only path trades the variant name for a universally-working
-  // non-zero exit.
+  // The catch arm calls it after reporting the exception, so an uncaught
+  // throw exits with status 1.
   let e_proc_exit = HirExternal(
     name: sym_proc_exit,
     wasm_module: host_wasi,
@@ -273,11 +272,13 @@ let stmt_expr = fn (e: HirExpr, sp: Span) -> HirStmt do
   return HirStmt(node: Expr(expr: e), span: sp)
 end
 
-/** Build the catch body: `report(e: caught)` when std:runtime/panic's
- *  `report_uncaught` is in the program (`report` is its name), then
- *  `proc_exit(cast_to_i32(1))`.
+/** Build the catch body: `report(e: caught, name: <ctor name of caught>)`
+ *  when std:runtime/panic's `report_uncaught_named` is in the program (`report` is
+ *  its name), then `proc_exit(cast_to_i32(1))`.
  */
-let synth_catch_body = fn (catch_var: string, report: Option<string>, sp: Span) -> [ HirStmt ] do
+let synth_catch_body = fn (
+  catch_var: string, report: Option<string>, exn_variants: [ VariantDef ], sp: Span
+) -> [ HirStmt ] do
   // proc_exit takes i32; lift the i64 literal 1 through cast-to-i32.
   let code_i32 = call1(fname: sym_cast_i32, label: "x", arg: lit_i64(n: 1, sp), sp)
   let exit_call = stmt_expr(e: call1(fname: sym_proc_exit, label: "a_code", arg: code_i32, sp), sp)
@@ -285,15 +286,66 @@ let synth_catch_body = fn (catch_var: string, report: Option<string>, sp: Span) 
     | None -> return [exit_call]
     | Some(val: rf) ->
       let caught = HirExpr(node: Variable(name: catch_var, sigil: SigilImmutable), span: sp)
-      return [ stmt_expr(e: call1(fname: rf, label: "e", arg: caught, sp), sp), exit_call ]
+      let name_expr = exn_name_match(target: caught, variants: exn_variants, sp)
+      let report_call = HirExpr(
+        node: Call(
+          func: rf,
+          args: [
+            HirCallArg(label: "e", value: caught),
+            HirCallArg(label: "name", value: name_expr)
+          ]
+        ),
+        span: sp
+      )
+      return [ stmt_expr(e: report_call, sp), exit_call ]
   end
 end
 
-/** Name of std:runtime/panic's `report_uncaught` in `funcs`, if present. */
+/** `match target do | V(_ ...) -> "V" ... | _ -> "" end` over the `Exn`
+ *  variants, giving the constructor name of a caught exception (the part
+ *  after `#` for module-qualified names). */
+let exn_name_match = fn (target: HirExpr, variants: [ VariantDef ], sp: Span) -> HirExpr do
+  let arms = list.map(xs: variants, f: fn (v: VariantDef) -> HirMatchCase do
+    let VariantDef(name: vn, fields: vfs) = v
+    let pfields = list.map(xs: vfs, f: fn (vf: VariantField) -> HirPatternField do
+      let VariantField(name: fname, typ: _) = vf
+      return HirPatternField(name: fname, pattern: PWild)
+    end)
+    return HirMatchCase(
+      pattern: PCtor(variant: vn, fields: pfields, sigil: SigilImmutable),
+      body: [ stmt_expr(e: lit_string(s: display_name(name: vn), sp), sp) ]
+    )
+  end)
+  let fallback = HirMatchCase(pattern: PWild, body: [ stmt_expr(e: lit_string(s: "", sp), sp) ])
+  return HirExpr(node: Match(target, cases: list.concat(xs: arms, ys: [ fallback ])), span: sp)
+end
+
+let lit_string = fn (s: string, sp: Span) -> HirExpr do
+  return HirExpr(node: Literal(lit: LitString(val: s)), span: sp)
+end
+
+let display_name = fn (name: string) -> string do
+  let i = str.index_of(s: name, sub: "#")
+  if i < 0 then return name end
+  return str.substring(s: name, start: i + 1, len: str.length(s: name) - i - 1)
+end
+
+/** Variants of the `Exn` enum in `enum_defs` (empty when absent). */
+let exn_variants_of = fn (enum_defs: [ EnumDef ]) -> [ VariantDef ] do
+  match list.find(xs: enum_defs, p: fn (d: EnumDef) -> bool do
+    let EnumDef(name, _) = d
+    return name == "Exn"
+  end) do
+    | Some(val: EnumDef(name: _, is_public: _, is_opaque: _, type_params: _, variants: vs, _)) -> return vs
+    | None -> return []
+  end
+end
+
+/** Name of std:runtime/panic's `report_uncaught_named` in `funcs`, if present. */
 let find_report_uncaught = fn (funcs: [ HirFunction ]) -> Option<string> do
   match list.find(xs: funcs, p: fn (val: HirFunction) -> bool do
     let HirFunction(name, type_params: _, params: _, ret_type: _, _) = val
-    return str.ends_with(s: name, suffix: "runtime_panic_nx#report_uncaught")
+    return str.ends_with(s: name, suffix: "runtime_panic_nx#report_uncaught_named")
   end) do
     | Some(val: HirFunction(name, type_params: _, params: _, ret_type: _, _)) -> return Some(val: name)
     | None -> return None
@@ -307,7 +359,9 @@ end
  * silently un-typechecked.
  */
 export let user_main_name = "__nx_user_main"
-let make_wrapper_main = fn (orig_main: HirFunction, report: Option<string>) -> HirFunction do
+let make_wrapper_main = fn (
+  orig_main: HirFunction, report: Option<string>, exn_variants: [ VariantDef ]
+) -> HirFunction do
   let HirFunction(
     name: _,
     type_params: _,
@@ -326,7 +380,7 @@ let make_wrapper_main = fn (orig_main: HirFunction, report: Option<string>) -> H
     node: Expr(expr: HirExpr(node: Call(func: user_main_name, args: forward_args), span: sp)),
     span: sp
   ) ]
-  let catch_body = synth_catch_body(catch_var: "__nx_main_caught", report, sp)
+  let catch_body = synth_catch_body(catch_var: "__nx_main_caught", report, exn_variants, sp)
   let try_stmt = HirStmt(
     node: Try(body: try_body, catch_param: "__nx_main_caught", catch_body),
     span: sp
@@ -447,7 +501,11 @@ export let wrap_main_if_needed_opts = fn (prog: HirProgram, component_target: bo
         return prog
       end
       let renamed_user = rename_main_to_user(f: m)
-      let wrapper = make_wrapper_main(orig_main: m, report: find_report_uncaught(funcs))
+      let wrapper = make_wrapper_main(
+        orig_main: m,
+        report: find_report_uncaught(funcs),
+        exn_variants: exn_variants_of(enum_defs)
+      )
       let new_funcs = wrapper :: renamed_user :: rest_funcs
       let new_exts = append_exts(a: synth_externals(), b: externals)
       return HirProgram(
