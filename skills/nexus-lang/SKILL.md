@@ -271,9 +271,10 @@ Omit `require { ... }` entirely when the body needs no caps.
 
 A lambda does not inherit the enclosing function's caps: its body is checked
 against its own `require` row, so a lambda that calls `Console.println` must say
-`fn () -> unit require { Console } do ... end`. Such a lambda cannot be passed
-where the parameter type has no `require` row (e.g. `test_assert.assert_raises`);
-call the code through a named helper function instead.
+`fn () -> unit require { Console } do ... end`. Such a lambda can be passed only
+where the parameter type admits that row: a closed row such as `() -> unit`
+rejects it, while a row-polymorphic parameter (`f: () -> unit require { |R }`, as
+in `test_assert.assert_raises` and `coop.spawn`) accepts it.
 
 ## Type System Summary
 
