@@ -169,6 +169,10 @@ forces a list of thunks and returns the results in input order, and
 force each thunk sequentially on the calling thread, and a thunk's exception
 surfaces at its join.
 
+A `return` inside a thunk body returns from the thunk, not from the enclosing
+function: in `let @t = if c then return 5 else 1 end`, forcing `@t` yields 5,
+and the returned value must have the thunk's value type.
+
 Thunk-creation vs force: `let @x = e` (let-binding sigil) is the **only**
 thunk-creation form — it wraps `e` into an `@T` thunk. Every `@e` in
 expression position is **force** (`@T → T`), including `@x` (bare ident) and
