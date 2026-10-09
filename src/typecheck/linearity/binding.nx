@@ -15,14 +15,14 @@ import { SigilImmutable, SigilLinear, SigilLazy } from "src/types/vocab.nx"
 import { TypeExpr, RecordDef, EnumDef } from "src/types/type_expr.nx"
 import {
   HirStmt, HirStmtKind, HirExpr, HirExprKind,
-  HirCallArg, HirNamedExpr, HirMatchCase
+  HirCallArg, HirNamedExpr, HirMatchCase, HirRecordPatField
 } from "src/ir/hir/types.nx"
 import { Option, Some, None } from "std:option"
 import { is_linear_binding_type } from "src/ir/shared/type_pred.nx"
 import { SigEntry, sig_lookup } from "src/typecheck/linearity/sig_map.nx"
 import {
   LinState, CtorBinding,
-  lin_member, lin_consumed_member, lin_lookup_ctor
+  lin_member, lin_consumed_member, lin_lookup_ctor, lin_add
 } from "src/typecheck/linearity/state.nx"
 import { lin_ctor_enum_is_linear } from "src/typecheck/linearity/predicates.nx"
 import { last_stmt } from "src/typecheck/linearity/diverge.nx"
@@ -74,13 +74,70 @@ let collect_ctor_bindings_expr = fn (expr: HirExpr, acc: [ CtorBinding ]) -> [ C
         | Some(val: e) -> return collect_ctor_bindings(stmts: e, acc: acc1)
         | None -> return acc1
       end
-    | Match(target: _, cases: cs) -> return collect_ctor_bindings_cases(cases: cs, acc)
+    | Match(target: t, cases: cs) ->
+      let acc1 = collect_rec_pattern_bindings(target: t, cases: cs, acc)
+      return collect_ctor_bindings_cases(cases: cs, acc: acc1)
     | While(cond: _, body: b) -> return collect_ctor_bindings(stmts: b, acc)
     | For(var: _, start: _, end_expr: _, body: b) -> return collect_ctor_bindings(stmts: b, acc)
     | Lambda(type_params: _, params: _, ret_type: _, requires: _, throw_row: _, body: b) ->
       return collect_ctor_bindings(stmts: b, acc)
     | Inject(handlers: _, body: b) -> return collect_ctor_bindings(stmts: b, acc)
     | _ -> return acc
+  end
+end
+
+/** For `match x do | { f: b, ... } -> ... end` where `x` was bound to a
+ *  record literal, record `b` as bound to that literal's `f` initializer. */
+let collect_rec_pattern_bindings = fn (
+  target: HirExpr, cases: [ HirMatchCase ], acc: [ CtorBinding ]
+) -> [ CtorBinding ] do
+  if let HirExpr(node: Variable(name: m, sigil: _), span: _) = target then
+    if let Some(val: HirExpr(node: Record(fields: lit), span: _)) = ctor_binding_find(
+      env: acc,
+      name: m
+    ) then
+      return rec_cases_bindings(cases, lit, acc)
+    end
+  end
+  return acc
+end
+
+let rec_cases_bindings = fn (
+  cases: [ HirMatchCase ],
+  lit: [ HirNamedExpr ],
+  acc: [ CtorBinding ]
+) -> [ CtorBinding ] do
+  match cases do
+    | [] -> return acc
+    | HirMatchCase(pattern: PRec(fields: pfs, is_partial: _), body: _) :: rest ->
+      return rec_cases_bindings(cases: rest, lit, acc: rec_field_bindings(fields: pfs, lit, acc))
+    | _ :: rest -> return rec_cases_bindings(cases: rest, lit, acc)
+  end
+end
+
+let rec_field_bindings = fn (
+  fields: [ HirRecordPatField ],
+  lit: [ HirNamedExpr ],
+  acc: [ CtorBinding ]
+) -> [ CtorBinding ] do
+  match fields do
+    | [] -> return acc
+    | HirRecordPatField(name: fname, pattern: PVar(name: n, sigil: _)) :: rest ->
+      let acc1 = match named_expr_value(fields: lit, name: fname) do
+        | Some(val: v) -> CtorBinding(name: n, value: v) :: acc
+        | None -> acc
+      end
+      return rec_field_bindings(fields: rest, lit, acc: acc1)
+    | _ :: rest -> return rec_field_bindings(fields: rest, lit, acc)
+  end
+end
+
+let ctor_binding_find = fn (env: [ CtorBinding ], name: string) -> Option<HirExpr> do
+  match env do
+    | [] -> return None
+    | CtorBinding(name: n, value: v) :: rest ->
+      if n == name then return Some(val: v) end
+      return ctor_binding_find(env: rest, name)
   end
 end
 
@@ -136,36 +193,58 @@ export let compute_demoted_tyvar_fields = fn (
   end
 end
 
-/** Field names of the record literal that `target` (a variable) was bound
- *  to whose initializer is linear (`ctor_arg_is_linear`). Empty when `target`
- *  is not a variable bound to a record literal. */
-export let compute_linear_record_fields = fn (
-  target: HirExpr, st: LinState, sigs: [ SigEntry ],
-  tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
-) -> [ string ] do
+/** Fields of the record literal that `target` (a variable) was bound to,
+ *  or None when `target` is not a variable bound to a record literal. */
+export let record_literal_fields = fn (target: HirExpr, st: LinState) -> Option<[ HirNamedExpr ]> do
   if let HirExpr(node: Variable(name: m, sigil: _), span: _) = target then
     if let Some(val: HirExpr(node: Record(fields: fs), span: _)) = lin_lookup_ctor(st, name: m) then
-      return linear_named_fields(fields: fs, st, sigs, tdefs, enum_defs, acc: [])
+      return Some(val: fs)
     end
   end
-  return []
+  return None
 end
 
-let linear_named_fields = fn (
-  fields: [ HirNamedExpr ], st: LinState, sigs: [ SigEntry ],
-  tdefs: [ RecordDef ], enum_defs: [ EnumDef ], acc: [ string ]
-) -> [ string ] do
+/** Bind linearly every variable of the record pattern `fields` whose
+ *  initializer in the record literal `lit` is linear; a nested record
+ *  pattern over a nested record literal is walked the same way. */
+export let bind_linear_rec_binders = fn (
+  fields: [ HirRecordPatField ], lit: [ HirNamedExpr ], st: LinState,
+  sigs: [ SigEntry ], tdefs: [ RecordDef ], enum_defs: [ EnumDef ]
+) -> LinState do
   match fields do
-    | [] -> return acc
-    | HirNamedExpr(name: fname, value: v) :: rest ->
-      let acc1 = if ctor_arg_is_linear(
-        arg: v,
-        st,
-        sigs,
-        tdefs,
-        enum_defs
-      ) then fname :: acc else acc end
-      return linear_named_fields(fields: rest, st, sigs, tdefs, enum_defs, acc: acc1)
+    | [] -> return st
+    | HirRecordPatField(name: fname, pattern: p) :: rest ->
+      let st1 = match named_expr_value(fields: lit, name: fname) do
+        | None -> st
+        | Some(val: v) ->
+          match p do
+            | PVar(name: n, sigil: _) ->
+              if ctor_arg_is_linear(
+                arg: v,
+                st,
+                sigs,
+                tdefs,
+                enum_defs
+              ) then lin_add(st, name: n) else st end
+            | PRec(fields: inner, is_partial: _) ->
+              if let HirExpr(node: Record(fields: inner_lit), span: _) = v then
+                bind_linear_rec_binders(fields: inner, lit: inner_lit, st, sigs, tdefs, enum_defs)
+              else
+                st
+              end
+            | _ -> st
+          end
+      end
+      return bind_linear_rec_binders(fields: rest, lit, st: st1, sigs, tdefs, enum_defs)
+  end
+end
+
+let named_expr_value = fn (fields: [ HirNamedExpr ], name: string) -> Option<HirExpr> do
+  match fields do
+    | [] -> return None
+    | HirNamedExpr(name: n, value: v) :: rest ->
+      if n == name then return Some(val: v) end
+      return named_expr_value(fields: rest, name)
   end
 end
 
