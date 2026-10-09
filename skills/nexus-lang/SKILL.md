@@ -144,6 +144,9 @@ when you genuinely need in-place mutation.
 - A linear value (`%T`, a closure that captured one, a list/record/enum holding
   one) cannot be passed where a non-linear `T` is expected; declare the
   parameter `%x: T` (scalars like `%i64` are exempt).
+- A `%x: T` parameter is linear in the body: return it as `-> %T`, not `-> T`,
+  and destructure it rather than discarding it with `_`. A closure that
+  captures it is linear too.
 - Generic type parameters range over sigil-free types: `list.reverse`,
   `list.map`, … cannot take `[%T]`, `[@T]` or `[| T |]`. Build such lists in
   order with direct recursion instead of reversing an accumulator.
