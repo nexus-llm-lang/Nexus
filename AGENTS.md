@@ -2,54 +2,67 @@
 
 Nexus is a self-hosting language and compiler designed for LLM-friendly development.
 
-## Nexus Language Skill
+Language reference skill: `npx skills add nexus-llm-lang/Nexus --skill nexus-lang`
+
+## Workflow
+
+### Before every commit: lint and fmt
+
+Run on the files you touched; fix everything before committing.
 
 ```bash
-npx skills add nexus-llm-lang/Nexus --skill nexus-lang
+./nexus lint --check src/ nxlib/        # same scope as CI
+./nexus fmt <file.nx>...                # rewrite in place
+./nexus fmt --check <file.nx>...        # verify only
 ```
 
-## Nix-managed Repository
-Development tooling/targets change → update `flake.nix` first.
+Do not relax a lint rule to get a commit through. If a relaxation is unavoidable,
+explain it in the commit message.
 
-## Capability Row Ordering
-`require { ... }` and `throws { ... }` rows are sets — order is not load-bearing.
-By convention, list capabilities/exceptions alphabetically (e.g. `require { Console, Fs }`, `require { PermClock, PermConsole, PermFs, PermProc }`).
-Drop `require { ... }` entirely if the body uses no caps.
+CI formats `src/`, `nxlib/`, `tests/`, `examples/`, except
+`tests/negative/parser/lex_line_comment_eof_column.nx` (intentionally has no
+trailing newline) — never format that file.
 
-## bd Issue IDs in Source
+### Before every push: test
 
-**Do not put bd issue IDs (`nexus-XXXX`) into source code or filenames.**
-The bd database is local to this repo; references are unresolvable for any reader
-outside the owner's machine.
-Capture bd context in **commit messages**, **PR descriptions**, and the bd issue body
-itself — never in source comments or test filenames.
+```bash
+./nexus test tests/                     # same as the CI test job
+./bootstrap.sh --ci                     # also, when src/ changed (stage0 -> stage2 + seed match)
+```
 
-## Comments: describe behavior, do not assert design authority
+Push only when these pass on a clean tree. If the seed changed, commit the
+regenerated seed separately (`build: regenerate the self-hosted seed`).
 
-An LLM has no design authority. Comments must describe **what the code does**
-(mechanical, checkable against the code itself).
+### Session completion
 
-- Do **not** author design-authority claims — "the sanctioned / canonical /
-  only / intended way", "X counts as Y", "must be done via Z". These declare
-  intent the LLM was never given. State observed behavior instead, or write nothing.
-- You may **transcribe** intent the designer has already stated; you may not
-  **invent** it. And do not manufacture a spec/doc to justify a claim — if a
-  rationale isn't already established by the designer, ask; don't write it as fact.
+1. Create issues for remaining work (`bd create`).
+2. Run lint/fmt/test as above if code changed.
+3. Update issue status (`bd close`).
+4. `git push` — work is not complete until it succeeds.
+5. Hand off context for the next session.
 
-## Module placement (src/ layout)
+## Conventions
 
-**`src/tools/` holds CLI subcommand surfaces (drivers); reusable engines get
-their own top-level dir.** A subcommand's thin driver (arg handling + calling
-into an engine) lives flat in `tools/` (e.g. `tools/lint.nx`, `tools/fmt.nx`);
-the engine it drives — reusable by other surfaces such as the LSP — lives in a
-top-level dir (`lint/`, `fmt/`, ...). Shared support is purpose-named, not a
-catch-all: `syntax/` (ast/token/source_pos), `collection/` (generic data
-structures), `diagnostics/` (errors), `ir/support/` (compiler-internal
-helpers). Do not reintroduce a `common/`/`util/` grab-bag.
+- **Nix-managed repo**: when dev tooling or targets change, update `flake.nix` first.
+- **Capability rows**: `require { ... }` and `throws { ... }` are sets; order is not
+  load-bearing. List alphabetically (`require { Console, Fs }`,
+  `require { PermClock, PermConsole, PermFs, PermProc }`). Drop `require` entirely
+  when the body uses no capabilities.
+- **bd issue IDs** (`nexus-XXXX`) do not go into source code or filenames; the bd
+  database is local to the owner's machine. Put them in commit messages, PR
+  descriptions, and the issue body.
+- **Comments describe behavior, not design authority.** State what the code does
+  (checkable against the code). Do not write "the sanctioned / canonical / only /
+  intended way", "X counts as Y", or "must be done via Z" — an LLM has no design
+  authority. You may transcribe intent the designer already stated; you may not
+  invent it. If a rationale isn't established, ask instead of writing it as fact.
 
-## Session Completion
-1. Create issues for remaining work (`bd create`)
-2. Run quality gates if code changed
-3. Update issue status (`bd close`)
-4. Push to remote — work is NOT complete until `git push` succeeds
-5. Hand off context for next session
+## Module placement (`src/`)
+
+`src/tools/` holds CLI subcommand drivers: thin arg handling that calls an engine
+(e.g. `tools/lint.nx`, `tools/fmt.nx`). Reusable engines live in their own
+top-level dir (`lint/`, `fmt/`, ...) so other surfaces such as the LSP can use them.
+
+Shared support is purpose-named: `syntax/` (ast/token/source_pos), `collection/`
+(generic data structures), `diagnostics/` (errors), `ir/support/` (compiler-internal
+helpers). Do not reintroduce a `common/` or `util/` grab-bag.
