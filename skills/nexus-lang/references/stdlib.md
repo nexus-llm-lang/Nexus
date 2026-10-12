@@ -89,7 +89,7 @@ let main = fn () -> unit require { PermConsole, PermFs, PermNet } do
 end
 ```
 
-Permissions: `PermConsole`, `PermFs`, `PermNet`, `PermProc`, `PermClock`, `PermRandom`. Pure modules (list, option, result, tuple, exn, lazy) need none.
+Permissions: `PermClock`, `PermConsole`, `PermEnv`, `PermFs`, `PermNet`, `PermProc`, `PermRandom`. Pure modules (list, option, result, tuple, exn, lazy) need none.
 
 ## See Also
 

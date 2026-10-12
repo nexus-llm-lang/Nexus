@@ -160,7 +160,7 @@ Compiled programs run under wasmtime with the wasm proposals the stdlib uses plu
 ```bash
 wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y main.wasm
 wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. main.wasm   # PermFs
-wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y -S inherit-network main.wasm   # PermNet
+nexus build main.nx --p2-component -o main.wasm && wasmtime run -W component-model=y,exceptions=y -S http -S inherit-network main.wasm   # PermNet (component only)
 ```
 
 ## Example
