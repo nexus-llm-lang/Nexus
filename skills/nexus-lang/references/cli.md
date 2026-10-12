@@ -592,15 +592,14 @@ recursively for `.nx` files.
     nexus lint [--check|--fix|--fix-diff] FILE [FILE...]
 
 Run the Nexus linter over the given source files. Reports style and
-correctness issues (L0001 empty-inject, L0002 unused-require-cap,
-L0100 cognitive-complexity). With --check the exit code is non-zero on
-any finding.
+correctness issues as L-code findings. With --check the exit code is
+non-zero on any finding.
 
 Auto-fix modes (the heavier front-end is only engaged in these modes;
 plain lint and --check remain AST-only and fast):
-  --fix       apply all fix-its in place, looping to a fixpoint. Covers
-              both lint rules (L-codes) and compiler diagnostics
-              (E2005 LazyBindingUnused, E2007 LinearUnused).
+  --fix       apply lint-rule fix-its in place, looping to a fixpoint, then
+              run the front-end; a remaining compiler error is printed
+              and the exit code is non-zero.
   --fix-diff  show a before/after diff for every fix-it without writing.
 
 See also: `nexus fmt` for whitespace normalisation (separate concern).
@@ -610,7 +609,7 @@ See also: `nexus fmt` for whitespace normalisation (separate concern).
 | Flag | Description |
 | ---- | ----------- |
 | `--check` | exit non-zero on any finding (CI mode) |
-| `--fix` | apply fix-its in place (lint rules + E2005/E2007; loops to fixpoint) |
+| `--fix` | apply lint-rule fix-its in place (loops to fixpoint) |
 | `--fix-diff` | show before/after diff without writing |
 
 **Examples**
