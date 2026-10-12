@@ -19,7 +19,7 @@
 #
 # To execute a compiled program, build it and invoke wasmtime directly, e.g.
 #   nexus build prog.nx -o prog.wasm
-#   wasmtime run -W max-wasm-stack=67108864,tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. prog.wasm
+#   wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. prog.wasm
 # Determinism hooks are read from the env at runtime: --env NEXUS_SEED=N and
 # --env NEXUS_FROZEN_CLOCK=EPOCH_MS.
 #
@@ -27,7 +27,14 @@
 # fails with a clear diagnostic rather than executing the compiler with
 # unexpected args.
 #
+# Standard library lookup:
+#   Imports of `std:*` read `nxlib/stdlib/...` relative to the working
+#   directory. When the working directory has no `nxlib/stdlib`, the launcher
+#   mounts the first of `$NEXUS_NXLIB` and `<launcher dir>/../share/nexus/nxlib`
+#   that contains `stdlib/` at the guest path `nxlib`.
+#
 # Environment overrides:
+#   NEXUS_NXLIB            Host directory holding `stdlib/`. See above.
 #   NEXUS_MAX_WASM_STACK   Bytes for -W max-wasm-stack=. Default: 67108864 (64 MiB).
 #   NEXUS_WASMTIME_ARGS    Extra args appended to `wasmtime run` (whitespace-split).
 set -eu
@@ -350,6 +357,18 @@ if [ -z "$PAYLOAD_WASM" ]; then
   TMP=$(mktemp) || exit 1
   head -c "$((OFFSET + SIZE))" "$0" | tail -c "$SIZE" > "$TMP"
   PAYLOAD_WASM="$TMP"
+fi
+
+# Installed-stdlib mount (see "Standard library lookup" in the header).
+NXLIB_FLAG=""
+if [ ! -d nxlib/stdlib ]; then
+  _self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+  for _d in "${NEXUS_NXLIB:-}" "$(dirname "$_self")/../share/nexus/nxlib"; do
+    if [ -n "$_d" ] && [ -d "$_d/stdlib" ]; then
+      NXLIB_FLAG="--dir=$_d::nxlib"
+      break
+    fi
+  done
 fi
 
 # Compose the wasmtime feature flag set. Both payloads are self-contained
@@ -1515,6 +1534,7 @@ fi
 exec wasmtime run \
   -W "$W_FLAGS" \
   --dir=. --dir="${TMPDIR:-/tmp}" \
+  ${NXLIB_FLAG:+"$NXLIB_FLAG"} \
   ${NEXUS_WASMTIME_ARGS:-} \
   "$PAYLOAD_WASM" "$@"
 #__NEXUS_PAYLOAD_MANIFEST__

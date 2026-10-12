@@ -15,7 +15,7 @@
 #
 # Usage: ./bootstrap.sh [--ci] [--install [PREFIX]]
 #   --ci              Strict mode for CI: fail on stage2 failure or non-identical output
-#   --install [PREFIX] Copy ./nexus to ${PREFIX:-/usr/local}/bin/nexus after bootstrap
+#   --install [PREFIX] Copy ./nexus to ${PREFIX:-/usr/local}/bin/nexus and nxlib/stdlib to ${PREFIX:-/usr/local}/share/nexus/nxlib after bootstrap
 #
 set -euo pipefail
 
@@ -298,4 +298,10 @@ if [[ "$INSTALL_MODE" -eq 1 ]]; then
   cp nexus "$INSTALL_TARGET"
   chmod 755 "$INSTALL_TARGET"
   ok "--install: nexus installed to $INSTALL_TARGET"
+  # The launcher mounts ${PREFIX}/share/nexus/nxlib when cwd has no nxlib/.
+  INSTALL_NXLIB="${EFFECTIVE_PREFIX}/share/nexus/nxlib"
+  rm -rf "$INSTALL_NXLIB"
+  mkdir -p "$INSTALL_NXLIB"
+  cp -R nxlib/stdlib "$INSTALL_NXLIB/stdlib"
+  ok "--install: stdlib installed to $INSTALL_NXLIB"
 fi
