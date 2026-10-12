@@ -77,7 +77,7 @@ Total: **46 examples**.
 | `std:json` | [`feature/json_basics.nx`](./feature/json_basics.nx) |
 | `std:bytebuffer` | [`feature/bytebuffer_basics.nx`](./feature/bytebuffer_basics.nx) (linear) |
 | `std:regexp` | [`feature/regexp_basics.nx`](./feature/regexp_basics.nx) |
-| `std:pbt` | [`feature/pbt_basics.nx`](./feature/pbt_basics.nx) |
+| `std:test/prop` | [`feature/pbt_basics.nx`](./feature/pbt_basics.nx) |
 | `std:lazy` | [`feature/lazy_force_all.nx`](./feature/lazy_force_all.nx) |
 | `std:exn` | [`feature/exn_todo.nx`](./feature/exn_todo.nx) |
 
