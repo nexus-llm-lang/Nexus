@@ -122,20 +122,23 @@ The compiler ships as a self-extracting POSIX sh + wasm polyglot. Build it local
 ```bash
 ./bootstrap.sh        # produces ./nexus (polyglot launcher) and ./nexus.wasm
 cp nexus ~/.local/bin/   # or anywhere on PATH
+mkdir -p ~/.local/share/nexus && cp -R nxlib ~/.local/share/nexus/   # stdlib, found at <bin>/../share/nexus/nxlib
 ```
+
+`std:*` imports read `nxlib/stdlib/` from the working directory; when it is absent the launcher falls back to `$NEXUS_NXLIB`, then `<bin>/../share/nexus/nxlib`.
 
 To bootstrap and install in one step, use `--install [PREFIX]` (defaults to `/usr/local`):
 
 ```bash
-./bootstrap.sh --install             # installs to /usr/local/bin/nexus
-./bootstrap.sh --install ~/.local    # installs to ~/.local/bin/nexus
+./bootstrap.sh --install             # nexus -> /usr/local/bin, stdlib -> /usr/local/share/nexus/nxlib
+./bootstrap.sh --install ~/.local    # nexus -> ~/.local/bin, stdlib -> ~/.local/share/nexus/nxlib
 ```
 
-[wasmtime](https://wasmtime.dev/) must be installed and on `PATH`. Override the wasm runtime via env vars:
+[wasmtime](https://wasmtime.dev/) must be installed and on `PATH`. These env vars tune the wasmtime process that runs the compiler itself (not compiled programs):
 
 ```bash
 NEXUS_MAX_WASM_STACK=134217728 nexus build foo.nx -o out.wasm   # 128 MiB stack
-NEXUS_WASMTIME_ARGS="-S http,inherit-network" nexus build foo.nx -o out.wasm
+NEXUS_WASMTIME_ARGS="--dir=/data" nexus build foo.nx -o out.wasm # extra `wasmtime run` args
 ```
 
 The committed `nexus.wasm` at the repo root is the Stage0 seed of the self-host. Any change under `src/**` or `nxlib/**` must regenerate it via `./bootstrap.sh`, and the new `nexus.wasm` must land in the same commit. CI enforces `nexus.wasm == stage1.wasm`.
@@ -152,11 +155,12 @@ nexus lsp                           # start Language Server (stdio)
 nexus help                          # full subcommand listing
 ```
 
-Compiled programs run under wasmtime with the caps they declare:
+Compiled programs run under wasmtime with the wasm proposals the stdlib uses plus the caps they declare. `nexus build --explain-capabilities wasmtime` prints the exact command for a program:
 
 ```bash
-wasmtime run -Scli main.wasm
-wasmtime run -Scli -Shttp -Sinherit-network -Sallow-ip-name-lookup -Stcp main.wasm
+wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y main.wasm
+wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. main.wasm   # PermFs
+wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y -S inherit-network main.wasm   # PermNet
 ```
 
 ## Example
