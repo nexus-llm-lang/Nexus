@@ -30,8 +30,11 @@ trailing newline) — never format that file.
 ./bootstrap.sh --ci                     # also, when src/ changed (stage0 -> stage2 + seed match)
 ```
 
-Push only when these pass on a clean tree. If the seed changed, commit the
-regenerated seed separately (`build: regenerate the self-hosted seed`).
+Push only when these pass on a clean tree.
+
+Any change under `src/**` or `nxlib/**` must regenerate the seed with
+`./bootstrap.sh`, and the new `nexus.wasm` (and `nexus` launcher) must land in
+the same commit as that change (see README).
 
 ### Session completion
 
