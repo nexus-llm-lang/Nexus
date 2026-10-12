@@ -113,7 +113,7 @@ let main = fn () -> unit require { PermNet, PermConsole } do
 end
 ```
 
-The `require { PermNet, PermConsole }` clause is checked at build time and enforced again at the WASI runtime level. A function may do network I/O only when it declares `PermNet` and a handler is injected.
+The `require { PermNet, PermConsole }` clause is checked at build time and enforced again at the WASI runtime level. Only `main` declares `Perm*` permissions; other functions and handlers declare the caps they call (`require { Net }`), and a handler for each cap must be injected around the call.
 
 ## Building
 

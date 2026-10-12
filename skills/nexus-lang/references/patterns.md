@@ -357,7 +357,7 @@ braces, never as a bare type identifier:
 
 ```nexus
 // CORRECT — required row
-let logger_handler = handler Logger require { PermConsole } do
+let logger_handler = handler Logger require { Console } do
   fn info(msg: string) -> unit do
     Console.println(val: msg)
   end

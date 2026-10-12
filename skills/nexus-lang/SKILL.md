@@ -249,7 +249,7 @@ cap Logger do                              // declare the capability (interface)
   fn log(msg: string) -> unit
 end
 
-let console_logger = handler Logger require { PermConsole } do   // implement it
+let console_logger = handler Logger require { Console } do       // implement it
   fn log(msg: string) -> unit do
     Console.println(val: "[LOG] " ++ msg)
     return ()
@@ -262,8 +262,10 @@ let greet = fn (name: string) -> unit require { Logger } do      // depend on th
 end
 
 let main = fn () -> unit require { PermConsole } do
-  inject stdio.system_handler, console_logger do                // supply handler(s)
-    greet(name: "World")
+  inject stdio.system_handler do                                 // Console from PermConsole
+    inject console_logger do                                     // Logger from Console
+      greet(name: "World")
+    end
   end
   return ()
 end
