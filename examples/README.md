@@ -3,6 +3,8 @@
 Minimal, runnable demonstrations of Nexus features. Each file is
 self-contained; build any one with `nexus build <path> -o out.wasm` and
 execute it with `wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. out.wasm`.
+Examples that use `Net` run only as a component; their headers give the
+`--p2-component` build and run command.
 
 This corpus is **positive-only** — every file here compiles and runs.
 Intentionally-broken snippets used as compiler regression tests live

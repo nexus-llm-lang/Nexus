@@ -12,10 +12,10 @@ against [`index.schema.json`](./index.schema.json)).
 
 | Directory | Purpose | Count |
 | --- | --- | --- |
-| `examples/` (root) | Historical end-to-end samples (hello, fib, bench) | 7 |
-| `examples/feature/` | One minimal example per language feature / stdlib module | 38 |
+| `examples/` (root) | Historical end-to-end samples (hello, fib, ...) | 6 |
+| `examples/feature/` | One minimal example per language feature / stdlib module (`bench_*.nx` are `nexus bench` inputs and not indexed) | 40 |
 
-Total: **45 examples**.
+Total: **46 examples**.
 
 ## How to use
 
@@ -35,6 +35,7 @@ Total: **45 examples**.
 | [`feature/effects_console_fs.nx`](./feature/effects_console_fs.nx) | Two caps in one function (`require { Console, Fs }`) |
 | [`feature/linear_consume.nx`](./feature/linear_consume.nx) | `%`-prefixed linear bindings, consumed exactly once |
 | [`feature/linear_borrow.nx`](./feature/linear_borrow.nx) | `&` borrow — read without consuming the linear handle |
+| [`feature/linear_thread.nx`](./feature/linear_thread.nx) | Thread a linear value through a recursive accumulator |
 | [`feature/match_basics.nx`](./feature/match_basics.nx) | The four core `match` shapes (literal / record / list / ctor) |
 | [`feature/match_guards_or.nx`](./feature/match_guards_or.nx) | Arm guards (`when ...`) and or-patterns |
 | [`feature/match_nested.nx`](./feature/match_nested.nx) | Sum-of-product nested destructure |
@@ -50,6 +51,7 @@ Total: **45 examples**.
 | [`feature/import_forms.nx`](./feature/import_forms.nx) | Named / wildcard / combined `import` shapes |
 | [`feature/if_expression.nx`](./feature/if_expression.nx) | `if` is a value-producing expression |
 | [`feature/recursive_loop.nx`](./feature/recursive_loop.nx) | Tail-recursive accumulator (no `for` / `while`) |
+| [`feature/ffi.nx`](./feature/ffi.nx) | `import external` + `external` host bindings |
 
 ### stdlib modules
 
@@ -94,5 +96,5 @@ comment).
 The structured index lives at [`index.json`](./index.json). It is validated
 against [`index.schema.json`](./index.schema.json) (JSON Schema draft
 2020-12). Adding a new example requires appending an entry; the
-runner-side check (in CI) ensures every `.nx` under `examples/` is
+`examples-smoke` CI job ensures every `.nx` under `examples/` is
 indexed and that no index entry references a missing file.
