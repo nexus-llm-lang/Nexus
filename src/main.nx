@@ -15,7 +15,7 @@ import {
   WriteFailed,
   ParseErrorsCollected,
   InTargetFile,
-  NetRequiresP2Component,
+  NetRequiresComponent,
   format_summary_json
 }, * as err from "src/diagnostics/error.nx"
 import { get_defs, dump_import_graph } from "src/ir/shared/imports.nx"
@@ -101,7 +101,6 @@ import { make_lint_build_policy, run_lint_on_build_traced } from "src/cli/lint_o
 import { print_parse_diags, print_build_result } from "src/cli/output.nx"
 import { HirBuildResult, CapsWriteResult,
          build_hir, str_nth, resolve_output_path, write_emit,
-         write_emit_p3_component, write_emit_p3_component_raw,
          write_emit_p2_component, Job, job_worker, build_caps_and_write } from "src/pipeline.nx"
 import { run_ast_dump_subcommand, run_hir_dump_subcommand, run_lir_dump_subcommand,
          run_types_dump_subcommand, run_caps_dump_subcommand } from "src/cli/dump_runners.nx"
@@ -157,14 +156,14 @@ let uses_net_bridge = fn (prog: HirProgram) -> bool do
   end)
 end
 
-/** Raise NetRequiresP2Component when `prog` uses Net outside a
- *  --p2-component build. */
+/** Raise NetRequiresComponent when `prog` uses Net outside a
+ *  --p2-component / --p3-component build. */
 let check_net_target = fn (
   prog: HirProgram,
-  p2_component: bool
-) -> unit throws { NetRequiresP2Component } do
-  if !p2_component && uses_net_bridge(prog) then
-    throw NetRequiresP2Component
+  component: bool
+) -> unit throws { NetRequiresComponent } do
+  if !component && uses_net_bridge(prog) then
+    throw NetRequiresComponent
   end
   return ()
 end
@@ -393,6 +392,8 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
       lint_level_error,
       deny: deny_codes
     ) = gf
+    // A p3 component carries the same WASI wiring as a p2 component.
+    let wasi_component = p2_component_enabled || p3_component_enabled
     let ParsedTestSubcommand(
       remaining: args_after_test,
       is_test
@@ -665,7 +666,7 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
           functions: expanded_fs,
           handler_bindings: injected_hb,
           seen: reach.collect_reachable_set(functions: expanded_fs, handler_bindings: injected_hb),
-          report_uncaught: !(p3_component_enabled || p2_component_enabled)
+          report_uncaught: !wasi_component
         )
         let final_reach = map.keys(m: final_set)
         let final_fs = reach.filter_reachable_functions_set(
@@ -688,16 +689,13 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
     end
     let t4b = Clock.now()
     if verbose then Console.eprintln(val: "[nexus] resolve (" ++ str.from_i64(val: t4b - t4) ++ "ms)") end
-    check_net_target(prog: hir_resolved, p2_component: p2_component_enabled)
+    check_net_target(prog: hir_resolved, component: wasi_component)
 
     let hir_canon = canon_match.canonicalize_program(prog: hir_resolved, reorder: true)
     let t4bc = Clock.now()
     if verbose then Console.eprintln(val: "[nexus] canonicalize-match (" ++ str.from_i64(val: t4bc - t4b) ++ "ms)") end
 
-    let hir = main_wrap.wrap_main_if_needed_opts(
-      prog: hir_canon,
-      component_target: p3_component_enabled || p2_component_enabled
-    )
+    let hir = main_wrap.wrap_main_if_needed_opts(prog: hir_canon, component_target: wasi_component)
 
     // Spec §Linearity (type-formation): let-annotation wf check on bodies
     // post-resolve, where LazyBody has been flipped to EagerBody. Must fire
@@ -748,7 +746,7 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
     let hir_for_tc_canon = canon_match.canonicalize_program(prog: hir_for_tc, reorder: false)
     let hir_for_tc_w = main_wrap.wrap_main_if_needed_opts(
       prog: hir_for_tc_canon,
-      component_target: p3_component_enabled || p2_component_enabled
+      component_target: wasi_component
     )
     let tc_import_index = iidx.build_module_import_index(
       cache: tc_import_cache,
@@ -897,7 +895,7 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
     end
 
     let str_base = 32
-    let coverage_flag = (if coverage_enabled then 1 else 0 end) | (if p3_component_enabled then 4 else 0 end) | (if p2_component_enabled then 8 else 0 end)
+    let coverage_flag = (if coverage_enabled then 1 else 0 end) | (if wasi_component then 8 else 0 end)
     let memo_unsafe_names = memo_plan.collect_memo_unsafe_names(mir: mir)
     let %wasm_buf_raw = codegen_then_free_effect_map(program: lir_opt, string_data_base: str_base,
                                                   effect_map: %effect_map,
@@ -920,7 +918,7 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
       Console.eprintln(val: "[nexus] ext-wasm-merge (" ++ str.from_i64(val: t9b - t9) ++ "ms)")
     end
 
-    let CapsWriteResult(caps: caps, ok: ok) = if p2_component_enabled then
+    let CapsWriteResult(caps: caps, ok: ok) = if wasi_component then
         // Streaming heap-reset strategy (mirrors the P3 path):
         // Writing the core wasm to a temp file before the heap_reset ensures
         // the bytes survive the bump-pointer rewind.  After heap_reset the bump
@@ -950,16 +948,6 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
           output_path
         )
         Fs.remove_file(path: temp_core_path)
-        CapsWriteResult(caps: caps_now, ok: ok_now)
-      else if p3_component_enabled then
-        // Streaming component-model write: capture the raw wasm ptr/len, free the
-        // ByteBuffer handle, then stream component sections to fd.  arena.heap_reset
-        // happens unconditionally below AFTER the write, so cw_ptr stays valid here.
-        let caps_now = find_main_caps(defs: get_defs(prog))
-        let cw_ptr = bb.raw_data_ptr(buf: &wasm_buf)
-        let cw_len = bb.length(buf: &wasm_buf)
-        bb.free(buf: %wasm_buf)
-        let ok_now = write_emit_p3_component_raw(core_ptr: cw_ptr, core_len: cw_len, output_path)
         CapsWriteResult(caps: caps_now, ok: ok_now)
       else
         // Submit/await under the `Job` cap: the cap-extraction thunk is forced

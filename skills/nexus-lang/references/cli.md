@@ -36,7 +36,7 @@ Determinism hooks are read from the environment at runtime:
 | `--coverage` | emit coverage counters and custom section |
 | `--profile-out VALUE` | write per-call-site profile JSONL to FILE (static const-arg analysis) |
 | `--dump-imports` | print the import graph and exit |
-| `--p3-component` | wrap output in a component model binary with future<T> canon ABI |
+| `--p3-component` | wrap output in a WASI component binary run with wasmtime -S p3=y |
 | `--p2-component` | wrap output in a WASI preview2 component binary (wasi:cli/run@0.2.0) |
 | `--verbose` | enable per-pass timing output |
 | `--format VALUE` | diagnostic format (text|json) |
