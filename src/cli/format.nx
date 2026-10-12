@@ -94,103 +94,89 @@ export let find_main_caps = fn (defs: [ SpannedTopLevel ]) -> [ string ] do
   end
 end
 
-let cap_wasmtime_flags = fn (name: string) -> [ string ] do
-  // Net: only `-S inherit-network` is safe on the preview1 core wasm we
-  // emit; `-S http` (wasi-http) requires a preview2 component and would
-  // fail at startup with "Cannot enable wasi-http for core wasm modules"
-  // Until a preview2 bridge lands the stdlib HTTP primitives
-  // are stubs anyway (see nxlib/stdlib/network.nx), so this flag is mostly
-  // a marker that the program touches the network.
-  if name == "Net" then return ["--wasi", "inherit-network"] end
-  if name == "Fs" then return ["--dir", "."] end
+/** Output shape of a build, which decides the `wasmtime run` flags. */
+export type RunTarget = RunCore | RunP2Component | RunP3Component
+
+/** Target for the build flags `--p2-component` / `--p3-component`. */
+export let run_target = fn (p2_component: bool, p3_component: bool) -> RunTarget do
+  if p3_component then return RunP3Component end
+  if p2_component then return RunP2Component end
+  return RunCore
+end
+
+/** Per-cap `wasmtime run` flags. Net is satisfied only by a component build
+ *  (`wasi:http` client, `wasi:sockets` server), so a core build gets no Net flag.
+ */
+let cap_wasmtime_flags = fn (name: string, target: RunTarget) -> [ string ] do
+  if name == "Fs" then return [ "--dir", "." ] end
+  if name == "Net" then
+    match target do
+      | RunCore -> return []
+      | _ -> return [ "-S", "http", "-S", "inherit-network" ]
+    end
+  end
   return []
 end
 
-let collect_all_wasmtime_flags = fn (caps: [ string ]) -> [ string ] do
+let collect_all_wasmtime_flags = fn (caps: [ string ], target: RunTarget) -> [ string ] do
   match caps do
     | [] -> return []
     | c :: rest -> return list.concat(
-      xs: cap_wasmtime_flags(name: c),
-      ys: collect_all_wasmtime_flags(caps: rest)
+      xs: cap_wasmtime_flags(name: c, target),
+      ys: collect_all_wasmtime_flags(caps: rest, target)
     )
   end
 end
 
-/** Wasm proposals required at runtime. The inlined stdlib uses every one of
- *  these (TCO, throw/throws, closures, handlers, threads/atomics for `@`), so
- *  emit them all whenever wasmtime mode is selected — detection on the user's
- *  AST alone would underreport because stdlib brings them in regardless.
+/** Wasm proposals required at runtime. For a core build the inlined stdlib
+ *  uses every one of these (TCO, throw/throws, closures, handlers,
+ *  threads/atomics for `@`), so all are emitted regardless of the user's AST.
  */
-export let wasmtime_feature_flags = fn () -> [ string ] do
-  return [
-    "-W",
-    "tail-call=y",
-    "-W",
-    "exceptions=y",
-    "-W",
-    "function-references=y",
-    "-W",
-    "stack-switching=y",
-    "-W",
-    "threads=y"
-  ]
-end
-
-let quote_strings = fn (xs: [ string ]) -> [ string ] do
-  match xs do
-    | [] -> return []
-    | v :: rest -> return ("\"" ++ v ++ "\"") :: quote_strings(xs: rest)
+let wasmtime_feature_flags = fn (target: RunTarget) -> [ string ] do
+  match target do
+    | RunCore ->
+      return [
+        "-W",
+        "tail-call=y",
+        "-W",
+        "exceptions=y",
+        "-W",
+        "function-references=y",
+        "-W",
+        "stack-switching=y",
+        "-W",
+        "threads=y"
+      ]
+    | RunP2Component -> return [ "-W", "component-model=y", "-W", "exceptions=y" ]
+    | RunP3Component ->
+      return [
+        "-W",
+        "component-model=y",
+        "-W",
+        "component-model-async=y",
+        "-W",
+        "exceptions=y",
+        "-S",
+        "p3=y"
+      ]
   end
 end
 
-export let build_run_cmd = fn (output_name: string, caps: [ string ]) -> string do
-  let feat_flags = wasmtime_feature_flags()
-  let cap_flags = collect_all_wasmtime_flags(caps)
-  let argv = list.concat(xs: feat_flags, ys: list.concat(xs: cap_flags, ys: [ output_name ]))
+/** Every `wasmtime run` flag for a build: proposals, then per-cap flags. */
+export let wasmtime_run_flags = fn (caps: [ string ], target: RunTarget) -> [ string ] do
+  return list.concat(
+    xs: wasmtime_feature_flags(target),
+    ys: collect_all_wasmtime_flags(caps, target)
+  )
+end
+
+export let build_run_cmd = fn (
+  output_name: string,
+  caps: [ string ],
+  target: RunTarget
+) -> string do
+  let argv = list.concat(xs: wasmtime_run_flags(caps, target), ys: [ output_name ])
   return "wasmtime run " ++ str.join(xs: argv, sep: " ")
-end
-
-export let print_build_result_text = fn (
-  output_name: string,
-  caps: [ string ],
-  explain: ExplainCaps
-) -> unit require { Console } do
-  Console.eprintln(val: "Built " ++ output_name)
-  match explain do
-    | ExplainNone -> return ()
-    | ExplainYes ->
-      if !list.is_empty(xs: caps) then
-        Console.eprintln(val: "Capabilities: " ++ str.join(xs: caps, sep: ", "))
-      end
-    | ExplainWasmtime ->
-      if !list.is_empty(xs: caps) then
-        Console.eprintln(val: "Capabilities: " ++ str.join(xs: caps, sep: ", "))
-      end
-      Console.eprintln(val: "Run: " ++ build_run_cmd(output_name, caps))
-  end
-end
-
-export let print_build_result_json = fn (
-  output_name: string,
-  caps: [ string ],
-  explain: ExplainCaps
-) -> unit require { Console } do
-  match explain do
-    | ExplainNone ->
-      Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\"}")
-    | ExplainYes ->
-      let caps_quoted = quote_strings(xs: caps)
-      Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\",\"capabilities\":[" ++ str.join(xs: caps_quoted, sep: ",") ++ "]}")
-    | ExplainWasmtime ->
-      let caps_quoted = quote_strings(xs: caps)
-      let all_flags = list.concat(
-        xs: wasmtime_feature_flags(),
-        ys: collect_all_wasmtime_flags(caps)
-      )
-      let flags_quoted = quote_strings(xs: all_flags)
-      let cmd = build_run_cmd(output_name, caps)
-      Console.eprintln(val: "{\"file\":\"" ++ output_name ++ "\",\"capabilities\":[" ++ str.join(xs: caps_quoted, sep: ",") ++ "],\"wasmtime\":{\"command\":\"" ++ cmd ++ "\",\"flags\":[" ++ str.join(xs: flags_quoted, sep: ",") ++ "]}}")
-  end
 end
 
 // Intentional narrow row for the option-parsing cluster below
