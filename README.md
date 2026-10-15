@@ -161,7 +161,10 @@ Compiled programs run under wasmtime with the wasm proposals the stdlib uses plu
 wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y main.wasm
 wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. main.wasm   # PermFs
 nexus build main.nx --p2-component -o main.wasm && wasmtime run -W component-model=y,exceptions=y -S http -S inherit-network main.wasm   # PermNet (component only)
+nexus build main.nx --p3-component -o main.wasm && wasmtime run -W component-model=y,component-model-async=y,component-model-async-stackful=y,exceptions=y,tail-call=y,function-references=y,stack-switching=y -S p3=y main.wasm   # async_io / Net coop_handler (add -S http -S inherit-network for Net)
 ```
+
+`--p3-component` builds export an async `wasi:cli/run@0.3.0`. Under it, `std:concurrency/async_io` (`sleep`, `clock_handler`, `force_all`) and `std:network.coop_handler` suspend only the calling Coop task, so sleeps and HTTP requests in different tasks overlap. These modules are rejected at compile time (E4008) for other build targets. This needs wasmtime's experimental `component-model-async-stackful`.
 
 ## Example
 
