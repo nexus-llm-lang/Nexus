@@ -797,13 +797,10 @@ if [ "$TEST_MODE" = "1" ]; then
 
     # ── p3_component fixture ───────────────────────────────────────────
     if [ "$P3C" = "1" ]; then
-      # `// p3c-auto` in the fixture builds it without --p3-component.
-      P3C_FLAG="--p3-component"
-      if grep -q -F -- "// p3c-auto" "$f"; then P3C_FLAG=""; fi
       t0=$(date +%s%N 2>/dev/null || date +%s000000000)
       if ! wasmtime run -W "$W_FLAGS" --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
-          ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" $P3C_FLAG --explain-capabilities none \
+          ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none \
           >/dev/null 2>"$elog"; then
         t1=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t1 - t0) / 1000000 ))
@@ -954,7 +951,7 @@ if [ "$TEST_MODE" = "1" ]; then
       t0=$(date +%s%N 2>/dev/null || date +%s000000000)
       if ! wasmtime run -W "$W_FLAGS" --dir=. --dir="$TMPDIR_REAL" \
           ${NEXUS_WASMTIME_ARGS:-} \
-          ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --p2-component --explain-capabilities none \
+          ${TC_CACHE_ENV:-} "$PAYLOAD_WASM" build "$f" -o "$wasm" --explain-capabilities none \
           >/dev/null 2>"$elog"; then
         t1=$(date +%s%N 2>/dev/null || date +%s000000000)
         ms=$(( (t1 - t0) / 1000000 ))

@@ -164,7 +164,7 @@ nexus build main.nx -o main.wasm && wasmtime run -W component-model=y,exceptions
 nexus build main.nx -o main.wasm && wasmtime run -W component-model=y,component-model-async=y,component-model-async-stackful=y,exceptions=y,tail-call=y,function-references=y,stack-switching=y -S p3=y main.wasm   # async_io / Net coop_handler (add -S http -S inherit-network for Net)
 ```
 
-`nexus build` picks the output target from what the program reaches. A program that uses Net builds as a p2 component. A program that uses `std:concurrency/async_io` (`sleep`, `clock_handler`, `force_all`) or `std:network.coop_handler` builds as a p3 component, which exports an async `wasi:cli/run@0.3.0`. Those APIs suspend only the calling Coop task, so sleeps and HTTP requests in different tasks overlap. A p3 component needs wasmtime's experimental `component-model-async-stackful`. `--p2-component` and `--p3-component` force a component build.
+`nexus build` picks the output target from what the program reaches. A program that uses Net builds as a p2 component. A program that uses `std:concurrency/async_io` (`sleep`, `clock_handler`, `force_all`) or `std:network.coop_handler` builds as a p3 component, which exports an async `wasi:cli/run@0.3.0`. Those APIs suspend only the calling Coop task, so sleeps and HTTP requests in different tasks overlap. A p3 component needs wasmtime's experimental `component-model-async-stackful`.
 
 ## Example
 

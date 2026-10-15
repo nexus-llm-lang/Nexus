@@ -16,7 +16,7 @@ These flags apply to every subcommand. Per-subcommand flags live under each subc
 
 **Synopsis**
 
-    nexus build <input.nx> [-o <output.wasm>] [--coverage] [--profile-out FILE] [--p3-component] [--p2-component]
+    nexus build <input.nx> [-o <output.wasm>] [--coverage] [--profile-out FILE]
 
 Compile a Nexus source file to a self-contained WebAssembly module.
 The full pipeline runs (parse, resolve, HIR/MIR/LIR, codegen, link, merge) and
@@ -36,8 +36,6 @@ Determinism hooks are read from the environment at runtime:
 | `--coverage` | emit coverage counters and custom section |
 | `--profile-out VALUE` | write per-call-site profile JSONL to FILE (static const-arg analysis) |
 | `--dump-imports` | print the import graph and exit |
-| `--p3-component` | force a WASI p3 component (wasmtime -S p3=y); chosen automatically when the program uses std:concurrency/async_io or std:network.coop_handler |
-| `--p2-component` | force a WASI preview2 component (wasi:cli/run@0.2.0); chosen automatically when the program uses Net |
 | `--verbose` | enable per-pass timing output |
 | `--format VALUE` | diagnostic format (text|json) |
 | `--explain-capabilities VALUE` | capability reporting (yes|none|wasmtime) |
