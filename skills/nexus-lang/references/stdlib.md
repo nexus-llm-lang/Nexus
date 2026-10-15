@@ -10,7 +10,7 @@ The standard library is the `std` package, rooted at `nxlib/stdlib/`. Every modu
 |-------------|--------|-----------------|---------|
 | `"std:stdio"` | [io/stdio.nx](../../../nxlib/stdlib/io/stdio.nx) | `Console` cap (`println`, `eprintln`, `read_line`), `system_handler` | [effects_console_fs.nx](../../../examples/feature/effects_console_fs.nx) |
 | `"std:fs"` | [io/fs.nx](../../../nxlib/stdlib/io/fs.nx) | `Fs` cap (`read_to_string`, `write_string`, `exists`, fd-based I/O), `FsThrow` group | [effects_console_fs.nx](../../../examples/feature/effects_console_fs.nx) |
-| `"std:network"` | [io/network.nx](../../../nxlib/stdlib/io/network.nx) | `Net` cap, `Request`/`Response`/`Server` types, HTTP client + listener; `coop_handler` (--p3-component: requests of `std:concurrency/coop` tasks overlap) | [network_request.nx](../../../examples/feature/network_request.nx) |
+| `"std:network"` | [io/network.nx](../../../nxlib/stdlib/io/network.nx) | `Net` cap, `Request`/`Response`/`Server` types, HTTP client + listener; `coop_handler` (builds as a p3 component: requests of `std:concurrency/coop` tasks overlap) | [network_request.nx](../../../examples/feature/network_request.nx) |
 | `"std:proc"` | [io/proc.nx](../../../nxlib/stdlib/io/proc.nx) | `Proc` cap (`exit`, `argv`, `exec`) | [proc_argv.nx](../../../examples/feature/proc_argv.nx) |
 | `"std:env"` | [io/env.nx](../../../nxlib/stdlib/io/env.nx) | `Env` cap (`get_env`, `has_env`, `set_env`) | [env_basics.nx](../../../examples/feature/env_basics.nx) |
 | `"std:clock"` | [io/clock.nx](../../../nxlib/stdlib/io/clock.nx) | `Clock` cap (`now`, `sleep`) | [clock_basics.nx](../../../examples/feature/clock_basics.nx) |
@@ -31,7 +31,7 @@ The standard library is the `std` package, rooted at `nxlib/stdlib/`. Every modu
 | `"std:exn"` | [core/exn.nx](../../../nxlib/stdlib/core/exn.nx) | Exception helpers, `todo()`, `backtrace()` | [exn_todo.nx](../../../examples/feature/exn_todo.nx) |
 | `"std:core"` | [core/core.nx](../../../nxlib/stdlib/core/core.nx) | `id` (polymorphic identity) | — |
 | `"std:lazy"` | [concurrency/lazy.nx](../../../nxlib/stdlib/concurrency/lazy.nx) | `force_all` (forces thunks in order, sequentially), `race`/`cancel`/`detach` | [lazy_force_all.nx](../../../examples/feature/lazy_force_all.nx) |
-| `"std:concurrency/async_io"` | [concurrency/async_io.nx](../../../nxlib/stdlib/concurrency/async_io.nx) | --p3-component only: `sleep`, `clock_handler` (`Clock` whose sleeps of `std:concurrency/coop` tasks overlap), `force_all` (each thunk in its own coop task) | — |
+| `"std:concurrency/async_io"` | [concurrency/async_io.nx](../../../nxlib/stdlib/concurrency/async_io.nx) | builds as a p3 component: `sleep`, `clock_handler` (`Clock` whose sleeps of `std:concurrency/coop` tasks overlap), `force_all` (each thunk in its own coop task) | — |
 | `"std:concurrency/task"` | [concurrency/task.nx](../../../nxlib/stdlib/concurrency/task.nx) | `host_spawn(@T) -> %Task<T>`, `host_join(%Task<T>) -> T` (forced at the join) | [lazy_force_all.nx](../../../examples/feature/lazy_force_all.nx) |
 | `"std:json"` | [encoding/json.nx](../../../nxlib/stdlib/encoding/json.nx) | `parse`, `serialize`, `get_field`, `JsonValue` algebra | [json_basics.nx](../../../examples/feature/json_basics.nx) |
 | `"std:jsonrpc"` | [encoding/jsonrpc.nx](../../../nxlib/stdlib/encoding/jsonrpc.nx) | JSON-RPC 2.0 framing — `frame_message`/`unframe_one`, `read_message`/`write_message` | — |

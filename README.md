@@ -160,11 +160,11 @@ Compiled programs run under wasmtime with the wasm proposals the stdlib uses plu
 ```bash
 wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y main.wasm
 wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. main.wasm   # PermFs
-nexus build main.nx --p2-component -o main.wasm && wasmtime run -W component-model=y,exceptions=y -S http -S inherit-network main.wasm   # PermNet (component only)
-nexus build main.nx --p3-component -o main.wasm && wasmtime run -W component-model=y,component-model-async=y,component-model-async-stackful=y,exceptions=y,tail-call=y,function-references=y,stack-switching=y -S p3=y main.wasm   # async_io / Net coop_handler (add -S http -S inherit-network for Net)
+nexus build main.nx -o main.wasm && wasmtime run -W component-model=y,exceptions=y -S http -S inherit-network main.wasm   # PermNet (component only)
+nexus build main.nx -o main.wasm && wasmtime run -W component-model=y,component-model-async=y,component-model-async-stackful=y,exceptions=y,tail-call=y,function-references=y,stack-switching=y -S p3=y main.wasm   # async_io / Net coop_handler (add -S http -S inherit-network for Net)
 ```
 
-`--p3-component` builds export an async `wasi:cli/run@0.3.0`. Under it, `std:concurrency/async_io` (`sleep`, `clock_handler`, `force_all`) and `std:network.coop_handler` suspend only the calling Coop task, so sleeps and HTTP requests in different tasks overlap. These modules are rejected at compile time (E4008) for other build targets. This needs wasmtime's experimental `component-model-async-stackful`.
+`nexus build` picks the output target from what the program reaches. A program that uses Net builds as a p2 component. A program that uses `std:concurrency/async_io` (`sleep`, `clock_handler`, `force_all`) or `std:network.coop_handler` builds as a p3 component, which exports an async `wasi:cli/run@0.3.0`. Those APIs suspend only the calling Coop task, so sleeps and HTTP requests in different tasks overlap. A p3 component needs wasmtime's experimental `component-model-async-stackful`. `--p2-component` and `--p3-component` force a component build.
 
 ## Example
 
@@ -190,7 +190,7 @@ end
 
 The [examples](./examples) folder ships minimal, runnable demos of every language surface. The demos cover linear types and borrowing, mutable references, generics, pattern matching, exceptions, caps and handlers, lazy evaluation, and FFI.
 
-Each file builds on its own with `nexus build` and runs under wasmtime (`wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. out.wasm`; examples using `Net` need a `--p2-component` build). The README inside that folder gives an indexed listing.
+Each file builds on its own with `nexus build` and runs under wasmtime (`wasmtime run -W tail-call=y,exceptions=y,function-references=y,stack-switching=y,threads=y --dir=. out.wasm`; examples using `Net` build as components and run with the component flags above). The README inside that folder gives an indexed listing.
 
 ## AI coding agent support
 

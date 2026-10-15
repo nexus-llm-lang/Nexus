@@ -15,8 +15,6 @@ import {
   WriteFailed,
   ParseErrorsCollected,
   InTargetFile,
-  NetRequiresComponent,
-  RequiresP3Component,
   format_summary_json
 }, * as err from "src/diagnostics/error.nx"
 import { get_defs, dump_import_graph } from "src/ir/shared/imports.nx"
@@ -128,20 +126,8 @@ let str_list_has = fn (xs: [ string ], s: string) -> bool do
   end
 end
 
-/** True when an external of `prog` imports from the core module `module`. */
-let uses_import_module = fn (prog: HirProgram, module: string) -> bool do
-  let HirProgram(
-    caps: _,
-    functions: _,
-    externals,
-    handler_bindings: _,
-    enum_defs: _,
-    exception_groups: _,
-    value_binding_names: _,
-    type_defs: _,
-    visible_enum_names: _,
-    ext_wasm_deps: _
-  ) = prog
+/** True when one of `externals` imports from the core module `module`. */
+let uses_import_module = fn (externals: [ HirExternal ], module: string) -> bool do
   return list.any(xs: externals, p: fn (val: HirExternal) -> bool do
     let HirExternal(
       name: _,
@@ -154,23 +140,6 @@ let uses_import_module = fn (prog: HirProgram, module: string) -> bool do
     ) = val
     return wasm_module == module
   end)
-end
-
-/** Raise NetRequiresComponent when `prog` uses Net outside a
- *  --p2-component / --p3-component build, and RequiresP3Component when it uses
- *  a `nexus_p3` API outside a --p3-component build. */
-let check_import_target = fn (
-  prog: HirProgram,
-  component: bool,
-  p3_component: bool
-) -> unit throws { NetRequiresComponent, RequiresP3Component } do
-  if !component && uses_import_module(prog, module: "nexus_net") then
-    throw NetRequiresComponent
-  end
-  if !p3_component && uses_import_module(prog, module: "nexus_p3") then
-    throw RequiresP3Component
-  end
-  return ()
 end
 
 /** `prog` with the functions of `all` that are named in `local_names` but
@@ -391,14 +360,12 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
       coverage: coverage_enabled,
       profile_out,
       dump_imports: dump_imports_flag,
-      p3_component: p3_component_enabled,
-      p2_component: p2_component_enabled,
+      p3_component: p3_component_flag,
+      p2_component: p2_component_flag,
       no_lint,
       lint_level_error,
       deny: deny_codes
     ) = gf
-    // A p3 component carries the same WASI wiring as a p2 component.
-    let wasi_component = p2_component_enabled || p3_component_enabled
     let ParsedTestSubcommand(
       remaining: args_after_test,
       is_test
@@ -636,6 +603,42 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
           visible_enum_names: _, ext_wasm_deps: _) ->
         expand_groups_in_handler_bindings(bindings: hb, groups: heg)
     end
+    // Handler bindings named by an `inject` stmt reachable from `main`. Only
+    // their arm functions are lowered, so their callees are emitted, and host
+    // imports of unused capabilities (e.g. `nexus_net::http_request` when Net
+    // is unused) are excluded.
+    let injected_hb = reach.filter_reachable_handler_bindings(
+      bindings: all_hb,
+      reachable: reach.collect_reachable_from_main(
+        functions: all_expanded,
+        handler_bindings: all_hb
+      )
+    )
+    let reach_seen = reach.collect_reachable_set(
+      functions: all_expanded,
+      handler_bindings: injected_hb
+    )
+    // The build target follows the host modules the reachable externals import:
+    // `nexus_p3` only a p3 component provides, `nexus_net` any component.
+    let all_exts = match hir_raw do
+      | HirProgram(caps: _, functions: _, externals: he, handler_bindings: _,
+          enum_defs: _, exception_groups: _, value_binding_names: _, type_defs: _,
+          visible_enum_names: _, ext_wasm_deps: _) ->
+        he
+    end
+    let used_exts = reach.filter_reachable_externals(
+      externals: all_exts,
+      reachable: map.keys(m: reach_seen)
+    )
+    let p3_component_enabled = p3_component_flag || uses_import_module(
+      externals: used_exts,
+      module: "nexus_p3"
+    )
+    // A p3 component carries the same WASI wiring as a p2 component.
+    let wasi_component = p3_component_enabled
+      || p2_component_flag
+      || uses_import_module(externals: used_exts, module: "nexus_net")
+    let p2_component_enabled = wasi_component && !p3_component_enabled
     let hir_resolved = match hir_raw do
       | HirProgram(
         caps: hp,
@@ -649,32 +652,15 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
         visible_enum_names: hven,
         ext_wasm_deps: hewds
       ) ->
-        let expanded_fs = all_expanded
-        let expanded_hb = all_hb
-        // Compute which handler bindings are actually used — those named by an
-        // `inject` stmt reachable from `main`.  This reachable set is used to:
-        //   1. Filter handler bindings for MIR: only used handlers' arm functions
-        //      are lowered, so their callees (w_fd_close, etc.) are transitively
-        //      included in final_reach and emitted by codegen.
-        //   2. Exclude host imports for capabilities never used (e.g.
-        //      `nexus_net::http_request` when Net is unused).
-        let injected_reach = reach.collect_reachable_from_main(
-          functions: expanded_fs,
-          handler_bindings: expanded_hb
-        )
-        let injected_hb = reach.filter_reachable_handler_bindings(
-          bindings: expanded_hb,
-          reachable: injected_reach
-        )
         let final_set = reach.with_runtime_helpers(
-          functions: expanded_fs,
+          functions: all_expanded,
           handler_bindings: injected_hb,
-          seen: reach.collect_reachable_set(functions: expanded_fs, handler_bindings: injected_hb),
+          seen: reach_seen,
           report_uncaught: !wasi_component
         )
         let final_reach = map.keys(m: final_set)
         let final_fs = reach.filter_reachable_functions_set(
-          functions: expanded_fs,
+          functions: all_expanded,
           reachable: final_set
         )
         let filtered_exts = reach.filter_reachable_externals(externals: he, reachable: final_reach)
@@ -693,11 +679,6 @@ let main = fn (args: [ string ]) -> unit require { PermClock, PermConsole, PermF
     end
     let t4b = Clock.now()
     if verbose then Console.eprintln(val: "[nexus] resolve (" ++ str.from_i64(val: t4b - t4) ++ "ms)") end
-    check_import_target(
-      prog: hir_resolved,
-      component: wasi_component,
-      p3_component: p3_component_enabled
-    )
 
     let hir_canon = canon_match.canonicalize_program(prog: hir_resolved, reorder: true)
     let t4bc = Clock.now()
