@@ -812,8 +812,13 @@ if [ "$TEST_MODE" = "1" ]; then
         exit 0
       fi
       t1=$(date +%s%N 2>/dev/null || date +%s000000000)
+      # `// p3c-http` in the fixture enables wasi:http and host networking.
+      P3C_HTTP=""
+      if grep -q -F -- "// p3c-http" "$f"; then
+        P3C_HTTP="-S http -S inherit-network"
+      fi
       if ! wasmtime run -W component-model=y,component-model-async=y,component-model-async-stackful=y,exceptions=y,tail-call=y,function-references=y,stack-switching=y \
-          -S p3=y --dir=. --dir="$scratch::/tmp" ${NEXUS_WASMTIME_ARGS:-} \
+          -S p3=y $P3C_HTTP --dir=. --dir="$scratch::/tmp" ${NEXUS_WASMTIME_ARGS:-} \
           "$wasm" \
           >/dev/null 2>"$elog"; then
         t2=$(date +%s%N 2>/dev/null || date +%s000000000)

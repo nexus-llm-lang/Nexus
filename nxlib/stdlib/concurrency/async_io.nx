@@ -1,13 +1,16 @@
 /**
  * std:concurrency/async_io: a sleep that suspends only the calling cooperative
  * task (`std:concurrency/coop`), so sleeps in different tasks overlap, and a
- * `Clock` handler built on it. Available only in a --p3-component build: the
+ * `Clock` handler built on it, and a `force_all` that forces each thunk in its
+ * own cooperative task. Available only in a --p3-component build: the
  * sleep starts `wasi:clocks/monotonic-clock@0.3.0#wait-for` as an async
  * subtask and waits for it through std:runtime/p3.
  */
 import { Clock, now_ms } from "std:clock"
-import { Coop } from "std:concurrency/coop"
-import { p3_wait_for, await_subtask, i64_of } from "std:runtime/p3"
+import { Coop, spawn } from "std:concurrency/coop"
+import * as mem from "std:runtime/mem"
+import { lazy_spawn, lazy_join, value_of_i64, value_to_i64 } from "std:runtime/lazy"
+import { p3_wait_for, await_count, await_subtask, i64_of, scratch } from "std:runtime/p3"
 
 /** Sleep `ms` milliseconds, letting other cooperative tasks run meanwhile. */
 export let sleep = fn (ms: i64) -> unit require { Coop } do
@@ -19,16 +22,56 @@ end
  *  inside a `std:concurrency/coop` scheduler. */
 export let clock_handler = handler Clock require { Coop, PermClock } do
   fn sleep(ms: i64) -> unit do
-    // `sleep` raises nothing, but its Coop.yield call is a cap call, which the
-    // no-throw analysis does not see through; Clock.sleep's row is closed.
-    try
-      sleep(ms)
-    catch _ ->
-      ()
-    end
-    return ()
+    return sleep(ms)
   end
   fn now() -> i64 do
     return now_ms()
   end
+end
+
+/** Force every thunk in its own cooperative task and return the results in
+ *  input order. Thunks whose waits go through these handlers (`clock_handler`,
+ *  std:network's `coop_handler`) overlap. */
+export let force_all = fn <T, R>(tasks: [ @(T require { |R }) ]) -> [ T ] require { Coop | R } do
+  // slots: [finished count, result 0, result 1, ...]
+  let slots = scratch(n: count(tasks: &tasks, acc: 0) + 1)
+  let n = spawn_forces(tasks, slots, i: 0)
+  await_count(cell: slots, n)
+  return collect(slots, i: n - 1, acc: [])
+end
+
+let count = fn <T, R>(tasks: &[ @(T require { |R }) ], acc: i64) -> i64 do
+  match tasks do
+    | [] -> return acc
+    | _ :: rest -> return count(tasks: rest, acc: acc + 1)
+  end
+end
+
+let spawn_forces = fn <T, R>(
+  tasks: [ @(T require { |R }) ],
+  slots: i64,
+  i: i64
+) -> i64 require { Coop | R } do
+  match tasks do
+    | [] -> return i
+    | t :: rest ->
+      // The thunk as its closure pointer, so the task closure captures an i64.
+      let id = lazy_spawn(a_thunk: t)
+      spawn(task: fn () -> unit do
+        let v: T = lazy_join(a_task: id)
+        mem.store_i64(addr: slots + 8 * (i + 1), val: value_to_i64(a_x: v))
+        mem.store_i64(addr: slots, val: mem.load_i64(addr: slots) + 1)
+        return ()
+      end)
+      return spawn_forces(tasks: rest, slots, i: i + 1)
+  end
+end
+
+let collect = fn <T>(slots: i64, i: i64, acc: [ T ]) -> [ T ] do
+  if i < 0 then return acc end
+  return collect(
+    slots,
+    i: i - 1,
+    acc: value_of_i64(a_x: mem.load_i64(addr: slots + 8 * (i + 1))) :: acc
+  )
 end

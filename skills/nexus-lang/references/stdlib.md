@@ -31,7 +31,7 @@ The standard library is the `std` package, rooted at `nxlib/stdlib/`. Every modu
 | `"std:exn"` | [core/exn.nx](../../../nxlib/stdlib/core/exn.nx) | Exception helpers, `todo()`, `backtrace()` | [exn_todo.nx](../../../examples/feature/exn_todo.nx) |
 | `"std:core"` | [core/core.nx](../../../nxlib/stdlib/core/core.nx) | `id` (polymorphic identity) | — |
 | `"std:lazy"` | [concurrency/lazy.nx](../../../nxlib/stdlib/concurrency/lazy.nx) | `force_all` (forces thunks in order, sequentially), `race`/`cancel`/`detach` | [lazy_force_all.nx](../../../examples/feature/lazy_force_all.nx) |
-| `"std:concurrency/async_io"` | [concurrency/async_io.nx](../../../nxlib/stdlib/concurrency/async_io.nx) | --p3-component only: `sleep` and `clock_handler` (`Clock` whose sleeps of `std:concurrency/coop` tasks overlap) | — |
+| `"std:concurrency/async_io"` | [concurrency/async_io.nx](../../../nxlib/stdlib/concurrency/async_io.nx) | --p3-component only: `sleep`, `clock_handler` (`Clock` whose sleeps of `std:concurrency/coop` tasks overlap), `force_all` (each thunk in its own coop task) | — |
 | `"std:concurrency/task"` | [concurrency/task.nx](../../../nxlib/stdlib/concurrency/task.nx) | `host_spawn(@T) -> %Task<T>`, `host_join(%Task<T>) -> T` (forced at the join) | [lazy_force_all.nx](../../../examples/feature/lazy_force_all.nx) |
 | `"std:json"` | [encoding/json.nx](../../../nxlib/stdlib/encoding/json.nx) | `parse`, `serialize`, `get_field`, `JsonValue` algebra | [json_basics.nx](../../../examples/feature/json_basics.nx) |
 | `"std:jsonrpc"` | [encoding/jsonrpc.nx](../../../nxlib/stdlib/encoding/jsonrpc.nx) | JSON-RPC 2.0 framing — `frame_message`/`unframe_one`, `read_message`/`write_message` | — |
