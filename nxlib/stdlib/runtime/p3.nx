@@ -1,0 +1,195 @@
+/**
+ * std:runtime/p3: the `nexus_p3` core instance of a --p3-component build
+ * (WASI 0.3 async calls, waitable sets, streams and futures) and a waiter that
+ * lets a std:concurrency/coop task wait for one waitable while the others run.
+ *
+ * While its waitable is pending, a task yields to the other ready tasks. When
+ * every queued task is itself waiting, it blocks in `waitable-set.wait`,
+ * records the event for the waitable that changed, and yields so that
+ * waitable's owner resumes.
+ */
+import external "nexus_p3"
+export external p3_wait_for = "wait-for" : (a_ns: i64) -> i32
+export external p3_ws_new = "ws-new" : () -> i32
+export external p3_ws_wait = "ws-wait" : (a_ws: i32, b_ptr: i32) -> i32
+export external p3_join = "join" : (a_w: i32, b_ws: i32) -> unit
+export external p3_subtask_drop = "st-drop" : (a_st: i32) -> unit
+export external p3_fields_new = "fields-new" : () -> i32
+export external p3_request_new = "request-new" : (
+  a_headers: i32,
+  b_contents_some: i32,
+  c_contents: i32,
+  d_trailers: i32,
+  e_options_some: i32,
+  f_options: i32,
+  g_ret: i32
+) -> unit
+export external p3_set_scheme = "set-scheme" : (
+  a_req: i32,
+  b_some: i32,
+  c_scheme: i32,
+  d_ptr: i32,
+  e_len: i32
+) -> i32
+export external p3_set_authority = "set-authority" : (
+  a_req: i32,
+  b_some: i32,
+  c_ptr: i32,
+  d_len: i32
+) -> i32
+export external p3_set_path = "set-path" : (a_req: i32, b_some: i32, c_ptr: i32, d_len: i32) -> i32
+export external p3_status_code = "status-code" : (a_resp: i32) -> i32
+export external p3_consume_body = "consume-body" : (a_resp: i32, b_res: i32, c_ret: i32) -> unit
+export external p3_send = "send" : (a_req: i32, b_ret: i32) -> i32
+export external p3_trailers_new = "trailers-new" : () -> i64
+export external p3_trailers_write = "trailers-write" : (a_w: i32, b_ptr: i32) -> i32
+export external p3_body_result_new = "body-result-new" : () -> i64
+export external p3_body_read = "body-read" : (a_s: i32, b_ptr: i32, c_len: i32) -> i32
+export external p3_set_method = "set-method" : (
+  a_req: i32,
+  b_method: i32,
+  c_ptr: i32,
+  d_len: i32
+) -> i32
+export external p3_fields_append = "fields-append" : (
+  a_fields: i32,
+  b_name_ptr: i32,
+  c_name_len: i32,
+  d_value_ptr: i32,
+  e_value_len: i32,
+  f_ret: i32
+) -> unit
+export external p3_get_headers = "get-headers" : (a_resp: i32) -> i32
+export external p3_fields_copy_all = "fields-copy-all" : (a_fields: i32, b_ret: i32) -> unit
+export external p3_fields_drop = "fields-drop" : (a_fields: i32) -> unit
+export external p3_body_new = "body-new" : () -> i64
+export external p3_body_write = "body-write" : (a_s: i32, b_ptr: i32, c_len: i32) -> i32
+export external p3_body_drop_writable = "body-drop-writable" : (a_s: i32) -> unit
+export external p3_body_drop_readable = "body-drop-readable" : (a_s: i32) -> unit
+export external p3_result_drop_writable = "result-drop-writable" : (a_f: i32) -> unit
+export external p3_result_drop_readable = "result-drop-readable" : (a_f: i32) -> unit
+export external p3_trailers_drop_readable = "trailers-drop-readable" : (a_f: i32) -> unit
+export external p3_result_write = "result-write" : (a_w: i32, b_ptr: i32) -> i32
+export external p3_trailers_drop_writable = "trailers-drop-writable" : (a_f: i32) -> unit
+
+import external "nexus:intrinsic"
+/** A string as its (ptr << 32) | len bits. */
+external string_bits = "value_of_i64" : (a_x: string) -> i64
+
+import * as mem from "std:runtime/mem"
+import * as cast from "std:runtime/cast"
+import * as arena from "std:runtime/arena"
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { sched_runq_len } from "std:runtime/sched"
+import { Coop } from "std:concurrency/coop"
+
+// Fixed cells in page 13, next to std:runtime/sched's run-queue cells.
+let ws_cell = fn () -> i64 do return 851984 end       // waitable set + 1 (0 = unset)
+let waiting_cell = fn () -> i64 do return 851992 end  // tasks waiting on a waitable
+let ready_cell = fn () -> i64 do return 852000 end    // events recorded, not yet taken
+let event_table_cell = fn () -> i64 do return 852008 end  // table base (0 = unset)
+let event_cell = fn () -> i64 do return 852016 end    // waitable-set.wait event out (8 bytes)
+
+// ponytail: event table indexed by handle, 4096 entries; grow it if handles exceed that.
+let table_cap = fn () -> i64 do return 4096 end
+
+let event_subtask = fn () -> i64 do return 1 end
+let subtask_returned = fn () -> i64 do return 2 end
+export let copy_blocked = fn () -> i64 do return 4294967295 end
+
+export let lo32 = fn (x: i64) -> i32 do return cast.i32_of(x: x & 4294967295) end
+export let hi32 = fn (x: i64) -> i32 do return cast.i32_of(x: (x >> 32) & 4294967295) end
+export let i64_of = fn (x: i32) -> i64 do return cast.i64_of(x) end
+
+let waitable_set = fn () -> i64 do
+  let c = mem.load_i64(addr: ws_cell())
+  if c != 0 then return c - 1 end
+  let ws = i64_of(x: p3_ws_new())
+  mem.store_i64(addr: ws_cell(), val: ws + 1)
+  return ws
+end
+
+let zero = fn (addr: i64, n: i64) -> unit do
+  if n <= 0 then return () end
+  mem.store_i64(addr, val: 0)
+  return zero(addr: addr + 8, n: n - 1)
+end
+
+/** Zeroed scratch of `n` 8-byte words. */
+export let scratch = fn (n: i64) -> i64 do
+  let p = arena.alloc_raw(size: n * 8)
+  zero(addr: p, n)
+  return p
+end
+
+/** Slot of handle `h`: 0 while pending, else the event payload + 1. */
+let event_slot = fn (h: i64) -> i64 do
+  let b = mem.load_i64(addr: event_table_cell())
+  if b != 0 then return b + h * 8 end
+  let nb = scratch(n: table_cap())
+  mem.store_i64(addr: event_table_cell(), val: nb)
+  return nb + h * 8
+end
+
+let bump = fn (cell: i64, by: i64) -> unit do
+  mem.store_i64(addr: cell, val: mem.load_i64(addr: cell) + by)
+  return ()
+end
+
+/** Block until some waitable in the set has an event, and record it. A subtask
+ *  is recorded only once it has returned. */
+let block_once = fn (ws: i64) -> unit do
+  let ev = event_cell()
+  let code = i64_of(x: p3_ws_wait(a_ws: lo32(x: ws), b_ptr: lo32(x: ev)))
+  let payload = mem.load_i32(addr: ev + 4)
+  if code == 0 then return () end
+  if code == event_subtask() && payload != subtask_returned() then return () end
+  mem.store_i64(addr: event_slot(h: mem.load_i32(addr: ev)), val: payload + 1)
+  bump(cell: ready_cell(), by: 1)
+  return ()
+end
+
+let wait_loop = fn (h: i64, ws: i64) -> unit require { Coop } do
+  if mem.load_i64(addr: event_slot(h)) != 0 then return () end
+  // Queued tasks that are neither waiting nor holding an event can run now.
+  let parked = mem.load_i64(addr: waiting_cell()) - 1 - mem.load_i64(addr: ready_cell())
+  if sched_runq_len() <= parked then block_once(ws) end
+  if mem.load_i64(addr: event_slot(h)) != 0 then return () end
+  Coop.yield()
+  return wait_loop(h, ws)
+end
+
+/** Wait for the next event of waitable `h` and return its payload. */
+export let await_event = fn (h: i64) -> i64 require { Coop } do
+  let ws = waitable_set()
+  p3_join(a_w: lo32(x: h), b_ws: lo32(x: ws))
+  bump(cell: waiting_cell(), by: 1)
+  wait_loop(h, ws)
+  bump(cell: waiting_cell(), by: -1)
+  bump(cell: ready_cell(), by: -1)
+  let slot = event_slot(h)
+  let payload = mem.load_i64(addr: slot) - 1
+  mem.store_i64(addr: slot, val: 0)
+  p3_join(a_w: lo32(x: h), b_ws: lo32(x: 0))
+  return payload
+end
+
+/** Wait for an async call's subtask (status `st` from the lowered call). */
+export let await_subtask = fn (st: i64) -> unit require { Coop } do
+  if (st & 15) == subtask_returned() then return () end
+  let h = st >> 4
+  let _ignored = await_event(h)
+  p3_subtask_drop(a_st: lo32(x: h))
+  return ()
+end
+
+/** A string as its (ptr << 32) | len bits, split into the two halves. */
+export let s_ptr = fn (s: string) -> i32 do return hi32(x: string_bits(a_x: s)) end
+export let s_len = fn (s: string) -> i32 do return lo32(x: string_bits(a_x: s)) end
+
+/** Append `n` bytes of linear memory at `p` to `buf`. */
+export let append_bytes = fn (buf: %ByteBuffer, p: i64, n: i64) -> %ByteBuffer do
+  if n <= 0 then return %buf end
+  let %buf = bb.push_byte(buf: %buf, byte: mem.load_u8(addr: p))
+  return append_bytes(buf: %buf, p: p + 1, n: n - 1)
+end

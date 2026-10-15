@@ -3,6 +3,18 @@ import { length as str_length, substring, index_of, to_i64_raw } from "std:str"
 import * as bb from "std:bytebuffer"
 import { ByteBuffer } from "std:bytebuffer"
 import { ssrf_is_blocked as _ssrf_is_blocked } from "std:io/network/ssrf"
+import { starts_with, byte_length } from "std:str"
+import * as mem from "std:runtime/mem"
+import * as arena from "std:runtime/arena"
+import { Coop } from "std:concurrency/coop"
+import { p3_fields_new, p3_request_new, p3_set_scheme, p3_set_authority, p3_set_path,
+         p3_set_method, p3_fields_append, p3_send, p3_status_code, p3_get_headers,
+         p3_fields_copy_all, p3_fields_drop, p3_consume_body, p3_trailers_new,
+         p3_trailers_write, p3_trailers_drop_readable, p3_trailers_drop_writable, p3_body_result_new, p3_body_new,
+         p3_body_read, p3_body_write, p3_body_drop_writable, p3_body_drop_readable,
+         p3_result_drop_writable, p3_result_drop_readable, p3_result_write, await_event, await_subtask,
+         scratch, copy_blocked, append_bytes, lo32, hi32, i64_of, s_ptr,
+         s_len } from "std:runtime/p3"
 import external "nexus_net"
 
 /** Raised when an HTTP request fails. */
@@ -521,6 +533,258 @@ export let system_handler = handler Net require { PermNet } do
     timeout_ms: i64
   ) -> Response throws { RequestError } do
     return request_with_timeout(method, url, headers, body, timeout_ms)
+  end
+  fn cancel_accept(server: &Server) -> bool do
+    return cancel_accept(server)
+  end
+end
+
+// ── Cooperative client (--p3-component) ──────────────────────────────────────
+// `coop_handler`'s client methods send through wasi:http/client@0.3.0 and wait
+// with std:runtime/p3, so the requests of different std:concurrency/coop tasks
+// overlap. Its server methods are `system_handler`'s.
+
+type UrlParts = UrlParts(https: bool, authority: string, path: string)
+
+let split_url = fn (url: string) -> UrlParts throws { RequestError } do
+  let https = starts_with(s: url, prefix: "https://")
+  if !https && !starts_with(s: url, prefix: "http://") then throw RequestError(url) end
+  let start = if https then 8 else 7 end
+  let rest = substring(s: url, start, len: byte_length(s: url) - start)
+  let slash = index_of(s: rest, sub: "/")
+  if slash < 0 then return UrlParts(https, authority: rest, path: "/") end
+  return UrlParts(
+    https,
+    authority: substring(s: rest, start: 0, len: slash),
+    path: substring(s: rest, start: slash, len: byte_length(s: rest) - slash)
+  )
+end
+
+/** Case index of `method` in wasi:http's `method` variant (9 = other). */
+let method_case = fn (method: string) -> i64 do
+  if method == "GET" then return 0 end
+  if method == "HEAD" then return 1 end
+  if method == "POST" then return 2 end
+  if method == "PUT" then return 3 end
+  if method == "DELETE" then return 4 end
+  if method == "CONNECT" then return 5 end
+  if method == "OPTIONS" then return 6 end
+  if method == "TRACE" then return 7 end
+  if method == "PATCH" then return 8 end
+  return 9
+end
+
+let append_headers = fn (fields: i32, headers: [ Header ]) -> unit do
+  match headers do
+    | [] -> return ()
+    | Header(name, value) :: rest ->
+      p3_fields_append(
+        a_fields: fields,
+        b_name_ptr: s_ptr(s: name),
+        c_name_len: s_len(s: name),
+        d_value_ptr: s_ptr(s: value),
+        e_value_len: s_len(s: value),
+        f_ret: lo32(x: scratch(n: 4))
+      )
+      return append_headers(fields, headers: rest)
+  end
+end
+
+/** Write `n` bytes at `p` to body stream `s`; false if the reader dropped it. */
+let write_body = fn (s: i64, p: i64, n: i64) -> bool require { Coop } do
+  if n <= 0 then return true end
+  let r = i64_of(x: p3_body_write(a_s: lo32(x: s), b_ptr: lo32(x: p), c_len: lo32(x: n)))
+  let payload = if r == copy_blocked() then await_event(h: s) else r end
+  let k = payload >> 4
+  if (payload & 15) != 0 && k < n then return false end
+  return write_body(s, p: p + k, n: n - k)
+end
+
+let read_body = fn (s: i64, chunk: i64, buf: %ByteBuffer) -> %ByteBuffer require { Coop } do
+  let r = i64_of(x: p3_body_read(a_s: lo32(x: s), b_ptr: lo32(x: chunk), c_len: lo32(x: 4096)))
+  let payload = if r == copy_blocked() then await_event(h: s) else r end
+  let %buf = append_bytes(buf: %buf, p: chunk, n: payload >> 4)
+  if (payload & 15) != 0 then return %buf end
+  return read_body(s, chunk, buf: %buf)
+end
+
+/** Encode `count` (name, value) entries at `p` as `name:value\n` lines. */
+let encode_fields = fn (buf: %ByteBuffer, p: i64, count: i64) -> %ByteBuffer do
+  if count <= 0 then return %buf end
+  let %buf = append_bytes(buf: %buf, p: mem.load_i32(addr: p), n: mem.load_i32(addr: p + 4))
+  let %buf = bb.push_string(%buf, s: ":")
+  let %buf = append_bytes(buf: %buf, p: mem.load_i32(addr: p + 8), n: mem.load_i32(addr: p + 12))
+  let %buf = bb.push_string(%buf, s: "\n")
+  return encode_fields(buf: %buf, p: p + 16, count: count - 1)
+end
+
+let response_headers = fn (resp: i64) -> string do
+  let h = p3_get_headers(a_resp: lo32(x: resp))
+  let ret = scratch(n: 1)
+  p3_fields_copy_all(a_fields: h, b_ret: lo32(x: ret))
+  let %buf = encode_fields(
+    buf: bb.empty(),
+    p: mem.load_i32(addr: ret),
+    count: mem.load_i32(addr: ret + 4)
+  )
+  p3_fields_drop(a_fields: h)
+  let out = bb.to_string(&buf)
+  bb.free(%buf)
+  return out
+end
+
+let coop_request = fn (
+  method: string,
+  url: string,
+  headers: [ Header ],
+  body: string
+) -> Response require { Coop } throws { RequestError } do
+  if ssrf_is_blocked(url) then throw RequestError(url) end
+  let UrlParts(https, authority, path) = split_url(url)
+  let fields = p3_fields_new()
+  append_headers(fields, headers)
+  let has_body = byte_length(s: body) > 0
+  let bs = if has_body then p3_body_new() else 0 end
+  // The trailers future carries Ok(None): a zeroed payload.
+  let tr = p3_trailers_new()
+  let tw = i64_of(x: p3_trailers_write(a_w: hi32(x: tr), b_ptr: lo32(x: scratch(n: 16))))
+  let ret = scratch(n: 2)
+  p3_request_new(
+    a_headers: fields,
+    b_contents_some: lo32(x: if has_body then 1 else 0 end),
+    c_contents: lo32(x: bs),
+    d_trailers: lo32(x: tr),
+    e_options_some: lo32(x: 0),
+    f_options: lo32(x: 0),
+    g_ret: lo32(x: ret)
+  )
+  let req = lo32(x: mem.load_i32(addr: ret))
+  let case = method_case(method)
+  let _ignored = p3_set_method(
+    a_req: req,
+    b_method: lo32(x: case),
+    c_ptr: if case == 9 then s_ptr(s: method) else lo32(x: 0) end,
+    d_len: if case == 9 then s_len(s: method) else lo32(x: 0) end
+  )
+  let _ignored = p3_set_scheme(
+    a_req: req,
+    b_some: lo32(x: 1),
+    c_scheme: lo32(x: if https then 1 else 0 end),
+    d_ptr: lo32(x: 0),
+    e_len: lo32(x: 0)
+  )
+  let _ignored = p3_set_authority(
+    a_req: req,
+    b_some: lo32(x: 1),
+    c_ptr: s_ptr(s: authority),
+    d_len: s_len(s: authority)
+  )
+  let _ignored = p3_set_path(
+    a_req: req,
+    b_some: lo32(x: 1),
+    c_ptr: s_ptr(s: path),
+    d_len: s_len(s: path)
+  )
+  let res = scratch(n: 16)
+  let st = i64_of(x: p3_send(a_req: req, b_ret: lo32(x: res)))
+  if has_body then
+    let _ignored = write_body(
+      s: i64_of(x: hi32(x: bs)),
+      p: i64_of(x: s_ptr(s: body)),
+      n: i64_of(x: s_len(s: body))
+    )
+    p3_body_drop_writable(a_s: hi32(x: bs))
+  end
+  await_subtask(st)
+  if tw == copy_blocked() then
+    let _ignored = await_event(h: i64_of(x: hi32(x: tr)))
+  end
+  p3_trailers_drop_writable(a_f: hi32(x: tr))
+  p3_result_drop_readable(a_f: lo32(x: mem.load_i32(addr: ret + 4)))
+  if mem.load_u8(addr: res) != 0 then throw RequestError(url) end
+  let resp = mem.load_i32(addr: res + 8)
+  let status = i64_of(x: p3_status_code(a_resp: lo32(x: resp)))
+  let hdrs = response_headers(resp)
+  let rf = p3_body_result_new()
+  let cret = scratch(n: 1)
+  p3_consume_body(a_resp: lo32(x: resp), b_res: lo32(x: rf), c_ret: lo32(x: cret))
+  let s = mem.load_i32(addr: cret)
+  let %buf = read_body(s, chunk: arena.alloc_raw(size: 4096), buf: bb.empty())
+  p3_body_drop_readable(a_s: lo32(x: s))
+  p3_trailers_drop_readable(a_f: lo32(x: mem.load_i32(addr: cret + 4)))
+  // Report Ok for the body to the host, then release the write end.
+  let w = p3_result_write(a_w: hi32(x: rf), b_ptr: lo32(x: scratch(n: 8)))
+  if i64_of(x: w) == copy_blocked() then
+    let _ignored = await_event(h: i64_of(x: hi32(x: rf)))
+  end
+  p3_result_drop_writable(a_f: hi32(x: rf))
+  let out = bb.to_string(&buf)
+  bb.free(%buf)
+  return Response(status, headers: hdrs, body: out)
+end
+
+/**
+Net handler for a --p3-component build: `get`, `request` and
+`request_with_timeout` (timeout 0) let other std:concurrency/coop tasks run
+while the request is in flight, so requests of different tasks overlap. Inject
+it inside a `std:concurrency/coop` scheduler. The server methods behave as in
+`system_handler`.
+*/
+export let coop_handler = handler Net require { Coop, PermNet } do
+  fn get(url: string) -> string throws { RequestError } do
+    let res = coop_request(method: "GET", url, headers: [], body: "")
+    return response_body(res)
+  end
+  fn request(
+    method: string,
+    url: string,
+    headers: [ Header ],
+    body: string
+  ) -> Response throws { RequestError } do
+    return coop_request(method, url, headers, body)
+  end
+  fn listen(addr: string) -> %Server throws { BindError } do
+    return listen(addr)
+  end
+  fn accept(server: &Server) -> %Request do
+    return accept(server)
+  end
+  fn respond(req: %Request, status: i64, body: string) -> unit throws { ResponseError } do
+    return respond(req, status, body)
+  end
+  fn respond_with_headers(
+    req: %Request,
+    status: i64,
+    headers: [ Header ],
+    body: string
+  ) -> unit throws { ResponseError } do
+    return respond_with_headers(req, status, headers, body)
+  end
+  fn stop(server: %Server) -> unit do
+    return stop(server)
+  end
+  fn respond_streaming_start(
+    req: %Request,
+    status: i64,
+    headers: [ Header ]
+  ) -> %RespondStream throws { ResponseError } do
+    return respond_streaming_start(req, status, headers)
+  end
+  fn respond_streaming_write(stream: &RespondStream, chunk: string) -> bool do
+    return respond_streaming_write(stream, chunk)
+  end
+  fn respond_streaming_finish(stream: %RespondStream) -> unit throws { ResponseError } do
+    return respond_streaming_finish(stream)
+  end
+  fn request_with_timeout(
+    method: string,
+    url: string,
+    headers: [ Header ],
+    body: string,
+    timeout_ms: i64
+  ) -> Response throws { RequestError } do
+    if timeout_ms != 0 then throw RequestError(url) end
+    return coop_request(method, url, headers, body)
   end
   fn cancel_accept(server: &Server) -> bool do
     return cancel_accept(server)
