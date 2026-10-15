@@ -812,7 +812,7 @@ if [ "$TEST_MODE" = "1" ]; then
         exit 0
       fi
       t1=$(date +%s%N 2>/dev/null || date +%s000000000)
-      if ! wasmtime run -W component-model=y,component-model-async=y,exceptions=y \
+      if ! wasmtime run -W component-model=y,component-model-async=y,component-model-async-stackful=y,exceptions=y,tail-call=y,function-references=y,stack-switching=y \
           -S p3=y --dir=. --dir="$scratch::/tmp" ${NEXUS_WASMTIME_ARGS:-} \
           "$wasm" \
           >/dev/null 2>"$elog"; then

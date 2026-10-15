@@ -17,6 +17,7 @@ import { p2_build_socket_sections } from "src/backend/wasm/section/p2/socket.nx"
 import { p2_build_core_modules } from "src/backend/wasm/section/p2/core_modules.nx"
 import { p2_build_canon_lower } from "src/backend/wasm/section/p2/canon_lower.nx"
 import { build_p2_core_instance_section } from "src/backend/wasm/section/p2/core_instance.nx"
+import { p3_build_pre, p3_build_tail, p3_pre_core_funcs } from "src/backend/wasm/section/p3.nx"
 
 /** Build a core alias entry for a function export from a core instance.
  *  Encoding: 0x00(CoreInstanceExport) 0x00(Func) 0x01(ExportAlias) instance_idx name
@@ -180,6 +181,27 @@ let p2_canon_lift_bytes_hasfs_hasnet_hassrv = fn () -> %ByteBuffer do
   return bb.push_bytes(buf: bb.empty(), bytes: [ 1, 0, 0, 45, 0, 38 ])
 end
 
+/** Core funcs defined before the run alias (the canon lowers). */
+let p2_run_core_func = fn (has_fs: bool, has_net: bool, has_server: bool) -> i64 do
+  if has_fs then
+    if has_net then
+      if has_server then return 45 end
+      return 30
+    end
+    return 18
+  end
+  if has_net then
+    if has_server then return 37 end
+    return 22
+  end
+  return 10
+end
+
+/** Core modules defined: stub, adapter, p2ext, nexus, then p2fs/p2net/p2sock. */
+let p2_core_module_count = fn (has_fs: bool, has_net: bool, has_server: bool) -> i64 do
+  return 4 + (if has_fs then 1 else 0 end) + (if has_net then 1 else 0 end) + (if has_server then 1 else 0 end)
+end
+
 let p2_run_inst_byte = fn (has_fs: bool, has_net: bool, has_server: bool) -> i64 do
   // Comp lift func index:
   // no-fs+no-net=9, has-fs+no-net=17
@@ -321,18 +343,37 @@ let p2_build_instance_lift_export = fn (
   has_net: bool,
   has_server: bool,
   wasi_iface: string,
-  run_func_export: string
+  run_func_export: string,
+  p3: bool
 ) -> %ByteBuffer do
   // Sec 39: core instances — 8-way count based on has_fs×has_net×has_server.
+  let run_core = p2_run_core_func(has_fs, has_net, has_server)
   let %core_inst_content = build_p2_core_instance_section(
     has_fs: has_fs,
     has_net: has_net,
-    has_server: has_server
+    has_server: has_server,
+    p3_core_func: if p3 then run_core else -1 end
   )
   let %s = cm_wrap_section(section_id: wdefs.cm_sec_core_instance, content: %core_inst_content)
   let %out = bb.empty()
   let %out = bb.push_buf(dst: %out, src: &s)
   bb.free(buf: %s)
+  if p3 then
+    // The p3 pre sections add one type, one component instance, one component
+    // func, p3_pre_core_funcs() core funcs, and one core instance.
+    let %tail = p3_build_tail(
+      run_func_export,
+      nexus_inst: p2_nexus_alias_inst(has_fs, has_net, has_server) + 1,
+      core_func: run_core + p3_pre_core_funcs(),
+      core_module: p2_core_module_count(has_fs, has_net, has_server),
+      type_idx: p2_result_type_byte(has_fs, has_net, has_server) + 1,
+      comp_func: p2_run_inst_byte(has_fs, has_net, has_server) + 1,
+      comp_inst: p2_export_inst_byte(has_fs, has_net, has_server) + 1
+    )
+    let %o = bb.push_buf(dst: %out, src: &tail)
+    bb.free(buf: %tail)
+    return %o
+  end
 
   let %out = p2_build_alias_type_canon(
     has_fs: has_fs,
@@ -360,6 +401,8 @@ let p2_build_instance_lift_export = fn (
   return %out
 end
 
+// p3: when true, add the WASI preview3 sections from section/p3.nx and export
+// wasi:cli/run@0.3.0 (async) instead of wasi_iface.
 // has_server: when true, add wasi:sockets TCP component imports and p2sock_bridge.
 // Set only when core wasm imports http_listen (Net.listen/accept/respond/stop path).
 // Net.get-only programs (has_net=true, has_server=false) omit socket sections.
@@ -369,7 +412,8 @@ export let build_p2_component = fn (
   run_func_export: string,
   has_fs: bool,
   has_net: bool,
-  has_server: bool
+  has_server: bool,
+  p3: bool
 ) -> %ByteBuffer do
   let %wasi = p2_build_wasi_header_sections()
   let %fs = p2_build_fs_sections(has_fs)
@@ -377,12 +421,21 @@ export let build_p2_component = fn (
   let %sock = p2_build_socket_sections(has_fs, has_server)
   let %mods = p2_build_core_modules(core_wasm: %core_wasm, has_fs, has_net, has_server)
   let %canon_lo = p2_build_canon_lower(has_fs, has_net, has_server)
+  let %canon_lo = if p3 then
+    p3_build_pre(
+      base: %canon_lo,
+      comp_func: p2_run_inst_byte(has_fs, has_net, has_server),
+      comp_inst: p2_export_inst_byte(has_fs, has_net, has_server),
+      type_idx: p2_result_type_byte(has_fs, has_net, has_server)
+    )
+  else %canon_lo end
   let %canon_hi = p2_build_instance_lift_export(
     has_fs,
     has_net,
     has_server,
     wasi_iface,
-    run_func_export
+    run_func_export,
+    p3
   )
   let %out = bb.push_buf(dst: %wasi, src: &fs)
   bb.free(buf: %fs)
