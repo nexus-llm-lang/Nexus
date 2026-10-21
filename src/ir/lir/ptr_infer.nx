@@ -1,0 +1,402 @@
+/**
+ * ptr_infer: retype `i64` locals that hold object pointers as `TyPtr`.
+ *
+ * A value that flows through the i64 value channel (a generic call result,
+ * a closure capture, an array element) is lowered as `TyI64`. When the
+ * function reads a field or the tag of such a local, the local holds an
+ * object pointer. This pass marks those locals, follows plain copies
+ * (`let a = b`) in both directions, and rewrites their `let` types and every
+ * use of them to `TyPtr`.
+ *
+ * Parameters are not retyped. A name is never retyped when it is an operand
+ * of a binary operation, is bound to anything but a call, a copy, a field
+ * read or a closure-call result, or has a `let` whose type is not `TyI64`.
+ */
+import * as list from "std:list"
+import { TypeExpr, TyI64, TyPtr } from "src/types/type_expr.nx"
+import {
+  LirFunction,
+  LirStmt,
+  LirExpr,
+  LirAtom,
+  LirCallArg,
+  LirNamedAtom,
+  LirParam,
+  LirStmtLet,
+  LirStmtIf,
+  LirStmtIfReturn,
+  LirStmtLoop,
+  LirStmtTryCatch,
+  LirAtomVar,
+  LirExprAtom,
+  LirExprBinary,
+  LirExprCall,
+  LirExprTailCall,
+  LirExprConstructor,
+  LirExprRecord,
+  LirExprObjectTag,
+  LirExprObjectField,
+  LirExprRaise,
+  LirExprForce,
+  LirExprMakeClosure,
+  LirExprCallClosure,
+  LirExprSuspend,
+  LirExprResume,
+  LirExprContNew,
+  LirExprInjectResume
+} from "src/ir/lir/types.nx"
+import { Option, Some, None } from "std:option"
+
+/** Facts gathered from one function body. */
+type Facts = Facts(
+  read_as_object: [ string ],
+  copies: [ Copy ],
+  candidates: [ string ],
+  excluded: [ string ]
+)
+
+type Copy = Copy(dst: string, src: string)
+
+/** Retype the object-pointer locals of `func` as `TyPtr`. */
+export let infer_ptr_locals = fn (func: LirFunction) -> LirFunction do
+  let LirFunction(name, params, ret_type, body, ret, span) = func
+  let facts = collect_stmts(
+    stmts: body,
+    facts: Facts(read_as_object: [], copies: [], candidates: [], excluded: [])
+  )
+  let Facts(read_as_object, copies, candidates, excluded) = facts
+  let seeds = keep_eligible(names: read_as_object, candidates, excluded, params, acc: [])
+  match seeds do
+    | [] -> return func
+    | _ ->
+      let ptrs = close_over_copies(ptrs: seeds, copies, candidates, excluded, params)
+      return LirFunction(
+        name,
+        params,
+        ret_type,
+        body: rewrite_stmts(stmts: body, ptrs),
+        ret: rewrite_atom(atom: ret, ptrs),
+        span
+      )
+  end
+end
+
+// ─── collection ─────────────────────────────────────────────────────────────
+
+let collect_stmts = fn (stmts: [ LirStmt ], facts: Facts) -> Facts do
+  match stmts do
+    | [] -> return facts
+    | s :: rest -> return collect_stmts(stmts: rest, facts: collect_stmt(stmt: s, facts))
+  end
+end
+
+let collect_stmt = fn (stmt: LirStmt, facts: Facts) -> Facts do
+  match stmt do
+    | LirStmtLet(name, typ, expr) ->
+      let f1 = note_let(name, typ, expr, facts)
+      return collect_expr(expr, facts: f1)
+    | LirStmtIf(cond: _, then_body, else_body) ->
+      return collect_stmts(stmts: else_body, facts: collect_stmts(stmts: then_body, facts))
+    | LirStmtIfReturn(cond: _, then_body, then_ret: _, else_body, else_ret: _, ret_type: _) ->
+      return collect_stmts(stmts: else_body, facts: collect_stmts(stmts: then_body, facts))
+    | LirStmtLoop(cond_stmts, cond: _, body) ->
+      return collect_stmts(stmts: body, facts: collect_stmts(stmts: cond_stmts, facts))
+    | LirStmtTryCatch(
+      body,
+      body_ret: _,
+      catch_param,
+      catch_param_typ: _,
+      catch_body,
+      catch_ret: _
+    ) ->
+      let f1 = add_excluded(name: catch_param, facts)
+      return collect_stmts(stmts: catch_body, facts: collect_stmts(stmts: body, facts: f1))
+  end
+end
+
+let note_let = fn (name: string, typ: TypeExpr, expr: LirExpr, facts: Facts) -> Facts do
+  if is_i64(typ) && binds_channel_value(expr) then
+    let Facts(read_as_object, copies, candidates, excluded) = facts
+    let copies2 = match expr do
+      | LirExprAtom(atom: LirAtomVar(name: src, typ: _)) -> Copy(dst: name, src) :: copies
+      | _ -> copies
+    end
+    return Facts(read_as_object, copies: copies2, candidates: name :: candidates, excluded)
+  end
+  return add_excluded(name, facts)
+end
+
+/** Expressions whose i64 result may be an object pointer from the value channel. */
+let binds_channel_value = fn (expr: LirExpr) -> bool do
+  match expr do
+    | LirExprAtom(atom: LirAtomVar(name: _, typ: _)) -> return true
+    | LirExprCall(func: _, args: _, typ: _) -> return true
+    | LirExprTailCall(func: _, args: _, typ: _) -> return true
+    | LirExprCallClosure(closure: _, args: _, typ: _) -> return true
+    | LirExprObjectField(value: _, index: _, typ: _) -> return true
+    | LirExprForce(value: _, typ: _) -> return true
+    | _ -> return false
+  end
+end
+
+let collect_expr = fn (expr: LirExpr, facts: Facts) -> Facts do
+  match expr do
+    | LirExprObjectField(
+      value: LirAtomVar(name, typ: _),
+      index: _,
+      typ: _
+    ) -> return add_read(name, facts)
+    | LirExprObjectTag(value: LirAtomVar(name, typ: _), typ: _) -> return add_read(name, facts)
+    | LirExprBinary(op: _, lhs, rhs, typ: _) ->
+      return exclude_atom(atom: rhs, facts: exclude_atom(atom: lhs, facts))
+    | _ -> return facts
+  end
+end
+
+let exclude_atom = fn (atom: LirAtom, facts: Facts) -> Facts do
+  match atom do
+    | LirAtomVar(name, typ: _) -> return add_excluded(name, facts)
+    | _ -> return facts
+  end
+end
+
+let add_read = fn (name: string, facts: Facts) -> Facts do
+  let Facts(read_as_object, copies, candidates, excluded) = facts
+  return Facts(read_as_object: name :: read_as_object, copies, candidates, excluded)
+end
+
+let add_excluded = fn (name: string, facts: Facts) -> Facts do
+  let Facts(read_as_object, copies, candidates, excluded) = facts
+  return Facts(read_as_object, copies, candidates, excluded: name :: excluded)
+end
+
+// ─── propagation ────────────────────────────────────────────────────────────
+
+let eligible = fn (
+  name: string,
+  candidates: [ string ],
+  excluded: [ string ],
+  params: [ LirParam ]
+) -> bool do
+  return has(names: candidates, name) && !has(names: excluded, name) && !is_param(params, name)
+end
+
+let keep_eligible = fn (
+  names: [ string ],
+  candidates: [ string ],
+  excluded: [ string ],
+  params: [ LirParam ],
+  acc: [ string ]
+) -> [ string ] do
+  match names do
+    | [] -> return acc
+    | n :: rest ->
+      if eligible(name: n, candidates, excluded, params) && !has(names: acc, name: n) then
+        return keep_eligible(names: rest, candidates, excluded, params, acc: n :: acc)
+      end
+      return keep_eligible(names: rest, candidates, excluded, params, acc)
+  end
+end
+
+let close_over_copies = fn (
+  ptrs: [ string ],
+  copies: [ Copy ],
+  candidates: [ string ],
+  excluded: [ string ],
+  params: [ LirParam ]
+) -> [ string ] do
+  let next = copy_step(cs: copies, ptrs, candidates, excluded, params)
+  if list.length(xs: next) == list.length(xs: ptrs) then return ptrs end
+  return close_over_copies(ptrs: next, copies, candidates, excluded, params)
+end
+
+let copy_step = fn (
+  cs: [ Copy ],
+  ptrs: [ string ],
+  candidates: [ string ],
+  excluded: [ string ],
+  params: [ LirParam ]
+) -> [ string ] do
+  match cs do
+    | [] -> return ptrs
+    | Copy(dst, src) :: rest ->
+      let touches = has(names: ptrs, name: dst) || has(names: ptrs, name: src)
+      if touches && eligible(
+        name: dst,
+        candidates,
+        excluded,
+        params
+      ) && eligible(name: src, candidates, excluded, params) then
+        let p1 = if has(names: ptrs, name: dst) then ptrs else dst :: ptrs end
+        let p2 = if has(names: p1, name: src) then p1 else src :: p1 end
+        return copy_step(cs: rest, ptrs: p2, candidates, excluded, params)
+      end
+      return copy_step(cs: rest, ptrs, candidates, excluded, params)
+  end
+end
+
+// ─── rewriting ──────────────────────────────────────────────────────────────
+
+let rewrite_stmts = fn (stmts: [ LirStmt ], ptrs: [ string ]) -> [ LirStmt ] do
+  match stmts do
+    | [] -> return []
+    | s :: rest -> return rewrite_stmt(stmt: s, ptrs) :: rewrite_stmts(stmts: rest, ptrs)
+  end
+end
+
+let rewrite_opt_atom = fn (atom: Option<LirAtom>, ptrs: [ string ]) -> Option<LirAtom> do
+  match atom do
+    | Some(val: a) -> return Some(val: rewrite_atom(atom: a, ptrs))
+    | None -> return None
+  end
+end
+
+let rewrite_stmt = fn (stmt: LirStmt, ptrs: [ string ]) -> LirStmt do
+  match stmt do
+    | LirStmtLet(name, typ, expr) ->
+      let t2 = if has(names: ptrs, name) then TyPtr else typ end
+      return LirStmtLet(name, typ: t2, expr: rewrite_expr(expr, ptrs))
+    | LirStmtIf(cond, then_body, else_body) ->
+      return LirStmtIf(
+        cond: rewrite_atom(atom: cond, ptrs),
+        then_body: rewrite_stmts(stmts: then_body, ptrs),
+        else_body: rewrite_stmts(stmts: else_body, ptrs)
+      )
+    | LirStmtIfReturn(cond, then_body, then_ret, else_body, else_ret, ret_type) ->
+      return LirStmtIfReturn(
+        cond: rewrite_atom(atom: cond, ptrs),
+        then_body: rewrite_stmts(stmts: then_body, ptrs),
+        then_ret: rewrite_atom(atom: then_ret, ptrs),
+        else_body: rewrite_stmts(stmts: else_body, ptrs),
+        else_ret: rewrite_opt_atom(atom: else_ret, ptrs),
+        ret_type
+      )
+    | LirStmtLoop(cond_stmts, cond, body) ->
+      return LirStmtLoop(
+        cond_stmts: rewrite_stmts(stmts: cond_stmts, ptrs),
+        cond: rewrite_atom(atom: cond, ptrs),
+        body: rewrite_stmts(stmts: body, ptrs)
+      )
+    | LirStmtTryCatch(body, body_ret, catch_param, catch_param_typ, catch_body, catch_ret) ->
+      return LirStmtTryCatch(
+        body: rewrite_stmts(stmts: body, ptrs),
+        body_ret: rewrite_opt_atom(atom: body_ret, ptrs),
+        catch_param,
+        catch_param_typ,
+        catch_body: rewrite_stmts(stmts: catch_body, ptrs),
+        catch_ret: rewrite_opt_atom(atom: catch_ret, ptrs)
+      )
+  end
+end
+
+let rewrite_atom = fn (atom: LirAtom, ptrs: [ string ]) -> LirAtom do
+  match atom do
+    | LirAtomVar(name, typ) ->
+      if has(names: ptrs, name) then return LirAtomVar(name, typ: TyPtr) end
+      return atom
+    | _ -> return atom
+  end
+end
+
+let rewrite_atoms = fn (atoms: [ LirAtom ], ptrs: [ string ]) -> [ LirAtom ] do
+  match atoms do
+    | [] -> return []
+    | a :: rest -> return rewrite_atom(atom: a, ptrs) :: rewrite_atoms(atoms: rest, ptrs)
+  end
+end
+
+let rewrite_args = fn (args: [ LirCallArg ], ptrs: [ string ]) -> [ LirCallArg ] do
+  match args do
+    | [] -> return []
+    | LirCallArg(label, value) :: rest ->
+      return LirCallArg(
+        label,
+        value: rewrite_atom(atom: value, ptrs)
+      ) :: rewrite_args(args: rest, ptrs)
+  end
+end
+
+let rewrite_named = fn (fields: [ LirNamedAtom ], ptrs: [ string ]) -> [ LirNamedAtom ] do
+  match fields do
+    | [] -> return []
+    | LirNamedAtom(name, value) :: rest ->
+      return LirNamedAtom(
+        name,
+        value: rewrite_atom(atom: value, ptrs)
+      ) :: rewrite_named(fields: rest, ptrs)
+  end
+end
+
+let rewrite_expr = fn (expr: LirExpr, ptrs: [ string ]) -> LirExpr do
+  match expr do
+    | LirExprAtom(atom) -> return LirExprAtom(atom: rewrite_atom(atom, ptrs))
+    | LirExprBinary(op, lhs, rhs, typ) ->
+      return LirExprBinary(
+        op,
+        lhs: rewrite_atom(atom: lhs, ptrs),
+        rhs: rewrite_atom(atom: rhs, ptrs),
+        typ
+      )
+    | LirExprCall(func, args, typ) -> return LirExprCall(func, args: rewrite_args(args, ptrs), typ)
+    | LirExprTailCall(
+      func,
+      args,
+      typ
+    ) -> return LirExprTailCall(func, args: rewrite_args(args, ptrs), typ)
+    | LirExprConstructor(
+      name,
+      args,
+      typ
+    ) -> return LirExprConstructor(name, args: rewrite_atoms(atoms: args, ptrs), typ)
+    | LirExprRecord(fields, typ) -> return LirExprRecord(fields: rewrite_named(fields, ptrs), typ)
+    | LirExprObjectTag(
+      value,
+      typ
+    ) -> return LirExprObjectTag(value: rewrite_atom(atom: value, ptrs), typ)
+    | LirExprObjectField(value, index, typ) ->
+      return LirExprObjectField(value: rewrite_atom(atom: value, ptrs), index, typ)
+    | LirExprRaise(value, typ) -> return LirExprRaise(value: rewrite_atom(atom: value, ptrs), typ)
+    | LirExprForce(value, typ) -> return LirExprForce(value: rewrite_atom(atom: value, ptrs), typ)
+    | LirExprMakeClosure(func_name, captures, typ) ->
+      return LirExprMakeClosure(func_name, captures: rewrite_atoms(atoms: captures, ptrs), typ)
+    | LirExprCallClosure(closure, args, typ) ->
+      return LirExprCallClosure(
+        closure: rewrite_atom(atom: closure, ptrs),
+        args: rewrite_args(args, ptrs),
+        typ
+      )
+    | LirExprSuspend(tag_name, payload, typ) ->
+      return LirExprSuspend(tag_name, payload: rewrite_atom(atom: payload, ptrs), typ)
+    | LirExprResume(cont, value, typ) ->
+      return LirExprResume(
+        cont: rewrite_atom(atom: cont, ptrs),
+        value: rewrite_atom(atom: value, ptrs),
+        typ
+      )
+    | _ -> return expr
+  end
+end
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+let is_i64 = fn (typ: TypeExpr) -> bool do
+  match typ do
+    | TyI64 -> return true
+    | _ -> return false
+  end
+end
+
+let has = fn (names: [ string ], name: string) -> bool do
+  match names do
+    | [] -> return false
+    | n :: rest -> if n == name then return true else return has(names: rest, name) end
+  end
+end
+
+let is_param = fn (params: [ LirParam ], name: string) -> bool do
+  match params do
+    | [] -> return false
+    | LirParam(label: _, name: n, typ: _) :: rest ->
+      if n == name then return true else return is_param(params: rest, name) end
+  end
+end

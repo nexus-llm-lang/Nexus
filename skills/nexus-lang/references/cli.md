@@ -184,17 +184,19 @@ to debug `let`/`fn`/handler desugaring or effect-row inference.
 
 **Synopsis**
 
-    nexus lir <input.nx> [--format text|json]
+    nexus lir <input.nx> [--format text|json] [--check-repr]
 
 Dump the Low-level IR after MIR→LIR lowering and the post-codegen
 optimisation passes. Used when chasing codegen bugs or sizing a
-specific function's wasm output.
+specific function's wasm output. With --check-repr, print instead each
+heap value the LIR types as i64 and exit 1 if there is any.
 
 **Flags**
 
 | Flag | Description |
 | ---- | ----------- |
 | `--format VALUE` | output format (text|json) |
+| `--check-repr VALUE` | report heap values typed i64 instead of dumping |
 | `--verbose` | enable per-pass timing output |
 | `--format VALUE` | diagnostic format (text|json) |
 | `--explain-capabilities VALUE` | capability reporting (yes|none|wasmtime) |
