@@ -845,11 +845,9 @@ if [ "$TEST_MODE" = "1" ]; then
       #   // p2c-env: KEY=VALUE              → passed as --env KEY=VALUE to wasmtime run
       #   // p2c-dir: HOST_PATH::GUEST       → passed as --dir HOST_PATH::GUEST to wasmtime run
       #   // p2c-http                        → passed as -S http to wasmtime run (wasi:http)
-      #   // p2c-http-serve: RELATIVE_DIR    → start python3 http.server on free port serving
-      #                                         RELATIVE_DIR; injects HTTP_TEST_PORT and
-      #                                         HTTP_TEST_URL env vars; implies p2c-http
       #   // p2c-tcp-serve                   → start component as TCP server in background;
-      #                                         picks a free port, injects LISTEN_PORT env var,
+      #                                         uses // p2c-tcp-port: N or a free port passed
+      #                                         as NEXUS_TCP_PORT,
       #                                         curls the server, checks expect-msg against body
       #   // expect-msg: TEXT                → TEXT must appear in stdout (substring match)
       P2C_HEADER_TSV=$(awk "
@@ -861,11 +859,6 @@ if [ "$TEST_MODE" = "1" ]; then
         /^[[:space:]]*\\/\\/[[:space:]]*p2c-dir:/ {
           sub(/^[[:space:]]*\\/\\/[[:space:]]*p2c-dir:[[:space:]]*/, \"\")
           print \"dir\\t\" \$0
-          next
-        }
-        /^[[:space:]]*\\/\\/[[:space:]]*p2c-http-serve:/ {
-          sub(/^[[:space:]]*\\/\\/[[:space:]]*p2c-http-serve:[[:space:]]*/, \"\")
-          print \"http-serve\\t\" \$0
           next
         }
         /^[[:space:]]*\\/\\/[[:space:]]*p2c-tcp-serve/ {
@@ -897,7 +890,6 @@ if [ "$TEST_MODE" = "1" ]; then
       P2C_ENV_FLAGS=""
       P2C_DIR_FLAGS=""
       P2C_HTTP_FLAGS=""
-      P2C_HTTP_SERVER_PID=""
       P2C_TCP_SERVE_PID=""
       P2C_TCP_SERVE_PORT=""
       P2C_ALLOW_NONZERO=""
@@ -912,22 +904,6 @@ if [ "$TEST_MODE" = "1" ]; then
       done
       if printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^http\t/" | grep -q .; then
         P2C_HTTP_FLAGS="-S http"
-      fi
-      _p2c_serve_dir=$(printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^http-serve\t/ { print \$2; exit }")
-      if [ -n "$_p2c_serve_dir" ]; then
-        P2C_HTTP_FLAGS="-S http"
-        # find a free port
-        _p2c_port=$(python3 -c "import socket; s=socket.socket(); s.bind((str(),0)); print(s.getsockname()[1]); s.close()")
-        python3 -m http.server "$_p2c_port" --directory "$_p2c_serve_dir" \
-          >/dev/null 2>/dev/null &
-        P2C_HTTP_SERVER_PID=$!
-        # wait for the server to be ready (max 3s)
-        _p2c_wait=0
-        until curl -sf "http://127.0.0.1:${_p2c_port}/" >/dev/null 2>&1 || [ "$_p2c_wait" -ge 30 ]; do
-          _p2c_wait=$((_p2c_wait + 1))
-          sleep 0.1
-        done
-        P2C_ENV_FLAGS="$P2C_ENV_FLAGS --env HTTP_TEST_PORT=${_p2c_port} --env HTTP_TEST_URL=http://127.0.0.1:${_p2c_port}"
       fi
       if printf "%s\n" "$P2C_HEADER_TSV" | awk -F"\t" "/^tcp-serve\t/" | grep -q .; then
         P2C_HTTP_FLAGS="-S http -S tcp=y -S inherit-network"
@@ -1007,7 +983,6 @@ if [ "$TEST_MODE" = "1" ]; then
             > "$RESULTS_DIR/result_$idx.tsv"
           printf "FAIL  %s  (%sms, p2c-run, tcp-serve-curl-failed)\n" "$f" "$ms" >&2
           rm -f "$p2c_out"
-          [ -n "$P2C_HTTP_SERVER_PID" ] && kill "$P2C_HTTP_SERVER_PID" 2>/dev/null; P2C_HTTP_SERVER_PID=""
           if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
           exit 0
         fi
@@ -1023,7 +998,6 @@ if [ "$TEST_MODE" = "1" ]; then
         done
         IFS=$IFS_BAK3
         rm -f "$p2c_out"
-        [ -n "$P2C_HTTP_SERVER_PID" ] && kill "$P2C_HTTP_SERVER_PID" 2>/dev/null; P2C_HTTP_SERVER_PID=""
         if [ -n "$p2c_miss" ]; then
           msg="missing substring(s) in tcp-serve response: ${p2c_miss#|}"
           printf "FAIL\t%s\tp2c-run\t%s\t%s\n" "$ms" "$f" "$msg" \
@@ -1053,7 +1027,6 @@ if [ "$TEST_MODE" = "1" ]; then
           > "$RESULTS_DIR/result_$idx.tsv"
         printf "FAIL  %s  (%sms, p2c-run)\n" "$f" "$ms" >&2
         rm -f "$p2c_out"
-        [ -n "$P2C_HTTP_SERVER_PID" ] && kill "$P2C_HTTP_SERVER_PID" 2>/dev/null; P2C_HTTP_SERVER_PID=""
         if [ "$TEST_COVERAGE" != "1" ]; then rm -f "$wasm"; fi
         exit 0
       fi
@@ -1071,7 +1044,6 @@ if [ "$TEST_MODE" = "1" ]; then
       done
       IFS=$IFS_BAK3
       rm -f "$p2c_out"
-      [ -n "$P2C_HTTP_SERVER_PID" ] && kill "$P2C_HTTP_SERVER_PID" 2>/dev/null; P2C_HTTP_SERVER_PID=""
       if [ -n "$p2c_miss" ]; then
         msg="missing substring(s) in p2c stdout: ${p2c_miss#|}"
         printf "FAIL\t%s\tp2c-run\t%s\t%s\n" "$ms" "$f" "$msg" \
