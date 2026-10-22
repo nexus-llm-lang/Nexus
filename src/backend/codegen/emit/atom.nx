@@ -390,12 +390,57 @@ export let emit_atomic_bump = fn (
   return bb.push_bytes(%buf, bytes: [ op_i32_shr_u, op_memory_grow, 0, op_drop, op_end ])
 end
 
-/** Allocate `words * 8` bytes via `emit_atomic_bump`, leaving the resulting base pointer in the per-function `obj_ptr` local (`temps_base + 3`). Convenience wrapper used for fixed-arity object/record allocation where the size is statically known. */
-export let emit_alloc_object = fn (buf: %ByteBuffer, ctx: CodegenCtx, words: i64) -> %ByteBuffer do
+/** Allocate a heap object of `words` 8-byte words via `emit_atomic_bump`, preceded by one header word holding `header` (see `object_header`), and leave the object pointer (the word after the header) in the per-function `obj_ptr` local (`temps_base + 3`). Field and tag offsets are relative to the object pointer, so they are unchanged by the header. */
+export let emit_alloc_object = fn (
+  buf: %ByteBuffer,
+  ctx: CodegenCtx,
+  words: i64,
+  header: i64
+) -> %ByteBuffer do
   let obj_ptr = ctx_temps_base(ctx) + 3
   let %buf = bb.push_byte(%buf, byte: op_i32_const)
-  let %buf = bb.push_sleb128(%buf, val: words * 8)
-  return emit_atomic_bump(%buf, ctx, ptr_local: obj_ptr)
+  let %buf = bb.push_sleb128(%buf, val: (words + 1) * 8)
+  let %buf = emit_atomic_bump(%buf, ctx, ptr_local: obj_ptr)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: obj_ptr)
+  let %buf = bb.push_byte(%buf, byte: op_i64_const)
+  let %buf = bb.push_sleb128(%buf, val: header)
+  let %buf = bb.push_byte(%buf, byte: op_i64_store)
+  let %buf = wdefs.emit_memarg_i64(%buf, offset: 0)
+  let %buf = bb.push_byte(%buf, byte: op_local_get)
+  let %buf = bb.push_uleb128(%buf, val: obj_ptr)
+  let %buf = bb.push_byte(%buf, byte: op_i32_const)
+  let %buf = bb.push_sleb128(%buf, val: 8)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_add, op_local_set ])
+  return bb.push_uleb128(%buf, val: obj_ptr)
+end
+
+/** The header word of a heap object: reference count 1 in bits 0-23, the
+ *  object's word count (capped at 255) in bits 24-31, and in bits 32-63 a
+ *  mask with bit k set when word k (k < 32) holds a pointer. */
+export let object_header = fn (words: i64, mask: i64) -> i64 do
+  let size = if words > 255 then 255 else words end
+  return 1 + size * 16777216 + mask * 4294967296
+end
+
+/** Pointer mask for an object whose words 1.. hold `atoms` in order (word 0 is
+ *  the tag or closure index): bit i+1 is set when atom i is a pointer or a
+ *  value-channel value. */
+export let pointer_mask = fn (atoms: [ LirAtom ]) -> i64 do
+  return pointer_mask_go(atoms, word: 1, acc: 0)
+end
+
+let pointer_mask_go = fn (atoms: [ LirAtom ], word: i64, acc: i64) -> i64 do
+  match atoms do
+    | [] -> return acc
+    | a :: rest ->
+      if word >= 32 then return acc end
+      let bit = match wdefs.peel_linear(typ: wdefs.atom_type(atom: a)) do
+        | TyPtr | TyAny -> 1 << word
+        | _ -> 0
+      end
+      return pointer_mask_go(atoms: rest, word: word + 1, acc: acc | bit)
+  end
 end
 
 /** Split a packed string handle held in `packed_local` (`(ptr << 32) | len`) into separate `ptr_local` and `len_local` i32 locals. Used whenever string contents need to be addressed directly — concat, compare, slice — without re-decoding the i64 each time. */
