@@ -33,8 +33,10 @@ export let force_key = fn (file: string, offset: i64) -> string do
   return file ++ ":" ++ str.from_i64(val: offset)
 end
 
-/** Names of the runtime helpers a list / array force calls. */
-export type ForceHelpers = ForceHelpers(list_fn: string, array_fn: string)
+/** Names of the runtime helpers a list / array force calls. A forced thunk
+ *  returns a scalar boxed, so an array of scalar thunks uses the unboxing
+ *  array helper. */
+export type ForceHelpers = ForceHelpers(list_fn: string, array_fn: string, array_unboxed_fn: string)
 
 /** Context threaded through the rewrite. */
 type Ctx = Ctx(types_id: i64, file: string, helpers: ForceHelpers, enums: [ EnumDef ])
@@ -350,6 +352,18 @@ end
 
 // ─── expansion ──────────────────────────────────────────────────────────────
 
+/** True when `t` is a thunk of a scalar (`@i64`, `@f64`, `@bool`, `@string`, ...). */
+let lazy_of_scalar = fn (t: TypeExpr) -> bool do
+  match strip_linear(t) do
+    | TyLazy(inner, require_row: _, throw_row: _) ->
+      match strip_linear(t: inner) do
+        | TyI64 | TyI32 | TyF64 | TyF32 | TyBool | TyChar | TyString | TyIntLit | TyFloatLit -> return true
+        | _ -> return false
+      end
+    | _ -> return false
+  end
+end
+
 let expand_force = fn (operand: HirExpr, span: Span, ctx: Ctx) -> HirExpr do
   let Ctx(types_id, file, helpers, enums) = ctx
   let Span(offset, line: _, col: _) = span
@@ -358,11 +372,13 @@ let expand_force = fn (operand: HirExpr, span: Span, ctx: Ctx) -> HirExpr do
     return HirExpr(node: Force(expr: operand), span)
   end
   let typ: TypeExpr = value_of_i64(a_x: smap_get_str(id: types_id, key, default_val: 0))
-  let ForceHelpers(list_fn, array_fn) = helpers
+  let ForceHelpers(list_fn, array_fn, array_unboxed_fn) = helpers
   let prefix = "__nx_forced_" ++ str.from_i64(val: offset) ++ "_"
   match strip_linear(t: typ) do
     | TyList(_) -> return call_helper(func: list_fn, label: "xs", operand, span)
-    | TyArray(_) -> return call_helper(func: array_fn, label: "arr", operand, span)
+    | TyArray(elem) ->
+      let f = if lazy_of_scalar(t: elem) then array_unboxed_fn else array_fn end
+      return call_helper(func: f, label: "arr", operand, span)
     | TyRecord(fields) -> return expand_record(operand, fields, prefix, span)
     | TyUserDefined(name, args) ->
       if name == "List" then return call_helper(func: list_fn, label: "xs", operand, span) end
@@ -427,16 +443,52 @@ let expand_record = fn (
     let NamedType(name, typ: _) = val
     return HirRecordPatField(name, pattern: PVar(name: prefix ++ name, sigil: SigilImmutable))
   end)
+  // Each forced field is bound with its result type first, so the record
+  // stores the value in the representation its field type gives it.
+  let forced_lets = forced_field_lets(fields, prefix, span)
   let out_fields = list.map(xs: fields, f: fn (val: NamedType) -> HirNamedExpr do
     let NamedType(name, typ) = val
-    return HirNamedExpr(name, value: forced_var(name: prefix ++ name, lazy: is_lazy(t: typ), span))
+    let v = prefix ++ name
+    let value = if is_lazy(t: typ) then var(name: v ++ "_forced", span) else var(name: v, span) end
+    return HirNamedExpr(name, value)
   end)
-  return single_case_match(
-    operand,
-    pattern: PRec(fields: pat_fields, is_partial: false),
-    result: HirExpr(node: Record(fields: out_fields), span),
+  let result = HirStmt(node: Expr(expr: HirExpr(node: Record(fields: out_fields), span)), span)
+  return HirExpr(
+    node: Match(
+      target: operand,
+      cases: [ HirMatchCase(pattern: PRec(fields: pat_fields, is_partial: false), body: list.concat(xs: forced_lets, ys: [ result ])) ]
+    ),
     span
   )
+end
+
+let forced_field_lets = fn (fields: [ NamedType ], prefix: string, span: Span) -> [ HirStmt ] do
+  match fields do
+    | [] -> return []
+    | NamedType(name, typ) :: rest ->
+      match lazy_inner(t: typ) do
+        | Some(val: inner) ->
+          let v = prefix ++ name
+          let s = HirStmt(
+            node: Let(
+              name: v ++ "_forced",
+              sigil: SigilImmutable,
+              typ: Some(val: inner),
+              value: forced_var(name: v, lazy: true, span)
+            ),
+            span
+          )
+          return s :: forced_field_lets(fields: rest, prefix, span)
+        | None -> return forced_field_lets(fields: rest, prefix, span)
+      end
+  end
+end
+
+let lazy_inner = fn (t: TypeExpr) -> Option<TypeExpr> do
+  match strip_linear(t) do
+    | TyLazy(inner, require_row: _, throw_row: _) -> return Some(val: inner)
+    | _ -> return None
+  end
 end
 
 /** A match over every constructor of `def` that rebuilds it, forcing each

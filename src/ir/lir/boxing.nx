@@ -1,0 +1,1014 @@
+/**
+ * boxing: box scalar values that enter the generic value channel and unbox
+ * them where a scalar is consumed.
+ *
+ * A value of a type variable is typed `TyAny` in LIR and is always a
+ * pointer: an object pointer, or a box (see codegen/intrinsics/box.nx) for a
+ * scalar (integers, floats, bool, char, string). Unit travels as 0 and is
+ * never boxed. This pass inserts `__nx_box(v)` where a scalar flows into a
+ * `TyAny` slot and `__nx_unbox(p)` where a `TyAny` value flows into a scalar
+ * slot. The slots it checks:
+ *
+ * - `let` bindings, against the type their expression produces;
+ * - call arguments, against the callee's parameter types;
+ * - constructor arguments, against the constructor's declared field types;
+ * - closure call arguments and results, and forced thunk results, which use
+ *   `TyAny` slots;
+ * - binary operands, against the other operand;
+ * - returned atoms, against the function's return type.
+ *
+ * A variable's representation is the type of its latest binding before the
+ * use, so a name rebound with another type is read correctly. Every use of a
+ * variable bound as `TyAny` is rewritten to carry `TyAny`. A pointer-typed
+ * binding of a `TyAny` value stays `TyAny`.
+ *
+ * Calls to externals cross the FFI boundary without boxing: arguments and
+ * results keep the representation they have at the call site, and a local
+ * bound to a generic external's result (or a copy of one) is never boxed or
+ * unboxed.
+ *
+ * A lifted closure's environment loads take the representation the captured
+ * atoms have where the closure is created.
+ *
+ * Lifted closures (`__closure_*`) take their scalar parameters as `TyAny`
+ * slots and unbox them on entry, and return `TyAny` when their declared
+ * return type is a scalar.
+ */
+import { Option, Some, None } from "std:option"
+import * as list from "std:list"
+import * as str from "std:str"
+import * as smap from "std:stringmap"
+import { StringMap, Found, Missing } from "std:stringmap"
+import { TypeExpr, TyI64, TyI32, TyF64, TyF32, TyBool, TyChar, TyString, TyIntLit, TyFloatLit,
+         TyAny, TyPtr, TyVar, TyLinear, TyBorrow, VariantDef, VariantField } from "src/types/type_expr.nx"
+import {
+  LirProgram,
+  LirFunction,
+  LirExternal,
+  LirParam,
+  LirStmt,
+  LirExpr,
+  LirAtom,
+  LirCallArg,
+  LirNamedAtom,
+  LirStmtLet,
+  LirStmtIf,
+  LirStmtIfReturn,
+  LirStmtLoop,
+  LirStmtTryCatch,
+  LirAtomVar,
+  LirExprAtom,
+  LirExprBinary,
+  LirExprCall,
+  LirExprTailCall,
+  LirExprConstructor,
+  LirExprRecord,
+  LirExprObjectTag,
+  LirExprObjectField,
+  LirExprRaise,
+  LirExprForce,
+  LirExprMakeClosure,
+  LirExprCallClosure,
+  LirExprSuspend,
+  LirExprResume
+} from "src/ir/lir/types.nx"
+import { atom_type } from "src/ir/lir/context.nx"
+import { VariantIndex }, * as vidx from "src/ir/support/variant_index.nx"
+import { is_closure_lift } from "src/backend/codegen/intrinsics.nx"
+import { expr_type } from "src/backend/wasm/defs.nx"
+
+/** A callee's parameter and return types. `is_ext` marks an FFI callee:
+ *  values cross it in their own representation. */
+type Sig = Sig(params: [ LirParam ], ret: TypeExpr, is_ext: bool)
+
+/** A binding and the type it declares. A `transparent` local holds a generic
+ *  external's result (or a copy of one). */
+type Decl = Decl(name: string, typ: TypeExpr, transparent: bool)
+
+/** State threaded through a function: the fresh-name counter and the
+ *  bindings seen so far, latest first. */
+type St = St(counter: i64, decls: [ Decl ])
+
+type StmtsOut = StmtsOut(stmts: [ LirStmt ], st: St)
+
+/** Statements to run before an expression, the rewritten expression, and the
+ *  representation it produces. */
+type ExprOut = ExprOut(pre: [ LirStmt ], expr: LirExpr, produced: TypeExpr, st: St)
+
+type AtomOut = AtomOut(pre: [ LirStmt ], atom: LirAtom, st: St)
+
+type ArgsOut = ArgsOut(pre: [ LirStmt ], args: [ LirCallArg ], st: St)
+
+type AtomsOut = AtomsOut(pre: [ LirStmt ], atoms: [ LirAtom ], st: St)
+
+type OptRet = OptRet(pre: [ LirStmt ], atom: Option<LirAtom>, st: St)
+
+/** Per-function context. */
+type Env = Env(ret_type: TypeExpr, enum_defs: VariantIndex)
+
+/** Insert box/unbox operations into every function of `program`. */
+export let insert_boxing = fn (program: LirProgram, enum_defs: VariantIndex) -> LirProgram do
+  let LirProgram(functions: raw_functions, externals) = program
+  let %caps = capture_types_of_functions(funcs: raw_functions, caps: smap.empty())
+  let functions = retype_env_loads(funcs: raw_functions, caps: &%caps)
+  smap.free(map: %caps)
+  let %sigs = add_externals(
+    sigs: add_functions(sigs: smap.empty(), funcs: functions),
+    exts: externals
+  )
+  let out = box_functions(funcs: functions, sigs: &%sigs, enum_defs)
+  smap.free(map: %sigs)
+  return LirProgram(functions: out, externals)
+end
+
+let add_functions = fn (sigs: %StringMap<Sig>, funcs: [ LirFunction ]) -> %StringMap<Sig> do
+  match funcs do
+    | [] -> return %sigs
+    | LirFunction(name, params, ret_type, body: _, ret: _, span: _) :: rest ->
+      let %s2 = smap.put(map: %sigs, key: name, value: Sig(params, ret: ret_type, is_ext: false))
+      return add_functions(sigs: %s2, funcs: rest)
+  end
+end
+
+let add_externals = fn (sigs: %StringMap<Sig>, exts: [ LirExternal ]) -> %StringMap<Sig> do
+  match exts do
+    | [] -> return %sigs
+    | LirExternal(name, wasm_module: _, wasm_name: _, params, ret_type, throw_row: _) :: rest ->
+      let %s2 = smap.put(map: %sigs, key: name, value: Sig(params, ret: ret_type, is_ext: true))
+      return add_externals(sigs: %s2, exts: rest)
+  end
+end
+
+let box_functions = fn (
+  funcs: [ LirFunction ],
+  sigs: &StringMap<Sig>,
+  enum_defs: VariantIndex
+) -> [ LirFunction ] do
+  match funcs do
+    | [] -> return []
+    | f :: rest -> return box_function(
+      func: f,
+      sigs,
+      enum_defs
+    ) :: box_functions(funcs: rest, sigs, enum_defs)
+  end
+end
+
+let box_function = fn (
+  func: LirFunction,
+  sigs: &StringMap<Sig>,
+  enum_defs: VariantIndex
+) -> LirFunction do
+  let LirFunction(name, params, ret_type, body, ret, span) = func
+  let closure = is_closure_lift(name)
+  let slot_params = if closure then closure_params(params) else params end
+  let fn_ret = if closure && is_scalar(typ: ret_type) then TyAny else ret_type end
+  let env = Env(ret_type: fn_ret, enum_defs)
+  let st0 = St(counter: 0, decls: decls_of_params(params: slot_params, acc: []))
+  let StmtsOut(
+    stmts: entry,
+    st: st1
+  ) = if closure then closure_entry(params, st: st0) else StmtsOut(stmts: [], st: st0) end
+  let StmtsOut(stmts: body2, st: st2) = box_stmts(stmts: body, sigs, env, st: st1)
+  let AtomOut(pre: ret_pre, atom: ret2, st: _) = coerce_atom(atom: ret, dst: fn_ret, st: st2)
+  return LirFunction(
+    name,
+    params: slot_params,
+    ret_type: fn_ret,
+    body: list.concat(xs: entry, ys: list.concat(xs: body2, ys: ret_pre)),
+    ret: ret2,
+    span
+  )
+end
+
+// ─── closure ABI ────────────────────────────────────────────────────────────
+
+let slot_name = fn (name: string) -> string do
+  return "__slot_" ++ name
+end
+
+let closure_params = fn (params: [ LirParam ]) -> [ LirParam ] do
+  match params do
+    | [] -> return []
+    | LirParam(label, name, typ) :: rest ->
+      let p = if name != "__env" && is_scalar(typ) then
+        LirParam(label, name: slot_name(name), typ: TyAny)
+      else LirParam(label, name, typ) end
+      return p :: closure_params(params: rest)
+  end
+end
+
+let closure_entry = fn (params: [ LirParam ], st: St) -> StmtsOut do
+  match params do
+    | [] -> return StmtsOut(stmts: [], st)
+    | LirParam(label: _, name, typ) :: rest ->
+      if name != "__env" && is_scalar(typ) then
+        let un = LirStmtLet(
+          name,
+          typ,
+          expr: unbox_expr(atom: LirAtomVar(name: slot_name(name), typ: TyAny))
+        )
+        let StmtsOut(
+          stmts: more,
+          st: st2
+        ) = closure_entry(params: rest, st: add_decl(st, name, typ, transparent: false))
+        return StmtsOut(stmts: un :: more, st: st2)
+      end
+      return closure_entry(params: rest, st)
+  end
+end
+
+// ─── statements ─────────────────────────────────────────────────────────────
+
+let box_stmts = fn (stmts: [ LirStmt ], sigs: &StringMap<Sig>, env: Env, st: St) -> StmtsOut do
+  match stmts do
+    | [] -> return StmtsOut(stmts: [], st)
+    | s :: rest ->
+      let StmtsOut(stmts: head, st: st1) = box_stmt(stmt: s, sigs, env, st)
+      let StmtsOut(stmts: tail, st: st2) = box_stmts(stmts: rest, sigs, env, st: st1)
+      return StmtsOut(stmts: list.concat(xs: head, ys: tail), st: st2)
+  end
+end
+
+let box_stmt = fn (stmt: LirStmt, sigs: &StringMap<Sig>, env: Env, st: St) -> StmtsOut do
+  let Env(ret_type: fn_ret, enum_defs: _) = env
+  match stmt do
+    | LirStmtLet(name, typ, expr) ->
+      let St(counter: _, decls) = st
+      let e0 = any_expr(expr, decls)
+      let transparent = is_any(typ) && is_transparent_source(expr: e0, decls, sigs)
+      let ExprOut(pre, expr: e2, produced: produced0, st: st1) = box_expr(expr: e0, sigs, env, st)
+      let produced = if calls_external(
+        expr: e0,
+        sigs
+      ) || is_transparent_source(expr: e0, decls, sigs) then typ else produced0 end
+      if needs_unbox(src: produced, dst: typ) then
+        let St(counter: c1, decls: _) = st1
+        let tmp = fresh(counter: c1)
+        let s1 = LirStmtLet(name: tmp, typ: TyAny, expr: e2)
+        let s2 = LirStmtLet(name, typ, expr: unbox_expr(atom: LirAtomVar(name: tmp, typ: TyAny)))
+        let st2 = add_decl(
+          st: add_decl(st: bump(st: st1), name: tmp, typ: TyAny, transparent: false),
+          name,
+          typ,
+          transparent: false
+        )
+        return StmtsOut(stmts: list.concat(xs: pre, ys: [ s1, s2 ]), st: st2)
+      end
+      if needs_box(src: produced, dst: typ) then
+        let St(counter: c1, decls: _) = st1
+        let tmp = fresh(counter: c1)
+        let s1 = LirStmtLet(name: tmp, typ: produced, expr: e2)
+        let s2 = LirStmtLet(
+          name,
+          typ: TyAny,
+          expr: box_expr_of(atom: LirAtomVar(name: tmp, typ: produced))
+        )
+        let st2 = add_decl(
+          st: add_decl(st: bump(st: st1), name: tmp, typ: produced, transparent: false),
+          name,
+          typ: TyAny,
+          transparent: false
+        )
+        return StmtsOut(stmts: list.concat(xs: pre, ys: [ s1, s2 ]), st: st2)
+      end
+      // A pointer-typed binding of a channel value stays a channel value: the
+      // pointer type may be a fallback for a lost result type, and a real
+      // pointer reads the same either way.
+      let typ2 = if is_ptr_type(typ) && is_any(typ: produced) then TyAny else typ end
+      let st2 = add_decl(st: st1, name, typ: typ2, transparent)
+      return StmtsOut(
+        stmts: list.concat(xs: pre, ys: [ LirStmtLet(name, typ: typ2, expr: e2) ]),
+        st: st2
+      )
+    | LirStmtIf(cond, then_body, else_body) ->
+      let AtomOut(pre, atom: c2, st: st1) = coerce_atom(atom: cond, dst: TyBool, st)
+      let StmtsOut(stmts: tb, st: st2) = box_stmts(stmts: then_body, sigs, env, st: st1)
+      let StmtsOut(stmts: eb, st: st3) = box_stmts(stmts: else_body, sigs, env, st: st2)
+      return StmtsOut(
+        stmts: list.concat(xs: pre, ys: [ LirStmtIf(cond: c2, then_body: tb, else_body: eb) ]),
+        st: st3
+      )
+    | LirStmtIfReturn(cond, then_body, then_ret, else_body, else_ret, ret_type: _) ->
+      let AtomOut(pre, atom: c2, st: st1) = coerce_atom(atom: cond, dst: TyBool, st)
+      let StmtsOut(stmts: tb, st: st2) = box_stmts(stmts: then_body, sigs, env, st: st1)
+      let AtomOut(pre: tpre, atom: tr, st: st3) = coerce_atom(atom: then_ret, dst: fn_ret, st: st2)
+      let StmtsOut(stmts: eb, st: st4) = box_stmts(stmts: else_body, sigs, env, st: st3)
+      let OptRet(
+        pre: epre,
+        atom: er,
+        st: st5
+      ) = coerce_opt_ret(atom: else_ret, dst: fn_ret, st: st4)
+      let s = LirStmtIfReturn(
+        cond: c2,
+        then_body: list.concat(xs: tb, ys: tpre),
+        then_ret: tr,
+        else_body: list.concat(xs: eb, ys: epre),
+        else_ret: er,
+        ret_type: fn_ret
+      )
+      return StmtsOut(stmts: list.concat(xs: pre, ys: [ s ]), st: st5)
+    | LirStmtLoop(cond_stmts, cond, body) ->
+      let StmtsOut(stmts: cs, st: st1) = box_stmts(stmts: cond_stmts, sigs, env, st)
+      let AtomOut(pre, atom: c2, st: st2) = coerce_atom(atom: cond, dst: TyBool, st: st1)
+      let StmtsOut(stmts: b, st: st3) = box_stmts(stmts: body, sigs, env, st: st2)
+      return StmtsOut(
+        stmts: [ LirStmtLoop(cond_stmts: list.concat(xs: cs, ys: pre), cond: c2, body: b) ],
+        st: st3
+      )
+    | LirStmtTryCatch(body, body_ret, catch_param, catch_param_typ, catch_body, catch_ret) ->
+      let StmtsOut(stmts: b, st: st1) = box_stmts(stmts: body, sigs, env, st)
+      let OptRet(
+        pre: bpre,
+        atom: br,
+        st: st2
+      ) = coerce_opt_ret(atom: body_ret, dst: fn_ret, st: st1)
+      let st3 = add_decl(st: st2, name: catch_param, typ: catch_param_typ, transparent: false)
+      let StmtsOut(stmts: cb, st: st4) = box_stmts(stmts: catch_body, sigs, env, st: st3)
+      let OptRet(
+        pre: cpre,
+        atom: cr,
+        st: st5
+      ) = coerce_opt_ret(atom: catch_ret, dst: fn_ret, st: st4)
+      let s = LirStmtTryCatch(
+        body: list.concat(xs: b, ys: bpre),
+        body_ret: br,
+        catch_param,
+        catch_param_typ,
+        catch_body: list.concat(xs: cb, ys: cpre),
+        catch_ret: cr
+      )
+      return StmtsOut(stmts: [ s ], st: st5)
+  end
+end
+
+let coerce_opt_ret = fn (atom: Option<LirAtom>, dst: TypeExpr, st: St) -> OptRet do
+  match atom do
+    | Some(val: a) ->
+      let AtomOut(pre, atom: a2, st: st1) = coerce_atom(atom: a, dst, st)
+      return OptRet(pre, atom: Some(val: a2), st: st1)
+    | None -> return OptRet(pre: [], atom: None, st)
+  end
+end
+
+// ─── expressions ────────────────────────────────────────────────────────────
+
+let box_expr = fn (expr: LirExpr, sigs: &StringMap<Sig>, env: Env, st: St) -> ExprOut do
+  let Env(ret_type: fn_ret, enum_defs) = env
+  let St(counter: _, decls) = st
+  match expr do
+    | LirExprAtom(atom) -> return ExprOut(pre: [], expr, produced: atom_repr(atom, decls), st)
+    | LirExprCall(func, args, typ) ->
+      let ArgsOut(pre, args: a2, st: st1) = coerce_args(args, params: param_types(func, sigs), st)
+      return ExprOut(pre, expr: LirExprCall(func, args: a2, typ), produced: typ, st: st1)
+    | LirExprTailCall(func, args, typ) ->
+      let ArgsOut(pre, args: a2, st: st1) = coerce_args(args, params: param_types(func, sigs), st)
+      // A tail call returns the callee's result as is; when that result needs
+      // boxing or unboxing to match this function's return type, call normally.
+      if needs_box(src: typ, dst: fn_ret) || needs_unbox(src: typ, dst: fn_ret) then
+        return ExprOut(pre, expr: LirExprCall(func, args: a2, typ), produced: typ, st: st1)
+      end
+      return ExprOut(pre, expr: LirExprTailCall(func, args: a2, typ), produced: typ, st: st1)
+    | LirExprConstructor(name, args, typ) ->
+      let AtomsOut(
+        pre,
+        atoms: a2,
+        st: st1
+      ) = coerce_atoms(atoms: args, tos: ctor_field_types(name, enum_defs), st)
+      return ExprOut(pre, expr: LirExprConstructor(name, args: a2, typ), produced: typ, st: st1)
+    | LirExprCallClosure(closure, args, typ: _) ->
+      let ArgsOut(pre, args: a2, st: st1) = coerce_args_to_any(args, st)
+      return ExprOut(
+        pre,
+        expr: LirExprCallClosure(closure, args: a2, typ: TyAny),
+        produced: TyAny,
+        st: st1
+      )
+    | LirExprForce(
+      value,
+      typ: _
+    ) -> return ExprOut(pre: [], expr: LirExprForce(value, typ: TyAny), produced: TyAny, st)
+    | LirExprBinary(op, lhs, rhs, typ) ->
+      let lt = atom_repr(atom: lhs, decls)
+      let rt = atom_repr(atom: rhs, decls)
+      let ltarget = operand_target(repr: lt, carried: atom_type(atom: lhs), other: rt, result: typ)
+      let rtarget = operand_target(repr: rt, carried: atom_type(atom: rhs), other: lt, result: typ)
+      // An arithmetic result typed TyAny (from a channel operand's semantic
+      // type) is the operands' scalar type.
+      let res = if is_any(typ) then
+        if is_scalar(typ: ltarget) then ltarget else if is_scalar(typ: rtarget) then rtarget else typ end
+      else typ end
+      let AtomOut(pre: lp, atom: l2, st: st1) = coerce_atom(atom: lhs, dst: ltarget, st)
+      let AtomOut(pre: rp, atom: r2, st: st2) = coerce_atom(atom: rhs, dst: rtarget, st: st1)
+      return ExprOut(
+        pre: list.concat(xs: lp, ys: rp),
+        expr: LirExprBinary(op, lhs: l2, rhs: r2, typ: res),
+        produced: res,
+        st: st2
+      )
+    | _ -> return ExprOut(pre: [], expr, produced: expr_type(expr), st)
+  end
+end
+
+/** The type a binary operand is coerced to. A channel operand is unboxed to
+ *  the other operand's scalar type, else to the scalar type the atom carries,
+ *  else to the (scalar, non-bool) result type of an arithmetic operation. */
+let operand_target = fn (
+  repr: TypeExpr,
+  carried: TypeExpr,
+  other: TypeExpr,
+  result: TypeExpr
+) -> TypeExpr do
+  if !is_any(typ: repr) then return repr end
+  if is_scalar(typ: other) then return other end
+  if is_scalar(typ: carried) then return carried end
+  match peel(typ: result) do
+    | TyBool -> return repr
+    | _ -> if is_scalar(typ: result) then return result else return repr end
+  end
+end
+
+let coerce_args = fn (args: [ LirCallArg ], params: Option<[ LirParam ]>, st: St) -> ArgsOut do
+  match params do
+    | None -> return ArgsOut(pre: [], args, st)
+    | Some(val: ps) -> return coerce_args_go(args, params: ps, st)
+  end
+end
+
+let coerce_args_go = fn (args: [ LirCallArg ], params: [ LirParam ], st: St) -> ArgsOut do
+  match args do
+    | [] -> return ArgsOut(pre: [], args: [], st)
+    | LirCallArg(label, value) :: rest ->
+      let AtomOut(pre, atom: v2, st: st1) = match param_type_of(params, label) do
+        | Some(val: pt) -> coerce_atom(atom: value, dst: pt, st)
+        | None -> AtomOut(pre: [], atom: value, st)
+      end
+      let ArgsOut(pre: rpre, args: rargs, st: st2) = coerce_args_go(args: rest, params, st: st1)
+      return ArgsOut(
+        pre: list.concat(xs: pre, ys: rpre),
+        args: LirCallArg(label, value: v2) :: rargs,
+        st: st2
+      )
+  end
+end
+
+let coerce_args_to_any = fn (args: [ LirCallArg ], st: St) -> ArgsOut do
+  match args do
+    | [] -> return ArgsOut(pre: [], args: [], st)
+    | LirCallArg(label, value) :: rest ->
+      let AtomOut(pre, atom: v2, st: st1) = coerce_atom(atom: value, dst: TyAny, st)
+      let ArgsOut(pre: rpre, args: rargs, st: st2) = coerce_args_to_any(args: rest, st: st1)
+      return ArgsOut(
+        pre: list.concat(xs: pre, ys: rpre),
+        args: LirCallArg(label, value: v2) :: rargs,
+        st: st2
+      )
+  end
+end
+
+let coerce_atoms = fn (atoms: [ LirAtom ], tos: [ TypeExpr ], st: St) -> AtomsOut do
+  match atoms do
+    | [] -> return AtomsOut(pre: [], atoms: [], st)
+    | a :: rest ->
+      let St(counter: _, decls) = st
+      let head_dst = match tos do
+        | t :: _ -> t
+        | [] -> atom_repr(atom: a, decls)
+      end
+      let rest_dst = match tos do
+        | _ :: ts -> ts
+        | [] -> []
+      end
+      let AtomOut(pre, atom: a2, st: st1) = coerce_atom(atom: a, dst: head_dst, st)
+      let AtomsOut(
+        pre: rpre,
+        atoms: ras,
+        st: st2
+      ) = coerce_atoms(atoms: rest, tos: rest_dst, st: st1)
+      return AtomsOut(pre: list.concat(xs: pre, ys: rpre), atoms: a2 :: ras, st: st2)
+  end
+end
+
+/** Box or unbox `atom` so it fits a slot of type `dst`. */
+let coerce_atom = fn (atom: LirAtom, dst: TypeExpr, st: St) -> AtomOut do
+  let St(counter, decls) = st
+  let a0 = any_atom(atom, decls)
+  if let LirAtomVar(name, typ: _) = a0 then
+    if is_transparent(decls, name) then return AtomOut(pre: [], atom: a0, st) end
+  end
+  let src = atom_repr(atom: a0, decls)
+  if needs_box(src, dst) then
+    let tmp = fresh(counter)
+    let s = LirStmtLet(name: tmp, typ: TyAny, expr: box_expr_of(atom: a0))
+    let st1 = add_decl(st: bump(st), name: tmp, typ: TyAny, transparent: false)
+    return AtomOut(pre: [ s ], atom: LirAtomVar(name: tmp, typ: TyAny), st: st1)
+  end
+  if needs_unbox(src, dst) then
+    let tmp = fresh(counter)
+    let target = peel(typ: dst)
+    let s = LirStmtLet(name: tmp, typ: target, expr: unbox_expr(atom: a0))
+    let st1 = add_decl(st: bump(st), name: tmp, typ: target, transparent: false)
+    return AtomOut(pre: [ s ], atom: LirAtomVar(name: tmp, typ: target), st: st1)
+  end
+  return AtomOut(pre: [], atom: a0, st)
+end
+
+let box_expr_of = fn (atom: LirAtom) -> LirExpr do
+  return LirExprCall(func: "__nx_box", args: [ LirCallArg(label: "v", value: atom) ], typ: TyAny)
+end
+
+let unbox_expr = fn (atom: LirAtom) -> LirExpr do
+  return LirExprCall(func: "__nx_unbox", args: [ LirCallArg(label: "p", value: atom) ], typ: TyI64)
+end
+
+let fresh = fn (counter: i64) -> string do
+  return "__bx" ++ str.from_i64(val: counter)
+end
+
+let bump = fn (st: St) -> St do
+  let St(counter, decls) = st
+  return St(counter: counter + 1, decls)
+end
+
+let add_decl = fn (st: St, name: string, typ: TypeExpr, transparent: bool) -> St do
+  let St(counter, decls) = st
+  return St(counter, decls: Decl(name, typ, transparent) :: decls)
+end
+
+// ─── signatures ─────────────────────────────────────────────────────────────
+
+let param_types = fn (func: string, sigs: &StringMap<Sig>) -> Option<[ LirParam ]> do
+  match smap.get(map: sigs, key: func) do
+    | Found(value: Sig(params, ret: _, is_ext)) -> if is_ext then return None else return Some(val: params) end
+    | Missing -> return None
+  end
+end
+
+let param_type_of = fn (params: [ LirParam ], label: string) -> Option<TypeExpr> do
+  match params do
+    | [] -> return None
+    | LirParam(label: l, name: _, typ) :: rest ->
+      if l == label then return Some(val: typ) end
+      return param_type_of(params: rest, label)
+  end
+end
+
+let is_external = fn (func: string, sigs: &StringMap<Sig>) -> bool do
+  match smap.get(map: sigs, key: func) do
+    | Found(value: Sig(params: _, ret: _, is_ext)) -> return is_ext
+    | Missing -> return false
+  end
+end
+
+let calls_external = fn (expr: LirExpr, sigs: &StringMap<Sig>) -> bool do
+  match expr do
+    | LirExprCall(func, args: _, typ: _) -> return is_external(func, sigs)
+    | LirExprTailCall(func, args: _, typ: _) -> return is_external(func, sigs)
+    | _ -> return false
+  end
+end
+
+/** A generic external's result, or a copy of a transparent local. */
+let is_transparent_source = fn (expr: LirExpr, decls: [ Decl ], sigs: &StringMap<Sig>) -> bool do
+  match expr do
+    | LirExprCall(func, args: _, typ: _) -> return is_external(func, sigs)
+    | LirExprTailCall(func, args: _, typ: _) -> return is_external(func, sigs)
+    | LirExprAtom(atom: LirAtomVar(name, typ: _)) -> return is_transparent(decls, name)
+    | _ -> return false
+  end
+end
+
+/** Declared field types of constructor `name`, in heap (argument) order: by
+ *  field name when every field is named, else declaration order. */
+let ctor_field_types = fn (name: string, enum_defs: VariantIndex) -> [ TypeExpr ] do
+  match vidx.lookup_variant_def_in_index(idx: enum_defs, variant: name) do
+    | Some(val: VariantDef(name: _, fields)) ->
+      if all_named(fields) then return field_types(fields: sort_fields(fields)) end
+      return field_types(fields)
+    | None -> return []
+  end
+end
+
+let all_named = fn (fields: [ VariantField ]) -> bool do
+  match fields do
+    | [] -> return true
+    | VariantField(name: Some(_), typ: _) :: rest -> return all_named(fields: rest)
+    | VariantField(name: None, typ: _) :: _ -> return false
+  end
+end
+
+let field_types = fn (fields: [ VariantField ]) -> [ TypeExpr ] do
+  match fields do
+    | [] -> return []
+    | VariantField(name: _, typ) :: rest -> return slot_type(typ) :: field_types(fields: rest)
+  end
+end
+
+/** The LIR slot type of a declared field: a type variable is a `TyAny` slot. */
+let slot_type = fn (typ: TypeExpr) -> TypeExpr do
+  match peel(typ) do
+    | TyVar(_) -> return TyAny
+    | other -> return other
+  end
+end
+
+let sort_fields = fn (fields: [ VariantField ]) -> [ VariantField ] do
+  match fields do
+    | [] -> return []
+    | f :: rest -> return insert_field(f, sorted: sort_fields(fields: rest))
+  end
+end
+
+let insert_field = fn (f: VariantField, sorted: [ VariantField ]) -> [ VariantField ] do
+  match sorted do
+    | [] -> return [ f ]
+    | g :: rest ->
+      if field_name(f) <= field_name(f: g) then return f :: sorted end
+      return g :: insert_field(f, sorted: rest)
+  end
+end
+
+let field_name = fn (f: VariantField) -> string do
+  match f do
+    | VariantField(name: Some(val: n), typ: _) -> return n
+    | VariantField(name: None, typ: _) -> return ""
+  end
+end
+
+// ─── representations ────────────────────────────────────────────────────────
+
+let peel = fn (typ: TypeExpr) -> TypeExpr do
+  match typ do
+    | TyLinear(inner) | TyBorrow(inner) -> return peel(typ: inner)
+    | _ -> return typ
+  end
+end
+
+/** Scalars that are boxed when they enter the value channel. */
+let is_scalar = fn (typ: TypeExpr) -> bool do
+  match peel(typ) do
+    | TyI64 | TyI32 | TyF64 | TyF32 | TyBool | TyChar | TyString | TyIntLit | TyFloatLit -> return true
+    | _ -> return false
+  end
+end
+
+let is_any = fn (typ: TypeExpr) -> bool do
+  match peel(typ) do
+    | TyAny -> return true
+    | _ -> return false
+  end
+end
+
+let is_ptr_type = fn (typ: TypeExpr) -> bool do
+  match peel(typ) do
+    | TyPtr -> return true
+    | _ -> return false
+  end
+end
+
+let needs_box = fn (src: TypeExpr, dst: TypeExpr) -> bool do
+  return is_scalar(typ: src) && is_any(typ: dst)
+end
+
+let needs_unbox = fn (src: TypeExpr, dst: TypeExpr) -> bool do
+  return is_any(typ: src) && is_scalar(typ: dst)
+end
+
+/** The representation of `atom`: a variable's latest binding type when the
+ *  function binds it, else the type the atom carries. */
+let atom_repr = fn (atom: LirAtom, decls: [ Decl ]) -> TypeExpr do
+  match atom do
+    | LirAtomVar(name, typ) ->
+      match lookup_decl(decls, name) do
+        | Some(val: t) -> return t
+        | None -> return typ
+      end
+    | _ -> return atom_type(atom)
+  end
+end
+
+let lookup_decl = fn (decls: [ Decl ], name: string) -> Option<TypeExpr> do
+  match decls do
+    | [] -> return None
+    | Decl(name: n, typ, transparent: _) :: rest ->
+      if n == name then return Some(val: typ) end
+      return lookup_decl(decls: rest, name)
+  end
+end
+
+let is_transparent = fn (decls: [ Decl ], name: string) -> bool do
+  match decls do
+    | [] -> return false
+    | Decl(name: n, typ: _, transparent) :: rest ->
+      if n == name then return transparent end
+      return is_transparent(decls: rest, name)
+  end
+end
+
+let decls_of_params = fn (params: [ LirParam ], acc: [ Decl ]) -> [ Decl ] do
+  match params do
+    | [] -> return acc
+    | LirParam(label: _, name, typ) :: rest ->
+      return decls_of_params(params: rest, acc: Decl(name, typ, transparent: false) :: acc)
+  end
+end
+
+// ─── channel atoms ──────────────────────────────────────────────────────────
+// A use of a variable whose latest binding is `TyAny` carries `TyAny`, so
+// codegen reads it from its i64 slot as is.
+
+let any_atom = fn (atom: LirAtom, decls: [ Decl ]) -> LirAtom do
+  match atom do
+    | LirAtomVar(name, typ: _) ->
+      match lookup_decl(decls, name) do
+        | Some(val: t) -> if is_any(typ: t) then return LirAtomVar(
+          name,
+          typ: TyAny
+        ) else return atom end
+        | None -> return atom
+      end
+    | _ -> return atom
+  end
+end
+
+let any_atoms = fn (atoms: [ LirAtom ], decls: [ Decl ]) -> [ LirAtom ] do
+  match atoms do
+    | [] -> return []
+    | a :: rest -> return any_atom(atom: a, decls) :: any_atoms(atoms: rest, decls)
+  end
+end
+
+let any_args = fn (args: [ LirCallArg ], decls: [ Decl ]) -> [ LirCallArg ] do
+  match args do
+    | [] -> return []
+    | LirCallArg(label, value) :: rest -> return LirCallArg(
+      label,
+      value: any_atom(atom: value, decls)
+    ) :: any_args(args: rest, decls)
+  end
+end
+
+let any_named = fn (fields: [ LirNamedAtom ], decls: [ Decl ]) -> [ LirNamedAtom ] do
+  match fields do
+    | [] -> return []
+    | LirNamedAtom(name, value) :: rest ->
+      return LirNamedAtom(
+        name,
+        value: any_atom(atom: value, decls)
+      ) :: any_named(fields: rest, decls)
+  end
+end
+
+let any_expr = fn (expr: LirExpr, decls: [ Decl ]) -> LirExpr do
+  match expr do
+    | LirExprAtom(atom) -> return LirExprAtom(atom: any_atom(atom, decls))
+    | LirExprBinary(op, lhs, rhs, typ) ->
+      return LirExprBinary(
+        op,
+        lhs: any_atom(atom: lhs, decls),
+        rhs: any_atom(atom: rhs, decls),
+        typ
+      )
+    | LirExprCall(func, args, typ) -> return LirExprCall(func, args: any_args(args, decls), typ)
+    | LirExprTailCall(
+      func,
+      args,
+      typ
+    ) -> return LirExprTailCall(func, args: any_args(args, decls), typ)
+    | LirExprConstructor(
+      name,
+      args,
+      typ
+    ) -> return LirExprConstructor(name, args: any_atoms(atoms: args, decls), typ)
+    | LirExprRecord(fields, typ) -> return LirExprRecord(fields: any_named(fields, decls), typ)
+    | LirExprObjectTag(
+      value,
+      typ
+    ) -> return LirExprObjectTag(value: any_atom(atom: value, decls), typ)
+    | LirExprObjectField(
+      value,
+      index,
+      typ
+    ) -> return LirExprObjectField(value: any_atom(atom: value, decls), index, typ)
+    | LirExprRaise(value, typ) -> return LirExprRaise(value: any_atom(atom: value, decls), typ)
+    | LirExprForce(value, typ) -> return LirExprForce(value: any_atom(atom: value, decls), typ)
+    | LirExprMakeClosure(func_name, captures, typ) ->
+      return LirExprMakeClosure(func_name, captures: any_atoms(atoms: captures, decls), typ)
+    | LirExprCallClosure(closure, args, typ) ->
+      return LirExprCallClosure(
+        closure: any_atom(atom: closure, decls),
+        args: any_args(args, decls),
+        typ
+      )
+    | LirExprSuspend(
+      tag_name,
+      payload,
+      typ
+    ) -> return LirExprSuspend(tag_name, payload: any_atom(atom: payload, decls), typ)
+    | LirExprResume(cont, value, typ) ->
+      return LirExprResume(
+        cont: any_atom(atom: cont, decls),
+        value: any_atom(atom: value, decls),
+        typ
+      )
+    | _ -> return expr
+  end
+end
+
+// ─── captured values ────────────────────────────────────────────────────────
+// `closure(f; c0, c1, …)` stores capture k in environment field k; the lifted
+// `f` reads it back with `field(__env, k)`. The load takes the representation
+// the capture has at the creation site.
+
+let capture_types_of_functions = fn (
+  funcs: [ LirFunction ],
+  caps: %StringMap<[ TypeExpr ]>
+) -> %StringMap<[ TypeExpr ]> do
+  match funcs do
+    | [] -> return %caps
+    | LirFunction(name: _, params, ret_type: _, body, ret: _, span: _) :: rest ->
+      let %c2 = capture_types_of_stmts(
+        stmts: body,
+        decls: decls_of_params(params, acc: []),
+        caps: %caps
+      )
+      return capture_types_of_functions(funcs: rest, caps: %c2)
+  end
+end
+
+type CapsOut = CapsOut(caps: %StringMap<[ TypeExpr ]>, decls: [ Decl ])
+
+let capture_types_of_stmts = fn (
+  stmts: [ LirStmt ],
+  decls: [ Decl ],
+  caps: %StringMap<[ TypeExpr ]>
+) -> %StringMap<[ TypeExpr ]> do
+  let CapsOut(caps: %c2, decls: _) = capture_types_walk(stmts, decls, caps: %caps)
+  return %c2
+end
+
+let capture_types_walk = fn (
+  stmts: [ LirStmt ],
+  decls: [ Decl ],
+  caps: %StringMap<[ TypeExpr ]>
+) -> CapsOut do
+  match stmts do
+    | [] -> return CapsOut(caps: %caps, decls)
+    | LirStmtLet(name, typ, expr) :: rest ->
+      let %c2 = note_closure(expr, decls, caps: %caps)
+      return capture_types_walk(
+        stmts: rest,
+        decls: Decl(name, typ, transparent: false) :: decls,
+        caps: %c2
+      )
+    | LirStmtIf(cond: _, then_body, else_body) :: rest ->
+      let CapsOut(caps: %c1, decls: d1) = capture_types_walk(stmts: then_body, decls, caps: %caps)
+      let CapsOut(caps: %c2, decls: d2) = capture_types_walk(stmts: else_body, decls: d1, caps: %c1)
+      return capture_types_walk(stmts: rest, decls: d2, caps: %c2)
+    | LirStmtIfReturn(
+      cond: _,
+      then_body,
+      then_ret: _,
+      else_body,
+      else_ret: _,
+      ret_type: _
+    ) :: rest ->
+      let CapsOut(caps: %c1, decls: d1) = capture_types_walk(stmts: then_body, decls, caps: %caps)
+      let CapsOut(caps: %c2, decls: d2) = capture_types_walk(stmts: else_body, decls: d1, caps: %c1)
+      return capture_types_walk(stmts: rest, decls: d2, caps: %c2)
+    | LirStmtLoop(cond_stmts, cond: _, body) :: rest ->
+      let CapsOut(caps: %c1, decls: d1) = capture_types_walk(stmts: cond_stmts, decls, caps: %caps)
+      let CapsOut(caps: %c2, decls: d2) = capture_types_walk(stmts: body, decls: d1, caps: %c1)
+      return capture_types_walk(stmts: rest, decls: d2, caps: %c2)
+    | LirStmtTryCatch(
+      body,
+      body_ret: _,
+      catch_param,
+      catch_param_typ,
+      catch_body,
+      catch_ret: _
+    ) :: rest ->
+      let CapsOut(caps: %c1, decls: d1) = capture_types_walk(stmts: body, decls, caps: %caps)
+      let d1c = Decl(name: catch_param, typ: catch_param_typ, transparent: false) :: d1
+      let CapsOut(
+        caps: %c2,
+        decls: d2
+      ) = capture_types_walk(stmts: catch_body, decls: d1c, caps: %c1)
+      return capture_types_walk(stmts: rest, decls: d2, caps: %c2)
+  end
+end
+
+let note_closure = fn (
+  expr: LirExpr,
+  decls: [ Decl ],
+  caps: %StringMap<[ TypeExpr ]>
+) -> %StringMap<[ TypeExpr ]> do
+  if let LirExprMakeClosure(func_name, captures, typ: _) = expr then
+    return smap.put(map: %caps, key: func_name, value: atom_reprs(atoms: captures, decls))
+  end
+  return %caps
+end
+
+let atom_reprs = fn (atoms: [ LirAtom ], decls: [ Decl ]) -> [ TypeExpr ] do
+  match atoms do
+    | [] -> return []
+    | a :: rest -> return atom_repr(atom: a, decls) :: atom_reprs(atoms: rest, decls)
+  end
+end
+
+let retype_env_loads = fn (
+  funcs: [ LirFunction ],
+  caps: &StringMap<[ TypeExpr ]>
+) -> [ LirFunction ] do
+  match funcs do
+    | [] -> return []
+    | LirFunction(name, params, ret_type, body, ret, span) :: rest ->
+      let f2 = match smap.get(map: caps, key: name) do
+        | Found(value: types) -> LirFunction(
+          name,
+          params,
+          ret_type,
+          body: retype_env_stmts(stmts: body, types),
+          ret,
+          span
+        )
+        | Missing -> LirFunction(name, params, ret_type, body, ret, span)
+      end
+      return f2 :: retype_env_loads(funcs: rest, caps)
+  end
+end
+
+/** Retype `let x: i64|ptr = field(__env, k)` to capture k's representation
+ *  when that is a pointer or a value-channel value, together with a plain
+ *  copy of such a load. */
+let retype_env_stmts = fn (stmts: [ LirStmt ], types: [ TypeExpr ]) -> [ LirStmt ] do
+  return retype_env_go(stmts, types, retyped: [])
+end
+
+let retype_env_go = fn (
+  stmts: [ LirStmt ],
+  types: [ TypeExpr ],
+  retyped: [ Decl ]
+) -> [ LirStmt ] do
+  match stmts do
+    | [] -> return []
+    | LirStmtLet(name, typ, expr) :: rest ->
+      match env_load_type(typ, expr, types, retyped) do
+        | Some(val: ct) ->
+          let s = LirStmtLet(name, typ: ct, expr: with_type(expr, typ: ct))
+          return s :: retype_env_go(
+            stmts: rest,
+            types,
+            retyped: Decl(name, typ: ct, transparent: false) :: retyped
+          )
+        | None -> return LirStmtLet(name, typ, expr) :: retype_env_go(stmts: rest, types, retyped)
+      end
+    | s :: rest -> return s :: retype_env_go(stmts: rest, types, retyped)
+  end
+end
+
+/** The representation a `let` of type `typ` binding `expr` takes: a capture's
+ *  representation for an environment load, or a retyped load's for a copy. */
+let env_load_type = fn (
+  typ: TypeExpr,
+  expr: LirExpr,
+  types: [ TypeExpr ],
+  retyped: [ Decl ]
+) -> Option<TypeExpr> do
+  if !(is_i64(typ) || is_ptr_type(typ)) then return None end
+  match expr do
+    | LirExprObjectField(value: LirAtomVar(name: vn, typ: _), index, typ: _) ->
+      if vn != "__env" then return None end
+      match nth_type(ts: types, n: index) do
+        | Some(val: ct) -> if is_any(typ: ct) || is_ptr_type(typ: ct) then return Some(val: ct) else return None end
+        | None -> return None
+      end
+    | LirExprAtom(atom: LirAtomVar(name: src, typ: _)) -> return lookup_decl(
+      decls: retyped,
+      name: src
+    )
+    | _ -> return None
+  end
+end
+
+let with_type = fn (expr: LirExpr, typ: TypeExpr) -> LirExpr do
+  match expr do
+    | LirExprObjectField(value, index, typ: _) -> return LirExprObjectField(value, index, typ)
+    | LirExprAtom(atom: LirAtomVar(name, typ: _)) -> return LirExprAtom(atom: LirAtomVar(name, typ))
+    | _ -> return expr
+  end
+end
+
+let nth_type = fn (ts: [ TypeExpr ], n: i64) -> Option<TypeExpr> do
+  match ts do
+    | [] -> return None
+    | t :: rest -> if n == 0 then return Some(val: t) else return nth_type(ts: rest, n: n - 1) end
+  end
+end
+
+let is_i64 = fn (typ: TypeExpr) -> bool do
+  match peel(typ) do
+    | TyI64 -> return true
+    | _ -> return false
+  end
+end

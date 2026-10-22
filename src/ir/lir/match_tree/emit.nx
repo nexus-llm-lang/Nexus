@@ -131,6 +131,36 @@ end
  *  element type routes it through the `TyF32` arm of `emit_typed_field_load`
  *  (`f64.load; f32.demote_f64`), symmetric with the sum-payload path. The tail
  *  and every non-`Cons` built-in field stay `TyI64`. */
+/** Built-in constructor fields declared with a type parameter: `Cons.v`
+ *  (declaration index 0), `Some.val`, `Ok.val`, `Err.err`. */
+let is_builtin_channel_field = fn (ctor_name: string, def_idx: i64) -> bool do
+  if ctor_name == "Cons" then return def_idx == 0 end
+  return ctor_name == "Some" || ctor_name == "Ok" || ctor_name == "Err"
+end
+
+/** True when the scrutinee's element type is known (its first type argument). */
+let def_idx_known = fn (scr_sem: TypeExpr) -> bool do
+  match scrutinee_type_args(scr_sem) do
+    | _ :: _ -> return true
+    | [] -> return false
+  end
+end
+
+let is_scalar_wasm = fn (typ: TypeExpr) -> bool do
+  match typ do
+    | TyI64 | TyI32 | TyF64 | TyF32 | TyBool | TyChar | TyString -> return true
+    | _ -> return false
+  end
+end
+
+let is_type_var = fn (typ: TypeExpr) -> bool do
+  match typ do
+    | TyVar(_) -> return true
+    | TyLinear(inner) | TyBorrow(inner) -> return is_type_var(typ: inner)
+    | _ -> return false
+  end
+end
+
 let builtin_ctor_field_sem = fn (ctor_name: string, def_idx: i64, scr_sem: TypeExpr) -> TypeExpr do
   if ctor_name == "Cons" && def_idx == 0 then
     match scrutinee_type_args(scr_sem) do
@@ -466,7 +496,12 @@ export let lir_emit_bindings = fn (
           temp_counter: c,
           enum_defs: ed
         ) = ctx
-      let typ = atom_type(atom: a)
+      // A value-channel field bound to a variable of a scalar type is bound as
+      // that scalar (the boxing pass unboxes it here).
+      let typ = match atom_type(atom: a) do
+        | TyAny -> if is_scalar_wasm(typ: wasm_type(typ: st)) then wasm_type(typ: st) else TyAny end
+        | other -> other
+      end
           let ctx2 = LowerCtx(
             vars: insert_type(name: n, typ, entries: v),
             semantic_vars: insert_type(name: n, typ: st, entries: sv),
@@ -531,7 +566,9 @@ let lir_extract_fields_loop = fn (scr_atom: LirAtom, scr_sem: TypeExpr, ctor_nam
       let substituted = subst_type_params(typ: raw_ft, params: tps,
         args: scrutinee_type_args(scr_sem))
       let sem_ft = vidx.resolve_record_alias(idx: enum_defs, typ: substituted)
-      let wasm_ft = wasm_type(typ: sem_ft)
+      // A field declared with a type parameter is a value-channel slot: it
+      // holds a pointer (a box for a scalar), whatever the instantiation.
+      let wasm_ft = if is_type_var(typ: raw_ft) then TyAny else wasm_type(typ: sem_ft) end
       let BindResult(ctx: ctx2, atom: field_atom) = bind_expr_to_temp_semantic(ctx,
         expr: LirExprObjectField(value: scr_atom, index: heap_idx, typ: wasm_ft),
         typ: wasm_ft, semantic_type: sem_ft)
@@ -542,8 +579,12 @@ let lir_extract_fields_loop = fn (scr_atom: LirAtom, scr_sem: TypeExpr, ctor_nam
     | None ->
       // Built-in constructor — alphabetical field sort for memory layout.
       let mem_idx = lir_builtin_field_mem_idx(ctor_name, def_idx: idx)
-      let builtin_sem = builtin_ctor_field_sem(ctor_name, def_idx: idx, scr_sem)
-      let builtin_wt = wasm_type(typ: builtin_sem)
+      let channel = is_builtin_channel_field(ctor_name, def_idx: idx)
+      let builtin_sem0 = builtin_ctor_field_sem(ctor_name, def_idx: idx, scr_sem)
+      // An unknown instantiation falls back to i64 above; in a value-channel
+      // slot that fallback would unbox a pointer, so keep it as TyAny.
+      let builtin_sem = if channel && !(ctor_name == "Cons" && def_idx_known(scr_sem)) then TyAny else builtin_sem0 end
+      let builtin_wt = if channel then TyAny else wasm_type(typ: builtin_sem) end
       let BindResult(ctx: ctx2, atom: field_atom) = bind_expr_to_temp_semantic(ctx,
         expr: LirExprObjectField(value: scr_atom, index: mem_idx, typ: builtin_wt),
         typ: builtin_wt, semantic_type: builtin_sem)

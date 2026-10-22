@@ -165,6 +165,69 @@ end
  *  types its binary node at the narrow width (see `narrow_binary_result`);
  *  the recursive operand lowerings and the generic-expression call site pass
  *  `None`. */
+type RawFields = RawFields(ctx: LowerCtx, atoms: [ LirNamedAtom ])
+
+/** A record field stores its value raw: a value-channel field value whose
+ *  semantic type is not a type parameter is unwrapped (a box gives its
+ *  payload; a pointer stays a pointer) before the record is built. */
+let raw_record_fields = fn (
+  atoms: [ LirNamedAtom ],
+  ctx: LowerCtx,
+  acc: [ LirNamedAtom ]
+) -> RawFields throws { LirError } do
+  match atoms do
+    | [] -> return RawFields(ctx, atoms: list.reverse(xs: acc))
+    | LirNamedAtom(name, value) :: rest ->
+      match atom_type(atom: value) do
+        | TyAny ->
+          match lir_get_atom_sem_type(atom: value, ctx) do
+            | TyVar(_) -> return raw_record_fields(
+              atoms: rest,
+              ctx,
+              acc: LirNamedAtom(name, value) :: acc
+            )
+            | _ ->
+              let BindResult(ctx: ctx2, atom: raw) = bind_expr_to_temp(
+                ctx,
+                expr: LirExprCall(
+                  func: "__nx_unwrap",
+                  args: [ LirCallArg(label: "v", value) ],
+                  typ: TyI64
+                ),
+                typ: TyI64
+              )
+              return raw_record_fields(
+                atoms: rest,
+                ctx: ctx2,
+                acc: LirNamedAtom(name, value: raw) :: acc
+              )
+          end
+        | _ -> return raw_record_fields(atoms: rest, ctx, acc: LirNamedAtom(name, value) :: acc)
+      end
+  end
+end
+
+let scalar_operand = fn (
+  atom: LirAtom,
+  sem: TypeExpr,
+  ctx: LowerCtx
+) -> BindResult throws { LirError } do
+  match atom_type(atom) do
+    | TyAny ->
+      match wasm_type(typ: sem) do
+        | TyI64 | TyI32 | TyF64 | TyF32 | TyBool | TyChar | TyString ->
+          return bind_expr_to_temp_semantic(
+            ctx,
+            expr: LirExprAtom(atom),
+            typ: wasm_type(typ: sem),
+            semantic_type: sem
+          )
+        | _ -> return BindResult(ctx, atom)
+      end
+    | _ -> return BindResult(ctx, atom)
+  end
+end
+
 let lower_binary_op = fn (
   lhs: MirExpr,
   op: BinaryOp,
@@ -172,10 +235,14 @@ let lower_binary_op = fn (
   result_hint: Option<TypeExpr>,
   ctx: LowerCtx
 ) -> BindResult throws { LirError } do
-  let BindResult(ctx: ctx2, atom: la) = lower_expr_to_atom(expr: lhs, ctx)
-  let BindResult(ctx: ctx3, atom: ra) = lower_expr_to_atom(expr: rhs, ctx: ctx2)
+  let BindResult(ctx: ctx2a, atom: la0) = lower_expr_to_atom(expr: lhs, ctx)
+  let BindResult(ctx: ctx3a, atom: ra0) = lower_expr_to_atom(expr: rhs, ctx: ctx2a)
   let sem_lhs = infer_semantic_type(expr: lhs, ctx)
   let sem_rhs = infer_semantic_type(expr: rhs, ctx)
+  // A value-channel operand of a scalar semantic type is bound to that scalar
+  // first (the boxing pass unboxes it there), so the operation sees the value.
+  let BindResult(ctx: ctx2, atom: la) = scalar_operand(atom: la0, sem: sem_lhs, ctx: ctx3a)
+  let BindResult(ctx: ctx3, atom: ra) = scalar_operand(atom: ra0, sem: sem_rhs, ctx: ctx2)
   // `==` / `!=` on a record or sum operand demands STRUCTURAL equality
   // (spec § T-Cmp), not the pointer-identity a plain LirExprBinary on the
   // i32 heap pointer would emit. Recover the operand's structural type
@@ -237,7 +304,14 @@ let lower_expr_to_atom = fn (expr: MirExpr, ctx: LowerCtx) -> BindResult throws 
           typ: TyPtr, semantic_type: sem)
 
     | MirRecord(fields) ->
-      let LowerNamedExprsResult(ctx: ctx2, atoms: named_atoms) = lir_lower_named_exprs(fields, ctx)
+      let LowerNamedExprsResult(
+        ctx: ctx2a,
+        atoms: named_atoms0
+      ) = lir_lower_named_exprs(fields, ctx)
+      let RawFields(
+        ctx: ctx2,
+        atoms: named_atoms
+      ) = raw_record_fields(atoms: named_atoms0, ctx: ctx2a, acc: [])
       let sorted_atoms = sort_lir_named_atoms(atoms: named_atoms)
         let sem_type = build_record_semantic_type(atoms: sorted_atoms, ctx: ctx2)
         return bind_expr_to_temp_semantic(ctx: ctx2,
@@ -271,10 +345,13 @@ let lower_expr_to_atom = fn (expr: MirExpr, ctx: LowerCtx) -> BindResult throws 
 
     | MirForce(expr: e) ->
       let BindResult(ctx: ctx2, atom: a) = lower_expr_to_atom(expr: e, ctx)
-      let inner_typ = match atom_type(atom: a) do
+      // The thunk's semantic type keeps the lazy value's result type; its LIR
+      // type is already the erased pointer.
+      let inner_typ = match lir_get_atom_sem_type(atom: a, ctx: ctx2) do
           // Rows are erased at runtime; only the inner result type matters.
-          | TyLazy(inner: t, require_row: _, throw_row: _) -> t
-          | other -> other
+          | TyLazy(inner: t, require_row: _, throw_row: _) -> wasm_type(typ: t)
+          // An unknown result arrives through the thunk's value-channel slot.
+          | _ -> TyAny
         end
         return bind_expr_to_temp(ctx: ctx2,
           expr: LirExprForce(value: a, typ: inner_typ),
@@ -352,7 +429,13 @@ let lower_expr_to_atom = fn (expr: MirExpr, ctx: LowerCtx) -> BindResult throws 
           args: cargs,
           ctx: ctx2
         )
-      let actual_rt = resolve_closure_ret_type(clos, fallback: rt, ctx: ctx3)
+      // MIR records an unknown closure result as i64; a closure returns its
+      // result through a value-channel slot, so an unknown result is TyAny.
+      let fallback_rt = match rt do
+        | TyI64 -> TyAny
+        | other -> other
+      end
+      let actual_rt = resolve_closure_ret_type(clos, fallback: fallback_rt, ctx: ctx3)
           let wt = wasm_type(typ: actual_rt)
           return bind_expr_to_temp_semantic(ctx: ctx3,
             expr: LirExprCallClosure(closure: clos_atom, args: lir_args, typ: wt),
@@ -847,6 +930,19 @@ end
  *  (a function-PARAMETER `i32` stays i32 via `LirAtomVar`), and a non-narrow
  *  declared type (incl. `TyUnit` for an unannotated `let`) is left untouched.
  */
+/** An annotation on a let whose value's semantic type is unknown (a
+ *  value-channel value) gives the binding its type. */
+let annotates_channel = fn (annot: TypeExpr, atom_sem: TypeExpr) -> bool do
+  match atom_sem do
+    | TyAny ->
+      match annot do
+        | TyUnit | TyAny -> return false
+        | _ -> return true
+      end
+    | _ -> return false
+  end
+end
+
 let preferred_let_width = fn (declared: TypeExpr, inferred: TypeExpr) -> TypeExpr do
   match declared do
     | TyI32 -> match inferred do | TyI64 -> return TyI32 | _ -> return inferred end
@@ -897,7 +993,18 @@ let lower_stmt_inner = fn (
       end
       // A narrow (`i32`/`f32`) annotation overrides the atom's wide default so a
       // literal-RHS let binds a narrow local (see `preferred_let_width`).
-      let inferred = preferred_let_width(declared: t, inferred: atom_type(atom: a))
+      let inferred0 = preferred_let_width(declared: t, inferred: atom_type(atom: a))
+      // A value-channel value bound under an annotation takes the annotated
+      // representation (the boxing pass unboxes a scalar here). An unannotated
+      // let declares TyUnit.
+      let inferred = match inferred0 do
+        | TyAny ->
+          match wasm_type(typ: t) do
+            | TyUnit | TyAny -> TyAny
+            | annotated -> annotated
+          end
+        | other -> other
+      end
         // Prefer semantic type from lowered atom if available
         let atom_sem = match a do
           | LirAtomVar(name: vn, typ: _) ->
@@ -922,7 +1029,10 @@ let lower_stmt_inner = fn (
           temp_counter: _,
           enum_defs: ed_for_sem
         ) = ctx2
-        let actual_sem0 = if prefer_annotation_sem(annot: t, atom_sem) then
+        let actual_sem0 = if prefer_annotation_sem(
+          annot: t,
+          atom_sem
+        ) || annotates_channel(annot: t, atom_sem) then
           t
         else
           reconcile_annotation_widths(annot: t, inferred: atom_sem, enum_defs: ed_for_sem)

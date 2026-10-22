@@ -1,0 +1,180 @@
+/**
+ * codegen/intrinsics/box: boxes for scalar values in the generic value
+ * channel.
+ *
+ * A box is a 2-word heap object: word 0 holds `box_tag()`, word 1 holds the
+ * scalar's 64 bits (an f64 bit-reinterpreted, an f32 promoted to f64 first,
+ * an i32/bool/char sign-extended, a string's packed handle as is).
+ *
+ * - `__nx_box(v)` allocates a box for `v` and leaves its pointer as an i64.
+ * - `__nx_unbox(p)` leaves the 64 bits stored in the box `p` as an i64.
+ * - `__nx_unwrap(v)` leaves the 64 bits a box `v` holds, or `v` itself when it
+ *   is 0 or not a box.
+ * - `__nx_any_eq(l, r)` compares two value-channel values: true when they are
+ *   the same pointer, or both boxes holding the same 64 bits; false otherwise.
+ */
+import { ByteBuffer }, * as bb from "std:bytebuffer"
+import { TyI64 } from "src/types/type_expr.nx"
+import { LirCallArg, LirAtom } from "src/ir/lir/types.nx"
+import { CodegenCtx, ctx_temps_base } from "src/backend/codegen/ctx/context.nx"
+import {
+  op_if,
+  op_else,
+  op_end,
+  bt_i32,
+  op_i32_const,
+  op_i32_and,
+  op_i64_eq,
+  op_i64_ne,
+  op_i32_wrap_i64,
+  op_i64_extend_i32_u,
+  op_i64_const,
+  op_i64_load,
+  op_i64_store,
+  op_local_get
+},
+       * as wdefs from "src/backend/wasm/defs.nx"
+import { emit_atom, emit_coercion, emit_alloc_object } from "src/backend/codegen/emit/atom.nx"
+import { SymbolNotFound, CodegenError, SkIntrinsicArg } from "src/backend/errors.nx"
+
+/** Header tag written into word 0 of every box. */
+export let box_tag = fn () -> i64 do
+  return wdefs.constructor_tag(name: "__Box", arity: 1)
+end
+
+/** `__nx_box(v)`: allocate a box holding `v`'s 64 bits. */
+export let emit_box = fn (
+  args: [ LirCallArg ],
+  buf: %ByteBuffer,
+  ctx: CodegenCtx
+) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: v) :: _ ->
+      let obj_ptr = ctx_temps_base(ctx) + 3
+      let %buf = emit_alloc_object(%buf, ctx, words: 2)
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: obj_ptr)
+      let %buf = bb.push_byte(%buf, byte: op_i64_const)
+      let %buf = bb.push_sleb128(%buf, val: box_tag())
+      let %buf = bb.push_byte(%buf, byte: op_i64_store)
+      let %buf = wdefs.emit_memarg_i64(%buf, offset: 0)
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: obj_ptr)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      let %buf = emit_coercion(from_type: wdefs.atom_type(atom: v), to_type: TyI64, %buf)
+      let %buf = bb.push_byte(%buf, byte: op_i64_store)
+      let %buf = wdefs.emit_memarg_i64(%buf, offset: 8)
+      let %buf = bb.push_byte(%buf, byte: op_local_get)
+      let %buf = bb.push_uleb128(%buf, val: obj_ptr)
+      return bb.push_byte(%buf, byte: op_i64_extend_i32_u)
+    | [] ->
+      bb.free(buf: %buf)
+      throw SymbolNotFound(name: "__nx_box", kind: SkIntrinsicArg, context: "expected (v)")
+  end
+end
+
+/** `__nx_unbox(p)`: load the 64 bits stored in box `p`. */
+export let emit_unbox = fn (
+  args: [ LirCallArg ],
+  buf: %ByteBuffer,
+  ctx: CodegenCtx
+) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: p) :: _ ->
+      let %buf = emit_atom(atom: p, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [ op_i32_wrap_i64, op_i64_load ])
+      return wdefs.emit_memarg_i64(%buf, offset: 8)
+    | [] ->
+      bb.free(buf: %buf)
+      throw SymbolNotFound(name: "__nx_unbox", kind: SkIntrinsicArg, context: "expected (p)")
+  end
+end
+
+/** `__nx_any_eq(l, r)`: equality of two value-channel values (see header). */
+export let emit_any_eq = fn (
+  args: [ LirCallArg ],
+  buf: %ByteBuffer,
+  ctx: CodegenCtx
+) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: l) :: LirCallArg(label: _, value: r) :: _ ->
+      let %buf = emit_atom(atom: l, %buf, ctx)
+      let %buf = emit_atom(atom: r, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [ op_i64_eq, op_if, bt_i32, op_i32_const, 1, op_else ])
+      let %buf = emit_nonzero(atom: l, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [ op_if, bt_i32 ])
+      let %buf = emit_nonzero(atom: r, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [ op_if, bt_i32 ])
+      let %buf = emit_is_box(atom: l, %buf, ctx)
+      let %buf = emit_is_box(atom: r, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [ op_i32_and, op_if, bt_i32 ])
+      let %buf = emit_word(atom: l, offset: 8, %buf, ctx)
+      let %buf = emit_word(atom: r, offset: 8, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_i64_eq)
+      let %buf = bb.push_bytes(%buf, bytes: [ op_else, op_i32_const, 0, op_end ])
+      let %buf = bb.push_bytes(%buf, bytes: [ op_else, op_i32_const, 0, op_end ])
+      let %buf = bb.push_bytes(%buf, bytes: [ op_else, op_i32_const, 0, op_end ])
+      return bb.push_byte(%buf, byte: op_end)
+    | _ ->
+      bb.free(buf: %buf)
+      throw SymbolNotFound(name: "__nx_any_eq", kind: SkIntrinsicArg, context: "expected (l, r)")
+  end
+end
+
+let emit_nonzero = fn (
+  atom: LirAtom,
+  buf: %ByteBuffer,
+  ctx: CodegenCtx
+) -> %ByteBuffer throws { CodegenError } do
+  let %buf = emit_atom(atom, %buf, ctx)
+  let %buf = bb.push_byte(%buf, byte: op_i64_const)
+  let %buf = bb.push_sleb128(%buf, val: 0)
+  return bb.push_byte(%buf, byte: op_i64_ne)
+end
+
+let emit_word = fn (
+  atom: LirAtom,
+  offset: i64,
+  buf: %ByteBuffer,
+  ctx: CodegenCtx
+) -> %ByteBuffer throws { CodegenError } do
+  let %buf = emit_atom(atom, %buf, ctx)
+  let %buf = bb.push_bytes(%buf, bytes: [ op_i32_wrap_i64, op_i64_load ])
+  return wdefs.emit_memarg_i64(%buf, offset)
+end
+
+let emit_is_box = fn (
+  atom: LirAtom,
+  buf: %ByteBuffer,
+  ctx: CodegenCtx
+) -> %ByteBuffer throws { CodegenError } do
+  let %buf = emit_word(atom, offset: 0, %buf, ctx)
+  let %buf = bb.push_byte(%buf, byte: op_i64_const)
+  let %buf = bb.push_sleb128(%buf, val: box_tag())
+  return bb.push_byte(%buf, byte: op_i64_eq)
+end
+
+/** `__nx_unwrap(v)`: the payload of a box, else `v` unchanged. */
+export let emit_unwrap = fn (
+  args: [ LirCallArg ],
+  buf: %ByteBuffer,
+  ctx: CodegenCtx
+) -> %ByteBuffer throws { CodegenError } do
+  match args do
+    | LirCallArg(label: _, value: v) :: _ ->
+      let %buf = emit_nonzero(atom: v, %buf, ctx)
+      let %buf = bb.push_bytes(%buf, bytes: [ op_if, bt_i32 ])
+      let %buf = emit_is_box(atom: v, %buf, ctx)
+      let %buf = bb.push_bytes(
+        %buf,
+        bytes: [ op_else, op_i32_const, 0, op_end, op_if, wdefs.bt_i64 ]
+      )
+      let %buf = emit_word(atom: v, offset: 8, %buf, ctx)
+      let %buf = bb.push_byte(%buf, byte: op_else)
+      let %buf = emit_atom(atom: v, %buf, ctx)
+      return bb.push_byte(%buf, byte: op_end)
+    | [] ->
+      bb.free(buf: %buf)
+      throw SymbolNotFound(name: "__nx_unwrap", kind: SkIntrinsicArg, context: "expected (v)")
+  end
+end

@@ -433,8 +433,12 @@ let compare_field = fn (
   heap_idx: i64,
   field_type: TypeExpr,
   gen_inst: bool,
+  channel: bool,
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
+  if channel then
+    return compare_channel_field(lhs_parent, rhs_parent, heap_idx, field_type, gen_inst, ctx)
+  end
   // wasm slot type for the field load: strings flow as i64 packed handles but
   // must be TYPED TyString so the recursive compare routes through the string
   // path (codegen is_string_op trusts atom_type == TyString). A FLOAT field
@@ -460,6 +464,68 @@ let compare_field = fn (
     typ: load_wt
   )
   return compare_values(l: l_field, r: r_field, sem_type: field_type, gen_inst, ctx: ctx2)
+end
+
+// A field declared with a type parameter holds a value-channel value (a box
+// for a scalar). Load it as TyAny on both sides. A scalar instantiation is
+// rebound to the scalar type (the boxing pass unboxes it) and compared as a
+// scalar; an erased type parameter compares with `__nx_any_eq`; anything else
+// compares through its helper as a pointer.
+let compare_channel_field = fn (
+  lhs_parent: LirAtom,
+  rhs_parent: LirAtom,
+  heap_idx: i64,
+  field_type: TypeExpr,
+  gen_inst: bool,
+  ctx: LowerCtx
+) -> CmpResult throws { LirError } do
+  let BindResult(ctx: ctx1, atom: l_any) = bind_expr_to_temp(
+    ctx,
+    expr: LirExprObjectField(value: lhs_parent, index: heap_idx, typ: TyAny),
+    typ: TyAny
+  )
+  let BindResult(ctx: ctx2, atom: r_any) = bind_expr_to_temp(
+    ctx: ctx1,
+    expr: LirExprObjectField(value: rhs_parent, index: heap_idx, typ: TyAny),
+    typ: TyAny
+  )
+  match resolve_operand_type(t: field_type, ctx: ctx2) do
+    | TyI64 | TyI32 | TyF64 | TyF32 | TyBool | TyChar | TyString ->
+      let st = scalar_slot_type(t: resolve_operand_type(t: field_type, ctx: ctx2))
+      let BindResult(
+        ctx: ctx3,
+        atom: l_s
+      ) = bind_expr_to_temp(ctx: ctx2, expr: LirExprAtom(atom: l_any), typ: st)
+      let BindResult(
+        ctx: ctx4,
+        atom: r_s
+      ) = bind_expr_to_temp(ctx: ctx3, expr: LirExprAtom(atom: r_any), typ: st)
+      return compare_values(l: l_s, r: r_s, sem_type: field_type, gen_inst, ctx: ctx4)
+    | TyVar(_) ->
+      let BindResult(ctx: ctx3, atom) = bind_expr_to_temp(
+        ctx: ctx2,
+        expr: LirExprCall(
+          func: "__nx_any_eq",
+          args: [ LirCallArg(label: "l", value: l_any), LirCallArg(label: "r", value: r_any) ],
+          typ: TyBool
+        ),
+        typ: TyBool
+      )
+      return CmpResult(ctx: ctx3, atom)
+    | _ -> return compare_values(l: l_any, r: r_any, sem_type: field_type, gen_inst, ctx: ctx2)
+  end
+end
+
+let scalar_slot_type = fn (t: TypeExpr) -> TypeExpr do
+  match t do
+    | TyBool -> return TyBool
+    | TyChar -> return TyChar
+    | TyI32 -> return TyI32
+    | TyF64 -> return TyF64
+    | TyF32 -> return TyF32
+    | TyString -> return TyString
+    | _ -> return TyI64
+  end
 end
 
 // Compare two already-loaded operand atoms of semantic type `sem_type`,
@@ -564,7 +630,7 @@ let compare_record_go = fn (
     | NamedType(name: fname, typ: ftyp) :: rest ->
       let heap_idx = heap_index_of(name: fname, all_names)
       let CmpResult(ctx: ctx1, atom: feq) = compare_field(
-        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, gen_inst, ctx
+        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, gen_inst, channel: false, ctx
       )
       let next_acc = match acc do
         | None -> CmpResult(ctx: ctx1, atom: feq)
@@ -632,9 +698,14 @@ let compare_variant_payload = fn (
   gen_inst: bool,
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
-  let VariantDef(name: _, fields: fs) = vd
+  let VariantDef(name: vname, fields: fs) = vd
   let all_names = variant_field_names(fs, acc: [])
-  return compare_variant_fields_go(l, r, fields: fs, all_names, acc: None, gen_inst, ctx)
+  let LowerCtx(vars: _, semantic_vars: _, stmts: _, temp_counter: _, enum_defs: ed) = ctx
+  let channels = match vidx.lookup_variant_def_in_index(idx: ed, variant: vname) do
+    | Some(val: VariantDef(name: _, fields: declared)) -> declared_channels(fs: declared)
+    | None -> []
+  end
+  return compare_variant_fields_go(l, r, fields: fs, all_names, acc: None, gen_inst, channels, ctx)
 end
 
 let compare_variant_fields_go = fn (
@@ -644,6 +715,7 @@ let compare_variant_fields_go = fn (
   all_names: [ string ],
   acc: Option<LirAtom>,
   gen_inst: bool,
+  channels: [ bool ],
   ctx: LowerCtx
 ) -> CmpResult throws { LirError } do
   match fields do
@@ -659,7 +731,7 @@ let compare_variant_fields_go = fn (
       end
       let heap_idx = heap_index_of(name: fname, all_names)
       let CmpResult(ctx: ctx1, atom: feq) = compare_field(
-        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, gen_inst, ctx
+        lhs_parent: l, rhs_parent: r, heap_idx, field_type: ftyp, gen_inst, channel: head_channel(channels), ctx
       )
       let next_acc = match acc do
         | None -> CmpResult(ctx: ctx1, atom: feq)
@@ -673,7 +745,7 @@ let compare_variant_fields_go = fn (
       end
       let CmpResult(ctx: ctx3, atom: acc_atom) = next_acc
       return compare_variant_fields_go(l, r, fields: rest, all_names,
-                                       acc: Some(val: acc_atom), gen_inst, ctx: ctx3)
+                                       acc: Some(val: acc_atom), gen_inst, channels: tail_channels(channels), ctx: ctx3)
   end
 end
 
@@ -995,5 +1067,38 @@ let is_ptr = fn (typ: TypeExpr) -> bool do
   match typ do
     | TyPtr -> return true
     | _ -> return false
+  end
+end
+
+// Per declared field of a variant, whether it is a value-channel slot (its
+// declared type is a type parameter), in declaration order.
+let declared_channels = fn (fs: [ VariantField ]) -> [ bool ] do
+  match fs do
+    | [] -> return []
+    | VariantField(
+      name: _,
+      typ
+    ) :: rest -> return is_tyvar_field(t: typ) :: declared_channels(fs: rest)
+  end
+end
+
+let is_tyvar_field = fn (t: TypeExpr) -> bool do
+  match t do
+    | TyVar(_) -> return true
+    | _ -> return false
+  end
+end
+
+let head_channel = fn (channels: [ bool ]) -> bool do
+  match channels do
+    | c :: _ -> return c
+    | [] -> return false
+  end
+end
+
+let tail_channels = fn (channels: [ bool ]) -> [ bool ] do
+  match channels do
+    | _ :: rest -> return rest
+    | [] -> return []
   end
 end
